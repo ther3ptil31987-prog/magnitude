@@ -79,7 +79,9 @@ export const countAnthropicMessageTokens = HttpApiEndpoint.post(
   "/anthropic/v1/messages/count_tokens",
 )
   .setPayload(
-    S.suspend((): S.Schema<Schemas.MessagesRequest, Schemas.MessagesRequestEncoded> => Schemas.MessagesRequest),
+    S.suspend(
+      (): S.Schema<Schemas.CountTokensRequest, Schemas.CountTokensRequestEncoded> => Schemas.CountTokensRequest,
+    ),
   )
   .addSuccess(
     S.suspend(
@@ -94,6 +96,14 @@ export const countAnthropicMessageTokens = HttpApiEndpoint.post(
   .addError(
     S.suspend((): S.Schema<Schemas.ErrorEnvelope, Schemas.ErrorEnvelopeEncoded> => Schemas.ErrorEnvelope),
     { status: 404 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorEnvelope, Schemas.ErrorEnvelopeEncoded> => Schemas.ErrorEnvelope),
+    { status: 409 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorEnvelope, Schemas.ErrorEnvelopeEncoded> => Schemas.ErrorEnvelope),
+    { status: 422 },
   )
   .addError(
     S.suspend((): S.Schema<Schemas.ErrorEnvelope, Schemas.ErrorEnvelopeEncoded> => Schemas.ErrorEnvelope),
@@ -123,6 +133,10 @@ export const createAnthropicMessage = HttpApiEndpoint.post("createAnthropicMessa
   .addError(
     S.suspend((): S.Schema<Schemas.ErrorEnvelope, Schemas.ErrorEnvelopeEncoded> => Schemas.ErrorEnvelope),
     { status: 500 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorEnvelope, Schemas.ErrorEnvelopeEncoded> => Schemas.ErrorEnvelope),
+    { status: 503 },
   )
 
 export const ensureModelInstance = HttpApiEndpoint.post("ensureModelInstance", "/api/v1/instances")

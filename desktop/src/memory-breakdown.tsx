@@ -1,3 +1,4 @@
+import { ErrorNotice } from "./error-notice"
 import { LoadingRegion, SkeletonLine } from "./page-skeletons"
 import { Skeleton } from "../../web/src/components/ui/skeleton"
 import { pageLayout } from "./page-layout"
@@ -10,9 +11,9 @@ import { activeLocalModel, formatMemorySize, useLocalModels } from "@magnitudede
 export function MemoryFigures({ allocation }: { readonly allocation: Option.Option<ModelInstanceAllocation> | null }) {
   const domains = allocation === null ? [] : Option.match(allocation, { onNone: () => [], onSome: value => value.memoryDomains })
   const segments = [
-    { label: "Model weights", bytes: domains.reduce((sum, domain) => sum + domain.modelBytes, 0), color: "bg-blue-600 dark:bg-blue-400" },
+    { label: "Model weights", bytes: domains.reduce((sum, domain) => sum + domain.modelBytes + domain.auxiliaryBytes, 0), color: "bg-blue-600 dark:bg-blue-400" },
     { label: "KV cache", bytes: domains.reduce((sum, domain) => sum + domain.contextBytes, 0), color: "bg-blue-300 dark:bg-blue-700" },
-    { label: "Overhead", bytes: domains.reduce((sum, domain) => sum + domain.computeBytes + domain.auxiliaryBytes, 0), color: "bg-slate-600 dark:bg-slate-300" },
+    { label: "Overhead", bytes: domains.reduce((sum, domain) => sum + domain.computeBytes, 0), color: "bg-slate-600 dark:bg-slate-300" },
   ]
   const total = segments.reduce((sum, segment) => sum + segment.bytes, 0)
   return <>
@@ -33,7 +34,8 @@ export function MemoryFigures({ allocation }: { readonly allocation: Option.Opti
 function ModelMemory() {
   const models = useLocalModels()
   if (Result.isInitial(models)) return <LoadingRegion label="Loading memory"><MemoryFigures allocation={null} /></LoadingRegion>
-  if (!Result.isSuccess(models)) return <p className="mt-4 text-sm text-slate-500">{Result.isFailure(models) ? "Memory unavailable" : "Reading memory…"}</p>
+  if (Result.isFailure(models)) return <ErrorNotice title="Memory usage is unavailable" description="Magnitude can’t read the model’s memory usage right now." className="mt-4" />
+  if (!Result.isSuccess(models)) return <p className="mt-4 text-sm text-slate-500">Reading memory…</p>
   const active = Option.getOrNull(activeLocalModel(models.value))
   if (active && active.residency._tag !== "Ready" && !(active.residency._tag === "Stopping" && active.residency.allocation._tag === "Resident")) return <p className="mt-4 text-sm text-slate-500">Loading model…</p>
   const allocation = active?.residency._tag === "Ready" ? Option.some(active.residency.allocation)

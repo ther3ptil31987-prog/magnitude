@@ -1,0 +1,17 @@
+[package]
+name = "magnitude-kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+seismic.workspace = true
+
+[build-dependencies]
+seismic-build.workspace = true
+
+[dev-dependencies]
+seismic-lang.workspace = true
+seismic-std.workspace = true
+# Offline formation coverage of this crate's kernels (`tests/formation.rs`).
+seismic = { workspace = true, features = ["coverage"] }

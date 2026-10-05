@@ -20,7 +20,7 @@ import {
 const startupProbe = vi.hoisted(() => vi.fn(() => { throw new Error("Unexpected service startup") }))
 vi.mock("../server/acn-connection", async () => {
   const { Effect } = await import("effect")
-  return { headlessAcnConnection: Effect.sync(startupProbe) }
+  return { existingAcnConnection: Effect.sync(startupProbe) }
 })
 
 type CatalogSnapshotState = Exclude<ModelCatalogState, { readonly _tag: "Initializing" }>
@@ -135,6 +135,17 @@ describe("inference command surface", () => {
       "Assessment: In progress",
       "",
     ].join("\n"))
+  })
+
+  it("does not present an unknown assessment target count as progress", () => {
+    const catalog = catalogState()
+    expect(renderCatalogStatus({
+      ...catalog,
+      localModelPreparation: {
+        ...catalog.localModelPreparation,
+        assessment: { complete: false, settledModels: 0, totalModels: 0 },
+      },
+    })).toContain("Assessment: Not complete - no assessment targets reported")
   })
 
   it("renders only fitting catalog evidence and exact model IDs", () => {

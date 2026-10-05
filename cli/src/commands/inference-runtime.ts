@@ -1,9 +1,18 @@
 import {
+  catalogModelReplacement,
+  catalogSupportLabel,
   deriveHardwareMemoryView,
+  describeCatalogDeprecation,
+  formatLocalInferenceBackend,
   formatLocalModelDisplayName,
   formatMemorySize,
+  formatModelLoadPercentage,
+  formatModelOptimization,
+  modelOptimizationFraction,
+  formatModelLoadStage,
   formatSpeculativeMethod,
   formatStorageSize,
+  isMeasuredModelLoadStage,
   LOCAL_MODEL_RANKING_SCALE_LABELS,
   LOCAL_MODEL_RANKING_SCALE_VALUES,
   localModelIsInstalled,
@@ -16,6 +25,7 @@ import {
 } from "@magnitudedev/client-common"
 import {
   CatalogFormModelIdSchema,
+  localModelDeprecation,
   type MagnitudeClient,
   type CatalogLocalModel,
   type LocalInferenceHardware,
@@ -23,7 +33,7 @@ import {
   type ModelId,
 } from "@magnitudedev/sdk"
 import { Data, Effect, Option, Schema } from "effect"
-import { headlessAcnConnection } from "../server/acn-connection"
+import { existingAcnConnection } from "../server/acn-connection"
 import {
   describeLocalHardware,
   formatContext,
@@ -43,7 +53,7 @@ class ModelCommandError extends Data.TaggedError("ModelCommandError")<{
 
 const withClient = <A>(use: (client: CliModelsClient) => Effect.Effect<A, unknown>) =>
   Effect.scoped(Effect.gen(function* () {
-    const connection = yield* headlessAcnConnection
+    const connection = yield* existingAcnConnection
     return yield* use(connection.client)
   }))
 
@@ -65,9 +75,15 @@ export const renderCatalogStatus = (catalog: ModelCatalogState): string => {
   ].join("\n"))
 
   const { assessment } = catalog.localModelPreparation
+  const progress = `${assessment.settledModels} of ${assessment.totalModels} model${assessment.totalModels === 1 ? "" : "s"} assessed`
+  const status = assessment.complete
+    ? `Complete - ${progress}`
+    : assessment.totalModels === 0
+      ? "Not complete - no assessment targets reported"
+      : `In progress - ${progress}`
   return ensureTrailingNewline([
     "Model catalog preparation",
-    `Assessment: ${assessment.complete ? "Complete" : "In progress"} - ${assessment.settledModels} of ${assessment.totalModels} model${assessment.totalModels === 1 ? "" : "s"} assessed`,
+    `Assessment: ${status}`,
   ].join("\n"))
 }
 
@@ -142,7 +158,8 @@ const catalogWarnings = (catalog: ModelCatalogState): string[] => catalog._tag =
     .map((message) => `Catalog warning: ${message}`)
 
 const fittingCatalogModels = (models: readonly CatalogLocalModel[]): CatalogLocalModel[] => models
-  .filter(model => model.servingState._tag === "Assessed"
+  .filter(model => Option.isNone(localModelDeprecation(model))
+    && model.servingState._tag === "Assessed"
     && model.servingState.assessment._tag === "Fits")
   .sort((left, right) => left.presentation.displayName.localeCompare(right.presentation.displayName)
     || String(left.presentation.variantLabel).localeCompare(String(right.presentation.variantLabel))
@@ -152,6 +169,27 @@ const radarDetail = (model: CatalogLocalModel, label: string): string =>
   Option.getOrUndefined(localModelRadarAxes(model))?.find((axis) => axis.label === label)?.detail ?? "—"
 
 const speedLabel = (model: CatalogLocalModel): string => radarDetail(model, "SPEED")
+
+const labeledModelName = (model: CatalogLocalModel): string => Option.match(
+  catalogSupportLabel(model.catalogData.support), {
+    onNone: () => formatLocalModelDisplayName(model),
+    onSome: (label) => `${formatLocalModelDisplayName(model)} [${label}]`,
+  })
+
+const supportFields = (
+  model: CatalogLocalModel,
+  models: readonly CatalogLocalModel[],
+): readonly (readonly [string, string])[] => {
+  const support = model.catalogData.support
+  switch (support._tag) {
+    case "Supported": return []
+    case "Disabled": return [["Support", `Disabled - ${support.reason}`]]
+    case "Deprecated": return [
+      ["Support", describeCatalogDeprecation(support, catalogModelReplacement(models, support))],
+      ["Switch", `magnitude catalog pull ${support.replacement}`],
+    ]
+  }
+}
 
 const accelerationLabel = (model: CatalogLocalModel): string =>
   model.servingState._tag === "Assessed"
@@ -173,7 +211,7 @@ export const renderCatalog = (catalog: ModelCatalogState): string => {
     return ensureTrailingNewline([lead, ...notice].join("\n"))
   }
   const table = renderTable(compatible, [
-    { heading: "MODEL", value: formatLocalModelDisplayName },
+    { heading: "MODEL", value: labeledModelName },
     { heading: "MEMORY", value: modelMemory },
     { heading: "SPEED", value: speedLabel },
     { heading: "CONTEXT", value: modelContext },
@@ -228,10 +266,10 @@ const capabilityLabels = (model: CatalogLocalModel): string[] => {
 const renderRecommendation = (model: CatalogLocalModel, index: number): string => {
   const capabilities = capabilityLabels(model)
   return [
-    `${index + 1}. ${formatLocalModelDisplayName(model)}`,
+    `${index + 1}. ${labeledModelName(model)}`,
     `   ID: ${model.modelId}`,
     `   ${speedLabel(model)} - ${modelMemory(model)} memory - ${modelContext(model)} context`,
-    `   Intelligence ${Math.round(model.catalogData.intelligence.score)}% - Fidelity ${radarDetail(model, "FIDELITY")} - Acceleration ${accelerationLabel(model)}`,
+    `   Intelligence ${model.catalogData.intelligence}% - Fidelity ${radarDetail(model, "FIDELITY")} - Acceleration ${accelerationLabel(model)}`,
     ...(capabilities.length > 0 ? [`   ${capabilities.join(", ")}`] : []),
   ].join("\n")
 }
@@ -303,13 +341,17 @@ const formatReleaseDate = (value: string): string => {
     : new Intl.DateTimeFormat("en", { month: "long", year: "numeric", timeZone: "UTC" }).format(date)
 }
 
-const renderCatalogDetail = (model: CatalogLocalModel): string => {
+const renderCatalogDetail = ({ model, models }: {
+  readonly model: CatalogLocalModel
+  readonly models: readonly CatalogLocalModel[]
+}): string => {
   const serving = model.servingState
   const header = [
     formatLocalModelDisplayName(model),
     ...(model.presentation.description.trim().length > 0 ? [model.presentation.description.trim()] : []),
     renderFields([
       ["Model ID", model.modelId],
+      ...supportFields(model, models),
       ["Released", formatReleaseDate(model.catalogData.releaseDate)],
       ["Architecture", formatParameters(model)],
       ["Context", modelContext(model)],
@@ -317,21 +359,17 @@ const renderCatalogDetail = (model: CatalogLocalModel): string => {
     ]),
   ]
   const performance = (() => {
-    if (serving._tag === "Assessing") return ["Assessment", renderFields([["Status", "Assessing"]])]
-    if (serving._tag === "Failed") return ["Assessment", renderFields([["Status", "Failed"], ["Reason", serving.failure.message]])]
+    if (serving._tag === "Assessing") return ["Assessment", renderFields([["Status", "Assessing memory and speed…"]])]
+    if (serving._tag === "Failed") return ["Assessment", renderFields([["Status", "Assessment failed."], ["Reason", serving.failure.message]])]
     if (serving.assessment._tag === "DoesNotFit") return ["Performance on this machine", renderFields([
       ["Status", "Does not fit"],
       ["Memory required", formatMemorySize(serving.assessment.totalRequiredBytes)],
       ["Additional memory", formatMemorySize(serving.assessment.deficitBytes)],
     ])]
-    if (serving.assessment._tag === "Incompatible") return ["Performance on this machine", renderFields([
-      ["Status", "Incompatible"],
-      ["Reason", serving.assessment.failure.message],
-    ])]
     return ["Performance on this machine", renderFields([
       ["Speed", speedLabel(model)],
-      ["Memory", radarDetail(model, "MEMORY")],
-      ["Intelligence", `${Math.round(model.catalogData.intelligence.score)}%`],
+      ["Fit", radarDetail(model, "FIT")],
+      ["Intelligence", `${model.catalogData.intelligence}%`],
       ["Fidelity", radarDetail(model, "FIDELITY")],
       ["Acceleration", accelerationLabel(model)],
     ])]
@@ -353,7 +391,7 @@ const renderCatalogDetail = (model: CatalogLocalModel): string => {
 export const showCatalogModel = (modelInput: string) => runCommand({
   effect: decodeCatalogId(modelInput).pipe(Effect.flatMap(modelId => withClient((client) => Effect.gen(function* () {
     const models = yield* requireLocalModels(yield* readCatalog(client))
-    return yield* findModel(models, modelId, "catalog model")
+    return { model: yield* findModel(models, modelId, "catalog model"), models }
   })))),
   render: renderCatalogDetail,
 })
@@ -400,10 +438,9 @@ const residencyLabel = (model: CatalogLocalModel): string => {
   if (residency === undefined) return "Unloaded"
   switch (residency._tag) {
     case "Requested": return "Loading"
-    case "Loading": return Option.match(residency.progress, {
-      onNone: () => "Loading",
-      onSome: (progress) => `Loading ${Math.round(progress * 100)}%`,
-    })
+    case "Loading": return isMeasuredModelLoadStage(residency.stage)
+      ? `${formatModelLoadStage(residency.stage)} ${formatModelLoadPercentage(residency.fraction)}`
+      : formatModelLoadStage(residency.stage)
     case "Failed": return `Failed - ${residency.failure.message}`
     default: return residency._tag
   }
@@ -414,12 +451,17 @@ const percent = (completed: number, total: number): string =>
 
 const modelStatus = (model: CatalogLocalModel): string => {
   const acquisition = model.acquisitionState
+  const deprecation = Option.getOrUndefined(localModelDeprecation(model))
+  if (deprecation !== undefined && acquisition._tag !== "Removing" && acquisition._tag !== "RemoveFailed") {
+    return `Deprecated - switch to ${deprecation.replacement}`
+  }
   switch (acquisition._tag) {
     case "Removing": return "Removing"
     case "Installing": return `Downloading ${percent(acquisition.progress.completedBytes, acquisition.progress.totalBytes)}`
     case "Updating": return `Updating ${percent(acquisition.progress.completedBytes, acquisition.progress.totalBytes)}`
     case "InstallFailed": return `Failed - ${modelDownloadFailureMessage(acquisition.failure)}`
     case "UpdateFailed": return `Failed - ${modelDownloadFailureMessage(acquisition.failure)}`
+    case "Optimizing": return formatModelOptimization(acquisition.progress)
     case "RemoveFailed": return `Failed - ${acquisition.failure.message}`
     case "NotInstalled": return "Not installed"
     case "UpdateAvailable": {
@@ -452,6 +494,13 @@ const installationFields = (model: CatalogLocalModel): readonly (readonly [strin
     ["Installation", state._tag === "Installing" ? "Downloading" : "Updating"],
     ["Progress", `${percent(state.progress.completedBytes, state.progress.totalBytes)} - ${formatStorageSize(state.progress.completedBytes)} / ${formatStorageSize(state.progress.totalBytes)}`],
   ]
+  if (state._tag === "Optimizing") return [
+    ["Installation", "Optimizing"],
+    ...Option.match(modelOptimizationFraction(state.progress), {
+      onNone: () => [],
+      onSome: (fraction) => [["Progress", formatModelLoadPercentage(fraction)]] as const,
+    }),
+  ]
   if (state._tag === "InstallFailed" || state._tag === "UpdateFailed") return [
     ["Installation", "Failed"],
     ["Reason", modelDownloadFailureMessage(state.failure)],
@@ -463,10 +512,14 @@ const installationFields = (model: CatalogLocalModel): readonly (readonly [strin
   ]
 }
 
-const renderModelDetail = (model: CatalogLocalModel): string => ensureTrailingNewline([
+const renderModelDetail = (
+  model: CatalogLocalModel,
+  models: readonly CatalogLocalModel[],
+): string => ensureTrailingNewline([
   formatLocalModelDisplayName(model),
   renderFields([
     ["Model ID", model.modelId],
+    ...supportFields(model, models),
     ...installationFields(model),
     ...(localModelIsInstalled(model) ? [["Runtime", residencyLabel(model)]] as const : []),
     ...(modelMemoryBytes(model) === undefined ? [] : [["Memory", modelMemory(model)]] as const),
@@ -481,12 +534,12 @@ export const showModelsStatus = (modelInput?: string) => runCommand({
       if (catalog._tag === "Initializing") return { _tag: "Initializing" as const }
       const models = localModels(catalog)
       if (Option.isNone(modelId)) return { _tag: "List" as const, models }
-      return { _tag: "Detail" as const, model: yield* findModel(models, modelId.value) }
+      return { _tag: "Detail" as const, model: yield* findModel(models, modelId.value), models }
     }))),
   ),
   render: (result) => result._tag === "Initializing"
     ? "Local models are initializing.\n"
-    : result._tag === "List" ? renderModelsStatus(result.models) : renderModelDetail(result.model),
+    : result._tag === "List" ? renderModelsStatus(result.models) : renderModelDetail(result.model, result.models),
 })
 
 export const loadInstance = (modelInput: string) => modelMutation(
@@ -551,10 +604,10 @@ const renderHardware = (hardware: LocalInferenceHardware, models: readonly Catal
     ...(current === undefined ? ["  None"] : [
       `  ${formatLocalModelDisplayName(current)} - ${residencyLabel(current)}`,
       ...Option.match(allocation, {
-        onSome: (value) => [`  Context ${formatContext(value.contextWindowTokens)} - Parallelism ${value.parallelSequences}`],
+        onSome: (value) => [`  Context ${formatContext(value.contextWindowTokens)}`],
         onNone: () => Option.match(plan, {
           onNone: () => [],
-          onSome: (value) => [`  Context ${formatContext(value.contextWindowTokens)} - Parallelism ${value.parallelSequences}`],
+          onSome: (value) => [`  Context ${formatContext(value.contextWindowTokens)} - Device ${formatLocalInferenceBackend(value.device.backend)}`],
         }),
       }),
     ]),

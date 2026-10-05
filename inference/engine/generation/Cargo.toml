@@ -1,0 +1,10 @@
+[package]
+name = "magnitude-generation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+magnitude-artifacts = { path = "../artifacts" }
+magnitude-executor = { path = "../executor" }
+serde.workspace = true

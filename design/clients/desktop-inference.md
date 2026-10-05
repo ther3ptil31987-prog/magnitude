@@ -3,11 +3,12 @@ applies_to:
   - assets/hardware/**
   - desktop/test/hardware/**
   - desktop/src/*.ts
-  - desktop/src/renderer*
   - desktop/src/*.tsx
-  - desktop/src/desktop-rpc.ts
-  - desktop/src/electron-rpc.ts
-  - desktop/src/login-startup.ts
+  - packages/daemon-management/src/desktop-native/*-preferences.ts
+  - desktop/native/**
+  - desktop/scripts/build-native.ts
+  - desktop/scripts/dev.ts
+  - packages/storage/src/types/config.ts
   - packages/sdk/src/desktop-host.ts
   - packages/client-common/src/desktop/**
   - packages/harness-connections/**
@@ -18,6 +19,8 @@ applies_to:
 The existing Electron application is the local inference product. Its retained renderer owns one
 SDK connection and one client-common Effect Query runtime. Electron main owns the tray and service
 supervisor; ACN owns the inference engine. Renderer recreation rereads ACN and never restarts it.
+The application snapshot identifies Desktop ownership with its tray state, separately from Headless
+ownership. Renderer background-activity presentation reads that Desktop variant directly.
 Every platform exposes full Quit in its native application menu, including when no tray host exists.
 Window Close remains hide-only; menu Quit uses the same awaited owner shutdown as tray and CLI.
 Unix SIGTERM requests that same awaited shutdown; it does not bypass child retirement.
@@ -37,7 +40,7 @@ may access the host RPC transport. Finite host calls declare replay policy; stat
 actions are at-most-once and lost replies are not replayed into a replacement renderer session.
 
 The main destinations are Discover, Catalog, My Models, Connections, Usage, Status, and Settings. Service health and
-model residency are distinct facts. There is no permanent bottom status strip. Usage and Connections begin directly with their content and controls beneath the page heading, without descriptive subtitles. Discover includes the connection guidance described below. Usage has one top toolbar: its model selection applies to the entire page, while its labeled Totals period controls the summary metrics. The 53-week token activity calendar remains a year view for that model. The calendar sits directly on the page without a surrounding card, background, or border; a compact current streak with an orange flame sits immediately left of the annual token total above the chart, with flat metric rows below. Week columns and weekday rows expose exact dates and recorded token counts on hover and keyboard focus, with one tab stop and arrow-key navigation. A neutral zero level and four increasing theme-blue levels scale against the busiest day. Only the current streak is shown, counting consecutive positive-token days; an unfinished today preserves a streak ending yesterday. Month labels identify the calendar without a separate date-range caption or bottom statistics. Calendar loading and failure remain distinct from zero activity. Discover, Catalog, My Models, Connections, and Usage occupy the top of the sidebar; Status and Settings stay pinned at the bottom. Discover leads with observed hardware, a Fast-to-Smart slider with five visible stops and clickable labels, and five recommendations with assessment-derived radar profiles, allowing up to two configurations per model in score order. Discover presents one shared panel with five compact numbered selection rows beside a single selected-model profile. While a recommended model is downloading or updating, Discover replaces the entire right profile pane with a centered download display, preserving the pane's width and height. It shows transferred and total bytes, a clear progress bar and percentage, current transfer speed, estimated time remaining, and cancellation. Estimates derive from observed remaining bytes and transfer rate, as in the CLI; absent or zero rates do not imply an ETA. Preparation stages stay explicit. The downloading model is selected while its transfer is active, and the ordinary profile returns after completion or cancellation. Only the selected model shows actions; Profile and Details controls switch the right pane without adding a full-width disclosure footer. The best match is selected initially and when the ranking preference changes. Preference changes update the existing panel without replaying an entrance fade or blanking the list and profile; radar geometry transitions between values, with motion disabled for reduced-motion preferences. Selection is local presentation state and never loads a model. If a selected recommendation disappears, the first available recommendation supplies the profile. Radar charts place each metric value beside its axis label, without a separate values list. Charts and their loading placeholders have a bounded size, shrink to fit narrow panes, and remain horizontally centered; wider panes add surrounding space instead of increasing chart height. Discover contains no catalog search or full catalog list. The separate Catalog destination owns the full collection, search, compatibility filtering, and expandable details with radar charts. My Models shows only acquisition/library entries, never the undownloaded catalog. Catalog and My Models each have one page heading with a small matching model count pinned to the right of the same row, without a redundant subtitle or section heading. A compact controls row combines dropdown filters and sorting on the left with search on the right, wrapping at narrow widths. Catalog filters by machine fit and defaults to recommendation order; both pages offer name and download-size sorting. My Models defaults to name order and filters by downloaded or downloading (including updates) state. Search and filters compose, and an empty filtered result is distinct from an empty library. Loading placeholders preserve the header and controls geometry. Connections show the supported harnesses’ own artwork in a single column at every window width; loading placeholders use the same layout. Discovery uses the
+model residency are distinct facts. There is no permanent bottom status strip. Usage and Connections begin directly with their content and controls beneath the page heading, without descriptive subtitles. Discover includes the connection guidance described below. Usage has one top toolbar: its model selection applies to the entire page, while its labeled Totals period controls the summary metrics. The 53-week token activity calendar remains a year view for that model. The calendar sits directly on the page without a surrounding card, background, or border; a compact current streak with an orange flame sits immediately left of the annual token total above the chart, with flat metric rows below. Week columns and weekday rows expose exact dates and recorded token counts on hover and keyboard focus, with one tab stop and arrow-key navigation. A neutral zero level and four increasing theme-blue levels scale against the busiest day. Only the current streak is shown, counting consecutive positive-token days; an unfinished today preserves a streak ending yesterday. Month labels identify the calendar without a separate date-range caption or bottom statistics. Calendar loading and failure remain distinct from zero activity. Discover, Catalog, My Models, Connections, and Usage occupy the top of the sidebar; Status and Settings stay pinned at the bottom. Discover leads with observed hardware, a Fast-to-Smart slider with five visible stops and clickable labels, and five recommendations with assessment-derived radar profiles, allowing up to two configurations per model in score order. Discover presents one shared panel with five compact numbered selection rows beside a single selected-model profile. While a recommended model is downloading or updating, Discover replaces the entire right profile pane with a centered download display, preserving the pane's width and height. It shows transferred and total bytes, a clear progress bar and percentage, current transfer speed, estimated time remaining, and cancellation. Estimates derive from observed remaining bytes and transfer rate, as in the CLI; absent or zero rates do not imply an ETA. Preparation stages stay explicit. The downloading model is selected while its transfer is active, and the ordinary profile returns after completion or cancellation. Only the selected model shows actions; Profile and Details controls switch the right pane without adding a full-width disclosure footer. A recommendation whose last load failed carries a small amber marker on its row; hovering it explains the failure, including the memory breakdown for low memory, while the profile pane keeps its Load action and shows no inline load notice above the radar. The best match is selected initially and when the ranking preference changes. Preference changes update the existing panel without replaying an entrance fade or blanking the list and profile; radar geometry transitions between values, with motion disabled for reduced-motion preferences. Selection is local presentation state and never loads a model. If a selected recommendation disappears, the first available recommendation supplies the profile. Radar charts place each metric value beside its axis label, without a separate values list. Charts and their loading placeholders have a bounded size, shrink to fit narrow panes, and remain horizontally centered; wider panes add surrounding space instead of increasing chart height. Discover contains no catalog search or full catalog list. The separate Catalog destination owns the full collection, search, compatibility filtering, and expandable details with radar charts. My Models shows only acquisition/library entries, never the undownloaded catalog. Best-effort and deprecated models carry a visible support label with the reason on hover. A deprecated model appears only when installed; it has no load, update, or download action, names its replacement, and offers one switch action that downloads the replacement or, once downloaded, loads it, beside ordinary removal. Catalog and My Models each have one page heading with a small matching model count pinned to the right of the same row, without a redundant subtitle or section heading. A compact controls row combines dropdown filters and sorting on the left with search on the right, wrapping at narrow widths. Catalog filters by machine fit and defaults to recommendation order; both pages offer name and download-size sorting. My Models defaults to name order and filters by downloaded or downloading (including updates) state. Search and filters compose, and an empty filtered result is distinct from an empty library. Loading placeholders preserve the header and controls geometry. Connections show the supported harnesses’ own artwork in a single column at every window width; loading placeholders use the same layout. Discovery uses the
 curated ACN catalog, hardware observations, and the shared ranking algorithm; no renderer-owned
 catalog, hardware inference, or independent recommendation source exists.
 Settings reads the running application's version from the privileged host independently of service
@@ -45,7 +48,7 @@ readiness; it never substitutes a hardcoded version or the service protocol vers
 Main owns scheduled Magnitude-hosted update checks, automatic downloads and explicit Settings actions
 independently of the renderer and service readiness. The automatic-download preference does not
 disable checks. Window Close and observer loss cannot cancel admitted work. Magnitude-owned user data
-lives under the shared `.magnitude` root: canonical config owns the automatic-download preference,
+lives under the shared `.magnitude` root: canonical config owns appearance and the automatic-download preference,
 root identity.pem owns request identity, electron/ owns Electron userData and sessionData configured
 before profile initialization, state/ owns application coordination, and updates/ owns one installer
 and one update.json. Isolated development/test roots preserve the same layout.
@@ -91,21 +94,48 @@ The packaged Linux desktop adopts the launcher's shared installation descriptor 
 children and marks it close-on-exec. The desktop retains package admission until process exit;
 service and update-helper children cannot inherit the lease and block their own installation.
 Recommendations order fitting assessed configurations using the shared preference. The remaining
-curated catalog stays discoverable with explicit pending, incompatible, or insufficient-memory
-explanations. Details expose catalog license/source links, capabilities, context, and labeled
-performance estimates. Source links open HTTPS destinations in the system browser. Loading a
-different model asks explicitly before replacing observed active residency.
+curated catalog stays discoverable with explicit pending, assessment-failed, or insufficient-memory
+explanations; every fitting model has a speed estimate. Details
+expose catalog license/source links, capabilities, context, and the estimated speed as one range
+(the radar's) with a dim note that it is a rough estimate and does not account for speculative
+decoding. Speed is a plain-decode estimate from memory bandwidth, accurate to roughly ±20% for most
+models, and is never shown as a per-context table of exact rates.
+Source links open HTTPS destinations in the system browser. Loading a different model asks
+explicitly before replacing observed active residency.
 
 The desktop session service owns navigation and bridges native menu actions into the same model
 mutations used by the window. Window and tray model commands pass through the shared local-model
 service; hooks expose actions and command status without exposing mutation atoms to the renderer.
 Tray model text is a disposable projection of the canonical model
 query. Loss of renderer observation disables model actions; it cannot imply no model is loaded.
+An active model's tray line is `<model> · <phase>` with, on the right, a spinner for work without a
+measure of its own, the percentage and a filling ring while tuning or importing weights, or the
+memory a loaded model holds. Phases are single words from a fixed set (Waiting, Preparing,
+Optimizing, Loading, Finalizing, Loaded, Stopping). On macOS the line is a native view on the menu
+item, drawn by the desktop's own tray addon (built with the desktop and shipped in its resources,
+separate from the desktop host addon), so it updates while the menu is open; main pops the menu up
+itself because Electron keeps running JavaScript only during a menu it pops up. Like a plain menu
+item the line fits the full model name, never truncating it: it holds room for the widest phase
+and detail so that only a model change alters its width, and an open menu never narrows. Other
+platforms show the same line as the item's plain label, current each time the menu opens.
 Main independently displays owned-service startup, recovery, failure, and shutdown.
 Stop remains available for an observed Stopping model, allowing explicit escalation or retry after
 cleanup failure. Window actions suppress duplicate requests while their mutation is pending and
-display declared model failure messages without internal Effect stacks; unknown failures use
-actionable fallback wording. ACN resolves both active and slot Stop against Stopping as well as Loading
+present compact, wrapping notices below the affected controls. Notices use the canonical error,
+warning, or information palette, an icon and concise title; optional actions are plain text with
+hover underline, keyboard focus and pending/eligibility guards. Actions invoke existing feature
+operations; observing or expanding a notice never retries work. Essential text is never truncated.
+User-facing content is authored from typed facts: diagnostics, raw byte counts, internal IDs and
+backend prose never appear in notices, tooltips, expanded details, or native dialogs. Unknown
+failures use truthful operation-specific wording; original diagnostics remain available to logging.
+Memory admission explains the additional memory needed and offers a human-readable breakdown using
+the shared memory units, rounding minimum requirements upward. Storage uses the shared disk units.
+A matching model-command rejection is represented once by its richer authoritative failure;
+unrelated commands and transport failures remain separate. Retry supersedes only the same command's
+feedback; authoritative readiness also retires obsolete load feedback. Stop rejection has one page-level placement. Failed reads replace loading placeholders
+without implying an empty, stopped, disconnected or zero state. Settings save failures take precedence
+over older warnings, and persistent restart guidance remains derived from saved-versus-active state.
+Native dialogs retain their existing native controls and cleanup decisions with safe explanations. ACN resolves both active and slot Stop against Stopping as well as Loading
 and Ready instances, so retry never silently succeeds without contacting the retained instance.
 Main retains the current tray menu independently of its native icon. Linux host recovery replaces
 the preceding icon before creating one replacement and restores the latest menu. Host loss never
@@ -116,7 +146,8 @@ means native registration was requested successfully, not guaranteed pixel visib
 The tray shows service and model state without a setup-completion state. First use follows the ordinary Discover, model and connection actions.
 
 A background launch starts the owner and tray without showing or focusing a window. Explicit Show
-Window or navigation intent opens it. Dock activation reopens a hidden window and explicit Open
+Window or navigation intent opens it. On Windows, left-click or double-click on the tray icon opens
+the window; right-click opens its context menu. Dock activation reopens a hidden window and explicit Open
 restores a minimized window. Raising or reactivating the retained window preserves its selected page;
 only an explicit destination from a native menu action requests navigation. Window close hides the retained renderer. Full Quit stops owned
 children, proves cleanup, and releases application ownership. Cleanup failure stays visible
@@ -156,6 +187,19 @@ also suppresses stale model controls. Model stopping uses the same canonical mut
 and model library.
 Status displays observed model-loading progress and current download, update, and removal activity.
 Unknown progress stays indeterminate; service or query unavailability cannot become an idle claim.
+While a model loads, its residency text names the stage in full (for example "Optimizing for
+<accelerator>…", "Loading weights…") and the bar below shows the load's measured fraction with its
+percentage to the bar's right; a requested load is preparing at zero, so nothing snaps back when it
+starts. A loaded model's residency text includes the memory it holds.
+A model's download card stays in place and becomes its optimization: "Preparing to optimize…"
+while preparing, then "Optimizing for <accelerator>…" (or "Optimizing…" when the previewed device
+is unknown) while tuning. The finished download's full bar pulses while preparing and then gives
+way to the tuning fraction without jumping backwards; the card describes the work as one-time setup
+for this device with its percentage and an estimated time remaining from the observed tuning rate,
+and its cancel action reads "Skip optimization". While the card is shown, load and remove are not
+offered beside it; skipping restores them, and an inference request still loads the model, which
+ends the optimization. Download selection, the Downloading filter and activity include optimizing
+models, whose activity label is `<model> · Optimizing`.
 
 Connection observations refresh after mutations and periodically while observed, so edits made by
 other tools become visible. Unrelated user fields do not invalidate a connection. Development profiles
@@ -169,7 +213,54 @@ action through the observed acquisition state. Catalog and My Models retain load
 Discover has no separate connection link or hint.
 
 The inference rewrite preserves the existing desktop/web visual identity. Reuse the existing
-appearance initializer and `magnitude.appearance` preference, with System, Light, and Dark choices.
+appearance initializer, with System, Light, and Dark choices. Desktop appearance is owned by the
+client host and persisted as `appearance` in its canonical config. Absence means System. Main reads
+it before window creation; the renderer reads it through the host bridge before its first render.
+Successful saves update native and renderer appearance; failed saves retain the previous appearance
+and surface an error. Desktop preference writes are serialized so appearance and update choices do
+not overwrite each other. Appearance reads never rewrite malformed configuration; existing general config recovery may
+preserve a corrupt backup and restore defaults. A failed startup appearance read uses
+System and reports the unavailable preference. Browser storage is not a desktop settings authority,
+and no old browser preference is imported. Renderer reloads reread the host preference independently
+of ACN readiness. The browser client retains its own persistence adapter around shared appearance
+rendering.
+
+Settings is a flat list of rows in two groups, General and About, each row a label with its
+control on the right and a one-line hint only when the state needs explaining: Theme (segmented
+control), Launch at login (switch), Model storage, and Automatic updates (switch), then one About row
+with the application version, update status, and the single update action for the current state.
+The version comes from the packaged bundle, or from the generated Magnitude version when unpackaged.
+
+Model storage is persisted as `modelsDirectory` in the canonical `config.json` that the service reads
+when it spawns the engine. The row shows the current path, marks the default, offers a native folder
+chooser and a return to the default, rejects relative paths, and re-reads the file whenever Settings
+opens so hand edits appear. Main records the folder in effect at launch; while the saved folder
+differs, a persistent toast in the window's bottom-right corner on every page states that a restart
+is required, offers Restart Magnitude, which relaunches the application through the ordinary quit
+path, and shows a copyable platform-specific command that moves the previous store into the new
+folder. Magnitude never moves model files itself.
+
+When the renderer is served by the `electron-vite` dev server, Electron cannot relaunch itself:
+that server belongs to the parent process and exits with the application, so a self-relaunch would
+open an empty window. A development relaunch instead exits with a dedicated exit code that carries
+window visibility, and the desktop dev script supervises `electron-vite dev`, starting it again with
+a fresh renderer server whenever it sees that code. Any other exit ends the dev script with the
+same code.
+
+Network access is a General row with a switch, off by default, persisted as `network` in the same
+`config.json` that the service reads when it binds. Turning it on generates an API key once and
+reveals nested rows: Address (all interfaces or one detected IPv4 address, physical networks first,
+then Tailscale, then virtual adapters), API key (the key with the copy control, Regenerate, and a
+Require key switch that is on by default), and Reachable at (one OpenAI-compatible base URL for the
+chosen address, or the first physical address when all interfaces are selected). Main records the
+resolved settings in effect at launch; when the saved settings resolve differently the same restart
+toast appears, naming network settings. Its hint links the remote server guide.
+Below the harnesses, Connections presents one card for other apps and agents. It states that an
+OpenAI-compatible API runs on this computer that any app or agent can use. The base URL has a copy
+control, captioned that any API key works, with a note for the Anthropic path beneath it. An Example
+request toggle pinned right on the note's row, wrapping beneath it in narrow windows, reveals a request for the active or best downloaded model in the
+user's shell. A divided footer links to Settings for network
+access. Network addresses and controls stay in Settings.
 The initializer installs the canonical client-common palette variables; importing Tailwind alone
 does not initialize that palette. Native window appearance follows the same selected preference. macOS integrates native traffic
 lights beside the collapse toggle in the sidebar’s top row, with branding below and no separate title bar. The sidebar border and main content extend to the window’s top edge. Collapsing slides the sidebar fully away while retaining the native controls and a background-free expand toggle. Content keeps the same width in both states and is centered in the remaining area; closing the sidebar adds margins instead of reflowing content. Reduced-motion settings disable the transition, and hidden navigation is inert. The toggle is pinned to the sidebar’s right edge when expanded and uses the same sidebar icon in both states. Windows integrates native caption controls
@@ -182,7 +273,10 @@ Use the existing slate surfaces and blue actions/selections, Inter UI text, Mart
 shared Magnitude mark, Phosphor icons exclusively, and shared button/input/progress primitives.
 The Magnitude mark is a transparent white outline in dark appearance and its black inverse in
 light appearance. Tray artwork uses the transparent outline; macOS template rendering follows the
-menu-bar appearance. Model identities use the landing site's family/provider artwork throughout
+menu-bar appearance. Windows tray artwork is black on a light taskbar and white on a dark taskbar,
+following system theme changes independently of the application's appearance preference.
+Windows uses separate multi-resolution icons rendered from the vector artwork for native display scaling.
+Model identities use the landing site's family/provider artwork throughout
 Discover, My Models, active-model status and download activity. Action and navigation icons retain
 their existing semantics. Missing provider artwork must not be replaced with another company's logo.
 Do not create a separate palette, substitute fonts, or copy a second appearance store. Desktop
@@ -219,7 +313,7 @@ so a lower-priority system entry cannot re-enable startup. No login adapter requ
 restart after Quit. Native platform acceptance includes signed macOS login and Windows startup approval;
 filesystem simulation does not establish those guarantees.
 
-Status presents a quiet service header with a green Ready badge and circular check on the right, above a divided model row. Model identity has a proportional logo and smaller residency text on the same line, separated by a dot; long names truncate. Stop aligns to the right. The idle state uses subdued text explaining that a model loads automatically when chatting starts; it does not imply that manual loading is required. Hardware recommendation artwork belongs to Discover, not Status. Normal background behavior is explained in user terms; native tray registration terminology stays out of the healthy-state UI. Development/test login-startup restrictions explicitly identify the build as such.
+Status presents a quiet service header with a green Ready badge and circular check on the right, above a divided model row. Model identity has a proportional logo and smaller residency text on the same line, separated by a dot; long names truncate. Stop aligns to the right. The idle state uses subdued text explaining that a model loads automatically when chatting starts; it does not imply that manual loading is required. Hardware recommendation artwork belongs to Discover, not Status. A registered tray adds nothing to Status. An unavailable tray shows one warning that closing the window keeps Magnitude running and the applications menu reopens it; native tray registration terminology stays out of the UI. Status does not show the service endpoint; connection details belong to Connections. Development/test login-startup restrictions explicitly identify the build as such.
 
 Status presents a single Memory section using authoritative active-model residency. The headline is the sum of model weights, KV cache, and overhead across the allocation's memory domains; overhead consists of compute and auxiliary allocations. No loaded model means zero in all three categories and the headline. Loading or unavailable residency is shown explicitly, never as an estimated allocation. OS process footprint and whole-machine usage are not part of this display. The section has no measurement disclosure or explanatory footer.
 
@@ -227,4 +321,4 @@ Discover supplements inference hardware with a read-only native description of t
 
 Hardware photos fit their cataloged nontransparent bounds into a common 4:3 frame with a 6% inset; embedded transparent margins do not determine product scale. The photo gallery shares this renderer. The hardware card groups information under CPU (or Chip for Apple Silicon/GB10), Memory, and separately labeled GPUs. A shared accelerator with the same identity as its integrated chip does not repeat the chip name; its known core counts stay with the chip. Multiple distinct accelerator entries are numbered. The hardware card distinguishes observed system RAM, unified memory, and each dedicated memory domain’s VRAM. Shared memory is never added to system RAM a second time; duplicate backend views of a domain do not repeat its capacity. The card shows one CPU cores value: observed physical cores take precedence over an exact fixed catalog fallback. Threads, duplicate specification counts, ambiguous core options, and server per-processor fallback counts are omitted from the card. Scheduling-available CPU threads remain separate internal metadata. ICN caches its native topology query once per process. No accelerator observation means CPU inference, not proof that no physical GPU exists. A small bundled catalog supplies published specifications only for exact chip or device matches; visible labels omit the internal `(spec)` suffix and do not add a tooltip; ambiguous bins omit their core counts/bandwidth; a published Apple bin can be resolved only when an observed physical core count uniquely selects it, never from process parallelism. GPU cards omit CUDA-core, compute-unit, Xe-core and stream-processor counts; these remain catalog research data. Dedicated GPU bandwidth variants use only physical device memory totals within 1% of exactly one catalog capacity, never shared memory or allocation budgets. Mobile bandwidth is a nominal maximum. Published specifications never override observed capacities, change scheduling/ranking, initiate benchmarks, or require runtime network access.
 
-The Usage destination exposes persistent [local serving usage](../acn/local-serving-usage.md): input, cached input and output tokens, Today/All time, model filtering, measured generation speed and first-token latency. Status contains operational state and memory, not usage statistics. Incomplete or unavailable evidence is explicit. Usage recording belongs to the service and continues while the window is closed.
+The Usage destination exposes persistent [local serving usage](../acn/local-serving-usage.md): input, cached input and output tokens, Today/All time, model filtering, measured generation speed and first-token latency. Below Memory, Status adds one compact overview row of today's tokens and requests, connected agents, and network access, each opening Usage, Connections, or Settings. Full usage statistics belong to Usage. Incomplete or unavailable evidence is explicit. Usage recording belongs to the service and continues while the window is closed.

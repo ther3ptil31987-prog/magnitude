@@ -1,0 +1,18 @@
+[package]
+name = "seismic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+seismic-lang.workspace = true
+seismic-compiler.workspace = true
+seismic-runtime.workspace = true
+seismic-native-cpu.workspace = true
+seismic-std.workspace = true
+sha2 = "0.10"
+self_cell = "1"
+
+[features]
+# Offline formation coverage of native implementations (`seismic::coverage`).
+coverage = ["seismic-runtime/coverage"]

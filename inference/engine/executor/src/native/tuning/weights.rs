@@ -1,0 +1,185 @@
+//! Real resident weights for tuning rotations. Each weight is imported from
+//! its source bytes through the same prepared import entry that loading uses,
+//! into a tensor owned by tuning; it is released when its entry is tuned.
+
+use crate::{
+    native::{import::ImportKernels, AttestedImport},
+    ArtifactComponent, ArtifactComponentKind, ModelLoadPlan, Stored, WeightPlan,
+};
+use magnitude_artifacts::{gguf::GgufArtifact, Package};
+use magnitude_family_contracts::{WeightKind, WeightRole, WeightScope};
+use seismic::{Device, Tensor};
+use std::collections::HashMap;
+
+/// Where tuning reads weights from.
+pub trait TuningWeightSource {
+    /// The bytes of `weight` in its upload representation.
+    fn source_bytes(&self, weight: &WeightPlan) -> Result<Vec<u8>, String>;
+}
+
+impl TuningWeightSource for Package {
+    /// The transformed (and dequantized) source bytes, as loading uploads
+    /// them.
+    fn source_bytes(&self, weight: &WeightPlan) -> Result<Vec<u8>, String> {
+        let artifact = artifact(self, weight.component)?;
+        let stored =
+            Stored::from_gguf(artifact, &weight.descriptor).map_err(|error| error.to_string())?;
+        let bytes = crate::programs::native_import::stored_source_bytes(&stored)
+            .map_err(|error| error.to_string())?;
+        crate::import_transforms::upload_bytes(
+            &weight.descriptor,
+            stored.shape(),
+            weight.source,
+            stored.packed_encoding(),
+            weight.upload,
+            bytes,
+        )
+    }
+}
+
+fn artifact(package: &Package, component: ArtifactComponent) -> Result<&GgufArtifact, String> {
+    let artifact = match component.kind {
+        ArtifactComponentKind::Target => package.target(),
+        ArtifactComponentKind::Projector => package
+            .projector()
+            .ok_or("the package has no projector artifact")?,
+        ArtifactComponentKind::Draft => package.draft().ok_or("the package has no draft artifact")?,
+    };
+    if artifact.identity() != component.identity {
+        return Err("the package artifact differs from the planned component".into());
+    }
+    Ok(artifact)
+}
+
+/// Zero weights of every planned shape, for programs prepared from a
+/// synthetic model definition without an artifact (test fixtures). Every
+/// source representation decodes zero bytes to zeros, so each entry tunes
+/// on well-defined values at the model's real geometry.
+pub struct ZeroTuningWeights;
+
+impl TuningWeightSource for ZeroTuningWeights {
+    fn source_bytes(&self, weight: &WeightPlan) -> Result<Vec<u8>, String> {
+        let bytes = weight
+            .upload
+            .canonical_byte_len(&[logical_count(&weight.shape)?])
+            .map_err(|error| error.to_string())?;
+        Ok(vec![
+            0;
+            usize::try_from(bytes)
+                .map_err(|_| "weight bytes exceed usize")?
+        ])
+    }
+}
+
+fn logical_count(shape: &[u64]) -> Result<u64, String> {
+    shape
+        .iter()
+        .try_fold(1u64, |count, extent| count.checked_mul(*extent))
+        .ok_or_else(|| "weight element count overflows".to_owned())
+}
+
+/// The load plan's weight of one role.
+pub(crate) fn weight_plan(
+    load: &ModelLoadPlan,
+    scope: WeightScope,
+    kind: WeightKind,
+) -> Result<&WeightPlan, String> {
+    let role = WeightRole { scope, kind };
+    load.weights()
+        .find(|weight| weight.role == role)
+        .ok_or_else(|| format!("weight {role:?} is absent from the load plan"))
+}
+
+pub(crate) struct TuningWeights<'a> {
+    device: &'a Device,
+    load: &'a ModelLoadPlan,
+    source: &'a dyn TuningWeightSource,
+    import: &'a ImportKernels,
+    resident: HashMap<WeightRole, Tensor>,
+}
+
+impl<'a> TuningWeights<'a> {
+    pub fn new(
+        device: &'a Device,
+        load: &'a ModelLoadPlan,
+        source: &'a dyn TuningWeightSource,
+        import: &'a ImportKernels,
+    ) -> Self {
+        Self {
+            device,
+            load,
+            source,
+            import,
+            resident: HashMap::new(),
+        }
+    }
+
+    /// Drop every imported weight; the next entry imports what it needs.
+    pub fn release(&mut self) {
+        self.resident.clear();
+    }
+
+    pub fn load(&self) -> &'a ModelLoadPlan {
+        self.load
+    }
+
+    fn plan(&self, scope: WeightScope, kind: WeightKind) -> Result<&'a WeightPlan, String> {
+        weight_plan(self.load, scope, kind)
+    }
+
+    /// Whether the weight of one role is already imported.
+    pub fn resident(&self, scope: WeightScope, kind: WeightKind) -> bool {
+        self.resident.contains_key(&WeightRole { scope, kind })
+    }
+
+    /// The resident bytes of one role's weight: what importing it writes.
+    pub fn bytes(&self, scope: WeightScope, kind: WeightKind) -> Result<u64, String> {
+        Ok(self.plan(scope, kind)?.resident_bytes)
+    }
+
+
+    pub fn weight(&mut self, scope: WeightScope, kind: WeightKind) -> Result<Tensor, String> {
+        let role = WeightRole { scope, kind };
+        if let Some(tensor) = self.resident.get(&role) {
+            return Ok(tensor.clone());
+        }
+        let plan = self.plan(scope, kind)?;
+        let bytes = self.source.source_bytes(plan)?;
+        if plan.placed_on_host() {
+            let tensor = Tensor::from_host(self.device, plan.resident, &plan.shape, &bytes)
+                .map_err(|error| error.to_string())?;
+            self.resident.insert(role, tensor.clone());
+            return Ok(tensor);
+        }
+        let logical = logical_count(&plan.shape)?;
+        let source = Tensor::from_host(self.device, plan.upload, &[logical], &bytes)
+            .map_err(|error| error.to_string())?;
+        let destination = Tensor::zeros(self.device, plan.resident, &plan.shape)
+            .map_err(|error| error.to_string())?;
+        let handle = match (plan.upload.dtype(), plan.resident.dtype()) {
+            (Some(source), Some(resident)) => self
+                .import
+                .import_dense
+                .get(&(source, resident))
+                .cloned()
+                .map(AttestedImport::Dense),
+            _ => self
+                .import
+                .repack_weight
+                .get(&(plan.upload, plan.resident))
+                .cloned()
+                .map(AttestedImport::Repack),
+        }
+        .ok_or_else(|| {
+            format!(
+                "no import entry was prepared for {} -> {}",
+                plan.source.name(),
+                plan.resident.name()
+            )
+        })?;
+        crate::programs::native_import::import_into(&handle, &source, &destination)
+            .map_err(|error| error.to_string())?;
+        self.resident.insert(role, destination.clone());
+        Ok(destination)
+    }
+}

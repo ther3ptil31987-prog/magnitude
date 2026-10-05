@@ -2,16 +2,16 @@ import { Option } from "effect"
 import type * as InferenceSchema from "@magnitudedev/icn-protocol/schemas"
 import type {
   ModelInstanceAllocation,
+  ModelLoadDevice,
   ModelLoadPlan,
   ModelResidency,
 } from "@magnitudedev/acn-protocol"
+import { LocalInferenceDeviceIdSchema } from "./schemas/model-state"
 
 export const projectInferenceAllocation = (
   allocation: InferenceSchema.ModelInstanceAllocation,
 ): ModelInstanceAllocation => ({
   contextWindowTokens: allocation.contextWindowTokens,
-  parallelSequences: allocation.parallelSequences,
-  physicalContextTokens: allocation.physicalContextTokens,
   memoryDomains: allocation.memoryDomains.map((domain) => ({
     memoryDomainId: domain.memoryDomainId as ModelInstanceAllocation["memoryDomains"][number]["memoryDomainId"],
     modelBytes: domain.modelBytes,
@@ -21,13 +21,19 @@ export const projectInferenceAllocation = (
   })),
 })
 
+export const projectInferenceLoadDevice = (
+  device: InferenceSchema.ModelLoadDevice,
+): ModelLoadDevice => ({
+  deviceId: LocalInferenceDeviceIdSchema.make(device.id),
+  backend: device.backend,
+})
+
 export const projectInferenceLoadPlan = (
   plan: InferenceSchema.ModelLoadPlan,
 ): ModelLoadPlan => ({
   contextWindowTokens: plan.contextWindowTokens,
-  parallelSequences: plan.parallelSequences,
-  physicalContextTokens: plan.physicalContextTokens,
-  requiredSystemMemoryBytes: plan.requiredSystemMemoryBytes,
+  requiredMemoryBytes: plan.requiredMemoryBytes,
+  device: projectInferenceLoadDevice(plan.device),
 })
 
 export const projectInferenceResidency = (
@@ -37,7 +43,7 @@ export const projectInferenceResidency = (
     case "Loading": return {
       _tag: "Loading",
       stage: instance.lifecycle.stage,
-      progress: Option.flatMap(instance.lifecycle.progress, Option.fromNullable),
+      fraction: instance.lifecycle.fraction,
       plannedAllocation: Option.map(instance.lifecycle.plannedAllocation, projectInferenceLoadPlan),
     }
     case "Ready": return {

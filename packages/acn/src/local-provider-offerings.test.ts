@@ -2,6 +2,7 @@ import { Option, Schema } from "effect"
 import { describe, expect, it } from "vitest"
 import {
   AssessmentEnvironmentIdSchema,
+  CatalogSupportSchema,
   LocalInferenceMemoryDomainIdSchema,
   LocalModelSchema,
   ModelIdSchema,
@@ -51,13 +52,7 @@ const assessed = (modelId: string, source: "Catalog" | "Discovered"): LocalModel
         systemUseState: { _tag: "NotObserved" },
         currentHeadroomState: { _tag: "NotObserved" },
       },
-      performance: [{
-        contextTokens: 32_768,
-        lowerTokensPerSecond: 20,
-        estimatedTokensPerSecond: 25,
-        upperTokensPerSecond: 30,
-        confidence: "high",
-      }],
+      performance: [{ contextTokens: 32_768, estimatedTokensPerSecond: 25 }],
     },
   } as const
   return Schema.validateSync(LocalModelSchema)({
@@ -75,12 +70,8 @@ const assessed = (modelId: string, source: "Catalog" | "Discovered"): LocalModel
       ? { catalogData: {
           releaseDate: "2026-08-29",
           parameterization: { architecture: "dense", totalParameters: 1 },
-          intelligence: { score: 1, provenance: {
-            kind: "artificialAnalysisIntelligenceIndex",
-            methodologyVersion: "test",
-            asOfDate: "2026-08-29",
-            url: "https://example.com/model",
-          } },
+          intelligence: 1,
+          support: { _tag: "Supported" },
           fidelityRank: 1,
           quantizationAware: false,
         } }
@@ -155,6 +146,39 @@ describe("local provider offerings", () => {
       _tag: "Disabled",
       reason: "insufficient_resources",
     })
+  })
+
+  it("never offers a deprecated catalog model even when it fits and is installed", () => {
+    const model = catalogAssessed("bonsai-8b-q1:gguf:q1-qat")
+    const deprecated: LocalModel = {
+      ...model,
+      catalogData: {
+        ...model.catalogData,
+        support: Schema.decodeUnknownSync(CatalogSupportSchema)({
+          _tag: "Deprecated",
+          since: "2026-09-27",
+          replacement: "qwen3.5-4b:gguf:q4",
+          reason: "unsupported architecture",
+        }),
+      },
+    }
+    const projection = projectLocalProviderOfferings([deprecated])
+    expect(projection.offerings).toEqual([])
+    expect(projection.entries[0]?.availability).toEqual({ _tag: "Disabled", reason: "deprecated" })
+  })
+
+  it("never offers a disabled catalog model even when it fits and is installed", () => {
+    const model = catalogAssessed("minicpm5-1b:gguf:q4")
+    const disabled: LocalModel = {
+      ...model,
+      catalogData: {
+        ...model.catalogData,
+        support: { _tag: "Disabled", reason: "not yet qualified" },
+      },
+    }
+    const projection = projectLocalProviderOfferings([disabled])
+    expect(projection.offerings).toEqual([])
+    expect(projection.entries[0]?.availability).toEqual({ _tag: "Disabled", reason: "catalog_disabled" })
   })
 
   it("does not make temporary startup or assessment emptiness authoritative", () => {

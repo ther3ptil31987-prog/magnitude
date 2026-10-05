@@ -107,7 +107,7 @@ export const buildWindowsDesktopInstaller = (options: {
     }
   })
   yield* inspect("")
-  for (const required of ["Magnitude.exe", "resources/app.asar", "resources/magnitude.exe", "resources/magnitude-service.exe", "resources/desktop-host.node", "resources/Magnitude-LICENSE.txt"]) {
+  for (const required of ["Magnitude.exe", "resources/app.asar", "resources/magnitude.exe", "resources/magnitude-launcher.exe", "resources/magnitude-service.exe", "resources/desktop-host.node", "resources/Magnitude-LICENSE.txt"]) {
     if (!files.includes(required)) return yield* new DesktopBuildFailed({ message: `Windows application is missing ${required}` })
   }
   const guard = yield* fs.readFile(resolve(options.guard))
@@ -118,7 +118,7 @@ export const buildWindowsDesktopInstaller = (options: {
       !(new DataView(guard.buffer, guard.byteOffset, guard.byteLength).getUint16(pe + 22, true) & 0x2000)) {
     return yield* new DesktopBuildFailed({ message: "NSIS installer helper must be an x86 PE DLL" })
   }
-  for (const file of ["Magnitude.exe", "resources/magnitude-service.exe", "resources/magnitude.exe", "resources/desktop-host.node"]) {
+  for (const file of ["Magnitude.exe", "resources/magnitude-service.exe", "resources/magnitude.exe", "resources/magnitude-launcher.exe", "resources/desktop-host.node"]) {
     yield* signWindowsCode(join(source, file))
   }
   const app = join(stage, "payload")
@@ -138,7 +138,7 @@ export const buildWindowsDesktopInstaller = (options: {
   const inventory = yield* renderWindowsInstallationInventory({ version: options.version, revision: options.revision, files: files as [string, ...string[]] })
   yield* fs.writeFile(join(stage, "installation-files.txt"), Buffer.from(`\uFEFF${inventory}`, "utf16le"))
   const scriptPath = join(stage, "desktop.nsi")
-  const signed = (yield* windowsSigning) === "artifact-signing"
+  const signed = (yield* windowsSigning).mode === "artifact-signing"
   if (signed) yield* fs.copyFile(windowsSigningScript, join(stage, "sign.ps1"))
   yield* fs.writeFileString(scriptPath, script + (signed
     ? '\n!uninstfinalize \'pwsh.exe -NoProfile -ExecutionPolicy Bypass -File sign.ps1 -Path "%1"\' = 0\n'

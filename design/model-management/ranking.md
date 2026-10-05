@@ -50,9 +50,9 @@ utility = intelligence ^ (0.9 * p)
         * fidelity     ^ 0.1
 ```
 
-Fidelity always contributes. Intelligence is model-level capability on the versioned Artificial
-Analysis Intelligence Index scale; fidelity is artifact-variant preservation and cannot supply or
-alter intelligence provenance. Memory is a hard filter and never a utility factor. A candidate is
+Fidelity always contributes. Intelligence is model-level capability as a percentage of the
+Artificial Analysis frontier score; fidelity is artifact-variant preservation and cannot supply or
+alter intelligence. Memory is a hard filter and never a utility factor. A candidate is
 eligible only when its assessed `memory.totalRequiredBytes` does not exceed the machine's normalized
 physical-memory capacity.
 
@@ -84,6 +84,8 @@ as its defaults. It prints a finite result and does not render a chooser or keyb
 
 - ACN publishes `LocalModelRankingScores`, never server-selected preference tiers or explanations.
 - Scores belong to one exact catalog model configuration with a terminal `Fits` assessment.
+- A deprecated catalog model is never a ranked choice. A best-effort model is ranked like any other
+  `Fits` configuration and is labeled wherever it is shown.
 - A model with distinct desired and effective installed configurations may temporarily have scores
   for both; the local product row uses the scores matching the configuration it currently exposes.
 - Normalized score fields are named `intelligence`, `speed`, and `fidelity`; `quality` is not a

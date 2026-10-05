@@ -2,6 +2,7 @@ import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
 import {
   LocalModelsStateSchema,
   LocalModelAssessmentSchema,
+  LocalModelDoesNotFitAssessmentSchema,
   CatalogLocalModelSchema,
   DiscoveredLocalModelSchema,
   LocalModelPresentationSchema,
@@ -22,7 +23,7 @@ import {
   type ModelResidency,
 } from "@magnitudedev/acn-protocol"
 import { IcnCatalogInstallations, IcnInstances, IcnModelAssessments } from "@magnitudedev/icn"
-import { projectInferenceResidency } from "@magnitudedev/acn-protocol"
+import { projectInferenceLoadDevice, projectInferenceResidency } from "@magnitudedev/acn-protocol"
 import type {
   CatalogInstallationOperation,
   CatalogModel,
@@ -60,8 +61,7 @@ const assessmentDomainProgress = (
         totalModels,
       }
     }
-    case "Pending":
-    case "Failed": return { complete: false, settledModels: 0, totalModels: 0 }
+    case "Pending": return { complete: false, settledModels: 0, totalModels: 0 }
   }
 }
 
@@ -73,14 +73,8 @@ export const projectLocalModelPreparation = (
     complete: source.reconciliationComplete,
     modelsFound: source.discoveredModels.length,
   }
-  if (assessments.state._tag !== "Ready") {
-    return {
-      discovery,
-      assessment: { complete: false, settledModels: 0, totalModels: 0 },
-    }
-  }
-  const catalog = assessmentDomainProgress(assessments.state.catalog, source.catalogRevision)
-  const discovered = assessmentDomainProgress(assessments.state.discovered, source.discoveryRevision)
+  const catalog = assessmentDomainProgress(assessments.catalog, source.catalogRevision)
+  const discovered = assessmentDomainProgress(assessments.discovered, source.discoveryRevision)
   return {
     discovery,
     assessment: {
@@ -132,7 +126,7 @@ const projectAssessment = (environmentId: string, assessment: ModelAssessment): 
     })
   }
   return Schema.decodeUnknownSync(LocalModelAssessmentSchema)({
-    _tag: "Incompatible", environmentId, profile: assessment.profile, failure: assessment.failure,
+    _tag: "Unsupported", environmentId, profile: assessment.profile, failure: assessment.failure,
   })
 }
 
@@ -142,10 +136,8 @@ export const coordinatedAssessment = (
   source: "catalog" | "discovered",
   modelId: ModelId,
 ): CoordinatedLocalModelAssessment | undefined => {
-  if (snapshot.state._tag !== "Ready") return undefined
-  const domain: ModelAssessmentDomainSnapshot = snapshot.state[source]
+  const domain: ModelAssessmentDomainSnapshot = snapshot[source]
   if (domain.sourceRevision !== sourceRevision || domain._tag === "Pending") return undefined
-  if (domain._tag === "Failed") return undefined
   const entry = domain.entries.find(({ subject }) => subject.modelId === modelId)
   if (entry === undefined || entry.state._tag === "Assessing") return undefined
   if (entry.state._tag === "Dropped") return { _tag: "Dropped" }
@@ -154,7 +146,7 @@ export const coordinatedAssessment = (
     ? { _tag: "Dropped" }
     : {
         _tag: "Assessed",
-        assessment: projectAssessment(snapshot.state.environmentId, assessment),
+        assessment: projectAssessment(snapshot.environmentId, assessment),
         capabilities: entry.state.capabilities,
       }
 }
@@ -188,6 +180,20 @@ export const catalogAcquisition = (
       ? { _tag: "Installing", progress: transfer }
       : { _tag: "Updating", ...installed, progress: transfer }
   }
+  if (operation?.state._tag === "Optimizing") {
+    const { stage, completed, total, device } = operation.state.progress
+    // The download is published; until the catalog observes the installation it reads as finishing.
+    const storageBytes = model.desired.metadata.storageBytes
+    return installed === undefined
+      ? { _tag: "Installing", progress: {
+          stage: "publishing", completedBytes: storageBytes, totalBytes: storageBytes, bytesPerSecond: Option.none(),
+        } }
+      : {
+          _tag: "Optimizing",
+          ...installed,
+          progress: { stage, completed, total, device: Option.map(device, projectInferenceLoadDevice) },
+        }
+  }
   if (operation?.state._tag === "Failed" && !operation.state.acknowledged
     && !(model.localState._tag === "Installed" && model.localState.updateState._tag === "Current")) {
     return installed === undefined
@@ -213,15 +219,16 @@ export const catalogModelServingState = (
   if (assessment === undefined || assessment._tag === "Assessing") return {
     _tag: "Assessing", profile: ready.profile,
   }
-  const fits = assessment.assessment._tag === "Fits"
   const assessed = {
     metadata: ready.metadata,
     capabilities: Schema.validateSync(ModelCapabilitiesSchema)(assessment.capabilities),
     speculativeMethod: ready.speculativeMethod,
   }
-  return fits
+  return assessment.assessment._tag === "Fits"
     ? { _tag: "Assessed", ...assessed, assessment: assessment.assessment, rankingScores }
-    : { _tag: "Assessed", ...assessed, assessment: assessment.assessment }
+    // The service never reports a catalog model as Unsupported; validation rejects that contract violation.
+    : { _tag: "Assessed", ...assessed,
+        assessment: Schema.validateSync(LocalModelDoesNotFitAssessmentSchema)(assessment.assessment) }
 }
 
 export const discoveredModelServingState = (
@@ -237,6 +244,19 @@ export const discoveredModelServingState = (
     speculativeMethod: ready.speculativeMethod,
   }
   return { _tag: "Assessed", ...assessed, assessment: assessment.assessment }
+}
+
+const catalogSupport = (support: CatalogModel["support"]) => {
+  switch (support.level) {
+    case "supported": return { _tag: "Supported" as const }
+    case "disabled": return { _tag: "Disabled" as const, reason: support.reason }
+    case "deprecated": return {
+      _tag: "Deprecated" as const,
+      since: support.since,
+      replacement: support.replacement,
+      reason: support.reason,
+    }
+  }
 }
 
 export const catalogRemovalAcquisition = (
@@ -275,7 +295,7 @@ const catalogModel = (
     : undefined
   const rankingScores = assessment?._tag === "Assessed" && assessment.assessment._tag === "Fits"
     ? modelRankingScores({
-        intelligenceScore: source.intelligence.score,
+        intelligenceScore: source.intelligence,
         fidelityRank: source.fidelityRank,
         profile: ready?.profile ?? source.desired.profile,
         performance: assessment.assessment.performance,
@@ -296,6 +316,7 @@ const catalogModel = (
       releaseDate: Schema.decodeUnknownSync(ModelReleaseDateSchema)(source.releaseDate),
       parameterization: source.parameterization,
       intelligence: source.intelligence,
+      support: catalogSupport(source.support),
       fidelityRank: source.fidelityRank,
       quantizationAware: source.quantizationAware,
     },

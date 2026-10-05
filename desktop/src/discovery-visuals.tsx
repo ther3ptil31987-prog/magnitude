@@ -1,14 +1,21 @@
+import { ErrorNotice } from "./error-notice"
 import { HardwarePending } from "./page-skeletons"
 import { pageLayout } from "./page-layout"
 import { Option } from "effect"
 import { useMemo } from "react"
 import { Result, useAtomValue } from "@effect-atom/atom-react"
-import { MemoryIcon, CircuitryIcon, CpuIcon } from "@phosphor-icons/react"
-import { DesktopSession, useAgentClient, localModelRadarAxes, useLocalInferenceHardware } from "@magnitudedev/client-common"
+import { MemoryIcon, CircuitryIcon, CpuIcon, InfoIcon } from "@phosphor-icons/react"
+import { DesktopSession, useAgentClient, localModelRadarAxes, localModelSpeedTooltip, useLocalInferenceHardware } from "@magnitudedev/client-common"
+import { ActionTooltip } from "../../web/src/components/ui/tooltip"
 import { type HardwarePhoto } from "./hardware-photos"
 import { hardwareDetails } from "./hardware-details"
 import type { MachineIdentityObservation } from "@magnitudedev/sdk/desktop-host"
 import type { CatalogLocalModel, LocalInferenceHardware } from "@magnitudedev/sdk"
+
+/** An estimated speed's small slate info icon, explaining what the estimate leaves out. */
+export function SpeedInfo() {
+  return <ActionTooltip label={localModelSpeedTooltip} trigger={<button type="button" aria-label={localModelSpeedTooltip} className="inline-flex rounded-sm text-slate-400 hover:text-slate-600 focus-visible:outline-2 focus-visible:outline-blue-500 dark:text-slate-500 dark:hover:text-slate-300"><InfoIcon aria-hidden="true" className="size-3" /></button>} />
+}
 
 export function ModelRadar({ model }: { model: CatalogLocalModel }) {
   const axes = localModelRadarAxes(model)
@@ -21,16 +28,22 @@ export function ModelRadar({ model }: { model: CatalogLocalModel }) {
   const profilePath = axes.value.map((axis, index) => `${index === 0 ? "M" : "L"} ${point(index, Option.getOrElse(axis.value, () => 0) * 80).join(" ")}`).join(" ") + " Z"
   return <div className={pageLayout.modelRadar}>
     <svg viewBox="0 0 360 270" role="img" aria-label={`${model.presentation.displayName} capability profile`} className="block h-full w-full text-blue-600 dark:text-blue-400">
-      <title>{axes.value.map(axis => `${axis.label}: ${axis.detail}`).join("; ")}</title>
       {[20,40,60,80].map(radius => <polygon key={radius} points={polygon(radius)} fill="none" className="stroke-slate-200 dark:stroke-slate-700" strokeWidth="0.8" />)}
       {axes.value.map((axis,index) => <line key={axis.label} x1="180" y1="138" x2={point(index,80)[0]} y2={point(index,80)[1]} className="stroke-slate-200 dark:stroke-slate-700" strokeWidth="0.8" />)}
       <path d={profilePath} style={{ d: `path("${profilePath}")` }} className="motion-safe:transition-[d] motion-safe:duration-300 motion-safe:ease-out" fill="currentColor" fillOpacity="0.13" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" />
       {axes.value.map((axis,index) => {
         const [x,y] = [[180,20],[290,83],[258,238],[102,238],[70,83]][index]!
-        return <text key={axis.label} x={x} y={y} textAnchor="middle">
-          <tspan x={x} className="fill-slate-500 dark:fill-slate-400" fontSize="11">{axis.label.charAt(0)+axis.label.slice(1).toLowerCase()}</tspan>
-          <tspan x={x} dy="18" className="fill-slate-800 dark:fill-slate-200" fontSize="13" fontWeight="500">{axis.detail}</tspan>
-        </text>
+        const label = axis.label.charAt(0)+axis.label.slice(1).toLowerCase()
+        // Speed's label carries its estimate marker and info icon: an HTML row centered on the
+        // axis, occupying the label line's box above the detail's baseline.
+        return <g key={axis.label}>
+          {axis.label === "SPEED"
+            ? <foreignObject x={x - 70} y={y - 11} width="140" height="14">
+                <div className="flex h-full items-center justify-center gap-1 text-[11px] leading-none text-slate-500 dark:text-slate-400">{label} (est.)<SpeedInfo /></div>
+              </foreignObject>
+            : <text x={x} y={y} textAnchor="middle" className="fill-slate-500 dark:fill-slate-400" fontSize="11">{label}</text>}
+          <text x={x} y={y + 18} textAnchor="middle" className="fill-slate-800 dark:fill-slate-200" fontSize="13" fontWeight="500">{axis.detail}</text>
+        </g>
       })}
     </svg>
   </div>
@@ -57,7 +70,8 @@ export function HardwarePhotograph({ photo }: { photo: HardwarePhoto }) {
 function HardwareCard({ identity }: { identity: MachineIdentityObservation | null }) {
   const hardware = useLocalInferenceHardware()
   if (Result.isInitial(hardware)) return <HardwarePending />
-  if (!Result.isSuccess(hardware)) return <div className="my-6 rounded-2xl border border-slate-200 p-6 text-sm text-slate-500 dark:border-slate-750">{Result.isFailure(hardware) ? "Hardware observation unavailable. Recommendations will return when it recovers." : "Getting to know your machine…"}</div>
+  if (Result.isFailure(hardware)) return <ErrorNotice title="Couldn’t read your hardware" description="Recommendations will return when hardware information is available." className="my-6" />
+  if (!Result.isSuccess(hardware)) return <div className="my-6 rounded-2xl border border-slate-200 p-6 text-sm text-slate-500 dark:border-slate-750">{"Getting to know your machine…"}</div>
   return <HardwareSummary identity={identity} value={hardware.value} />
 }
 export function HardwareSummary({ identity, value }: { identity: MachineIdentityObservation | null; value: LocalInferenceHardware }) {

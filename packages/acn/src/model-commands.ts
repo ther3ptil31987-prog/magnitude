@@ -73,7 +73,8 @@ export const ModelCommandsLive: Layer.Layer<
     cancelSync: (modelId) => operationFor(modelId).pipe(
       Effect.mapError((cause) => modelCommandFailure("cancel_sync", cause)),
       Effect.flatMap((operation) => operation === undefined
-        || (operation.state._tag !== "Pending" && operation.state._tag !== "Running")
+        || (operation.state._tag !== "Pending" && operation.state._tag !== "Running"
+          && operation.state._tag !== "Optimizing")
         ? Effect.succeed({})
         : client.catalog.cancelCatalogInstallation({ path: { operation_id: operation.operationId } }).pipe(
             Effect.mapError((cause) => modelCommandFailure("cancel_sync", cause)),
@@ -89,7 +90,7 @@ export const ModelCommandsLive: Layer.Layer<
             Effect.tap(() => installations.refresh.pipe(Effect.ignore)), Effect.as({}),
           )),
     ),
-    remove: removals.remove,
+    remove: (modelId) => stopModel(modelId).pipe(Effect.zipRight(removals.remove(modelId))),
     loadSlot: (slotId) => selectedLocalModel(slotId).pipe(
       Effect.flatMap((modelId) => client.models.ensureModelInstance({ payload: { modelId } })),
       Effect.tap(() => slots.refresh), Effect.as({}),

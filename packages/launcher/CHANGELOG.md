@@ -1,5 +1,152 @@
 # @magnitudedev/cli
 
+## 0.2.5
+
+### Patch Changes
+
+- [`32e095e`](https://github.com/magnitudedev/magnitude/commit/32e095e6561b2e58daaaf1438604a21d36ee827f) Thanks [@anerli](https://github.com/anerli)! - - Speed up generation for mixture-of-experts models with multi-token prediction by drafting three tokens ahead instead of one: Qwen3.6-35B-A3B now generates 106–138 tok/s on a GB10 (previously 97–105) and 109–138 tok/s on an M4 Pro (previously 103–111).
+
+  - Speed up generation at a 16K context by about 8% on Macs (67.0 → 72.4 tok/s) and 11% on NVIDIA GPUs (66.3 → 73.4 tok/s), with the same output, by choosing each token while reading less of the output layer and doing more of each step in fewer GPU launches.
+  - Speed up multi-token prediction on NVIDIA GPUs by loading each expert's weights once per step when several drafted tokens choose it, cutting verification time by up to 11%.
+
+- [`32e095e`](https://github.com/magnitudedev/magnitude/commit/32e095e6561b2e58daaaf1438604a21d36ee827f) Thanks [@anerli](https://github.com/anerli)! - - Speed up prompt processing on M5 and later Macs about 2x by running matrix multiplies and attention on the GPU's tensor operations: Qwen3.5-4B at a 64K context now processes prompts at 649 tok/s (previously 308), cutting time to first token from 213 to 101 seconds, with identical output. Other Macs are unchanged.
+
+- [`7aea836`](https://github.com/magnitudedev/magnitude/commit/7aea83653a5acf2035d6d3229efd5700ff684e8d) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Fix models failing to load on M1 and M2 Macs with "requests N threads per threadgroup; the pipeline allows M". Metal kernels are now built to accept the thread count they launch with, which fixes Qwen3.8 27B on M1 Max and similar errors in other kernels.
+
+  - Fix models with 16 or more query heads per key (Gemma 4 12B, Muse Glimmer 30B, Nemotron 3.5 Lightning, Qwen3.5 122B, Nemotron 3 Super) failing on M1 and M2 Macs. Prefill attention now splits a key's query heads into groups, so it fits every Mac's thread limit, with no change in speed or output elsewhere.
+
+- [`cffe46e`](https://github.com/magnitudedev/magnitude/commit/cffe46e77af5f45ce99565f096d545443dbbd3d0) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Fix removing a model that is running or loading failing with a misleading error. Removing it now stops the model first, and the confirmation says so.
+
+- [`a3e5422`](https://github.com/magnitudedev/magnitude/commit/a3e542241b075567894881290aad2a5ed2f94aaf) Thanks [@anerli](https://github.com/anerli)! - - Fix models with DFlash2 speculative decoding (Qwen3.8 27B) and Nemotron models failing to load on Vulkan GPUs with a shader compilation error. Every GPU kernel is now compiled for Vulkan, CUDA and Metal before each release, including every kernel each catalog model loads.
+
+## 0.2.4
+
+### Patch Changes
+
+- [`f0498ce`](https://github.com/magnitudedev/magnitude/commit/f0498ce285e4e97815ba16dd74044ce5efebb63a) Thanks [@anerli](https://github.com/anerli)! - - Keep first-load kernel tuning within its minute for large models too, such as Gemma 4 26B: preparing each kernel's test data now counts against the same time, is done once instead of twice, and is skipped for kernels whose share of the minute cannot cover it, which keep their default configuration.
+
+- [`e38af0e`](https://github.com/magnitudedev/magnitude/commit/e38af0e9a232293dca12c5bad3a91b96e58ca12e) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Fix models failing to load on M1 and M2 Macs when a kernel's default configuration needs more threads than the chip allows for it. Tuning now starts from the nearest configuration that runs.
+
+- [`cef7f3b`](https://github.com/magnitudedev/magnitude/commit/cef7f3bb9c2dd06d96aeb59dde8039b6f83386a5) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Fix requests that fail partway through, for example when memory runs short during a long conversation, returning an empty reply that looked like success. They now return a 503 with `Retry-After` and a message agent harnesses recognize, so Pi, OpenCode, Claude Code and others retry them automatically.
+
+  - Log memory pressure and request failures from the inference engine, which previously failed silently.
+
+- [`4713d97`](https://github.com/magnitudedev/magnitude/commit/4713d97b4b913a3ed2194f53826ae01658600839) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Fix `magnitude serve` failing to start on a Mac reached over SSH with nobody logged in at the console.
+
+- [`7eabf99`](https://github.com/magnitudedev/magnitude/commit/7eabf993ebbd96a4ab2c067d2c7f2e7d3e4ff8f8) Thanks [@anerli](https://github.com/anerli)! - - Reduce the memory a model needs beyond its weights, so larger models and longer contexts fit: Qwen3.5-4B's working memory fell from 3.7 GB to 120 MB, and the memory reserved to run it from 10.0 GB to 5.9 GB, at the same speed. Image-processing memory is now claimed on the first image and released when idle.
+
+- [`7eabf99`](https://github.com/magnitudedev/magnitude/commit/7eabf993ebbd96a4ab2c067d2c7f2e7d3e4ff8f8) Thanks [@anerli](https://github.com/anerli)! - - Fix the first load of a model taking 20–50 minutes and appearing to hang on CPU-only machines. Kernel tuning now takes at most about a minute on any device, instead of a fixed number of configurations whose time grew with the device's slowness, and its progress reports that minute. On an M4 Max, a first load of Qwen3.5-4B now tunes in about 50 seconds (previously 149 on the GPU and 279 on the CPU) with the same speed afterwards.
+  - Speed up CPU inference on x86 for models with Q6_K weights by converting their half-precision scales without a slow processor path.
+
+## 0.2.3
+
+### Patch Changes
+
+- [`5b1aba8`](https://github.com/magnitudedev/magnitude/commit/5b1aba81185ac8b07ba363ba2a11427c3447d62a) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Fix the Windows installer failing on Windows 10 with "An interrupted installation could not be recovered (code 4395)". Setup now installs normally and publishes the `magnitude` command to PATH, which also failed on Windows 10 once installation got past that error.
+
+## 0.2.2
+
+### Patch Changes
+
+- [`1588451`](https://github.com/magnitudedev/magnitude/commit/1588451a88f979a70c1f6385599d50de029064f7) Thanks [@anerli](https://github.com/anerli)! - - Fix the app getting stuck on "Assessing models" on some hardware: model speed is now estimated from the device's memory bandwidth instead of running kernels on the GPU, which could hang or fail.
+
+- [`3940408`](https://github.com/magnitudedev/magnitude/commit/394040878bd6cf10bf5a9addd9a3791d8eb2ef9f) Thanks [@anerli](https://github.com/anerli)! - - Fix Codex hanging after its first tool call over the Responses WebSocket: follow-up requests now continue from the previous response's output, and request errors end the request instead of leaving it waiting.
+  - Fix requests that repeat the same image, in one message or across turns, failing with a 400. A repeated image is now encoded once.
+  - Fix tool call IDs repeating across turns (every turn's first call was `call_0`), which made Claude Code drop tool calls and loop.
+  - Fix Anthropic token usage counting cached tokens twice in responses and reporting none when streaming, and `count_tokens` requiring `max_tokens`.
+  - Fix large system prompts being re-read in full when only the last message changes: later requests now resume from the cached prompt.
+  - Fix tools with free-form object parameters failing on Gemma 4 with "Too many items" (breaking Claude Code and Oh My Pi), Cline failing mid-task with "Output parser would retract a published tool call", and forced tool calls (`tool_choice` "required", "any" or a named tool) repeating until the token limit.
+
+## 0.2.1
+
+### Patch Changes
+
+- [`0476b71`](https://github.com/magnitudedev/magnitude/commit/0476b71a0fb772245328529312a3392d77b630aa) Thanks [@anerli](https://github.com/anerli)! - - Fix the local model hanging forever when a request arrived while another was generating, as with Qwen3.6 35B-A3B: every later request waited without a response while the model still reported Ready, and the engine held a CPU core at 100%. Admission no longer waits on the running generation, and the engine can no longer wait on work only it could release.
+  - Fix speculative-decoding models failing mid-request with "only a blocked last page is relocated" during long prompts.
+
+## 0.2.0
+
+### Minor Changes
+
+- [`f0cd67e`](https://github.com/magnitudedev/magnitude/commit/f0cd67ed900fe76022273081490be0939908df70) Thanks [@anerli](https://github.com/anerli)! - Replace the llama.cpp-based inference engine with Magnitude's own engine which automatically optimizes itself for any hardware and has efficient kernels for several open-weight model families.
+
+### Patch Changes
+
+- [`9b929cf`](https://github.com/magnitudedev/magnitude/commit/9b929cfef434742e0f43043dfbf212f7801d5ba5) Thanks [@anerli](https://github.com/anerli)! - - Fix models that load and run, such as Gemma 4 26B-A4B and Qwen3.6 35B-A3B on Apple Silicon, being reported as unable to run on this computer.
+
+  - A model is reported as unsupported only when Magnitude cannot actually run it. A gap in the device's speed measurements now shows "Speed estimate unavailable" instead of hiding the model.
+
+- [`482e6ab`](https://github.com/magnitudedev/magnitude/commit/482e6abbb94f4081c19e223fef09263ac559df14) Thanks [@anerli](https://github.com/anerli)! - - Make DFlash, DSpark, and DFlash2 speculative decoding faster than plain decoding on Apple Silicon (Qwen3.6-35B-A3B at 65k tokens: 10.7% faster, previously 7% slower) and faster on NVIDIA (38.8% over plain, previously 28.7%), with better draft acceptance at long context.
+
+  - Fix speculative drafts whose layers are all sliding-window (such as Muse-Glimmer's DFlash) failing to load.
+  - Reduce the time to first token added by speculative decoding from about 2.6% to 0.6% of prompt processing on NVIDIA and from about 1.5% to 0.7% on Apple Silicon.
+  - Speed up long-context decoding and speculative verification by reading each attention head group's history once, on Apple Silicon, NVIDIA, and Vulkan GPUs.
+  - Speed up mixture-of-experts decoding on Apple Silicon and prompt processing on NVIDIA.
+
+- [`07c39a1`](https://github.com/magnitudedev/magnitude/commit/07c39a14870d8691d7762a3601b913b140ba3319) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Add `magnitude serve` to run inference without a desktop window on macOS, Windows, and Linux. Opening Desktop takes over from the foreground server and reports why it stopped.
+
+  - Replace the `magnitude service` commands with `magnitude serve` and `magnitude status`. Model, catalog, hardware, and connection commands require an existing Desktop or server instead of starting one automatically. Startup errors identify which application must be stopped.
+  - Share application updates between Desktop and the CLI. A running server can prepare updates without being interrupted; prepared updates install at the next startup. The `magnitude update` commands support checking, downloading, inspecting, installing, and discarding updates while Desktop is closed. Failed installations require an explicit retry.
+  - Fix Windows update preparation when the update folder has inherited permissions, and improve update recovery and command continuation. Existing affected releases still require a manual installer to receive the fix.
+  - Add shell and PowerShell installation scripts for the complete application, including its CLI.
+  - Improve `magnitude app open` during Desktop takeover. On Windows, clicking the tray icon opens Desktop, and sharper tray icons adapt to the system's light or dark theme.
+  - Add a remote server guide and update network access, CLI, and installation documentation.
+
+- [`f29bcb2`](https://github.com/magnitudedev/magnitude/commit/f29bcb218cc60d6cf01c930a54cd6e735ba4ba7f) Thanks [@anerli](https://github.com/anerli)! - - Fix long prompts failing partway through with "target graph class ... was not sealed" and the model server going down, as with Qwen3.8-27B on a 64k-token prompt on Apple Silicon. Attention history now stays within the bound its kernels were prepared for on every model, however requests interleave, fork or are reclaimed.
+
+- [#125](https://github.com/magnitudedev/magnitude/pull/125) [`fd37123`](https://github.com/magnitudedev/magnitude/commit/fd37123a374ee4931a0f2bb28e6b3cb091a6d601) Thanks [@Nitish-1303](https://github.com/Nitish-1303)! - Gate remote callers in the /rpc and inference route handlers instead of the middleware, so case, slash, and percent-encoded path variants can no longer skip the API key check.
+
+## 0.2.0-alpha.2
+
+### Patch Changes
+
+- [`9b929cf`](https://github.com/magnitudedev/magnitude/commit/9b929cfef434742e0f43043dfbf212f7801d5ba5) Thanks [@anerli](https://github.com/anerli)! - - Fix models that load and run, such as Gemma 4 26B-A4B and Qwen3.6 35B-A3B on Apple Silicon, being reported as unable to run on this computer.
+
+  - A model is reported as unsupported only when Magnitude cannot actually run it. A gap in the device's speed measurements now shows "Speed estimate unavailable" instead of hiding the model.
+
+- [`f29bcb2`](https://github.com/magnitudedev/magnitude/commit/f29bcb218cc60d6cf01c930a54cd6e735ba4ba7f) Thanks [@anerli](https://github.com/anerli)! - - Fix long prompts failing partway through with "target graph class ... was not sealed" and the model server going down, as with Qwen3.8-27B on a 64k-token prompt on Apple Silicon. Attention history now stays within the bound its kernels were prepared for on every model, however requests interleave, fork or are reclaimed.
+
+## 0.2.0-alpha.1
+
+### Patch Changes
+
+- [`482e6ab`](https://github.com/magnitudedev/magnitude/commit/482e6abbb94f4081c19e223fef09263ac559df14) Thanks [@anerli](https://github.com/anerli)! - - Make DFlash, DSpark, and DFlash2 speculative decoding faster than plain decoding on Apple Silicon (Qwen3.6-35B-A3B at 65k tokens: 10.7% faster, previously 7% slower) and faster on NVIDIA (38.8% over plain, previously 28.7%), with better draft acceptance at long context.
+  - Fix speculative drafts whose layers are all sliding-window (such as Muse-Glimmer's DFlash) failing to load.
+  - Reduce the time to first token added by speculative decoding from about 2.6% to 0.6% of prompt processing on NVIDIA and from about 1.5% to 0.7% on Apple Silicon.
+  - Speed up long-context decoding and speculative verification by reading each attention head group's history once, on Apple Silicon, NVIDIA, and Vulkan GPUs.
+  - Speed up mixture-of-experts decoding on Apple Silicon and prompt processing on NVIDIA.
+
+## 0.2.0-alpha.0
+
+### Minor Changes
+
+- [`f0cd67e`](https://github.com/magnitudedev/magnitude/commit/f0cd67ed900fe76022273081490be0939908df70) Thanks [@anerli](https://github.com/anerli)! - Replace the llama.cpp-based inference engine with Magnitude's own engine which automatically optimizes itself for any hardware and has efficient kernels for several open-weight model families.
+
+### Patch Changes
+
+- [`07c39a1`](https://github.com/magnitudedev/magnitude/commit/07c39a14870d8691d7762a3601b913b140ba3319) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Add `magnitude serve` to run inference without a desktop window on macOS, Windows, and Linux. Opening Desktop takes over from the foreground server and reports why it stopped.
+
+  - Replace the `magnitude service` commands with `magnitude serve` and `magnitude status`. Model, catalog, hardware, and connection commands require an existing Desktop or server instead of starting one automatically. Startup errors identify which application must be stopped.
+  - Share application updates between Desktop and the CLI. A running server can prepare updates without being interrupted; prepared updates install at the next startup. The `magnitude update` commands support checking, downloading, inspecting, installing, and discarding updates while Desktop is closed. Failed installations require an explicit retry.
+  - Fix Windows update preparation when the update folder has inherited permissions, and improve update recovery and command continuation. Existing affected releases still require a manual installer to receive the fix.
+  - Add shell and PowerShell installation scripts for the complete application, including its CLI.
+  - Improve `magnitude app open` during Desktop takeover. On Windows, clicking the tray icon opens Desktop, and sharper tray icons adapt to the system's light or dark theme.
+  - Add a remote server guide and update network access, CLI, and installation documentation.
+
+- [`fd37123`](https://github.com/magnitudedev/magnitude/commit/fd37123a374ee4931a0f2bb28e6b3cb091a6d601) - Gate remote callers in the /rpc and inference route handlers instead of the middleware, so case, slash, and percent-encoded path variants can no longer skip the API key check.
+
+## 0.1.5
+
+### Patch Changes
+
+- [`d157b35`](https://github.com/magnitudedev/magnitude/commit/d157b35a79f41ebd3d8b0017d7f2ee0471173a62) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Clamp reported available system memory to physical capacity so model loading does not fail on macOS memory samples that briefly exceed installed RAM, stop an inherited `ELECTRON_RUN_AS_NODE` (for example from a VS Code terminal) from breaking desktop app launch, and size the macOS app icon to Apple's icon grid so it matches other Dock icons.
+
+## 0.1.4
+
+### Patch Changes
+
+- [`6b56b68`](https://github.com/magnitudedev/magnitude/commit/6b56b68640051e65b4a1e28e053e3b11d74518b0) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Add a configurable model storage folder, opt-in network access with a generated API key so other devices, containers, and WSL can use local inference, a redesigned Settings page, the real version in development builds, and tighter CORS and WebSocket origin checks on the local service.
+
 ## 0.1.3
 
 ### Patch Changes

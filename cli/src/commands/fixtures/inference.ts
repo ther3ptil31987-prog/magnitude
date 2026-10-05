@@ -1,7 +1,6 @@
 import { Option, Schema } from "effect"
 import {
   AssessmentEnvironmentIdSchema,
-  CatalogIntelligenceSchema,
   CatalogFormModelIdSchema,
   HuggingFaceFormModelIdSchema,
   HttpsUrlSchema,
@@ -39,7 +38,7 @@ export const makeHardware = (
   accelerators: [{
     acceleratorId: LocalInferenceAcceleratorIdSchema.make("gpu"),
     name: "Test GPU",
-    backend: "CUDA",
+    backend: "cuda",
     memoryDomainId: TEST_MEMORY_DOMAIN_ID,
   }],
   memoryDomains: [{
@@ -63,16 +62,10 @@ const capabilities = {
 const performance = (contextLength: number) => [...new Set([
   ...[25_000, 50_000, 75_000].filter((context) => context <= contextLength),
   contextLength,
-])].sort((left, right) => left - right).map((contextTokens) => {
-  const estimatedTokensPerSecond = contextTokens === contextLength ? 24 : 28
-  return {
-    contextTokens,
-    lowerTokensPerSecond: estimatedTokensPerSecond - 4,
-    estimatedTokensPerSecond,
-    upperTokensPerSecond: estimatedTokensPerSecond + 4,
-    confidence: "moderate" as const,
-  }
-})
+])].sort((left, right) => left - right).map((contextTokens) => ({
+  contextTokens,
+  estimatedTokensPerSecond: contextTokens === contextLength ? 24 : 28,
+}))
 
 type ReadyDiscoveredLocalModel = Omit<DiscoveredLocalModel, "state"> & {
   readonly state: Extract<DiscoveredLocalModel["state"], { readonly _tag: "Ready" }>
@@ -154,15 +147,8 @@ const makeCatalogOnlyModel = (
     catalogData: {
         releaseDate: "2026-01-01" as ModelReleaseDate,
         parameterization: { architecture: "dense", totalParameters: 8_000_000_000 },
-        intelligence: Schema.decodeUnknownSync(CatalogIntelligenceSchema)({
-          score: 75,
-          provenance: {
-            kind: "artificialAnalysisIntelligenceIndex",
-            methodologyVersion: "test",
-            asOfDate: "2026-01-01",
-            url: "https://example.com/model",
-          },
-        }),
+        intelligence: 75,
+        support: { _tag: "Supported" },
         fidelityRank: 75,
         quantizationAware: false,
     },

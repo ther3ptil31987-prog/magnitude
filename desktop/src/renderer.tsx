@@ -1,10 +1,13 @@
-import { LoadingRegion, SkeletonLine, ModelsSkeleton, RecommendationsSkeleton, ConnectionsSkeleton, LoginSkeleton, UpdatesSkeleton } from "./page-skeletons"
+import { ErrorNotice, NoticeAction } from "./error-notice"
+import { ModelLoadFailureIndicator, ModelLoadNotice, modelRemovalNotice, downloadNotice, modelCommandNotice } from "./model-error"
+import { LoadingRegion, SkeletonLine, ModelsSkeleton, RecommendationsSkeleton, ConnectionsSkeleton } from "./page-skeletons"
 import { pageLayout } from "./page-layout"
 import { RecommendationPreference } from "./model-preference-slider"
 import { ServingUsage } from "./serving-usage"
-import { initializeAppearance, setAppearancePreference, useAppearancePreference, subscribeAppearance, getAppearancePreference } from "../../web/src/stores/appearance-store"
+import { initializeAppearance, setAppearancePreference, useAppearancePreference, type AppearancePreference } from "../../web/src/stores/appearance-store"
 import { ActionTooltip, TooltipProvider } from "../../web/src/components/ui/tooltip"
 import { Button } from "../../web/src/components/ui/button"
+import { Switch } from "../../web/src/components/ui/switch"
 import { Input } from "../../web/src/components/ui/input"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../../web/src/components/ui/select"
 import { Progress } from "../../web/src/components/ui/progress"
@@ -31,41 +34,62 @@ import {
   MonitorIcon,
   SunIcon,
   MoonIcon,
+  FolderOpenIcon,
+  BuildingsIcon,
 } from "@phosphor-icons/react"
+import { CopyCommand } from "./copy-command"
 import { createRoot } from "react-dom/client"
-import { useId, useMemo, useState, type ReactNode } from "react"
-import { Atom, RegistryProvider, Result, useAtomValue, useAtomSet } from "@effect-atom/atom-react"
+import { useId, useMemo, useRef, useState, type ReactNode } from "react"
+import { Atom, RegistryProvider, Result, useAtomValue, useAtomSet, useAtomMount } from "@effect-atom/atom-react"
 import { Cause, Effect, Exit, Layer, Option, Runtime, Schema, Scope, Stream } from "effect"
 import { FetchHttpClient } from "@effect/platform"
-import { MagnitudeClient, ProviderModelIdSchema, type ProviderModelId, type CatalogLocalModel } from "@magnitudedev/sdk"
-import { ApplicationSnapshot, LoginStartupState } from "@magnitudedev/sdk/desktop-host"
+import { MagnitudeClient, ProviderModelIdSchema, localModelDeprecation, type ProviderModelId, type CatalogLocalModel, type LocalInferenceHardware, type ModelOptimizationProgress, type ModelResidency } from "@magnitudedev/sdk"
+import { ApplicationSnapshot, LoginStartupState, type NetworkAccessChange } from "@magnitudedev/sdk/desktop-host"
 import {
-  DesktopApplicationInfo, DesktopUpdateState, DesktopConnectRequest, DesktopHostUnavailable, DesktopSession, DesktopConnectionsSnapshot, activeLocalModel, modelDownloadFailureMessage,
+  DesktopApplicationInfo, DesktopUpdateState, DesktopConnectRequest, DesktopHostUnavailable, DesktopSession, ModelTrayPresentation, DesktopConnectionsSnapshot, activeLocalModel,
   createAgentClient, AgentClientProvider, useAgentClient, makeFirstPartyConnection,
-  useCatalogModels, useLocalModelCommandStatus, useLocalModelMutations, useLocalModelStopStatus, useLocalModels, localModelFailureMessage, modelTrayPresentation, useLocalInferenceHardware, formatLocalModelDisplayName,
+  useCatalogModels, useLocalModelCommandStatus, useLocalModelMutations, useLocalModelStopStatus, useLocalModels, modelTrayPresentation, useLocalInferenceHardware, formatLocalModelDisplayName,
+  describeModelLoadStage, describeModelOptimization, formatModelLoadPercentage, formatModelMemory,
   formatStorageSize, formatTransferRate, formatMemorySize, localModelIsInstalled, localModelProviderModelId, rankedLocalModelOptions, featuredCatalogModels, targetPhysicalMemoryBytes,
+  catalogModelReplacement, performanceRangeSpeedLabel, localModelSpeedNote,
   LOCAL_MODEL_RANKING_SCALE_VALUES,
 } from "@magnitudedev/client-common"
-import { HardwareOverview, ModelRadar } from "./discovery-visuals"
+import { HardwareOverview, ModelRadar, SpeedInfo } from "./discovery-visuals"
 import { MemoryBreakdown } from "./memory-breakdown"
 import { HarnessConnections } from "./harness-connections"
-import { ModelLogo } from "./model-logo"
+import { OtherApps } from "./other-apps"
+import { LabLogo, ModelLogo, modelLab, modelLabs, type ModelLab } from "./model-logo"
 import type { DesktopApi, Page } from "./desktop-rpc"
 import "@web-styles/tailwind.css"
 
-initializeAppearance()
 document.documentElement.dataset.desktopPlatform = window.__magnitudeDesktop.platform
 const host = window.__magnitudeDesktop
 class DesktopHostFailed extends Schema.TaggedError<DesktopHostFailed>()("DesktopHostFailed", { message: Schema.String }) {}
-const hostCommand = (action: () => Promise<void>) => Effect.tryPromise({ try: action, catch: error => {
+const hostCommand = <A,>(action: () => Promise<A>) => Effect.tryPromise({ try: action, catch: error => {
   const decoded = Schema.decodeUnknownEither(Schema.Struct({ message: Schema.String }))(error)
   return new DesktopHostFailed({ message: decoded._tag === "Right" ? decoded.right.message : "Magnitude could not complete this action. Try again or check Status." })
 } })
-const hostFailureMessage = (cause: Cause.Cause<unknown>) => {
-  const failure = Cause.failureOption(cause)
-  return Option.isSome(failure) && Schema.is(DesktopHostFailed)(failure.value)
-    ? failure.value.message : "Magnitude could not complete this action. Try again or check Status."
-}
+// The host owns persistence; this store is only the renderer's applied appearance.
+const appearanceReadError = Atom.keepAlive(Atom.make<string | null>(null))
+const saveAppearance = Atom.fn((preference: AppearancePreference, context) => hostCommand(() => host.setAppearance(preference)).pipe(
+  Effect.tap(() => Effect.sync(() => { context.set(appearanceReadError, null); setAppearancePreference(preference) })),
+))
+
+const modelStorageSettings = Atom.keepAlive(Atom.make(hostCommand(() => host.getModelStorage())))
+const chooseModelStorage = Atom.fn((_: void) => hostCommand(() => host.chooseModelStorageDirectory()).pipe(
+  Effect.flatMap(path => path === null ? Effect.void : hostCommand(() => host.setModelStorage(path))), Effect.ensuring(Atom.refresh(modelStorageSettings))))
+const resetModelStorage = Atom.fn((_: void) => hostCommand(() => host.setModelStorage(null)).pipe(Effect.ensuring(Atom.refresh(modelStorageSettings))))
+const retryService = Atom.fn((_: void) => hostCommand(() => host.retry()))
+const relaunchApplication = Atom.fn((_: void) => hostCommand(() => host.relaunch()))
+const networkAccessSettings = Atom.keepAlive(Atom.make(hostCommand(() => host.getNetworkAccess())))
+const updateNetworkAccess = Atom.fn((change: NetworkAccessChange) => hostCommand(() => host.setNetworkAccess(change)).pipe(Effect.ensuring(Atom.refresh(networkAccessSettings))))
+const regenerateNetworkApiKey = Atom.fn((_: void) => hostCommand(() => host.regenerateNetworkApiKey()).pipe(Effect.ensuring(Atom.refresh(networkAccessSettings))))
+const ALL_INTERFACES = "all"
+const inferenceUrl = (address: string, port: number) => `http://${address}:${port}/inference/v1`
+/** The exact command that moves an existing store; the root holds only hub/, locks/ and one JSON file. */
+const moveModelsCommand = (platform: string, from: string, to: string) => platform === "win32"
+  ? `robocopy "${from}" "${to}" /E /MOVE`
+  : `mv "${from}/"* "${to}/"`
 
 const observation = Stream.asyncPush<typeof ApplicationSnapshot.Type, DesktopHostFailed>(emit => Effect.acquireRelease(
   Effect.sync(() => host.observe(encoded => {
@@ -78,14 +102,14 @@ const hostState = Atom.keepAlive(Atom.make(observation))
 const pageNames: Record<Page, string> = { discover: "Discover", catalog: "Catalog", models: "My Models", connections: "Connections", usage: "Usage", status: "Status", settings: "Settings" }
 const pageIcons = { discover: StackIcon, catalog: SquaresFourIcon, models: CubeIcon, connections: PlugIcon, usage: ChartBarIcon, status: PulseIcon, settings: SlidersIcon }
 
-function ModelFit({ model }: { model: CatalogLocalModel }) {
+/** Memory fit is advice, separate from an attempted operation's failure. */
+const fitNotice = (model: CatalogLocalModel): string | null => {
   const serving = model.servingState
-  if (serving._tag === "Assessing") return <p className="mt-3 text-sm text-slate-500">Checking compatibility with your machine…</p>
-  if (serving._tag === "Failed") return <p className="mt-3 text-sm text-slate-500">Assessment unavailable: {serving.failure.message}</p>
+  if (serving._tag === "Assessing") return "Assessing memory and speed…"
+  if (serving._tag === "Failed") return "Assessment failed."
   const assessment = serving.assessment
-  if (assessment._tag === "Incompatible") return <p className="mt-3 text-sm text-slate-500">Not compatible: {assessment.failure.message}</p>
-  if (assessment._tag === "DoesNotFit") return <p className="mt-3 text-sm text-slate-500">Doesn’t fit this machine · short by {formatMemorySize(assessment.deficitBytes, { rounding: "up" })} of memory.</p>
-  return <p className="mt-3 text-sm text-blue-700 dark:text-blue-400">Fits your machine · {formatMemorySize(assessment.memory.totalRequiredBytes)} estimated memory</p>
+  if (assessment._tag === "DoesNotFit") return `This model needs ${formatMemorySize(assessment.deficitBytes, { rounding: "up" })} more memory than this computer can provide. Choose a smaller model.`
+  return null
 }
 function ModelDetails({ model, radar = false, open, contentId, compact = false }: { model: CatalogLocalModel; radar?: boolean; open?: boolean; contentId?: string; compact?: boolean }) {
   const serving = model.servingState
@@ -104,12 +128,11 @@ function ModelDetails({ model, radar = false, open, contentId, compact = false }
           return <a className="inline-flex items-center gap-1 text-sm text-slate-600 hover:underline dark:text-slate-300" key={url} href={url} title={url} target="_blank" rel="noreferrer">{label}<ArrowUpRightIcon aria-hidden="true" className="size-3.5" /></a>
         })}</div></div>}
       </div>
-      {serving._tag === "Assessed" && serving.assessment._tag === "Fits" && serving.assessment.performance.length > 0 && <div className="min-w-0">
-        <table className="w-full text-left text-sm tabular-nums">
-          <caption className="mb-3 text-left font-medium">Estimated speed on your machine</caption>
-          <thead className="text-xs text-slate-500"><tr><th className="pb-2 font-normal">Context tokens</th><th className="pb-2 text-right font-normal">Tokens / sec</th></tr></thead>
-          <tbody>{serving.assessment.performance.map(sample => <tr key={sample.contextTokens} className="border-t border-slate-200 dark:border-slate-750"><td className="py-2">{sample.contextTokens.toLocaleString()}</td><td className="py-2 text-right">{Math.round(sample.estimatedTokensPerSecond)}</td></tr>)}</tbody>
-        </table>
+      {serving._tag === "Failed" && <div className="min-w-0"><p className="mb-1 text-xs text-slate-500">Assessment</p><p className="break-words text-slate-600 dark:text-slate-300">{serving.failure.message}</p></div>}
+      {serving._tag === "Assessed" && serving.assessment._tag === "Fits" && <div className="min-w-0">
+        <p className="mb-1 flex items-center gap-1.5 font-medium">Estimated speed on your machine<SpeedInfo /></p>
+        <p className="text-sm tabular-nums">{performanceRangeSpeedLabel(serving.assessment.performance, serving.assessment.profile.contextLength)}</p>
+        <p className="mt-1 text-xs text-slate-500">{localModelSpeedNote}</p>
       </div>}
       </div>
       {radar && <ModelRadar model={model} />}
@@ -121,29 +144,128 @@ function ModelDetails({ model, radar = false, open, contentId, compact = false }
     {content}
   </details>
 }
-function DownloadProgress({ acquisition, modelName, onCancel, pending = false }: { acquisition: CatalogLocalModel["acquisitionState"]; modelName: string; onCancel?: () => void; pending?: boolean }) {
-  if (acquisition._tag !== "Installing" && acquisition._tag !== "Updating") return null
-  const { progress } = acquisition
-  const downloading = progress.stage === "downloading"
-  const percent = progress.totalBytes > 0 ? progress.completedBytes / progress.totalBytes * 100 : null
-  const rate = downloading ? Option.getOrNull(progress.bytesPerSecond) : null
-  const eta = downloading && rate !== null && rate > 0 && progress.totalBytes > 0
-    ? `About ${Math.max(1, Math.ceil((progress.totalBytes - progress.completedBytes) / rate / 60))} min`
-    : downloading ? "Estimating…" : "—"
+/** A catalog model's download and the one-time optimization that follows it. */
+const acquiring = (acquisition: CatalogLocalModel["acquisitionState"]) =>
+  acquisition._tag === "Installing" || acquisition._tag === "Updating" || acquisition._tag === "Optimizing"
+const minutesRemaining = (seconds: number) => `About ${Math.max(1, Math.ceil(seconds / 60))} min`
+/** Tuning's time remaining from its observed rate; units are measured configurations, so they track time. */
+function useTuningEstimate(progress: ModelOptimizationProgress | null): string {
+  const baseline = useRef<{ at: number; completed: number } | null>(null)
+  if (progress === null || progress.stage !== "tuning") {
+    baseline.current = null
+    return "—"
+  }
+  const now = Date.now()
+  if (baseline.current === null || progress.completed < baseline.current.completed) baseline.current = { at: now, completed: progress.completed }
+  const elapsed = (now - baseline.current.at) / 1000
+  const done = progress.completed - baseline.current.completed
+  return elapsed < 5 || done <= 0 ? "Estimating…" : minutesRemaining((progress.total - progress.completed) * elapsed / done)
+}
+/**
+ * One card from the first byte to the model being ready: once the download is verified it turns into
+ * the optimization in place. Every line keeps its place, and the finished download's bar fades into
+ * tuning progress rather than jumping back.
+ */
+function DownloadProgress({ acquisition, modelName, onCancel, pending = false, layout = "panel" }: { acquisition: CatalogLocalModel["acquisitionState"]; modelName: string; onCancel?: () => void; pending?: boolean; layout?: "panel" | "row" }) {
+  const hardware = useLocalInferenceHardware()
+  const optimization = acquisition._tag === "Optimizing" ? acquisition.progress : null
+  const tuningEstimate = useTuningEstimate(optimization)
+  if (acquisition._tag !== "Installing" && acquisition._tag !== "Updating" && acquisition._tag !== "Optimizing") return null
   const stages = { queued: "Queued", resolving: "Preparing download", checking_space: "Checking space", downloading: "Downloading", verifying: "Verifying download", publishing: "Finishing download" }
-  const bytes = `${formatStorageSize(progress.completedBytes)} / ${progress.totalBytes > 0 ? formatStorageSize(progress.totalBytes) : "Unknown total"}`
+  const bar = "absolute inset-y-0 left-0 rounded-md bg-blue-700 transition-[width,opacity] duration-500 ease-out dark:bg-blue-500"
+  let heading: string, title: ReactNode, detail: string, percent: number | null, downloadWidth: number, pulse: boolean, stat: { label: string; value: string }, remaining: string, cancelLabel: string
+  if (acquisition._tag === "Optimizing") {
+    const { stage, completed, total } = acquisition.progress
+    heading = describeModelOptimization(acquisition.progress, Result.isSuccess(hardware) ? Option.some(hardware.value) : Option.none())
+    title = <span className="min-w-0 flex-1 truncate">{heading}</span>
+    detail = "One-time setup for this device"
+    percent = stage === "tuning" && total > 0 ? Math.min(100, completed * 100 / total) : null
+    downloadWidth = 100
+    pulse = percent === null
+    stat = { label: "Model", value: modelName }
+    remaining = tuningEstimate
+    cancelLabel = "Skip optimization"
+  } else {
+    const { progress } = acquisition
+    const downloading = progress.stage === "downloading"
+    const rate = downloading ? Option.getOrNull(progress.bytesPerSecond) : null
+    heading = stages[progress.stage]
+    title = downloading ? <><span className="shrink-0">Downloading</span><span className="min-w-0 flex-1 truncate" title={modelName}>{modelName}</span></> : <span className="min-w-0 flex-1 truncate">{heading}</span>
+    detail = `${formatStorageSize(progress.completedBytes)} / ${progress.totalBytes > 0 ? formatStorageSize(progress.totalBytes) : "Unknown total"}`
+    percent = progress.totalBytes > 0 ? progress.completedBytes / progress.totalBytes * 100 : null
+    downloadWidth = percent ?? 100
+    pulse = percent === null
+    stat = { label: "Download speed", value: rate !== null ? formatTransferRate(rate) : "—" }
+    remaining = downloading && rate !== null && rate > 0 && progress.totalBytes > 0
+      ? minutesRemaining((progress.totalBytes - progress.completedBytes) / rate)
+      : downloading ? "Estimating…" : "—"
+    cancelLabel = "Cancel download"
+  }
+  const tuning = optimization !== null && percent !== null
+  const phase = acquisition._tag === "Optimizing" ? "optimizing" : "download"
+  const fade = "motion-safe:animate-[fade-in_400ms_ease-out]"
+  const spinner = <CircleNotchIcon aria-hidden="true" className="size-3.5 shrink-0 text-blue-700 motion-safe:animate-spin dark:text-blue-400" />
+  const percentText = percent !== null ? `${Math.floor(percent)}%` : "—"
+  const cancelButton = (className: string, size?: "sm") => onCancel && <Button variant="ghost" size={size} className={`hover:bg-transparent hover:text-red-600 dark:hover:bg-transparent dark:hover:text-red-400 ${className}`} disabled={pending} onClick={onCancel}><XIcon />{cancelLabel}</Button>
+  const progressBar = <div role="progressbar" aria-label={optimization ? "Optimization progress" : "Download progress"} aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent ?? undefined} aria-valuetext={detail} className="relative h-2 w-full overflow-hidden rounded-md bg-slate-100 dark:bg-slate-800">
+    <div className={`${bar} ${pulse ? "motion-safe:animate-pulse" : ""}`} style={{ width: `${downloadWidth}%`, opacity: tuning ? 0 : 1 }} />
+    <div className={bar} style={{ width: `${tuning ? percent : 0}%`, opacity: tuning ? 1 : 0 }} />
+  </div>
+  // A model row already names the model: one status line over the bar, one line of detail under it.
+  if (layout === "row") {
+    const facts = [optimization === null ? stat.value : null, remaining].filter(fact => fact !== null && fact !== "—").join(" · ")
+    return <div className="w-full min-w-0" aria-label="Model download">
+      <div className="flex h-7 items-center gap-2 text-sm">
+        {spinner}
+        <span key={phase} className={`min-w-0 flex-1 truncate font-medium ${fade}`}>{heading}</span>
+        <span className="shrink-0 tabular-nums text-slate-600 dark:text-slate-300">{percent !== null ? percentText : null}</span>
+        {cancelButton("-mr-2.5 ml-2", "sm")}
+      </div>
+      <div className="mt-2">{progressBar}</div>
+      <div className="mt-2 flex items-baseline justify-between gap-3 text-xs tabular-nums text-slate-500 dark:text-slate-400"><span className="min-w-0 truncate">{detail}</span><span className="shrink-0">{facts}</span></div>
+    </div>
+  }
   return <div className="w-full min-w-0" aria-label="Model download">
     <h3 className="mb-6 flex items-center gap-2 text-sm font-medium">
-      {downloading ? <><span className="shrink-0">Downloading</span><span className="min-w-0 flex-1 truncate" title={modelName}>{modelName}</span></> : <span className="min-w-0 flex-1 truncate">{stages[progress.stage]}</span>}
-      <CircleNotchIcon aria-hidden="true" className="size-3.5 shrink-0 text-blue-700 motion-safe:animate-spin dark:text-blue-400" />
+      <span key={phase} className={`flex min-w-0 flex-1 items-center gap-2 ${fade}`}>{title}</span>
+      {spinner}
     </h3>
-    <Progress aria-label="Download progress" aria-valuetext={bytes} value={percent} trackClassName="h-2" indicatorClassName={`bg-blue-700 dark:bg-blue-500 ${percent === null ? "w-full motion-safe:animate-pulse" : ""}`} />
-    <div className="mt-3 flex items-baseline justify-between gap-3 text-sm tabular-nums text-slate-600 dark:text-slate-300"><span>{bytes}</span><span>{percent !== null ? `${Math.floor(percent)}%` : "—"}</span></div>
-    <dl className="mt-6 grid grid-cols-2 gap-4 text-sm"><div><dt className="text-xs text-slate-500 dark:text-slate-400">Download speed</dt><dd className="mt-1 font-medium tabular-nums text-slate-800 dark:text-slate-200">{rate !== null ? formatTransferRate(rate) : "—"}</dd></div><div className="text-right"><dt className="text-xs text-slate-500 dark:text-slate-400">Time remaining</dt><dd className="mt-1 font-medium tabular-nums text-slate-800 dark:text-slate-200">{eta}</dd></div></dl>
-    {onCancel && <div className="mt-7 flex justify-center"><Button variant="ghost" className="hover:bg-transparent hover:text-red-600 dark:hover:bg-transparent dark:hover:text-red-400" disabled={pending} onClick={onCancel}><XIcon />Cancel download</Button></div>}
+    {progressBar}
+    <div className="mt-3 flex items-baseline justify-between gap-3 text-sm tabular-nums text-slate-600 dark:text-slate-300"><span className="min-w-0 truncate">{detail}</span><span>{percentText}</span></div>
+    <dl className="mt-6 grid grid-cols-2 gap-4 text-sm"><div className="min-w-0"><dt className="text-xs text-slate-500 dark:text-slate-400">{stat.label}</dt><dd className="mt-1 truncate font-medium tabular-nums text-slate-800 dark:text-slate-200" title={stat.value}>{stat.value}</dd></div><div className="text-right"><dt className="text-xs text-slate-500 dark:text-slate-400">Time remaining</dt><dd className="mt-1 font-medium tabular-nums text-slate-800 dark:text-slate-200">{remaining}</dd></div></dl>
+    {onCancel && <div className="mt-7 flex justify-center">{cancelButton("")}</div>}
   </div>
 }
-function ModelControls({ model, replacing, children, onConnectAgent }: { model: CatalogLocalModel; replacing?: string; children?: ReactNode; onConnectAgent?: () => void }) {
+/** One step from a deprecated model to its replacement: download it, or load it once downloaded. */
+function SwitchToReplacement({ target }: { target: CatalogLocalModel }) {
+  const { install, load } = useLocalModelMutations()
+  const command = useLocalModelCommandStatus(target.modelId)
+  const fits = target.servingState._tag === "Assessed" && target.servingState.assessment._tag === "Fits"
+  const transferring = target.acquisitionState._tag === "Installing" || target.acquisitionState._tag === "Updating"
+  return <>
+    <Button disabled={command.pending || transferring || !fits} onClick={() => localModelIsInstalled(target) ? load(target.modelId) : install(target.modelId)}>Switch to {formatLocalModelDisplayName(target)}</Button>
+  </>
+}
+/** An installed deprecated model is removable and offers one step to its replacement; it never loads. */
+function DeprecatedModelControls({ model, replacement, children }: { model: CatalogLocalModel; replacement: Option.Option<CatalogLocalModel>; children?: ReactNode }) {
+  const { remove } = useLocalModelMutations()
+  const command = useLocalModelCommandStatus(model.modelId)
+  const replacementCommand = useLocalModelCommandStatus(Option.match(replacement, { onNone: () => model.modelId, onSome: target => target.modelId }))
+  const acquisition = model.acquisitionState
+  const pending = command.pending || acquisition._tag === "Removing"
+  return <TooltipProvider><div className="contents">
+    <div className="flex flex-wrap items-center justify-end gap-2">{children}
+      {Option.match(replacement, { onNone: () => null, onSome: target => <SwitchToReplacement target={target} /> })}
+      {localModelIsInstalled(model) && <Button variant="ghost" size="icon" aria-label={`Remove ${formatLocalModelDisplayName(model)}`} title="Remove download" disabled={pending} onClick={() => { if (window.confirm(`Remove the downloaded files for ${formatLocalModelDisplayName(model)}?`)) remove(model.modelId) }}><TrashIcon /></Button>}
+    </div>
+    {Option.isSome(replacement) && replacementCommand.failures.map(failure => <ErrorNotice key={`replacement-${failure.operation}`} {...modelCommandNotice(failure)} className="col-span-full mt-3" />)}
+    <ErrorNotice severity="info" title={Option.isSome(replacement) ? "A replacement model is available" : "This model is no longer supported"} description={Option.isSome(replacement) ? `Switch to ${formatLocalModelDisplayName(replacement.value)} to continue receiving support.` : "Choose another model from Catalog."} className="col-span-full mt-3" />
+    {acquisition._tag === "RemoveFailed" && <ErrorNotice {...modelRemovalNotice(acquisition.failure)} className="col-span-full mt-3" />}
+    {command.failures.map(failure => <ErrorNotice key={failure.operation} {...modelCommandNotice(failure)} className="col-span-full mt-3" />)}
+  </div></TooltipProvider>
+}
+/** `inlineLoadFailure` false leaves a failed load to the caller's own presentation and keeps the Load action available. */
+function ModelControls({ model, replacing, children, onConnectAgent, inlineLoadFailure = true }: { model: CatalogLocalModel; replacing?: string; children?: ReactNode; onConnectAgent?: () => void; inlineLoadFailure?: boolean }) {
   const { install, load, stop, cancel, remove, dismissFailure: dismiss } = useLocalModelMutations()
   const command = useLocalModelCommandStatus(model.modelId)
   const stopping = useLocalModelStopStatus()
@@ -152,36 +274,51 @@ function ModelControls({ model, replacing, children, onConnectAgent }: { model: 
   const installed = "residencyState" in acquisition
   const residency = installed ? acquisition.residencyState : undefined
   const canStop = residency !== undefined && ["Ready", "Loading", "Requested", "Stopping"].includes(residency._tag)
-  const transferring = acquisition._tag === "Installing" || acquisition._tag === "Updating"
-  return <div>
-    <div className="flex flex-wrap items-center gap-2">{children}
-      {transferring ? <DownloadProgress modelName={formatLocalModelDisplayName(model)} acquisition={acquisition} pending={command.pending} onCancel={() => cancel(model.modelId)} /> : !installed ? <Button disabled={pending || model.servingState._tag !== "Assessed" || model.servingState.assessment._tag !== "Fits"} onClick={() => { install(model.modelId) }}><DownloadSimpleIcon />Download ({formatStorageSize(model.storageBytes).replace(/\s/g, "")})</Button> : <>
-        {onConnectAgent ? <Button className="min-w-28" disabled={pending} onClick={onConnectAgent}><PlugIcon />Connect Agent</Button> : canStop ? <Button className="min-w-28" variant="outline" disabled={stopping.pending} onClick={() => stop()}><SquareIcon />Stop model</Button> : <Button className="min-w-28" disabled={pending} onClick={() => { if (!replacing || window.confirm(`Loading ${formatLocalModelDisplayName(model)} will stop ${replacing}. Continue?`)) load(model.modelId) }}><PlayIcon />Load model</Button>}
-        {!onConnectAgent && <Button variant="ghost" size="icon" aria-label={`Remove ${formatLocalModelDisplayName(model)}`} title="Remove download" disabled={pending} onClick={() => { if (window.confirm(`Remove the downloaded files for ${formatLocalModelDisplayName(model)}?`)) remove(model.modelId) }}><TrashIcon /></Button>}
-        {(acquisition._tag === "UpdateAvailable" || acquisition._tag === "UpdateFailed") && <Button variant="outline" disabled={pending} onClick={() => install(model.modelId)}>Update</Button>}
+  const transferring = acquiring(acquisition)
+  const fit = model.catalogData.support._tag === "Supported" ? fitNotice(model) : null
+  const loadFailure = residency?._tag === "Failed" && !command.pendingOperations.includes("load") ? residency.failure : null
+  const loadNotice = inlineLoadFailure ? loadFailure : null
+  const downloadFailure = (acquisition._tag === "InstallFailed" || acquisition._tag === "UpdateFailed") && !command.pendingOperations.includes("install") ? acquisition.failure : null
+  const canDownload = model.catalogData.support._tag === "Supported" && model.servingState._tag === "Assessed" && model.servingState.assessment._tag === "Fits"
+  const requestLoad = () => { if (!replacing || window.confirm(`Loading ${formatLocalModelDisplayName(model)} will stop ${replacing}. Continue?`)) load(model.modelId) }
+
+  return <TooltipProvider><div className="contents">
+    <div className="flex flex-wrap items-center justify-end gap-2">{children}
+      {transferring ? null : !installed ? downloadFailure ? null : <Button disabled={pending || model.catalogData.support._tag !== "Supported" || model.servingState._tag !== "Assessed" || model.servingState.assessment._tag !== "Fits"} onClick={() => { install(model.modelId) }}><DownloadSimpleIcon />Download ({formatStorageSize(model.storageBytes).replace(/\s/g, "")})</Button> : <>
+        {model.catalogData.support._tag === "Supported" && (onConnectAgent ? <Button className="min-w-28" disabled={pending} onClick={onConnectAgent}><PlugIcon />Connect Agent</Button> : canStop ? <Button className="min-w-28" variant="outline" disabled={stopping.pending} onClick={() => stop()}><SquareIcon />Stop model</Button> : loadNotice ? null : <Button className="min-w-28" disabled={pending} onClick={requestLoad}><PlayIcon />Load model</Button>)}
+        {!onConnectAgent && <Button variant="ghost" size="icon" aria-label={`Remove ${formatLocalModelDisplayName(model)}`} title="Remove download" disabled={pending} onClick={() => { if (window.confirm(canStop ? `Stop ${formatLocalModelDisplayName(model)} and remove its downloaded files?` : `Remove the downloaded files for ${formatLocalModelDisplayName(model)}?`)) remove(model.modelId) }}><TrashIcon /></Button>}
+        {model.catalogData.support._tag === "Supported" && acquisition._tag === "UpdateAvailable" && <Button variant="outline" disabled={pending} onClick={() => install(model.modelId)}>Update</Button>}
       </>}
-      {(acquisition._tag === "InstallFailed" || acquisition._tag === "UpdateFailed") && <Button variant="outline" onClick={() => dismiss(model.modelId)}>Dismiss error</Button>}
+
     </div>
-    {(model.servingState._tag !== "Assessed" || model.servingState.assessment._tag !== "Fits") && <ModelFit model={model} />}
-    {"failure" in acquisition && <p role="alert" className="mt-3 text-sm">{acquisition._tag === "InstallFailed" || acquisition._tag === "UpdateFailed" ? modelDownloadFailureMessage(acquisition.failure) : acquisition.failure.message}</p>}
-    {residency?._tag === "Failed" && <p role="alert" className="mt-3 text-sm">{residency.failure.message}</p>}
-    {command.failures.map(message => <p key={message} role="alert" className="mt-3 text-sm">{message}</p>)}
-    {residency?._tag === "Stopping" && Option.isSome(stopping.failure) && <p role="alert" className="mt-3 text-sm">{stopping.failure.value}</p>}
-  </div>
+    {transferring && <div className="col-span-full mt-1"><DownloadProgress layout="row" modelName={formatLocalModelDisplayName(model)} acquisition={acquisition} pending={command.pending} onCancel={() => cancel(model.modelId)} /></div>}
+    {fit !== null && !loadFailure && !downloadFailure && <ErrorNotice severity="info" title={fit} className="col-span-full mt-3" />}
+    {model.catalogData.support._tag === "Disabled" && <ErrorNotice severity="warning" title="This model is unavailable" description="Choose another model from Catalog." className="col-span-full mt-3" />}
+    {downloadFailure && <ErrorNotice {...downloadNotice(downloadFailure)} className="col-span-full mt-3" actions={<>
+      {canDownload && <NoticeAction disabled={pending} onClick={() => install(model.modelId)}>Retry download</NoticeAction>}
+      <NoticeAction disabled={pending} onClick={() => dismiss(model.modelId)}>Dismiss</NoticeAction>
+    </>} />}
+    {acquisition._tag === "RemoveFailed" && <ErrorNotice {...modelRemovalNotice(acquisition.failure)} className="col-span-full mt-3" />}
+    {loadNotice && <div className="col-span-full mt-3"><ModelLoadNotice failure={loadNotice} actions={model.catalogData.support._tag === "Supported" && loadNotice.retryable && !onConnectAgent ? <NoticeAction disabled={pending} onClick={requestLoad}>Load again</NoticeAction> : undefined} /></div>}
+    {command.failures.map(failure => <ErrorNotice key={failure.operation} {...modelCommandNotice(failure)} className="col-span-full mt-3" />)}
+  </div></TooltipProvider>
 }
-function ModelCard({ model, showMemory = false, replacing }: { model: CatalogLocalModel; showMemory?: boolean; replacing?: string }) {
+function ModelCard({ model, models, showMemory = false, replacing }: { model: CatalogLocalModel; models: readonly CatalogLocalModel[]; showMemory?: boolean; replacing?: string }) {
   const [detailsOpen, setDetailsOpen] = useState(false)
   const detailsId = useId()
+  const deprecation = localModelDeprecation(model)
+  const detailsToggle = <Button variant="ghost" aria-expanded={detailsOpen} aria-controls={detailsId} onClick={() => setDetailsOpen(value => !value)}>Details<CaretDownIcon aria-hidden="true" className={`size-4 ${detailsOpen ? "rotate-180" : ""}`} /></Button>
   const acquisition = model.acquisitionState
   const residency = "residencyState" in acquisition ? acquisition.residencyState : undefined
-  const statusLabel = acquisition._tag === "Removing" ? "Removing…" : acquisition._tag === "RemoveFailed" ? "Removal failed" : residency?._tag === "Ready" ? "Loaded" : residency?._tag === "Unloaded" ? "Downloaded" : residency?._tag ?? (acquisition._tag === "NotInstalled" ? "" : acquisition._tag)
+  const statusLabel = acquisition._tag === "Removing" ? "Removing…" : acquisition._tag === "RemoveFailed" ? "Removal failed" : residency?._tag === "Ready" ? "Loaded" : residency?._tag === "Unloaded" ? "Downloaded" : residency?._tag === "Failed" ? "Not loaded" : residency?._tag === "Requested" ? "Preparing…" : residency?._tag ?? (acquisition._tag === "NotInstalled" ? "" : acquisition._tag === "InstallFailed" ? "Not downloaded" : acquisition._tag === "UpdateFailed" ? "Update incomplete" : acquisition._tag === "UpdateAvailable" ? "Update available" : acquisition._tag)
   const status = (statusLabel || showMemory) && <div className="mt-1 flex flex-wrap items-center gap-x-3 text-sm text-slate-500">{statusLabel && <span className={residency?._tag === "Ready" ? "text-green-600 dark:text-green-400" : ""}>{statusLabel}</span>}{showMemory && model.servingState._tag === "Assessed" && model.servingState.assessment._tag === "Fits" && <><span aria-hidden="true">·</span><span>{formatMemorySize(model.servingState.assessment.memory.totalRequiredBytes)} memory</span></>}</div>
   return <article className={pageLayout.modelCard}>
     <div className={pageLayout.modelRow}>
-      <div className="flex min-w-0 items-center gap-4"><ModelLogo model={model} /><div className="min-w-0"><h2 className="text-lg font-semibold">{formatLocalModelDisplayName(model)}</h2>{status}</div></div>
-      <ModelControls model={model} {...(replacing ? { replacing } : {})}>
-        <Button variant="ghost" aria-expanded={detailsOpen} aria-controls={detailsId} onClick={() => setDetailsOpen(value => !value)}>Details<CaretDownIcon aria-hidden="true" className={`size-4 ${detailsOpen ? "rotate-180" : ""}`} /></Button>
-      </ModelControls>
+      <div className="flex min-w-0 items-center gap-4"><ModelLogo model={model} /><div className="min-w-0"><h2 className="flex flex-wrap items-center gap-2 text-lg font-semibold">{formatLocalModelDisplayName(model)}</h2>{status}</div></div>
+      {Option.match(deprecation, {
+        onNone: () => <ModelControls model={model} {...(replacing ? { replacing } : {})}>{detailsToggle}</ModelControls>,
+        onSome: value => <DeprecatedModelControls model={model} replacement={catalogModelReplacement(models, value)}>{detailsToggle}</DeprecatedModelControls>,
+      })}
     </div>
     <ModelDetails model={model} radar open={detailsOpen} contentId={detailsId} />
   </article>
@@ -192,7 +329,7 @@ function SelectedRecommendation({ model, active }: { model: CatalogLocalModel; a
   const [view, setView] = useState<"profile" | "details">("profile")
   const { cancel } = useLocalModelMutations()
   const command = useLocalModelCommandStatus(model.modelId)
-  const transferring = model.acquisitionState._tag === "Installing" || model.acquisitionState._tag === "Updating"
+  const transferring = acquiring(model.acquisitionState)
   return <div className={`relative ${pageLayout.recommendationPane}`} aria-label="Selected model profile">
     <div className={transferring ? "invisible" : undefined} inert={transferring} aria-hidden={transferring}>
     <div className={pageLayout.recommendationToolbar}>
@@ -200,7 +337,7 @@ function SelectedRecommendation({ model, active }: { model: CatalogLocalModel; a
       <Button variant={view === "profile" ? "secondary" : "ghost"} aria-pressed={view === "profile"} onClick={() => setView("profile")}>Profile</Button>
       <Button variant={view === "details" ? "secondary" : "ghost"} aria-pressed={view === "details"} onClick={() => setView("details")}>Details</Button>
     </div>
-      {transferring ? <Button disabled><DownloadSimpleIcon />Download ({formatStorageSize(model.storageBytes).replace(/\s/g, "")})</Button> : <ModelControls model={model} onConnectAgent={() => connectAgent()} {...(Option.isSome(active) && active.value.model.modelId !== model.modelId ? { replacing: formatLocalModelDisplayName(active.value.model) } : {})} />}
+      {transferring ? <Button disabled><DownloadSimpleIcon />Download ({formatStorageSize(model.storageBytes).replace(/\s/g, "")})</Button> : <ModelControls model={model} inlineLoadFailure={false} onConnectAgent={() => connectAgent()} {...(Option.isSome(active) && active.value.model.modelId !== model.modelId ? { replacing: formatLocalModelDisplayName(active.value.model) } : {})} />}
     </div>
     <div className="grid min-h-72">
       <div className={`col-start-1 row-start-1 min-w-0 ${view === "profile" ? "" : "invisible"}`} aria-hidden={view !== "profile"}><ModelRadar model={model} /></div>
@@ -210,7 +347,7 @@ function SelectedRecommendation({ model, active }: { model: CatalogLocalModel; a
     {transferring && <div className="absolute inset-5 flex items-center justify-center overflow-y-auto" aria-label="Download panel">
       <div className="w-full max-w-sm px-3 py-4">
         <DownloadProgress modelName={formatLocalModelDisplayName(model)} acquisition={model.acquisitionState} pending={command.pending} onCancel={() => cancel(model.modelId)} />
-        {command.failures.map(message => <p key={message} role="alert" className="mt-3 text-sm">{message}</p>)}
+        {command.failures.map(failure => <ErrorNotice key={failure.operation} {...modelCommandNotice(failure)} className="mt-3" />)}
       </div>
     </div>}
   </div>
@@ -219,13 +356,13 @@ function Recommendations({ models, active, preference }: { models: readonly Cata
   const [selection, setSelection] = useState<{ preference: number; modelId: CatalogLocalModel["modelId"] | null }>({ preference, modelId: null })
   if (selection.preference !== preference) setSelection({ preference, modelId: null })
   const selectedId = selection.preference === preference ? selection.modelId : null
-  const downloads = models.filter(model => model.acquisitionState._tag === "Installing" || model.acquisitionState._tag === "Updating")
+  const downloads = models.filter(model => acquiring(model.acquisitionState))
   const selectable = downloads.length > 0 ? downloads : models
   const selected = selectable.find(model => model.modelId === selectedId) ?? selectable[0]
   if (!selected) return null
   return <section aria-label="Top recommendations" className="mb-8">
-    <div className={pageLayout.recommendations}>
-      <div className={pageLayout.recommendationList} aria-label="Recommended models">{models.map((model, rank) => <button key={model.modelId} type="button" aria-pressed={model.modelId === selected.modelId} onClick={() => setSelection({ preference, modelId: model.modelId })} className={`${pageLayout.recommendationRow} transition-colors focus-visible:outline-2 focus-visible:outline-blue-500 ${model.modelId === selected.modelId ? "border-blue-300 bg-blue-50 dark:border-blue-700 dark:bg-slate-800" : "border-transparent hover:bg-slate-100 dark:hover:bg-slate-800"}`}>
+    <TooltipProvider><div className={pageLayout.recommendations}>
+      <div className={pageLayout.recommendationList} aria-label="Recommended models">{models.map((model, rank) => <button key={model.modelId} type="button" aria-pressed={model.modelId === selected.modelId} onClick={() => setSelection({ preference, modelId: model.modelId })} className={`${pageLayout.recommendationRow} focus-visible:outline-2 focus-visible:outline-blue-500 ${model.modelId === selected.modelId ? "border-blue-300 bg-blue-50 dark:border-blue-700 dark:bg-slate-800" : "border-transparent hover:bg-slate-100 dark:hover:bg-slate-800"}`}>
         <span className="w-4 shrink-0 text-sm tabular-nums text-slate-500">{rank + 1}</span>
         <ModelLogo model={model} className="size-7" />
         <span className="flex min-w-0 flex-1 items-center text-sm font-medium">
@@ -237,10 +374,14 @@ function Recommendations({ models, active, preference }: { models: readonly Cata
           >{model.presentation.displayName}{"\u00a0"}</span>
           <span className="shrink-0 whitespace-nowrap">({model.presentation.variantLabel})</span>
         </span>
+        {"residencyState" in model.acquisitionState && model.acquisitionState.residencyState._tag === "Failed" && <ModelLoadFailureIndicator failure={model.acquisitionState.residencyState.failure} />}
       </button>)}</div>
       <SelectedRecommendation model={selected} active={active} />
-    </div>
+    </div></TooltipProvider>
   </section>
+}
+function LabOption({ lab }: { lab: ModelLab | null }) {
+  return <span className="flex items-center gap-2">{lab ? <LabLogo lab={lab} className="size-4" /> : <BuildingsIcon aria-hidden="true" className="size-4 text-slate-500" />}{lab ? lab.name : "Any lab"}</span>
 }
 function Models({ page }: { page: "discover" | "catalog" | "models" }) {
   const installedOnly = page === "models"
@@ -259,6 +400,7 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
     { value: "name", label: "Name A–Z" }, { value: "smallest", label: "Smallest download" }, { value: "largest", label: "Largest download" },
   ]
   const [filter, setFilter] = useState("all")
+  const [lab, setLab] = useState<ModelLab | null>(null)
   const [sort, setSort] = useState(installedOnly ? "name" : "recommended")
   const client = useAgentClient()
   const session = useMemo(() => client.runtime.atom(DesktopSession), [client])
@@ -266,7 +408,7 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
   const preferenceResult = useAtomValue(preferenceAtom)
   const preference = Result.isSuccess(preferenceResult) ? preferenceResult.value : 2
   const setPreference = useAtomSet(useMemo(() => client.runtime.fn((index: number) => Effect.flatMap(DesktopSession, service => service.setRankingPreference(index))), [client]))
-  if (Result.isFailure(catalog)) return <>{!discover && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}<p role="alert" className="mt-5">{localModelFailureMessage(catalog.cause, "Could not read the model catalog. Check Status and try again.")}</p></>
+  if (Result.isFailure(catalog)) return <>{!discover && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}<ErrorNotice title="Couldn’t load the model catalog" description="Model information is unavailable. Check the service on Status." className="mt-5" /></>
   if (!Result.isSuccess(catalog) && !discover) return <ModelsSkeleton page={page} />
   const models = (Result.isSuccess(catalog) ? catalog.value.models : []).filter((model): model is CatalogLocalModel => model._tag === "Catalog")
   const ranked = !installedOnly && Result.isSuccess(hardware) ? rankedLocalModelOptions(models.map(model => ({ id: model.modelId, kind: localModelIsInstalled(model) ? "stored" as const : "downloadable" as const, model })), { fastToSmart: LOCAL_MODEL_RANKING_SCALE_VALUES[preference]!, memoryBudgetBytes: targetPhysicalMemoryBytes(hardware.value) }, models.length).flatMap(option => option.model._tag === "Catalog" ? [option.model] : []) : []
@@ -274,14 +416,17 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
   const recommendationsPending = !Result.isFailure(hardware) && (Result.isInitial(hardware) || !assessment?.complete)
   const rankedIds = new Set(ranked.map(model => model.modelId))
   const ordered = installedOnly ? models : [...ranked, ...models.filter(model => !rankedIds.has(model.modelId))]
-  const library = ordered.filter(model => !installedOnly || model.acquisitionState._tag !== "NotInstalled")
+  // Deprecated and disabled models are listed only where installed.
+  const library = ordered.filter(model => model.acquisitionState._tag !== "NotInstalled"
+    || !installedOnly && model.catalogData.support._tag === "Supported")
+  const labOptions = modelLabs.filter(entry => library.some(model => modelLab(model) === entry))
   const visible = library.filter(model => {
     const acquisition = model.acquisitionState
     const matchesFilter = filter === "all"
       || filter === "fits" && model.servingState._tag === "Assessed" && model.servingState.assessment._tag === "Fits"
       || filter === "downloaded" && localModelIsInstalled(model)
-      || filter === "downloading" && (acquisition._tag === "Installing" || acquisition._tag === "Updating")
-    return matchesFilter && `${formatLocalModelDisplayName(model)} ${model.presentation.description}`.toLowerCase().includes(search.trim().toLowerCase())
+      || filter === "downloading" && acquiring(acquisition)
+    return matchesFilter && (lab === null || modelLab(model) === lab) && `${formatLocalModelDisplayName(model)} ${model.presentation.description}`.toLowerCase().includes(search.trim().toLowerCase())
   })
   if (sort !== "recommended") visible.sort((a, b) => {
     const byName = formatLocalModelDisplayName(a).localeCompare(formatLocalModelDisplayName(b), undefined, { numeric: true }) || a.modelId.localeCompare(b.modelId)
@@ -299,6 +444,10 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
             <SelectTrigger aria-label="Filter models"><SelectValue /></SelectTrigger>
             <SelectContent>{filterOptions.map(option => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
           </Select>
+          <Select value={lab} onValueChange={setLab}>
+            <SelectTrigger aria-label="Filter by lab"><SelectValue>{(value: ModelLab | null) => <LabOption lab={value} />}</SelectValue></SelectTrigger>
+            <SelectContent>{[<SelectItem key="any" value={null}><LabOption lab={null} /></SelectItem>, ...labOptions.map(option => <SelectItem key={option.name} value={option}><LabOption lab={option} /></SelectItem>)]}</SelectContent>
+          </Select>
           <Select items={sortOptions} value={sort} onValueChange={value => { if (value !== null) setSort(value) }}>
             <SelectTrigger aria-label="Sort models"><span className="text-slate-500">Sort:</span><SelectValue /></SelectTrigger>
             <SelectContent>{sortOptions.map(option => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
@@ -308,31 +457,32 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
       </div>
     </>}
     {discover && <HardwareOverview /> }
-    {Option.isSome(stopResult.failure) && <p role="alert" className="mt-5 text-sm">{stopResult.failure.value}</p>}
+    {Option.isSome(stopResult.failure) && <ErrorNotice title="Couldn’t stop the model" description={stopResult.failure.value} className="mt-5" />}
     {discover && <RecommendationPreference value={preference} onChange={setPreference} />}
     {!discover && assessment && !assessment.complete && <p className="mb-4 text-sm text-slate-500">Assessing models · {assessment.settledModels} of {assessment.totalModels}</p>}
     {discover && (recommendationsPending
       ? <RecommendationsSkeleton assessment={assessment} waitingForHardware={Result.isInitial(hardware)} />
       : <Recommendations preference={preference} models={featuredCatalogModels(ranked, 5)} active={Option.fromNullable(active)} />)}
     {!discover && <>
-    <div className="grid items-start gap-5">{visible.map(model => <ModelCard key={model.modelId} model={model} showMemory={installedOnly} {...(active && active.model.modelId !== model.modelId ? { replacing: formatLocalModelDisplayName(active.model) } : {})} />)}</div>
-    {visible.length === 0 && <p className="py-8 text-slate-500">{search.trim() || filter !== "all" ? "No models match your search or filter." : installedOnly ? "No models downloaded yet. Find one in Discover." : "No models match this filter."}</p>}
+    <div className="grid items-start gap-5">{visible.map(model => <ModelCard key={model.modelId} model={model} models={models} showMemory={installedOnly} {...(active && active.model.modelId !== model.modelId ? { replacing: formatLocalModelDisplayName(active.model) } : {})} />)}</div>
+    {visible.length === 0 && <p className="py-8 text-slate-500">{search.trim() || filter !== "all" || lab !== null ? "No models match your search or filter." : installedOnly ? "No models downloaded yet. Find one in Discover." : "No models match this filter."}</p>}
     </>}
-    {discover && ranked.length === 0 && !recommendationsPending && Result.isSuccess(hardware) && <p className="py-8 text-slate-500">No fitting recommendations right now. Explore Catalog for compatibility details.</p>}
+    {discover && ranked.length === 0 && !recommendationsPending && Result.isSuccess(hardware) && <p className="py-8 text-slate-500">No fitting recommendations right now. Explore Catalog for memory and speed details.</p>}
   </>
 }
 function Connections({ serviceReady, selectedModel }: { serviceReady: boolean; selectedModel: Option.Option<ProviderModelId> }) {
   const client = useAgentClient()
   const session = useMemo(() => client.runtime.atom(DesktopSession), [client])
   const service = useAtomValue(session)
-  return Result.isSuccess(service) ? <ConnectionsView service={service.value} serviceReady={serviceReady} selectedModel={selectedModel} /> : Result.isFailure(service) ? <p role="alert" className="mt-5">Could not prepare connections. {hostFailureMessage(service.cause)}</p> : <ConnectionsSkeleton />
+  return Result.isSuccess(service) ? <ConnectionsView service={service.value} serviceReady={serviceReady} selectedModel={selectedModel} /> : Result.isFailure(service) ? <ErrorNotice title="Couldn’t open Connections" description="Magnitude can’t read connection information right now." className="mt-5" /> : <ConnectionsSkeleton />
 }
 function ConnectionsView({ service, serviceReady, selectedModel }: { service: DesktopSession; serviceReady: boolean; selectedModel: Option.Option<ProviderModelId> }) {
   const models = useLocalModels()
   const canConnect = serviceReady && Result.isSuccess(models) && models.value.models.some(model => Option.isSome(localModelProviderModelId(model)))
   const client = useAgentClient()
-  const discover = useAtomSet(useMemo(() => client.runtime.fn(() => Effect.flatMap(DesktopSession, session => session.navigate("discover"))), [client]))
+  const navigate = useAtomSet(useMemo(() => client.runtime.fn((page: Page) => Effect.flatMap(DesktopSession, session => session.navigate(page))), [client]))
   const hardware = useLocalInferenceHardware()
+  const state = useAtomValue(hostState)
   const available = Result.isSuccess(models) ? models.value.models.filter(model => Option.isSome(localModelProviderModelId(model))) : []
   const active = Result.isSuccess(models) ? Option.getOrUndefined(activeLocalModel(models.value))?.model.modelId : undefined
   const ranked = Result.isSuccess(hardware) ? rankedLocalModelOptions(available.map(model => ({ id: model.modelId, kind: "stored" as const, model })), { fastToSmart: 0.5, memoryBudgetBytes: targetPhysicalMemoryBytes(hardware.value) }, available.length).map(option => option.model) : available
@@ -344,20 +494,41 @@ function ConnectionsView({ service, serviceReady, selectedModel }: { service: De
   const connecting = useAtomValue(service.connect)
   const disconnecting = useAtomValue(service.disconnect)
   const busy = connecting.waiting || disconnecting.waiting
-  const error = [connecting, disconnecting].find(Result.isFailure)
+  const error = !busy && firstFailure([connecting, disconnecting])
   return <>
     {!serviceReady && <p className="mt-5 text-sm text-slate-500">Configuration checks are available. Start the service from Status before connecting a harness.</p>}
-    {serviceReady && !canConnect && !Result.isInitial(models) && <div className="mt-5 flex flex-wrap items-center gap-3 text-sm text-slate-500"><p>{Result.isFailure(models) ? "Model availability could not be checked." : !Result.isSuccess(models) ? "Checking available models…" : "Download a compatible model before connecting a harness. It doesn’t need to be loaded."}</p><Button variant="outline" onClick={() => discover()}>Discover models</Button></div>}
-    {error && Result.isFailure(error) && <p role="alert" className="mt-5 text-sm">{hostFailureMessage(error.cause)}</p>}
-    {Result.isFailure(rows) ? <p role="alert" className="mt-5">Could not check connections. {hostFailureMessage(rows.cause)}</p>
+    {serviceReady && !canConnect && !Result.isInitial(models) && <ErrorNotice severity={Result.isFailure(models) ? "error" : "info"} title={Result.isFailure(models) ? "Couldn’t check available models" : "Download a model to connect an agent"} description={Result.isFailure(models) ? "Check the service on Status." : "Choose a compatible model. It doesn’t need to be loaded."} className="mt-5" actions={!Result.isFailure(models) && <NoticeAction onClick={() => navigate("discover")}>Discover models</NoticeAction>} />}
+    {error && Result.isFailure(error) && <ErrorNotice title={Result.isFailure(disconnecting) ? "Couldn’t disconnect this agent" : "Couldn’t connect this agent"} description="Check the agent’s configuration before trying again. Some changes may not have completed." className="mt-5" />}
+    {Result.isFailure(rows) ? <ErrorNotice title="Couldn’t check your connections" description="Connection status is unavailable. Magnitude will check again automatically." className="mt-5" />
       : !Result.isSuccess(rows) ? <ConnectionsSkeleton />
-      : rows.value._tag === "Unavailable" ? <p role="alert" className="mt-5">Could not check connections. {rows.value.message}</p>
+      : rows.value._tag === "Unavailable" ? <ErrorNotice title="Couldn’t check your connections" description="Magnitude can’t read the saved connection information. Check that its configuration is accessible." className="mt-5" />
       : <HarnessConnections connections={rows.value.connections} busy={busy} canConnect={canConnect} models={commandModels} defaultModel={defaultModel} platform={host.platform}
           onConnect={harness => connect({ harness, model: selectedModel })} onDisconnect={harness => disconnect(harness)} />}
+    {Result.isSuccess(state) && <OtherApps origin={`http://127.0.0.1:${new URL(state.value.endpoint).port}`} model={defaultModel} platform={host.platform} onOpenSettings={() => navigate("settings")} />}
   </>
+}
+/** The model row's status: the load stage in full while loading, the memory in use once loaded. */
+const modelStatusText = (residency: ModelResidency, hardware: Option.Option<LocalInferenceHardware>): string => {
+  switch (residency._tag) {
+    case "Requested": return describeModelLoadStage("preparing", Option.none(), hardware)
+    case "Loading": return describeModelLoadStage(residency.stage, residency.plannedAllocation, hardware)
+    case "Ready": return `Loaded · ${formatModelMemory(residency.allocation)}`
+    case "Stopping": return "Stopping…"
+    case "Unloaded":
+    case "Failed": return "Not loaded"
+  }
+}
+/** A load's completed fraction; a requested load has not started. */
+const loadFraction = (residency: ModelResidency): Option.Option<number> => {
+  switch (residency._tag) {
+    case "Requested": return Option.some(0)
+    case "Loading": return Option.some(residency.fraction)
+    default: return Option.none()
+  }
 }
 function ModelStatus() {
   const models = useLocalModels()
+  const hardware = useLocalInferenceHardware()
   const { stop } = useLocalModelMutations()
   const stopping = useLocalModelStopStatus()
   const presentation = Result.isSuccess(models) ? modelTrayPresentation(models.value) : null
@@ -370,27 +541,36 @@ function ModelStatus() {
         {active ? <ModelLogo model={active.model} className="size-6 shrink-0" /> : <CubeIcon aria-hidden="true" className="size-5 shrink-0 text-slate-400 dark:text-slate-500" />}
         <div className="flex min-w-0 items-baseline gap-2">
           <p title={active ? formatLocalModelDisplayName(active.model) : undefined} className={`m-0 min-w-0 truncate ${active ? "text-base font-medium text-slate-800 dark:text-slate-200" : "text-sm text-slate-500 dark:text-slate-400"}`}>{active ? formatLocalModelDisplayName(active.model) : presentation?.label ?? (Result.isFailure(models) ? "Model status unavailable" : "Reading model status…")}</p>
-          {active && <><span aria-hidden="true" className="text-slate-400 dark:text-slate-500">·</span><span className={`shrink-0 text-xs ${active.residency._tag === "Ready" ? "text-green-700 dark:text-green-400" : "text-slate-500 dark:text-slate-400"}`}>{active.residency._tag === "Ready" ? "Loaded" : active.residency._tag === "Requested" ? "Queued" : `${active.residency._tag}…`}</span></>}
+          {active && <><span aria-hidden="true" className="text-slate-400 dark:text-slate-500">·</span><span className={`shrink-0 text-xs ${active.residency._tag === "Ready" ? "text-green-700 dark:text-green-400" : "text-slate-500 dark:text-slate-400"}`}>{modelStatusText(active.residency, Result.isSuccess(hardware) ? Option.some(hardware.value) : Option.none())}</span></>}
         </div>
       </div>
       {presentation?.canStop && <Button variant="outline" className="hover:border-red-300 hover:text-red-600 dark:hover:border-red-800 dark:hover:text-red-400" disabled={stopping.pending} onClick={() => stop()}><SquareIcon />Stop model</Button>}
     </div>
-    {active?.residency._tag === "Loading" && <div className="mt-4"><Progress aria-label="Model loading progress" indicatorClassName="bg-blue-700 dark:bg-blue-500" value={Option.match(active.residency.progress, { onNone: () => null, onSome: fraction => fraction * 100 })} /></div>}
-    {Result.isFailure(models) && <p role="alert" className="mt-2 text-sm text-slate-500">{localModelFailureMessage(models.cause, "Could not read model status. Check Status and try again.")}</p>}
-    {Option.isSome(stopping.failure) && <p role="alert" className="mt-2 text-sm">{stopping.failure.value}</p>}
+    {active && Option.match(loadFraction(active.residency), {
+      onNone: () => null,
+      onSome: fraction => <div className="mt-4 flex items-center gap-3">
+        <Progress aria-label="Model loading progress" className="flex-1" indicatorClassName="bg-blue-700 dark:bg-blue-500" value={fraction * 100} />
+        <span className="w-9 shrink-0 text-right text-xs tabular-nums text-slate-500 dark:text-slate-400">{formatModelLoadPercentage(fraction)}</span>
+      </div>,
+    })}
+    {Result.isFailure(models) && <ErrorNotice title="Couldn’t read model status" description="Magnitude can’t confirm whether a model is running." className="mt-2" />}
+    {Option.isSome(stopping.failure) && <ErrorNotice title="Couldn’t stop the model" description={stopping.failure.value} className="mt-2" />}
   </div>
 }
 function DownloadActivity() {
   const models = useLocalModels()
-  const active = Result.isSuccess(models) ? models.value.models.filter((model): model is CatalogLocalModel => model._tag === "Catalog" && (model.acquisitionState._tag === "Installing" || model.acquisitionState._tag === "Updating" || model.acquisitionState._tag === "Removing")) : []
+  const active = Result.isSuccess(models) ? models.value.models.filter((model): model is CatalogLocalModel => model._tag === "Catalog" && (acquiring(model.acquisitionState) || model.acquisitionState._tag === "Removing")) : []
   if (Result.isInitial(models)) return null
   if (Result.isSuccess(models) && active.length === 0) return null
   return <div className="mt-5 border-t border-slate-200 pt-5 dark:border-slate-700">
-    {!Result.isSuccess(models) ? <p className="mt-3 text-sm text-slate-500">{Result.isFailure(models) ? "Download activity unavailable" : "Reading download activity…"}</p> : <ul className="space-y-5">{active.map(model => <li key={model.modelId}><div className="flex items-center gap-3"><ModelLogo model={model} className="size-6" /><p className="text-sm">{formatLocalModelDisplayName(model)} · {model.acquisitionState._tag === "Removing" ? "Removing files…" : model.acquisitionState._tag === "Updating" ? "Updating" : "Downloading"}</p></div><DownloadProgress modelName={formatLocalModelDisplayName(model)} acquisition={model.acquisitionState} /></li>)}</ul>}
+    {!Result.isSuccess(models) ? <p className="mt-3 text-sm text-slate-500">{Result.isFailure(models) ? "Download activity unavailable" : "Reading download activity…"}</p> : <ul className="space-y-5">{active.map(model => <li key={model.modelId}><div className="flex items-center gap-3"><ModelLogo model={model} className="size-6" /><p className="text-sm">{formatLocalModelDisplayName(model)} · {model.acquisitionState._tag === "Removing" ? "Removing files…" : model.acquisitionState._tag === "Optimizing" ? "Optimizing" : model.acquisitionState._tag === "Updating" ? "Updating" : "Downloading"}</p></div><DownloadProgress modelName={formatLocalModelDisplayName(model)} acquisition={model.acquisitionState} /></li>)}</ul>}
   </div>
 }
 function Status({ snapshot }: { snapshot: typeof ApplicationSnapshot.Type | null }) {
+  const retry = useAtomSet(retryService)
+  const retrying = useAtomValue(retryService)
   const service = snapshot?.service
+  const tray = snapshot?.owner._tag === "Desktop" ? snapshot.owner.tray : undefined
   const ready=service?._tag === "Ready"
   return <div className={pageLayout.statusStack}>
     <section aria-busy={!snapshot} aria-label={!snapshot ? "Loading service status" : undefined} className={pageLayout.statusHero}>
@@ -401,103 +581,256 @@ function Status({ snapshot }: { snapshot: typeof ApplicationSnapshot.Type | null
           <span>{!snapshot ? <SkeletonLine className="h-4 w-16 text-xs" /> : ready ? "Ready" : service?._tag === "CleanupFailed" ? "Cleanup needs attention" : service?._tag === "Failed" ? "Unavailable" : "Starting"}</span>
         </div>
       </div>
-      {ready ? <ModelStatus /> : !snapshot ? <SkeletonLine className="mt-5 h-12 w-64" /> : <p className="mt-5 text-sm text-slate-500">{service?._tag}</p>}
+      {ready ? <ModelStatus /> : !snapshot ? <SkeletonLine className="mt-5 h-12 w-64" /> : service?._tag === "Failed" || service?._tag === "CleanupFailed" ? null : <p className="mt-5 text-sm text-slate-500">Starting the service…</p>}
       {ready && <DownloadActivity />}
-      {service && "message" in service && <p role="alert" className="mt-5 text-sm">{service.message}</p>}
-      {service?._tag === "Failed" && <Button className="mt-5" variant="outline" onClick={() => host.retry()}>Retry service</Button>}
+      {service && "message" in service && <ErrorNotice className="mt-5" title={service._tag === "CleanupFailed" ? "Couldn’t confirm the service has stopped" : "The service couldn’t start"}
+        description={service._tag === "CleanupFailed" ? "Some background work may still be running. Quit Magnitude to retry cleanup." : "Check that another copy of Magnitude isn’t running, then retry the service."}
+        actions={service._tag === "Failed" ? <NoticeAction disabled={retrying.waiting} onClick={() => retry()}>Retry service</NoticeAction> : undefined} />}
+      {Result.isFailure(retrying) && !retrying.waiting && service?._tag !== "Failed" && service?._tag !== "Ready" && <ErrorNotice title="Couldn’t retry the service" className="mt-3" />}
     </section>
     <MemoryBreakdown />
-    <section className={pageLayout.card}><div className="flex items-center gap-3"><PlugIcon className="size-5 text-blue-600 dark:text-blue-400" /><h2 className="font-heading text-lg">Local connection</h2></div><p className="mt-2 text-sm text-slate-500">Your tools connect to Magnitude on this machine.</p><p className="mt-4 break-all rounded-lg bg-slate-50 p-4 font-mono text-sm dark:bg-slate-900">{snapshot?.endpoint ?? <SkeletonLine className="h-5 text-sm" width="200px" />}</p><div className="mt-5 flex items-start gap-3"><span className={`mt-1 size-2 shrink-0 rounded-full ${snapshot?.tray._tag === "Registered" ? "bg-blue-500" : "bg-slate-400"}`} /><div><p className="text-sm font-medium">Background activity</p><p className="mt-1 text-sm text-slate-500">{snapshot?.tray._tag === "Registered" ? "Magnitude keeps running when you close the window." : snapshot?.tray._tag === "Unavailable" ? snapshot.tray.message : snapshot?.tray._tag === "Closed" ? "Magnitude is quitting." : <SkeletonLine className="h-5 w-72 text-sm" />}</p></div></div></section>
+    {ready && <StatusOverview />}
+    {tray?._tag === "Unavailable" && <ErrorNotice severity="warning" title="The tray icon isn’t available" description="Closing this window keeps Magnitude running. Open it again from your applications menu." />}
   </div>
 }
-function ApplicationSettings() {
+const compact = new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 })
+function StatusTile({ label, value, detail, onClick }: { label: string; value: ReactNode; detail: ReactNode; onClick: () => void }) {
+  return <button type="button" onClick={onClick} className="min-w-0 cursor-pointer rounded-lg p-3 text-left transition-colors hover:bg-slate-50 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:bg-slate-800">
+    <span className="block text-xs text-slate-500">{label}</span>
+    <span className="mt-1 block truncate font-heading text-xl tabular-nums">{value}</span>
+    <span className="mt-0.5 block truncate text-xs text-slate-500">{detail}</span>
+  </button>
+}
+function StatusOverview() {
+  const client = useAgentClient()
+  const navigate = useAtomSet(useMemo(() => client.runtime.fn((page: Page) => Effect.flatMap(DesktopSession, session => session.navigate(page))), [client]))
+  const usage = useAtomValue(client.Models.GetServingUsage({ period: "Today", timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, model: Option.none() })).result
+  const session = useMemo(() => client.runtime.atom(DesktopSession), [client])
+  const rows = useAtomValue(useMemo(() => Atom.make(get => Result.flatMap(get(session), value => get(value.connections))), [session]))
+  const network = useAtomValue(networkAccessSettings)
+  const today = Result.isSuccess(usage) && usage.value._tag === "Available" ? usage.value : null
+  const installed = Result.isSuccess(rows) && rows.value._tag === "Ready" ? rows.value.connections.filter(row => row.installed) : null
+  const connected = installed?.filter(row => row.inspection._tag === "Connected").length
+  const address = Result.isSuccess(network) && network.value.enabled ? network.value.bind ?? "All interfaces" : null
+  const loading = <SkeletonLine className="h-4 text-xs" width="80px" />
+  return <section aria-label="Activity" className={`${pageLayout.card} grid grid-cols-3 gap-2 p-3`}>
+    <StatusTile label="Today" onClick={() => navigate("usage")}
+      value={today ? `${compact.format(today.totalTokens)} tokens` : Result.isInitial(usage) ? loading : "Unavailable"}
+      detail={today ? `${today.requests.toLocaleString()} ${today.requests === 1 ? "request" : "requests"}` : null} />
+    <StatusTile label="Agents" onClick={() => navigate("connections")}
+      value={connected !== undefined ? `${connected} connected` : Result.isInitial(rows) ? loading : "Unavailable"}
+      detail={installed ? `${installed.length} installed` : null} />
+    <StatusTile label="Network access" onClick={() => navigate("settings")}
+      value={Result.isSuccess(network) ? network.value.enabled ? "On" : "Off" : Result.isInitial(network) ? loading : "Unavailable"}
+      detail={Result.isSuccess(network) ? address ?? "This computer only" : null} />
+  </section>
+}
+type UpdateTransfer = (typeof DesktopUpdateState.Type)["transfer"]
+const firstFailure = (results: ReadonlyArray<Result.Result<unknown, unknown>>) => results.find((result): result is Result.Failure<unknown, unknown> => Result.isFailure(result) && !result.waiting)
+function useUpdateSnapshot() {
+  const client = useAgentClient()
+  const session = useMemo(() => client.runtime.atom(DesktopSession), [client])
+  const service = useAtomValue(session)
+  return service
+}
+function SettingsGroup({ label, children }: { label: string; children: ReactNode }) {
+  return <section aria-label={label} className="mt-7">
+    <h2 className="mb-2 px-1 text-xs font-medium uppercase tracking-wide text-slate-500">{label}</h2>
+    <div className="divide-y divide-slate-200 rounded-lg border border-slate-300 bg-white dark:divide-slate-800 dark:border-slate-750 dark:bg-slate-850">{children}</div>
+  </section>
+}
+function SettingsRow({ label, hint, alert, control, children, nested = false }: { label: ReactNode; hint?: ReactNode; alert?: ReactNode; control?: ReactNode; children?: ReactNode; nested?: boolean }) {
+  return <div className={nested ? "bg-slate-50 py-2.5 pl-10 pr-4 dark:bg-slate-900/40" : "px-4 py-3"}>
+    <div className="flex items-center justify-between gap-6">
+      <div className="min-w-0"><p className={nested ? "text-[13px] font-medium" : "text-sm font-medium"}>{label}</p>
+        {hint && <div className="mt-0.5 text-xs text-slate-500">{hint}</div>}
+
+      </div>
+      {control && <div className="flex shrink-0 items-center gap-2">{control}</div>}
+    </div>
+    {alert && <div className="mt-2">{alert}</div>}
+    {children}
+  </div>
+}
+function ThemeRow() {
+  const appearance = useAppearancePreference()
+  const save = useAtomSet(saveAppearance)
+  const saving = useAtomValue(saveAppearance)
+  const readError = useAtomValue(appearanceReadError)
+  return <SettingsRow label="Theme" alert={!saving.waiting && (Result.isFailure(saving) ? <ErrorNotice title="Your theme wasn’t saved" description="Your previous appearance setting is still in use." /> : readError ? <ErrorNotice title="Couldn’t read your saved theme" description="System appearance is being used for this window." /> : undefined)} control={
+    <div className="inline-flex rounded-md border border-slate-300 p-0.5 dark:border-slate-700" role="group" aria-label="Theme">
+      {(["system", "light", "dark"] as const).map(value => { const Icon = value === "system" ? MonitorIcon : value === "light" ? SunIcon : MoonIcon
+        return <Button key={value} size="sm" variant={appearance === value ? "secondary" : "ghost"} aria-pressed={appearance === value} disabled={saving.waiting} onClick={() => save(value)}><Icon />{value[0]!.toUpperCase() + value.slice(1)}</Button> })}
+    </div>} />
+}
+function LaunchAtLoginRow() {
+  const service = useUpdateSnapshot()
+  if (!Result.isSuccess(service)) return <SettingsRow label="Launch at login" hint={Result.isInitial(service) ? <SkeletonLine className="h-4 text-xs" width="160px" /> : undefined} alert={Result.isFailure(service) ? <ErrorNotice title="Couldn’t check launch at login" /> : undefined} />
+  return <LaunchAtLoginRowView service={service.value} />
+}
+function LaunchAtLoginRowView({ service }: { service: DesktopSession }) {
+  const state = useAtomValue(service.loginStartup)
+  const set = useAtomSet(service.setLoginStartup)
+  const change = useAtomValue(service.setLoginStartup)
+  const current = Result.isSuccess(state) ? state.value : null
+  const enabled = current?._tag === "Enabled" || current?._tag === "RequiresApproval"
+  const hint = current?._tag === "Unavailable" ? current.message
+    : current?._tag === "RequiresApproval" ? "Allow Magnitude in your system login settings to finish enabling startup."
+    : "Starts in the background with its tray icon."
+  const alert = !change.waiting && Result.isFailure(change) ? <ErrorNotice title="Couldn’t update launch at login" description="Check Magnitude’s status in your system startup settings." /> : Result.isFailure(state) ? <ErrorNotice title="Couldn’t check launch at login" description="Magnitude can’t confirm whether it will open when you sign in." /> : undefined
+  return <SettingsRow label="Launch at login" hint={Result.isInitial(state) ? <SkeletonLine className="h-4 text-xs" width="160px" /> : hint} alert={alert}
+    control={<Switch aria-label="Launch at login" checked={enabled} disabled={!current || current._tag === "Unavailable" || change.waiting} onCheckedChange={checked => set(checked)} />} />
+}
+function ModelStorageRow() {
+  const settings = useAtomValue(modelStorageSettings)
+  const choose = useAtomSet(chooseModelStorage)
+  const choosing = useAtomValue(chooseModelStorage)
+  const reset = useAtomSet(resetModelStorage)
+  const resetting = useAtomValue(resetModelStorage)
+  const busy = choosing.waiting || resetting.waiting
+  const current = Result.isSuccess(settings) ? settings.value : null
+  const failure = firstFailure([choosing, resetting])
+  return <>
+    <SettingsRow label="Model storage" alert={!busy && failure ? <ErrorNotice title={Result.isFailure(choosing) ? "Couldn’t choose the model folder" : "The model folder wasn’t saved"} description="Check that the folder is available and writable, then try again." /> : Result.isFailure(settings) ? <ErrorNotice title="Couldn’t read the model folder setting" description="The folder used by the running service has not been changed." /> : current?.warning ? <ErrorNotice severity="warning" title="The saved model folder is invalid" description="The default folder is selected. Choose a different folder to save a valid location." /> : undefined}
+      hint={current ? <span className="block truncate" title={current.path}>Current path is <span className="text-slate-700 dark:text-slate-300" data-testid="model-storage-path">{current.path}</span>{current.source === "Default" && " (default)"}</span>  : Result.isInitial(settings) ? <SkeletonLine className="h-4 text-xs" width="220px" /> : undefined}
+      control={<>
+        {current?.source === "Configured" && <Button size="sm" variant="ghost" disabled={busy} onClick={() => { reset(); }}>Use default</Button>}
+        <Button size="sm" variant="outline" disabled={!current || busy} onClick={() => { choose(); }}><FolderOpenIcon />Change…</Button>
+      </>} />
+  </>
+}
+function RestartRequiredToast() {
+  const storage = useAtomValue(modelStorageSettings)
+  const network = useAtomValue(networkAccessSettings)
+  const relaunch = useAtomSet(relaunchApplication)
+  const relaunching = useAtomValue(relaunchApplication)
+  const storageValue = Result.isSuccess(storage) ? storage.value : null
+  const storagePending = storageValue !== null && storageValue.path !== storageValue.active
+  const networkPending = Result.isSuccess(network) && network.value.pending
+  if (!storagePending && !networkPending) return null
+  const reason = storagePending && networkPending ? "Magnitude is still using the previous model folder and network settings."
+    : storagePending ? "Magnitude is still using the previous model folder." : "Magnitude is still using the previous network settings."
+  return <div className="fixed bottom-4 right-4 z-50 w-96 max-w-[calc(100vw-2rem)] rounded-lg bg-white shadow-md dark:bg-slate-850">
+    <ErrorNotice severity={Result.isFailure(relaunching) && !relaunching.waiting ? "error" : "info"}
+      title={Result.isFailure(relaunching) && !relaunching.waiting ? "Magnitude couldn’t restart" : "Restart to apply your changes"}
+      description={reason} actions={<NoticeAction disabled={relaunching.waiting} onClick={() => relaunch()}>Restart Magnitude</NoticeAction>}>
+      {storagePending && storageValue && <details className="mt-2 text-xs text-slate-600 dark:text-slate-400">
+        <summary className="w-fit cursor-pointer rounded py-0.5 hover:underline focus-visible:outline-2 focus-visible:outline-blue-500">Moving existing models</summary>
+        <p className="my-2">Existing downloads stay in the previous folder. To move them, quit Magnitude, run this command, then open Magnitude again.</p>
+        <CopyCommand command={moveModelsCommand(window.__magnitudeDesktop.platform, storageValue.active, storageValue.path)} label="Copy move command" />
+      </details>}
+    </ErrorNotice>
+  </div>
+}
+
+function NetworkAccessRows() {
+  const settings = useAtomValue(networkAccessSettings)
+  const update = useAtomSet(updateNetworkAccess)
+  const updating = useAtomValue(updateNetworkAccess)
+  const regenerate = useAtomSet(regenerateNetworkApiKey)
+  const regenerating = useAtomValue(regenerateNetworkApiKey)
+  const busy = updating.waiting || regenerating.waiting
+  const current = Result.isSuccess(settings) ? settings.value : null
+  const failure = firstFailure([updating, regenerating])
+  const reachable = current?.enabled ? (current.bind ?? current.interfaces[0]?.address) : undefined
+  return <>
+    <SettingsRow label="Network access" hint={current ? <>Let other devices on your network use Magnitude for inference. <a href="https://docs.magnitude.dev/remote-server" target="_blank" rel="noreferrer" className="inline-flex items-center gap-0.5 font-medium text-slate-700 hover:underline dark:text-slate-300">Remote server guide<ArrowUpRightIcon aria-hidden="true" className="size-3" /></a></> : Result.isInitial(settings) ? <SkeletonLine className="h-4 text-xs" width="240px" /> : undefined}
+      alert={!busy && failure ? <ErrorNotice title="Network settings weren’t saved" description="Your previous saved settings are still in use." /> : Result.isFailure(settings) ? <ErrorNotice title="Couldn’t read network settings" description="The running service’s network settings have not been changed." /> : current?.warning ? <ErrorNotice severity="warning" title="The saved network address is invalid" description="All interfaces are selected. Choose an address below to save a valid setting." /> : undefined}
+      control={<Switch aria-label="Network access" checked={current?.enabled ?? false} disabled={!current || busy} onCheckedChange={checked => update({ enabled: checked })} />} />
+    {current?.enabled && <>
+      <SettingsRow nested label="Address" hint={current.interfaces.length === 0 ? "No network interfaces were found." : "Which of this computer's addresses accepts connections."}
+        control={<Select items={[{ value: ALL_INTERFACES, label: "All interfaces" }, ...current.interfaces.map(entry => ({ value: entry.address, label: `${entry.address} (${entry.kind === "tailscale" ? "Tailscale" : entry.name})` }))]}
+          value={current.bind ?? ALL_INTERFACES} onValueChange={value => update({ bind: value === ALL_INTERFACES || value === null ? null : value })}>
+          <SelectTrigger aria-label="Network address" className="min-w-56"><SelectValue /></SelectTrigger>
+          <SelectContent>{[<SelectItem key={ALL_INTERFACES} value={ALL_INTERFACES}>All interfaces</SelectItem>, ...current.interfaces.map(entry => <SelectItem key={entry.address} value={entry.address}>{entry.address} ({entry.kind === "tailscale" ? "Tailscale" : entry.name})</SelectItem>)]}</SelectContent>
+        </Select>} />
+      <SettingsRow nested label="API key" hint={current.requireApiKey ? "Other devices must send this key as a Bearer token." : "Other devices can connect without a key. Only do this on a network you trust."}
+        control={<><Button size="sm" variant="ghost" disabled={busy} onClick={() => { regenerate(); }}>Regenerate</Button><Switch aria-label="Require API key" checked={current.requireApiKey} disabled={busy} onCheckedChange={checked => update({ requireApiKey: checked })} /></>}>
+        {current.apiKey && current.requireApiKey && <div className="mt-2"><CopyCommand command={current.apiKey} label="Copy API key" /></div>}
+      </SettingsRow>
+      {reachable && <SettingsRow nested label="Reachable at" hint={`Use this as the OpenAI-compatible base URL on other devices${current.requireApiKey ? ", with the API key above" : ""}. Anthropic-compatible apps use /inference/anthropic on the same address.`}>
+        <div className="mt-2"><CopyCommand command={inferenceUrl(reachable, current.port)} label="Copy base URL" /></div>
+      </SettingsRow>}
+    </>}
+  </>
+}
+function AutomaticUpdatesRow() {
+  const service = useUpdateSnapshot()
+  if (!Result.isSuccess(service)) return <SettingsRow label="Automatic updates" hint={Result.isInitial(service) ? <SkeletonLine className="h-4 text-xs" width="200px" /> : undefined} alert={Result.isFailure(service) ? <ErrorNotice title="Update preferences are unavailable" /> : undefined} />
+  return <AutomaticUpdatesRowView service={service.value} />
+}
+function AutomaticUpdatesRowView({ service }: { service: DesktopSession }) {
+  const observation = useAtomValue(service.updates)
+  const setAutoDownload = useAtomSet(service.setAutoDownload)
+  const saving = useAtomValue(service.setAutoDownload)
+  const snapshot = Result.isSuccess(observation) ? observation.value : null
+  const preference = snapshot?.preference
+  const closed = snapshot?.transfer._tag === "Closed"
+  return <SettingsRow label="Automatic updates"
+    hint={Result.isInitial(observation) ? <SkeletonLine className="h-4 text-xs" width="200px" /> : preference?._tag === "Known" ? "Download updates in the background when they are available." : undefined}
+    alert={Result.isFailure(saving) && !saving.waiting ? <ErrorNotice title="Update preferences weren’t saved" description="Your previous preference is still in use." /> : Result.isFailure(observation) || preference?._tag === "Unavailable" ? <ErrorNotice title="Couldn’t read update preferences" description="Automatic downloads are unavailable until your preference can be read." /> : undefined}
+    control={<Switch aria-label="Automatic updates" checked={preference?._tag === "Known" && preference.autoDownload} disabled={preference?._tag !== "Known" || saving.waiting || closed} onCheckedChange={checked => setAutoDownload(checked)} />} />
+}
+function AboutRow() {
   const client = useAgentClient()
   const session = useMemo(() => client.runtime.atom(DesktopSession), [client])
   const service = useAtomValue(session)
   const info = useAtomValue(useMemo(() => Atom.make(get => Result.flatMap(get(session), value => get(value.applicationInfo))), [session]))
-  return <section className={pageLayout.settingsCard}>
-    <h2 className="font-heading text-lg">About Magnitude</h2>
-    <p className="mt-2 text-sm text-slate-500">{Result.isSuccess(info) ? `Version ${info.value.version}` : Result.isFailure(info) ? "Version unavailable" : <SkeletonLine className="h-5 text-sm" width="96px" />}</p>
-    {Result.isSuccess(service) ? <UpdateSettingsView service={service.value} /> : Result.isFailure(service) ? <p role="alert">Update settings unavailable.</p> : <UpdatesSkeleton />}
-  </section>
+  const version = Result.isSuccess(info) ? `Magnitude ${info.value.version}` : Result.isFailure(info) ? "Magnitude" : <SkeletonLine className="h-5 text-sm" width="120px" />
+  if (!Result.isSuccess(service)) return <SettingsRow label={version} hint={Result.isFailure(service) ? "Update status unavailable." : <SkeletonLine className="h-4 text-xs" width="160px" />} />
+  return <AboutRowView service={service.value} version={version} />
 }
-function UpdateSettingsView({ service }: { service: DesktopSession }) {
+function AboutRowView({ service, version }: { service: DesktopSession; version: ReactNode }) {
   const observation = useAtomValue(service.updates)
   const check = useAtomSet(service.checkUpdate)
   const discard = useAtomSet(service.discardUpdate)
   const discarding = useAtomValue(service.discardUpdate)
   const download = useAtomSet(service.downloadUpdate)
   const restart = useAtomSet(service.restartUpdate)
-  const setAutoDownload = useAtomSet(service.setAutoDownload)
   const checking = useAtomValue(service.checkUpdate)
   const downloading = useAtomValue(service.downloadUpdate)
   const restarting = useAtomValue(service.restartUpdate)
-  const saving = useAtomValue(service.setAutoDownload)
   const snapshot = Result.isSuccess(observation) ? observation.value : null
-  const current = snapshot?.transfer
+  const current: UpdateTransfer | undefined = snapshot?.transfer
   const pending = downloading.waiting || restarting.waiting || discarding.waiting
   const message = !current ? Result.isFailure(observation) ? "Update status unavailable." : "Reading update status…"
-    : current._tag === "Idle" ? snapshot?.check._tag === "Succeeded" ? "You’re up to date." : "Magnitude checks for updates automatically."
+    : current._tag === "Idle" ? snapshot?.check._tag === "Succeeded" ? "You’re up to date." : "Checks for updates automatically."
     : current._tag === "Available" ? `Version ${current.version} is available · ${formatStorageSize(current.bytes)}`
     : current._tag === "Downloading" ? `Downloading version ${current.version} · ${formatStorageSize(current.completed)} of ${formatStorageSize(current.total)}`
     : current._tag === "Cancelling" ? "Stopping automatic download…"
     : current._tag === "Staging" ? `Preparing version ${current.version}…`
-    : current._tag === "Ready" ? `Version ${current.version} is ready to install. Restart Magnitude to update.`
-    : current._tag === "Closed" ? "Magnitude is quitting…" : current.message
-  if (Result.isInitial(observation)) return <UpdatesSkeleton />
-  return <div className="mt-5 border-t border-slate-200 pt-5 dark:border-slate-750">
-    <h3 className="font-medium">Application updates</h3>
-    {snapshot?.preference._tag === "Known" && <label className="mt-3 flex items-center gap-3 text-sm">
-      <input type="checkbox" className="size-4 accent-sky-500" checked={snapshot.preference.autoDownload} disabled={saving.waiting || current?._tag === "Closed"} onChange={event => setAutoDownload(event.target.checked)} />
-      Auto-download updates
-    </label>}
-    {snapshot?.preference._tag === "Unavailable" && current?._tag !== "Unavailable" && <div className="mt-2">
-      <p role="alert" className="text-sm">{snapshot.preference.message}</p>
-      <div className="mt-2 flex gap-2"><Button variant="outline" disabled={saving.waiting} onClick={() => setAutoDownload(true)}>Enable automatic downloads</Button>
-        <Button variant="outline" disabled={saving.waiting} onClick={() => setAutoDownload(false)}>Use manual downloads</Button></div>
-    </div>}
-    <p className="mt-3 text-sm text-slate-500" role="status">{message}</p>
-    {snapshot?.check._tag === "Failed" && <p className="mt-2 text-sm" role="alert">{snapshot.check.message}</p>}
-    <div className="mt-3 flex flex-wrap gap-2">
-      {current && !["Unavailable", "Closed"].includes(current._tag) && <Button variant="outline" disabled={checking.waiting || snapshot?.check._tag === "Checking"} onClick={() => check()}>{snapshot?.check._tag === "Checking" ? "Checking…" : "Check for updates"}</Button>}
-      {current?._tag === "Available" && <Button disabled={pending} onClick={() => download()}>Download update</Button>}
-      {(current?._tag === "Ready" || current?._tag === "InstallationFailed") && <Button disabled={pending} onClick={() => restart()}>{current._tag === "InstallationFailed" ? "Retry update" : "Restart to update"}</Button>}
-      {(current?._tag === "Ready" || current?._tag === "InstallationFailed") && <Button variant="outline" disabled={pending} onClick={() => discard()}>Discard download</Button>}
-    </div>
-    {current?._tag === "Ready" && <p className="mt-2 text-sm text-slate-500">Restarting stops the running model and service.</p>}
-    {[checking, downloading, restarting, discarding, saving].map((result, index) => Result.isFailure(result) ? <p key={index} role="alert" className="mt-2 text-sm">{hostFailureMessage(result.cause)}</p> : null)}
-  </div>
+    : current._tag === "Ready" ? `Version ${current.version} is ready. Restarting stops the running model and service.`
+    : current._tag === "Closed" ? "Magnitude is quitting…" : current._tag === "Unavailable" ? "Updates aren’t available right now." : undefined
+  const actionFailure = firstFailure([checking, downloading, restarting, discarding])
+  const checkFailed = snapshot?.check._tag === "Failed"
+  const installable = current?._tag === "Ready" || current?._tag === "InstallationFailed"
+  const hasFailure = Boolean(actionFailure || checkFailed || current?._tag === "Failed" || current?._tag === "InstallationFailed")
+  const busy = pending || checking.waiting || snapshot?.check._tag === "Checking"
+  const actions = <>
+    {installable ? <><NoticeAction disabled={busy} onClick={() => restart()}>Retry update</NoticeAction><NoticeAction disabled={busy} onClick={() => discard()}>Discard download</NoticeAction></>
+      : current?._tag === "Available" ? <NoticeAction disabled={busy} onClick={() => download()}>Download update</NoticeAction>
+      : current && !["Unavailable", "Closed"].includes(current._tag) ? <NoticeAction disabled={busy} onClick={() => check()}>Check for updates</NoticeAction> : null}
+  </>
+  return <SettingsRow label={version} hint={Result.isInitial(observation) ? <SkeletonLine className="h-4 text-xs" width="160px" /> : message}
+    alert={hasFailure && !busy ? <ErrorNotice
+      title={Result.isFailure(discarding) && !discarding.waiting ? "Couldn’t discard the update" : current?._tag === "InstallationFailed" ? "The update wasn’t completed" : checkFailed ? "Couldn’t check for updates" : "The update couldn’t finish"}
+      description={installable ? "The prepared update is still available. Retry it, or discard its download." : "Check your connection before trying again."}
+      actions={actions} /> : undefined}
+    control={hasFailure ? busy ? <span className="text-xs text-slate-500">Working…</span> : null : <>
+      {installable && <Button size="sm" variant="ghost" disabled={pending} onClick={() => discard()}>Discard download</Button>}
+      {installable ? <Button size="sm" disabled={pending} onClick={() => restart()}>Restart to update</Button>
+        : current?._tag === "Available" ? <Button size="sm" disabled={pending} onClick={() => download()}>Download update</Button>
+        : current && !["Unavailable", "Closed"].includes(current._tag) ? <Button size="sm" variant="outline" disabled={busy} onClick={() => check()}>{busy ? "Checking…" : "Check for updates"}</Button>
+        : null}
+    </>} />
 }
-function AppearanceSettings() {
-  const appearance = useAppearancePreference()
-  return <section aria-labelledby="appearance-heading" className="mt-8 overflow-hidden rounded-lg border border-slate-300 bg-white dark:border-slate-750 dark:bg-slate-850">
-    <header className="border-b border-slate-200 px-5 py-4 dark:border-slate-800"><h2 id="appearance-heading" className="font-heading text-lg">Appearance</h2></header>
-    <div className="flex flex-wrap items-center justify-between gap-6 px-5 py-5"><div><p className="font-medium">Theme</p><p className="mt-1 text-sm text-slate-500">Use your system appearance or choose a theme.</p></div>
-      <div className="flex gap-2" role="group" aria-label="Theme">{(["system", "light", "dark"] as const).map(value => { const Icon = value === "system" ? MonitorIcon : value === "light" ? SunIcon : MoonIcon; return <Button key={value} variant={appearance === value ? "default" : "outline"} aria-pressed={appearance === value} onClick={() => setAppearancePreference(value)}><Icon />{value[0]!.toUpperCase() + value.slice(1)}</Button> })}</div>
-    </div>
-  </section>
-}
-function LoginSettings() {
-  const client = useAgentClient()
-  const session = useMemo(() => client.runtime.atom(DesktopSession), [client])
-  const service = useAtomValue(session)
-  return Result.isSuccess(service) ? <LoginSettingsView service={service.value} /> : Result.isFailure(service) ? <p role="alert" className="mt-6">Login settings unavailable.</p> : <LoginSkeleton />
-}
-function LoginSettingsView({ service }: { service: DesktopSession }) {
-  const state = useAtomValue(service.loginStartup)
-  const set = useAtomSet(service.setLoginStartup)
-  const change = useAtomValue(service.setLoginStartup)
-  const current = Result.isSuccess(state) ? state.value : null
-  if (Result.isInitial(state)) return <LoginSkeleton />
-  const enabled = current?._tag === "Enabled" || current?._tag === "RequiresApproval"
-  return <section className={pageLayout.settingsCard}>
-    <div className="flex items-center justify-between gap-6"><div><h2 className="font-heading text-lg">Launch at login</h2><p className="mt-2 text-sm text-slate-500">Start Magnitude in the background with its tray icon. The window stays closed.</p></div>
-    <Button variant="outline" disabled={!current || current._tag === "Unavailable" || change.waiting} aria-pressed={enabled} onClick={() => set(!enabled)}>{enabled ? "Disable" : "Enable"}</Button></div>
-    {current?._tag === "Unavailable" && <p className="mt-3 text-sm text-slate-500">{current.message}</p>}
-    {current?._tag === "RequiresApproval" && <p className="mt-3 text-sm">Allow Magnitude in your system login settings to finish enabling startup.</p>}
-    {Result.isFailure(state) && <p role="alert" className="mt-3 text-sm">Could not read login startup. {hostFailureMessage(state.cause)}</p>}
-    {Result.isFailure(change) && <p role="alert" className="mt-3 text-sm">{hostFailureMessage(change.cause)}</p>}
-  </section>
+function SettingsPage() {
+  // A fresh mount observes hand edits; writes refresh in their own Effect actions.
+  useAtomMount(useMemo(() => Atom.make(Effect.all([Atom.refresh(modelStorageSettings), Atom.refresh(networkAccessSettings)], { discard: true })), []))
+  return <>
+    <SettingsGroup label="General"><ThemeRow /><LaunchAtLoginRow /><ModelStorageRow /><NetworkAccessRows /><AutomaticUpdatesRow /></SettingsGroup>
+    <SettingsGroup label="About"><AboutRow /></SettingsGroup>
+  </>
 }
 function App() {
   const state = useAtomValue(hostState)
@@ -508,15 +841,15 @@ function App() {
   const pageResult = useAtomValue(pageAtom)
   const page = Result.isSuccess(pageResult) ? pageResult.value : "discover"
   const service = Result.isSuccess(state) ? state.value.service : null
-  return <DesktopShell page={page} navigate={navigate}>
-      {page === "status" ? Result.isFailure(state) ? <p role="alert" className="mt-7">{hostFailureMessage(state.cause)}</p> : <Status snapshot={Result.isSuccess(state) ? state.value : null} />
+  return <><RestartRequiredToast /><DesktopShell page={page} navigate={navigate}>
+      {page === "status" ? Result.isFailure(state) ? <ErrorNotice title="Couldn’t read service status" description="Magnitude can’t confirm the service’s current state." className="mt-7" /> : <Status snapshot={Result.isSuccess(state) ? state.value : null} />
       : page === "usage" ? <ServingUsage />
-      : page === "settings" ? <><AppearanceSettings /><LoginSettings /><ApplicationSettings /></>
+      : page === "settings" ? <SettingsPage />
       : page === "connections" ? <Connections serviceReady={service?._tag === "Ready"} selectedModel={Option.none()} />
-      : service?._tag !== "Ready" ? (service?._tag === "Failed" || service?._tag === "CleanupFailed" || Result.isFailure(state) ? <>{page !== "discover" && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}<p role="alert" className="mt-8">The service needs attention. Open Status for details.</p></> : <ModelsSkeleton page={page} />)
+      : service?._tag !== "Ready" ? (service?._tag === "Failed" || service?._tag === "CleanupFailed" || Result.isFailure(state) ? <>{page !== "discover" && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}<ErrorNotice title="Magnitude needs your attention" description="The inference service is unavailable." className="mt-8" actions={<NoticeAction onClick={() => navigate("status")}>Open Status</NoticeAction>} /></> : <ModelsSkeleton page={page} />)
       : page === "discover" || page === "catalog" || page === "models" ? <Models page={page} />
       : null}
-  </DesktopShell>
+  </DesktopShell></>
 }
 function DesktopShell({ page, navigate, children }: { page: Page; navigate?: (page: Page) => void; children: ReactNode }) {
   const platform = window.__magnitudeDesktop.platform
@@ -555,14 +888,12 @@ function DesktopShell({ page, navigate, children }: { page: Page; navigate?: (pa
 }
 
 const root = createRoot(document.getElementById("root")!)
-root.render(<DesktopShell page="discover"><ModelsSkeleton page="discover" /></DesktopShell>)
 const boot = Effect.gen(function* () {
+  const appearance = yield* Effect.tryPromise(() => host.getAppearance()).pipe(Effect.either)
+  initializeAppearance(appearance._tag === "Right" ? appearance.right : "system")
+  root.render(<DesktopShell page="discover"><ModelsSkeleton page="discover" /></DesktopShell>)
   const initial = yield* observation.pipe(Stream.take(1), Stream.runHead, Effect.flatMap(value => value._tag === "Some" ? Effect.succeed(value.value) : Effect.fail(new DesktopHostUnavailable())))
   const scope = yield* Scope.make()
-  const updateNativeTheme = () => { void host.appearance(getAppearancePreference()).catch(console.error) }
-  updateNativeTheme()
-  const unsubscribeAppearance = subscribeAppearance(updateNativeTheme)
-  yield* Scope.addFinalizer(scope, Effect.sync(unsubscribeAppearance))
   const runtime = yield* Effect.runtime<never>()
   window.addEventListener("beforeunload", () => { Runtime.runFork(runtime)(Scope.close(scope, Exit.void)) }, { once: true })
   const connection = yield* makeFirstPartyConnection(MagnitudeClient.layer({ origin: initial.endpoint, autoStart: false }).pipe(Layer.provide(FetchHttpClient.layer))).pipe(Effect.provideService(Scope.Scope, scope))
@@ -594,8 +925,8 @@ const boot = Effect.gen(function* () {
     connect: input => hostCommand(() => host.connect(Schema.encodeSync(DesktopConnectRequest)(input))),
     disconnect: harness => hostCommand(() => host.disconnect(harness)),
     actions: Stream.asyncPush(emit => Effect.acquireRelease(Effect.sync(() => host.actions(action => emit.single(action))), unsubscribe => Effect.sync(unsubscribe)).pipe(Effect.asVoid)),
-    presentModel: value => Effect.tryPromise(() => host.presentModel(value)),
+    presentModel: value => Effect.tryPromise(() => host.presentModel(Schema.encodeSync(ModelTrayPresentation)(value))),
   } })
-  root.render(<RegistryProvider><AgentClientProvider tag={client}><App /></AgentClientProvider></RegistryProvider>)
+  root.render(<RegistryProvider initialValues={[[appearanceReadError, appearance._tag === "Left" ? "The saved appearance could not be read. Using System appearance." : null]]}><AgentClientProvider tag={client}><App /></AgentClientProvider></RegistryProvider>)
 })
-Effect.runPromise(boot).catch(error => root.render(<p role="alert">Unable to open Magnitude: {String(error)}</p>))
+Effect.runPromise(boot).catch(error => { console.error(error); root.render(<div className="p-6"><ErrorNotice title="Magnitude couldn’t open" description="Quit Magnitude and open it again." /></div>) })

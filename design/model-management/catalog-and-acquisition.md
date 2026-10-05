@@ -1,14 +1,22 @@
 ---
 applies_to:
   - inference/catalog/**
-  - inference/crates/icn-catalog/**
-  - inference/crates/icn-models/**
-  - inference/crates/icn-contracts/src/inventory.rs
-  - inference/crates/icn-contracts/src/models.rs
+  - inference/service/catalog-tool/**
+  - inference/service/models/**
+  - inference/service/server/src/main.rs
+  - inference/service/contracts/src/inventory.rs
+  - inference/service/contracts/src/models.rs
   - packages/icn/src/models/**
   - packages/icn/src/events/**
   - packages/acn/src/local-model-**
   - packages/acn-protocol/src/schemas/model-state.ts
+  - packages/acn-protocol/src/schemas/local-model-projection.ts
+  - packages/ai/src/provider/model.ts
+  - packages/client-common/src/local-models/**
+  - packages/client-common/src/utils/model-presentation.ts
+  - cli/src/commands/inference-runtime.ts
+  - desktop/src/renderer.tsx
+  - web/src/components/model-center.tsx
 ---
 
 # Model catalog and acquisition
@@ -26,6 +34,11 @@ and do not infer command authorization or completion from cached projections.
 Catalog membership, artifact presence, download activity, package validation, assessment, provider
 offering, slot selection, and runtime residency remain separate facts.
 
+Live Hugging Face search and repository resolution are service-owned discovery queries. Search
+returns GGUF repositories with immutable commit identities; resolution returns the requested
+repository's immutable snapshot and GGUF file evidence. These queries do not change the release
+catalog or managed inventory, and catalog use does not depend on them.
+
 Catalog attribution across exact artifact or drafter changes follows
 [Intrinsic catalog target mapping](./intrinsic-target-mapping.md).
 
@@ -40,17 +53,25 @@ that date; every artifact variant inherits the model declaration's date. Each en
 `ModelServingConfiguration`, required package components, presentation, and ranking evidence.
 Published catalog rows reduce package sources to deduplicated HTTPS repository links for product
 presentation; package coordinates and bundle structure remain private.
-The reviewed context length is a local serving configuration, not a claim about the architecture's
-absolute maximum. Compact tiers may deliberately use a shorter context, such as 64K instead of
-100K, because longer context increases KV memory and decode cost and would undermine their role on
-resource-constrained machines.
-Every active model carries one model-level intelligence assessment on a single declared Artificial
-Analysis Intelligence Index methodology version. A direct assessment records the observation date
-and canonical Artificial Analysis model URL. When no direct result exists, an estimate is a
-structurally distinct value that records its target scale, methodology, confidence, observation
-date, and non-empty primary evidence URLs. Intelligence is shared by every artifact variant;
-variant-specific preservation remains represented only by fidelity rank. Catalog intelligence is
-reviewed immutable release data and is never refreshed from the network at runtime.
+A catalog declaration names no context length. The serving profile's context is the target's
+supported maximum context from its GGUF metadata, the context the engine resolves and serves;
+memory is elastic, so a long supported context no longer reserves memory up front.
+Every active model carries one model-level Artificial Analysis score with its declared Artificial
+Analysis Intelligence Index methodology version. A direct score records the observation date and
+canonical Artificial Analysis model URL. When no direct result exists, or Artificial Analysis marks
+its own result as estimated, an estimate is a structurally distinct value that records its target
+scale, methodology, observation date, and non-empty primary evidence URLs. The catalog declares one
+Artificial Analysis frontier: the top Intelligence Index model, its score, methodology version,
+observation date, and URL. Every model score shares the frontier's methodology version, because
+scores from different versions are not on one scale, and none exceeds the frontier.
+
+A model's intelligence is its Artificial Analysis score as a percentage of the frontier score,
+rounded half-up to a whole number. Intelligence is the canonical score that clients display and
+ranking uses; Artificial Analysis scores and their provenance are catalog-internal and never leave
+the service. Updating the frontier rescales every model. Intelligence is shared by every artifact
+variant; variant-specific preservation remains represented only by fidelity rank. Catalog
+Artificial Analysis data is reviewed immutable release data and is never refreshed from the network
+at runtime.
 
 Reviewed model parameterization states whether the architecture is dense or
 mixture-of-experts, its positive total parameter count, and, only for mixture-of-experts, a
@@ -79,6 +100,31 @@ Removing a model from the release catalog removes all its variants, revision pin
 inputs. Its former catalog IDs no longer resolve; removal does not alias them to a replacement
 model or delete downloaded artifacts. Catalog membership and physical artifact presence remain
 separate. Runtime catalog use performs no upstream discovery and does not follow mutable revisions.
+Deprecation, not removal, is how a release withdraws a model that users may have installed.
+
+### Support lifecycle
+
+Every model declaration states one reviewed support level, shared by all its variants:
+
+- **Supported**: intended to be available as a supported catalog model. Qualification evidence and
+  optimization status are tracked separately from this declaration.
+- **Disabled** with a non-empty reason: temporarily unavailable or not yet supported. A disabled
+  model is never recommended, offered, installed, or loaded. Its installed files remain identifiable
+  and removable.
+- **Deprecated** with a calendar date, a non-empty reason, and one required exact replacement
+  catalog configuration of a supported model. A deprecated model is never
+  recommended, offered as a provider model, admitted for installation, or loaded; ICN rejects
+  installation and serving with a typed deprecation failure that names the replacement. Its
+  declaration, planner inputs, and locked revisions stay in the release catalog, so an existing
+  installation remains identifiable. Clients report an installed copy as unsupported, name the
+  replacement, offer a one-step switch to it, and remove its files through ordinary catalog
+  removal. A lock update never advances a deprecated model's revisions.
+
+Support level and assessment are independent facts. Support is what the release promises for a
+model; assessment is what this device can do with it. A supported model can be `DoesNotFit`. A
+catalog model is never `Unsupported`: a catalog model the engine cannot execute is a release
+defect, whose assessment is dropped with an error. A declaration whose family the engine does not
+implement is disabled until support is implemented and qualified.
 
 ## Package resolution
 
@@ -198,6 +244,28 @@ attempts. Packages already installed at admission contribute neither baseline pr
 Consequently a first installation measures the whole missing bundle, while an update measures only
 its actual artifact delta.
 
+An admitted installation ends by optimizing the model for this computer, so a new model's first
+load does not pay for kernel tuning. Once its download has verified and published the complete
+bundle, the occurrence enters `Optimizing` and runs one preparation of the model on the device a
+load would select (see [instance lifecycle](./instance-lifecycle.md)); it then ends `Completed`
+however that preparation ends. Optimization progress is its own measure: `preparing` while the
+device opens and tuning units are counted, then `tuning` with completed and total units, naming the
+previewed device once known. When every unit is already stored it ends straight from `preparing`.
+An installation whose admission downloads nothing does not optimize. `Optimizing` is active for
+duplicate-installation admission, and the occurrence's observation covers download and
+optimization changes alike.
+
+Optimization is an ahead-of-time cost move, never a gate on the model:
+
+- cancellation while optimizing stops the preparation and the occurrence still ends `Completed`;
+- a load of the same model stops the preparation and tunes only what is not yet stored;
+- removal while optimizing stops the preparation and then proceeds;
+- a failed preparation is logged and never becomes an installation failure; and
+- restart loses the process-local occurrence, and the next load tunes what is missing.
+
+An engine update that changes tuning keys leaves models to retune on their next load; installations
+are not re-optimized after an update.
+
 Expected failures distinguish insufficient disk space, interruption, unavailable source content,
 unavailable network, local storage failure, and corrupt content. Cancellation is a separate
 terminal result. Structured facts, including required and available byte counts, cross boundaries
@@ -268,7 +336,8 @@ guessing. Interrupted deletion is represented by the files that remain and may b
 idempotently. Conservative garbage collection may remove blobs proven unreferenced. Runtime
 ownership rejects or waits for removal of files used by a live model instance.
 
-Catalog removal is serialized with installation admission. An active installation is rejected.
+Catalog removal is serialized with installation admission. An installation that is still
+downloading is rejected; one that is optimizing is stopped and removal proceeds.
 Externally owned or shared dependencies are retained while a removable target and other exclusively
 owned material are removed; removal is retained as a whole only when a target itself is external or
 shared, because deleting it would either violate ownership or break another catalog model. Removing
@@ -296,9 +365,16 @@ artifact mutations update the same materialized derivation.
 - Catalog configurations are not copied into durable model state.
 - Issued catalog configurations remain resolvable after deprecation.
 - Every catalog variant publishes the valid ISO calendar date inherited from its model declaration.
-- Every active catalog model publishes exactly one finite, non-negative intelligence assessment
-  with valid direct or estimated provenance on the catalog's declared Intelligence Index version.
+- Every active catalog model declares exactly one finite, non-negative Artificial Analysis score with
+  valid direct or estimated provenance, the frontier's methodology version, and a score no greater
+  than the frontier's.
+- Published intelligence is exactly the model's Artificial Analysis score as a percentage of the
+  frontier, rounded half-up to a whole number, in the range 0 to 100.
 - Model intelligence and artifact-variant fidelity remain separate catalog authorities.
+- Every catalog model declares one support level; a deprecation's required replacement is an exact
+  configuration of a supported catalog model.
+- A deprecated model is never recommended, offered, installed, or loaded, keeps its locked
+  revisions, and its installed files remain removable.
 - Independently callable external Hugging Face packages without catalog attribution publish under
   their canonical `hf:` identity; other unattributed packages remain inventory only.
 - Installed inventory is derived without network access or hardware assessment.
@@ -308,6 +384,8 @@ artifact mutations update the same materialized derivation.
 - Inventory reconciliation never mutates managed artifacts.
 - One artifact failure cannot hide unrelated valid artifacts.
 - Download identities and terminal history do not survive ICN restart.
+- Optimization never changes an installation's outcome: cancellation, load, removal, failure, or
+  restart during it leaves the installed model intact and loadable.
 - Valid partial bytes may be reused only with matching integrity evidence.
 - Historical download completion never proves current presence.
 - Shared blobs are deleted only after current filesystem references prove them unreferenced.

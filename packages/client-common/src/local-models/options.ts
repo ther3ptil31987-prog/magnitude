@@ -1,5 +1,5 @@
 import { Option } from "effect"
-import { parseModelId, type CatalogLocalModel } from "@magnitudedev/sdk"
+import { localModelIsAvailable, parseModelId, type CatalogLocalModel } from "@magnitudedev/sdk"
 import type {
   LocalInferenceHardware,
   LocalModel,
@@ -67,22 +67,31 @@ export const rankedLocalModelOptions = (
   preference: LocalModelRankingPreference,
   limit = 10,
 ): readonly LocalModelOption[] => options
-  .flatMap((option): readonly { readonly option: LocalModelOption; readonly utility: number }[] => {
-    if (option.model._tag !== "Catalog") return []
+  .flatMap((option): readonly {
+    readonly option: LocalModelOption
+    readonly utility: Option.Option<number>
+  }[] => {
+    if (option.model._tag !== "Catalog" || !localModelIsAvailable(option.model)) return []
     const serving = option.model.servingState
     if (serving._tag !== "Assessed"
       || serving.assessment._tag !== "Fits"
       || !("rankingScores" in serving)
-      || Option.isNone(serving.rankingScores)
       || !Number.isFinite(preference.memoryBudgetBytes)
       || serving.assessment.memory.totalRequiredBytes > Math.max(0, preference.memoryBudgetBytes)) return []
     return [{
       option,
-      utility: localModelRankingUtility(serving.rankingScores.value, preference.fastToSmart),
+      utility: Option.map(serving.rankingScores, (scores) =>
+        localModelRankingUtility(scores, preference.fastToSmart)),
     }]
   })
-  .sort((left, right) => right.utility - left.utility
-    || left.option.model.modelId.localeCompare(right.option.model.modelId))
+  // A fitting model without ranking scores (its speed is unavailable) follows every ranked model.
+  .sort((left, right) => Option.match(left.utility, {
+    onNone: () => Option.isSome(right.utility) ? 1 : 0,
+    onSome: (leftUtility) => Option.match(right.utility, {
+      onNone: () => -1,
+      onSome: (rightUtility) => rightUtility - leftUtility,
+    }),
+  }) || left.option.model.modelId.localeCompare(right.option.model.modelId))
   .slice(0, Math.max(0, Math.floor(limit)))
   .map(({ option }) => option)
 
@@ -122,11 +131,10 @@ export const localModelOptions = (
   const representedModelIds = new Set(installed.map(({ model }) => model.modelId))
   const downloadable = models.models.flatMap((model): readonly LocalModelOption[] => {
     if (model._tag !== "Catalog"
+      || !localModelIsAvailable(model)
       || representedModelIds.has(model.modelId)
       || model.servingState._tag !== "Assessed"
-      || model.servingState.assessment._tag !== "Fits"
-      || !("rankingScores" in model.servingState)
-      || Option.isNone(model.servingState.rankingScores)) return []
+      || model.servingState.assessment._tag !== "Fits") return []
     return [{
       id: `downloadable:${model.modelId}`,
       kind: "downloadable",

@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest"
 import { Option, Schema } from "effect"
 import {
-  CatalogIntelligenceSchema,
   CatalogBaseIdSchema,
   CatalogVariantIdSchema,
+  CatalogLocalModelServingStateSchema,
+  CatalogSupportSchema,
+  DiscoveredLocalModelServingStateSchema,
+  IntelligenceScoreSchema,
   LocalModelMemorySchema,
   LocalModelPreparationSchema,
   LocalModelSchema,
@@ -22,12 +25,8 @@ const catalogModel = {
   catalogData: {
     releaseDate: "2026-08-29",
     parameterization: { architecture: "dense", totalParameters: 1 },
-    intelligence: { score: 1, provenance: {
-      kind: "artificialAnalysisIntelligenceIndex",
-      methodologyVersion: "test",
-      asOfDate: "2026-08-29",
-      url: "https://example.com/model",
-    } },
+    intelligence: 1,
+    support: { _tag: "Supported" },
     fidelityRank: 1,
     quantizationAware: false,
   },
@@ -38,6 +37,18 @@ const catalogModel = {
     failure: { code: "unavailable", message: "Unavailable", retryable: true },
   },
 } as const
+
+describe("CatalogSupportSchema", () => {
+  it("requires a disabled reason and a deprecated replacement", () => {
+    expect(() => Schema.decodeUnknownSync(CatalogSupportSchema)({ _tag: "Disabled", reason: "" })).toThrow()
+    expect(() => Schema.decodeUnknownSync(CatalogSupportSchema)({
+      _tag: "Deprecated", since: "2026-09-27", reason: "superseded",
+    })).toThrow()
+    expect(() => Schema.decodeUnknownSync(CatalogSupportSchema)({
+      _tag: "Deprecated", since: "2026-09-27", reason: "superseded", replacement: "model:gguf:q4",
+    })).not.toThrow()
+  })
+})
 
 describe("ModelIdSchema", () => {
   it("accepts canonical catalog and Hugging Face callable identities", () => {
@@ -202,13 +213,50 @@ describe("LocalModelSchema invariants", () => {
           domains: [], totalRequiredBytes: 0, requiredSystemMemoryBytes: 0,
           systemUseState: { _tag: "NotObserved" }, currentHeadroomState: { _tag: "NotObserved" },
         },
-        performance: [{
-          contextTokens: 4096, lowerTokensPerSecond: 1, estimatedTokensPerSecond: 2,
-          upperTokensPerSecond: 3, confidence: "high",
-        }],
+        performance: [{ contextTokens: 4096, estimatedTokensPerSecond: 2 }],
       },
     } as const
     expect(() => Schema.decodeUnknownSync(LocalModelServingStateSchema)(assessed)).not.toThrow()
+  })
+
+  it("requires performance for fitting models and admits Unsupported only for discovered models", () => {
+    const failure = { code: "unsupported_family", message: "Unrecognized family", retryable: false }
+    const assessed = {
+      _tag: "Assessed",
+      metadata: {
+        format: "gguf", architecture: "test", quantization: "q4", quantizationName: "Q4",
+        storageBytes: 1,
+      },
+      capabilities: {
+        vision: false, tools: false, structuredOutput: false,
+        reasoning: { supported: false, efforts: [] },
+      },
+    } as const
+    const fits = {
+      ...assessed,
+      assessment: {
+        _tag: "Fits",
+        assessmentId: "assessment",
+        environmentId: "environment",
+        profile: { contextLength: 4096 },
+        memory: {
+          domains: [], totalRequiredBytes: 0, requiredSystemMemoryBytes: 0,
+          systemUseState: { _tag: "NotObserved" }, currentHeadroomState: { _tag: "NotObserved" },
+        },
+        performance: [{ contextTokens: 4096, estimatedTokensPerSecond: 2 }],
+      },
+    }
+    const withoutPerformance = { ...fits, assessment: { ...fits.assessment, performance: [] } }
+    const unsupported = {
+      ...assessed,
+      assessment: {
+        _tag: "Unsupported", environmentId: "environment", profile: { contextLength: 4096 }, failure,
+      },
+    }
+    expect(() => Schema.decodeUnknownSync(CatalogLocalModelServingStateSchema)(fits)).not.toThrow()
+    expect(() => Schema.decodeUnknownSync(CatalogLocalModelServingStateSchema)(withoutPerformance)).toThrow()
+    expect(() => Schema.decodeUnknownSync(CatalogLocalModelServingStateSchema)(unsupported)).toThrow()
+    expect(() => Schema.decodeUnknownSync(DiscoveredLocalModelServingStateSchema)(unsupported)).not.toThrow()
   })
 
   it("rejects memory totals that disagree with domain evidence", () => {
@@ -290,52 +338,13 @@ describe("ModelParameterizationSchema", () => {
   })
 })
 
-describe("CatalogIntelligenceSchema", () => {
-  it("preserves direct and estimated provenance as distinct variants", () => {
-    const direct = {
-      score: 20.4,
-      provenance: {
-        kind: "artificialAnalysisIntelligenceIndex",
-        methodologyVersion: "4.1.1",
-        asOfDate: "2026-08-26",
-        url: "https://artificialanalysis.ai/models/qwen3-5-4b",
-      },
+describe("IntelligenceScoreSchema", () => {
+  it("accepts whole percentages of the frontier and rejects fractions or values outside 0 to 100", () => {
+    for (const valid of [0, 59, 100]) {
+      expect(Schema.decodeUnknownSync(IntelligenceScoreSchema)(valid)).toBe(valid)
     }
-    const estimate = {
-      score: 7.3,
-      provenance: {
-        kind: "estimate",
-        target: "artificialAnalysisIntelligenceIndex",
-        methodologyVersion: "4.1.1",
-        asOfDate: "2026-08-26",
-        confidence: "moderate",
-        methodology: "Compared with the exact parent model.",
-        evidenceUrls: ["https://example.com/evidence"],
-      },
-    }
-    expect(Schema.decodeUnknownSync(CatalogIntelligenceSchema)(direct)).toEqual(direct)
-    expect(Schema.decodeUnknownSync(CatalogIntelligenceSchema)(estimate)).toEqual(estimate)
-  })
-
-  it("rejects malformed dates, non-HTTPS evidence, and empty estimate evidence", () => {
-    const provenance = {
-      kind: "estimate",
-      target: "artificialAnalysisIntelligenceIndex",
-      methodologyVersion: "4.1.1",
-      asOfDate: "2026-08-26",
-      confidence: "low",
-      methodology: "Peer comparison.",
-      evidenceUrls: ["https://example.com/evidence"],
-    }
-    for (const invalid of [
-      { ...provenance, asOfDate: "2026-02-29" },
-      { ...provenance, evidenceUrls: ["http://example.com/evidence"] },
-      { ...provenance, evidenceUrls: [] },
-    ]) {
-      expect(() => Schema.decodeUnknownSync(CatalogIntelligenceSchema)({
-        score: 1,
-        provenance: invalid,
-      })).toThrow()
+    for (const invalid of [-1, 101, 58.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(() => Schema.decodeUnknownSync(IntelligenceScoreSchema)(invalid)).toThrow()
     }
   })
 })

@@ -17,13 +17,14 @@ applies_to:
 
 The retained browser client consumes local model services. The inference-focused desktop has its
 own shell, specified in `desktop-inference.md`, and shares the established appearance system and UI
-primitives. Onboarding belongs exclusively to that desktop shell.
+primitives. Appearance rendering is independent of persistence: the browser adapter uses localStorage,
+while desktop preferences belong to its client host and canonical config. Onboarding belongs exclusively to that desktop shell.
 
 ## Authority and boundaries
 
 The unified `ModelCatalog` is ACN's read-only Magnitude product projection: each local row's
 `acquisitionState` carries the model's complete materialization lifecycle (disk truth, transfer
-progress, unacknowledged failure, update availability, and residency once installed) alongside
+and optimization progress, unacknowledged failure, update availability, and residency once installed) alongside
 assessment presentation, provider availability, ranking scores, and product warnings. Native ICN
 Models, Packages, Downloads, Instances, and Hardware remain authoritative beneath ACN and are not
 client-visible. `ModelSlotsState` owns durable selection, favorites, and recency, resolved
@@ -51,13 +52,15 @@ The ordinary shell contains a dedicated Settings surface for local inference:
   only artifact-level actions: reveal the daemon-published installed target path or remove the
   download. Externally managed Hugging Face cache artifacts may be revealed but do not expose a
   removal action. Slot selection, residency, favorites, transfer activity, and load controls do not belong
-  on this surface.
+  on this surface. A deprecated installed model is labeled, names its replacement, and offers one
+  switch action that downloads the replacement until it is installed; best-effort models are
+  labeled wherever they appear.
 - Catalog presents the unified assessed local catalog. Its index may be searched by model identity,
   filtered to installed models, and sorted by intelligence (the default), release date, download
   size, or name. Onboarding preference is not applied to this general catalog. Ordinary
-  downloadable rows do not repeat an `Available` label; non-default lifecycle and compatibility
-  states remain visible while completed `DoesNotFit` and `Incompatible` assessments are excluded
-  from the browsable catalog. Catalog owns
+  downloadable rows do not repeat an `Available` label; non-default lifecycle and assessment
+  states remain visible while completed `DoesNotFit` assessments and deprecated models are
+  excluded from the browsable catalog. Catalog owns
   install, update, and transfer cancellation; active-model selection remains in the composer and
   installed-artifact removal remains in Models.
 - Hardware presents server-reported topology and a labeled physical-memory breakdown alongside
@@ -83,7 +86,7 @@ title bar, and other application chrome do not duplicate model identity, residen
 context information.
 
 CLI and web share the pure five-axis local-model comparison profile: intelligence, speed,
-speculation, memory efficiency, and accuracy. Each client owns its renderer, so terminal cells and
+speculation, fit, and accuracy. Each client owns its renderer, so terminal cells and
 browser SVG remain separate presentations of the same model evidence.
 
 Install, update, cancellation, failure dismissal, removal, and warm load use the canonical model

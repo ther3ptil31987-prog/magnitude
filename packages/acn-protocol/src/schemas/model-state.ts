@@ -57,6 +57,17 @@ export const LocalInferenceMemoryDomainIdSchema = Schema.String.pipe(
 )
 export type LocalInferenceMemoryDomainId = typeof LocalInferenceMemoryDomainIdSchema.Type
 
+/** Stable identity of one inference execution device, including the host CPU. */
+export const LocalInferenceDeviceIdSchema = Schema.String.pipe(
+  Schema.minLength(1),
+  Schema.maxLength(512),
+  Schema.brand("LocalInferenceDeviceId"),
+)
+export type LocalInferenceDeviceId = typeof LocalInferenceDeviceIdSchema.Type
+
+export const LocalInferenceBackendSchema = Schema.Literal("cpu", "metal", "cuda", "vulkan")
+export type LocalInferenceBackend = typeof LocalInferenceBackendSchema.Type
+
 export const PercentageSchema = Schema.Number.pipe(Schema.int(), Schema.between(0, 100))
 export type Percentage = typeof PercentageSchema.Type
 
@@ -71,12 +82,11 @@ export const LowMemoryModelInstanceFailureSchema = Schema.TaggedStruct("LowMemor
   code: Schema.Literal("low_memory"),
   message: Schema.String,
   retryable: Schema.Boolean,
-  requiredSystemMemoryBytes: NonNegativeSafeInteger,
+  requiredMemoryBytes: NonNegativeSafeInteger,
   allocationHeadroomBytes: NonNegativeSafeInteger,
   systemReserveBytes: NonNegativeSafeInteger,
   loadBoundaryBytes: NonNegativeSafeInteger,
   minimumAdditionalAvailableBytes: PositiveSafeInteger,
-  parallelSequences: PositiveSafeInteger,
 })
 export type LowMemoryModelInstanceFailure =
   typeof LowMemoryModelInstanceFailureSchema.Type
@@ -102,18 +112,22 @@ export const formatModelDisplayName = (
   onSome: (label) => `${displayName} (${label})`,
 })
 
+export const ModelLoadDeviceSchema = Schema.Struct({
+  deviceId: LocalInferenceDeviceIdSchema,
+  backend: LocalInferenceBackendSchema,
+})
+export type ModelLoadDevice = typeof ModelLoadDeviceSchema.Type
+
 export const ModelLoadPlanSchema = Schema.Struct({
   contextWindowTokens: PositiveSafeInteger,
-  parallelSequences: PositiveSafeInteger,
-  physicalContextTokens: PositiveSafeInteger,
-  requiredSystemMemoryBytes: NonNegativeSafeInteger,
+  /** Startup peak claim in the selected device's allocation domain; excludes context growth. */
+  requiredMemoryBytes: NonNegativeSafeInteger,
+  device: ModelLoadDeviceSchema,
 })
 export type ModelLoadPlan = typeof ModelLoadPlanSchema.Type
 
 export const ModelInstanceAllocationSchema = Schema.Struct({
   contextWindowTokens: PositiveSafeInteger,
-  parallelSequences: PositiveSafeInteger,
-  physicalContextTokens: PositiveSafeInteger,
   memoryDomains: Schema.Array(Schema.Struct({
     memoryDomainId: LocalInferenceMemoryDomainIdSchema,
     modelBytes: NonNegativeSafeInteger,
@@ -319,13 +333,6 @@ export const ModelParameterizationSchema = Schema.Union(
 )
 export type ModelParameterization = typeof ModelParameterizationSchema.Type
 
-const IntelligenceAsOfDateSchema = Schema.String.pipe(
-  Schema.filter(isRealIsoCalendarDate, {
-    message: () => "intelligence observation date must be a real YYYY-MM-DD calendar date",
-  }),
-  Schema.brand("IntelligenceAsOfDate"),
-)
-
 export const HttpsUrlSchema = Schema.String.pipe(
   Schema.filter((value) => {
     try {
@@ -337,30 +344,8 @@ export const HttpsUrlSchema = Schema.String.pipe(
   Schema.brand("HttpsUrl"),
 )
 
-export const IntelligenceProvenanceSchema = Schema.Union(
-  Schema.Struct({
-    kind: Schema.Literal("artificialAnalysisIntelligenceIndex"),
-    methodologyVersion: NonEmptyString,
-    asOfDate: IntelligenceAsOfDateSchema,
-    url: HttpsUrlSchema,
-  }),
-  Schema.Struct({
-    kind: Schema.Literal("estimate"),
-    target: Schema.Literal("artificialAnalysisIntelligenceIndex"),
-    methodologyVersion: NonEmptyString,
-    asOfDate: IntelligenceAsOfDateSchema,
-    confidence: Schema.Literal("high", "moderate", "low"),
-    methodology: NonEmptyString,
-    evidenceUrls: Schema.NonEmptyArray(HttpsUrlSchema),
-  }),
-)
-export type IntelligenceProvenance = typeof IntelligenceProvenanceSchema.Type
-
-export const CatalogIntelligenceSchema = Schema.Struct({
-  score: FiniteNonNegative,
-  provenance: IntelligenceProvenanceSchema,
-})
-export type CatalogIntelligence = typeof CatalogIntelligenceSchema.Type
+/** A model's intelligence as a whole percentage of the top Artificial Analysis Intelligence Index score. */
+export const IntelligenceScoreSchema = Schema.Int.pipe(Schema.between(0, 100))
 
 export const MemoryAssessmentSchema = Schema.Struct({
   memoryDomainId: LocalInferenceMemoryDomainIdSchema,
@@ -371,16 +356,11 @@ export const MemoryAssessmentSchema = Schema.Struct({
 })
 export type MemoryAssessment = typeof MemoryAssessmentSchema.Type
 
+/** An estimated decode speed at one context depth: bytes per decode step over the device's bandwidth. */
 export const GenerationPerformanceEvidenceSchema = Schema.Struct({
   contextTokens: PositiveSafeInteger,
-  lowerTokensPerSecond: Schema.Number.pipe(Schema.finite(), Schema.positive()),
   estimatedTokensPerSecond: Schema.Number.pipe(Schema.finite(), Schema.positive()),
-  upperTokensPerSecond: Schema.Number.pipe(Schema.finite(), Schema.positive()),
-  confidence: Schema.Literal("high", "moderate", "low"),
-}).pipe(Schema.filter((sample) =>
-  sample.lowerTokensPerSecond <= sample.estimatedTokensPerSecond
-  && sample.estimatedTokensPerSecond <= sample.upperTokensPerSecond,
-{ message: () => "performance rates must be ordered lower, expected, upper" }))
+})
 export type GenerationPerformanceEvidence =
   typeof GenerationPerformanceEvidenceSchema.Type
 
@@ -426,15 +406,22 @@ export const ModelReleaseReasonSchema = Schema.Literal(
 )
 export type ModelReleaseReason = typeof ModelReleaseReasonSchema.Type
 
+export const ModelLoadStageSchema = Schema.Literal(
+  "queued",
+  "preparing",
+  "optimizing",
+  "loading_weights",
+  "finalizing",
+)
+export type ModelLoadStage = typeof ModelLoadStageSchema.Type
+
 export const ModelResidencySchema = Schema.Union(
   Schema.TaggedStruct("Unloaded", {}),
   Schema.TaggedStruct("Requested", {}),
   Schema.TaggedStruct("Loading", {
-    stage: Schema.Literal("queued", "resolving", "unloading", "loading", "verifying"),
-    progress: Schema.optionalWith(Schema.Number.pipe(Schema.finite(), Schema.between(0, 1)), {
-      as: "Option",
-      exact: true,
-    }),
+    stage: ModelLoadStageSchema,
+    /** Completed fraction by measured work: tuning (when the load tunes) fills the first half. */
+    fraction: Schema.Number.pipe(Schema.finite(), Schema.between(0, 1)),
     plannedAllocation: Schema.optionalWith(ModelLoadPlanSchema, { as: "Option", exact: true }),
   }),
   Schema.TaggedStruct("Ready", {
@@ -456,6 +443,16 @@ export const ModelTransferProgressSchema = Schema.Struct({
 }).pipe(Schema.filter((progress) => progress.completedBytes <= progress.totalBytes,
   { message: () => "model transfer progress cannot exceed its declared total" }))
 export type ModelTransferProgress = typeof ModelTransferProgressSchema.Type
+
+/** Kernel tuning after a download, in tuning work units; `preparing` counts them (0 of 0). */
+export const ModelOptimizationProgressSchema = Schema.Struct({
+  stage: Schema.Literal("preparing", "tuning"),
+  completed: NonNegativeSafeInteger,
+  total: NonNegativeSafeInteger,
+  device: Schema.optionalWith(ModelLoadDeviceSchema, { as: "Option", exact: true }),
+}).pipe(Schema.filter((progress) => progress.completed <= progress.total,
+  { message: () => "model optimization progress cannot exceed its declared total" }))
+export type ModelOptimizationProgress = typeof ModelOptimizationProgressSchema.Type
 
 export const ModelAcquisitionFailureSchema = Schema.Union(
   Schema.TaggedStruct("Interrupted", {}),
@@ -498,6 +495,11 @@ export const LocalModelAcquisitionStateSchema = Schema.Union(
     ...InstalledModelFields,
     failure: ModelAcquisitionFailureSchema,
   }),
+  /** One-time kernel tuning after an install or update download; it ends Installed however it ends. */
+  Schema.TaggedStruct("Optimizing", {
+    ...InstalledModelFields,
+    progress: ModelOptimizationProgressSchema,
+  }),
   Schema.TaggedStruct("Removing", InstalledModelFields),
   Schema.TaggedStruct("RemoveFailed", {
     ...InstalledModelFields,
@@ -518,6 +520,7 @@ export const installedAcquisition = (
   || state._tag === "UpdateAvailable"
   || state._tag === "Updating"
   || state._tag === "UpdateFailed"
+  || state._tag === "Optimizing"
   || state._tag === "Removing"
   || state._tag === "RemoveFailed"
   ? state
@@ -542,8 +545,10 @@ export const ProviderModelDisabledReasonSchema = Schema.Literal(
   "provider_unavailable",
   "model_unavailable",
   "installation_unavailable",
-  "incompatible_runtime",
+  "unsupported_model",
   "invalid_configuration",
+  "catalog_disabled",
+  "deprecated",
 )
 export type ProviderModelDisabledReason = typeof ProviderModelDisabledReasonSchema.Type
 
@@ -571,10 +576,30 @@ export const ProviderModelCatalogEntrySchema = Schema.Struct({
   { message: () => "supported model slots must be unique" }))
 export type ProviderModelCatalogEntry = typeof ProviderModelCatalogEntrySchema.Type
 
+const CatalogDeprecationDateSchema = Schema.String.pipe(
+  Schema.filter(isRealIsoCalendarDate, {
+    message: () => "catalog deprecation date must be a real YYYY-MM-DD calendar date",
+  }),
+  Schema.brand("CatalogDeprecationDate"),
+)
+
+/** What the release promises for a catalog model, independent of this device's assessment. */
+export const CatalogSupportSchema = Schema.Union(
+  Schema.TaggedStruct("Supported", {}),
+  Schema.TaggedStruct("Disabled", { reason: NonEmptyString }),
+  Schema.TaggedStruct("Deprecated", {
+    since: CatalogDeprecationDateSchema,
+    replacement: CatalogFormModelIdSchema,
+    reason: NonEmptyString,
+  }),
+)
+export type CatalogSupport = typeof CatalogSupportSchema.Type
+
 export const LocalModelCatalogDataSchema = Schema.Struct({
   releaseDate: ModelReleaseDateSchema,
   parameterization: ModelParameterizationSchema,
-  intelligence: CatalogIntelligenceSchema,
+  intelligence: IntelligenceScoreSchema,
+  support: CatalogSupportSchema,
   fidelityRank: NonNegativeSafeInteger,
   quantizationAware: Schema.Boolean,
 })
@@ -653,6 +678,7 @@ export const LocalModelMemorySchema = Schema.Struct({
 }, { message: () => "local model memory totals and domains must agree with their evidence" }))
 export type LocalModelMemory = typeof LocalModelMemorySchema.Type
 
+/** A fitting model, with one decode-speed estimate per assessed context depth. */
 export const LocalModelFitsAssessmentSchema = Schema.TaggedStruct("Fits", {
   assessmentId: ModelAssessmentIdSchema,
   environmentId: AssessmentEnvironmentIdSchema,
@@ -675,17 +701,18 @@ export const LocalModelDoesNotFitAssessmentSchema = Schema.TaggedStruct("DoesNot
 { message: () => "non-fitting assessment memory total must match its domain evidence" }))
 export type LocalModelDoesNotFitAssessment = typeof LocalModelDoesNotFitAssessmentSchema.Type
 
-export const LocalModelIncompatibleAssessmentSchema = Schema.TaggedStruct("Incompatible", {
+/** The engine cannot execute a discovered model; catalog models are never unsupported. */
+export const LocalModelUnsupportedAssessmentSchema = Schema.TaggedStruct("Unsupported", {
   environmentId: AssessmentEnvironmentIdSchema,
   profile: ServingProfileSchema,
   failure: ModelFailureSchema,
 })
-export type LocalModelIncompatibleAssessment = typeof LocalModelIncompatibleAssessmentSchema.Type
+export type LocalModelUnsupportedAssessment = typeof LocalModelUnsupportedAssessmentSchema.Type
 
 export const LocalModelAssessmentSchema = Schema.Union(
   LocalModelFitsAssessmentSchema,
   LocalModelDoesNotFitAssessmentSchema,
-  LocalModelIncompatibleAssessmentSchema,
+  LocalModelUnsupportedAssessmentSchema,
 )
 export type LocalModelAssessment = typeof LocalModelAssessmentSchema.Type
 
@@ -702,6 +729,7 @@ export type LocalModelPresentation = typeof LocalModelPresentationSchema.Type
 export const SpeculativeMethodSchema = Schema.Union(
   Schema.TaggedStruct("Mtp", {}),
   Schema.TaggedStruct("DFlash", {}),
+  Schema.TaggedStruct("DFlash2", {}),
   Schema.TaggedStruct("DSpark", {}),
 )
 export type SpeculativeMethod = typeof SpeculativeMethodSchema.Type
@@ -733,12 +761,9 @@ const CatalogModelAssessedFitsServingStateSchema = Schema.TaggedStruct("Assessed
     exact: true,
   }),
 })
-const CatalogModelAssessedUnavailableServingStateSchema = Schema.TaggedStruct("Assessed", {
+const CatalogModelAssessedDoesNotFitServingStateSchema = Schema.TaggedStruct("Assessed", {
   ...LocalModelAssessedFields,
-  assessment: Schema.Union(
-    LocalModelDoesNotFitAssessmentSchema,
-    LocalModelIncompatibleAssessmentSchema,
-  ),
+  assessment: LocalModelDoesNotFitAssessmentSchema,
 })
 const DiscoveredModelAssessedServingStateSchema = Schema.TaggedStruct("Assessed", {
   ...LocalModelAssessedFields,
@@ -748,7 +773,7 @@ export const CatalogLocalModelServingStateSchema = Schema.Union(
   LocalModelAssessingServingStateSchema,
   LocalModelFailedServingStateSchema,
   CatalogModelAssessedFitsServingStateSchema,
-  CatalogModelAssessedUnavailableServingStateSchema,
+  CatalogModelAssessedDoesNotFitServingStateSchema,
 )
 export type CatalogLocalModelServingState = typeof CatalogLocalModelServingStateSchema.Type
 
@@ -1110,7 +1135,7 @@ export type ModelSlotsState = typeof ModelSlotsStateSchema.Type
 export const LocalInferenceAcceleratorSchema = Schema.Struct({
   acceleratorId: LocalInferenceAcceleratorIdSchema,
   name: Schema.String,
-  backend: Schema.String,
+  backend: LocalInferenceBackendSchema,
   memoryDomainId: LocalInferenceMemoryDomainIdSchema,
 })
 export const LocalInferenceMemoryDomainSchema = Schema.Struct({

@@ -4,8 +4,8 @@
     "title": "Magnitude Inference Control Node",
     "description": "",
     "license": {
-      "name": "MIT",
-      "identifier": "MIT"
+      "name": "UNLICENSED",
+      "identifier": "UNLICENSED"
     },
     "version": "0.1.0"
   },
@@ -76,6 +76,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "Memory or request capacity is temporarily unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
           }
         }
       }
@@ -90,7 +100,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/MessagesRequest"
+                "$ref": "#/components/schemas/CountTokensRequest"
               }
             }
           },
@@ -118,7 +128,27 @@
             }
           },
           "404": {
-            "description": "Requested model is unavailable",
+            "description": "Model is not installed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Installed model cannot be resolved for serving",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Installed model failed integrity validation",
             "content": {
               "application/json": {
                 "schema": {
@@ -531,7 +561,7 @@
             }
           },
           "409": {
-            "description": "Model cannot currently be admitted",
+            "description": "Installed model cannot be resolved for serving",
             "content": {
               "application/json": {
                 "schema": {
@@ -653,21 +683,21 @@
           }
         },
         "x-magnitude-stream": {
+          "version": 1,
+          "responseStatus": 200,
+          "framing": "sse",
           "data": {
             "encoding": "json",
             "schema": {
               "$ref": "#/components/schemas/InferenceResourceInvalidation"
             }
           },
-          "framing": "sse",
-          "reconnect": {
-            "type": "none"
-          },
-          "responseStatus": 200,
           "termination": {
             "type": "long-lived"
           },
-          "version": 1
+          "reconnect": {
+            "type": "none"
+          }
         }
       }
     },
@@ -1044,7 +1074,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Loaded model and active template properties",
+            "description": "Model and template properties from its installed material",
             "content": {
               "application/json": {
                 "schema": {
@@ -1054,7 +1084,7 @@
             }
           },
           "400": {
-            "description": "Invalid model identity or request",
+            "description": "Invalid model identity",
             "content": {
               "application/json": {
                 "schema": {
@@ -1074,7 +1104,7 @@
             }
           },
           "409": {
-            "description": "Model cannot currently be admitted",
+            "description": "Installed model cannot be resolved for serving",
             "content": {
               "application/json": {
                 "schema": {
@@ -1318,25 +1348,35 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "Memory or request capacity is temporarily unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         },
         "x-magnitude-stream": {
+          "version": 1,
+          "responseStatus": 200,
+          "framing": "sse",
           "data": {
             "encoding": "json",
             "schema": {
               "$ref": "#/components/schemas/ChatCompletionStreamEvent"
             }
           },
-          "framing": "sse",
-          "reconnect": {
-            "type": "none"
-          },
-          "responseStatus": 200,
           "termination": {
             "type": "sentinel",
             "value": "[DONE]"
           },
-          "version": 1
+          "reconnect": {
+            "type": "none"
+          }
         }
       }
     },
@@ -1462,24 +1502,34 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "Memory or request capacity is temporarily unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         },
         "x-magnitude-stream": {
+          "version": 1,
+          "responseStatus": 200,
+          "framing": "sse",
           "data": {
             "encoding": "json",
             "schema": {
               "$ref": "#/components/schemas/ResponseStreamEvent"
             }
           },
-          "framing": "sse",
-          "reconnect": {
-            "type": "none"
-          },
-          "responseStatus": 200,
           "termination": {
             "type": "eof"
           },
-          "version": 1
+          "reconnect": {
+            "type": "none"
+          }
         }
       }
     }
@@ -1548,6 +1598,79 @@
         "type": "string",
         "enum": [
           "allowed_tools"
+        ]
+      },
+      "AnthropicToolChoice": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "disable_parallel_tool_use": {
+                "type": "boolean"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "auto"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "disable_parallel_tool_use": {
+                "type": "boolean"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "any"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "name",
+              "type"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "disable_parallel_tool_use": {
+                "type": "boolean"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "tool"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "none"
+                ]
+              }
+            }
+          }
         ]
       },
       "ApiErrorBody": {
@@ -1680,47 +1803,6 @@
       "AssessmentEnvironmentId": {
         "type": "string"
       },
-      "BackendEligibilityReport": {
-        "type": "object",
-        "required": [
-          "schemaVersion",
-          "cuda",
-          "vulkan",
-          "metal"
-        ],
-        "properties": {
-          "schemaVersion": {
-            "type": "integer",
-            "format": "int32",
-            "maximum": 1,
-            "minimum": 1
-          },
-          "cuda": {
-            "$ref": "#/components/schemas/CudaEligibility"
-          },
-          "vulkan": {
-            "$ref": "#/components/schemas/VulkanEligibility"
-          },
-          "metal": {
-            "$ref": "#/components/schemas/MetalEligibility"
-          }
-        },
-        "additionalProperties": false
-      },
-      "CacheTypeResponse": {
-        "type": "string",
-        "enum": [
-          "f32",
-          "f16",
-          "bf16",
-          "q8_0",
-          "q4_0",
-          "q4_1",
-          "iq4_nl",
-          "q5_0",
-          "q5_1"
-        ]
-      },
       "CatalogInstallationAdmission": {
         "oneOf": [
           {
@@ -1814,6 +1896,24 @@
                 "type": "string",
                 "enum": [
                   "Running"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "progress",
+              "_tag"
+            ],
+            "properties": {
+              "progress": {
+                "$ref": "#/components/schemas/CatalogOptimizationProgress"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Optimizing"
                 ]
               }
             }
@@ -1970,23 +2070,6 @@
           }
         }
       },
-      "CatalogIntelligence": {
-        "type": "object",
-        "required": [
-          "score",
-          "provenance"
-        ],
-        "properties": {
-          "score": {
-            "type": "number",
-            "format": "double"
-          },
-          "provenance": {
-            "$ref": "#/components/schemas/IntelligenceProvenance"
-          }
-        },
-        "additionalProperties": false
-      },
       "CatalogModel": {
         "type": "object",
         "required": [
@@ -2000,6 +2083,7 @@
           "sourceUrls",
           "parameterization",
           "intelligence",
+          "support",
           "fidelityRank",
           "quantizationAware",
           "localState"
@@ -2036,7 +2120,12 @@
             "$ref": "#/components/schemas/ModelParameterization"
           },
           "intelligence": {
-            "$ref": "#/components/schemas/CatalogIntelligence"
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "support": {
+            "$ref": "#/components/schemas/CatalogSupport"
           },
           "fidelityRank": {
             "type": "integer",
@@ -2166,6 +2255,107 @@
         },
         "additionalProperties": false
       },
+      "CatalogOptimizationProgress": {
+        "type": "object",
+        "description": "Kernel tuning after a verified download, in tuning work units. `Preparing` opens the device\nand counts the units (0 of 0); `device` is the device a load would select, once previewed.",
+        "required": [
+          "stage",
+          "completed",
+          "total"
+        ],
+        "properties": {
+          "stage": {
+            "$ref": "#/components/schemas/CatalogOptimizationStage"
+          },
+          "completed": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "device": {
+            "$ref": "#/components/schemas/ModelLoadDevice"
+          }
+        },
+        "additionalProperties": false
+      },
+      "CatalogOptimizationStage": {
+        "type": "string",
+        "enum": [
+          "preparing",
+          "tuning"
+        ]
+      },
+      "CatalogSupport": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Intended to be available as a supported catalog model.",
+            "required": [
+              "level"
+            ],
+            "properties": {
+              "level": {
+                "type": "string",
+                "enum": [
+                  "supported"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Temporarily unavailable or not yet supported. Never installed or loaded.",
+            "required": [
+              "reason",
+              "level"
+            ],
+            "properties": {
+              "reason": {
+                "type": "string"
+              },
+              "level": {
+                "type": "string",
+                "enum": [
+                  "disabled"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Never offered for new installs and never loaded. An installed copy stays identifiable and\nremovable, and points at its replacement.",
+            "required": [
+              "since",
+              "replacement",
+              "reason",
+              "level"
+            ],
+            "properties": {
+              "since": {
+                "type": "string"
+              },
+              "replacement": {
+                "$ref": "#/components/schemas/ModelId"
+              },
+              "reason": {
+                "type": "string"
+              },
+              "level": {
+                "type": "string",
+                "enum": [
+                  "deprecated"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "What the release promises for a catalog model. It is independent of assessment, which says\nwhat one device can do with it."
+      },
       "ChatCompletionChoice": {
         "type": "object",
         "required": [
@@ -2262,10 +2452,14 @@
           {
             "type": "object",
             "required": [
+              "stage",
               "fraction",
               "phase"
             ],
             "properties": {
+              "stage": {
+                "$ref": "#/components/schemas/ModelLoadStage"
+              },
               "fraction": {
                 "type": "number",
                 "format": "float"
@@ -2387,9 +2581,38 @@
             "type": "number",
             "format": "float"
           },
+          "top_k": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Keep the `top_k` most likely tokens; 0 disables the filter.",
+            "minimum": 0
+          },
+          "min_p": {
+            "type": "number",
+            "format": "float"
+          },
+          "repetition_penalty": {
+            "type": "number",
+            "format": "float"
+          },
+          "presence_penalty": {
+            "type": "number",
+            "format": "float"
+          },
+          "frequency_penalty": {
+            "type": "number",
+            "format": "float"
+          },
           "seed": {
             "type": "integer",
             "format": "int32",
+            "minimum": 0
+          },
+          "n": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Only one choice is generated.",
+            "default": 1,
             "minimum": 0
           },
           "tools": {
@@ -3045,6 +3268,51 @@
           }
         ]
       },
+      "CountTokensRequest": {
+        "type": "object",
+        "description": "`count_tokens` takes only what renders the prompt; generation controls\nsuch as `max_tokens` belong to Messages alone.",
+        "required": [
+          "model",
+          "messages"
+        ],
+        "properties": {
+          "model": {
+            "type": "string"
+          },
+          "messages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Message"
+            }
+          },
+          "system": {
+            "$ref": "#/components/schemas/SystemPrompt"
+          },
+          "tools": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Tool"
+            }
+          },
+          "tool_choice": {
+            "$ref": "#/components/schemas/AnthropicToolChoice"
+          },
+          "thinking": {
+            "$ref": "#/components/schemas/Thinking"
+          },
+          "output_config": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OutputConfig"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
       "CountTokensResponse": {
         "type": "object",
         "required": [
@@ -3057,79 +3325,6 @@
             "minimum": 0
           }
         }
-      },
-      "CudaEligibility": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "driverApi",
-              "architectures",
-              "driverLibrary",
-              "state"
-            ],
-            "properties": {
-              "driverApi": {
-                "type": "integer",
-                "format": "int32",
-                "minimum": 1
-              },
-              "architectures": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                },
-                "minItems": 1
-              },
-              "driverLibrary": {
-                "type": "string",
-                "minLength": 1
-              },
-              "state": {
-                "type": "string",
-                "enum": [
-                  "usable"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "diagnostic",
-              "state"
-            ],
-            "properties": {
-              "diagnostic": {
-                "type": "string"
-              },
-              "state": {
-                "type": "string",
-                "enum": [
-                  "absent"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "diagnostic",
-              "state"
-            ],
-            "properties": {
-              "diagnostic": {
-                "type": "string"
-              },
-              "state": {
-                "type": "string",
-                "enum": [
-                  "failed"
-                ]
-              }
-            }
-          }
-        ]
       },
       "DefaultGenerationSettings": {
         "type": "object",
@@ -3501,107 +3696,14 @@
         },
         "additionalProperties": false
       },
-      "ExecutionConfigResponse": {
-        "type": "object",
-        "required": [
-          "requested",
-          "resolved"
-        ],
-        "properties": {
-          "requested": {
-            "$ref": "#/components/schemas/ExecutionSettingsResponse"
-          },
-          "resolved": {
-            "$ref": "#/components/schemas/ExecutionSettingsResponse",
-            "description": "Concrete parameters passed to the native backend after planning and thread selection."
-          }
-        },
-        "additionalProperties": false
-      },
-      "ExecutionSettingsResponse": {
-        "type": "object",
-        "required": [
-          "gpu_layers",
-          "use_mmap",
-          "use_mlock",
-          "split_mode",
-          "cache_type_k",
-          "cache_type_v",
-          "offload_kqv",
-          "operation_offload",
-          "swa_full",
-          "kv_unified",
-          "flash_attention"
-        ],
-        "properties": {
-          "gpu_layers": {
-            "$ref": "#/components/schemas/GpuLayersResponse"
-          },
-          "use_mmap": {
-            "type": "boolean"
-          },
-          "use_mlock": {
-            "type": "boolean"
-          },
-          "split_mode": {
-            "$ref": "#/components/schemas/SplitModeResponse"
-          },
-          "tensor_split": {
-            "type": [
-              "array",
-              "null"
-            ],
-            "items": {
-              "type": "number",
-              "format": "float"
-            }
-          },
-          "cache_type_k": {
-            "$ref": "#/components/schemas/CacheTypeResponse"
-          },
-          "cache_type_v": {
-            "$ref": "#/components/schemas/CacheTypeResponse"
-          },
-          "offload_kqv": {
-            "type": "boolean"
-          },
-          "operation_offload": {
-            "type": "boolean"
-          },
-          "swa_full": {
-            "type": "boolean"
-          },
-          "kv_unified": {
-            "type": "boolean"
-          },
-          "threads": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int32",
-            "minimum": 0
-          },
-          "threads_batch": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int32",
-            "minimum": 0
-          },
-          "flash_attention": {
-            "$ref": "#/components/schemas/FlashAttentionResponse"
-          }
-        },
-        "additionalProperties": false
-      },
-      "FlashAttentionResponse": {
+      "ExecutionBackend": {
         "type": "string",
+        "description": "An execution backend compiled into the inference engine.",
         "enum": [
-          "auto",
-          "disabled",
-          "enabled"
+          "cpu",
+          "metal",
+          "cuda",
+          "vulkan"
         ]
       },
       "FunctionCallOutput": {
@@ -3713,58 +3815,6 @@
           "function"
         ]
       },
-      "GpuLayersResponse": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "mode"
-            ],
-            "properties": {
-              "mode": {
-                "type": "string",
-                "enum": [
-                  "auto"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "mode"
-            ],
-            "properties": {
-              "mode": {
-                "type": "string",
-                "enum": [
-                  "all"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "value",
-              "mode"
-            ],
-            "properties": {
-              "value": {
-                "type": "integer",
-                "format": "int32",
-                "minimum": 0
-              },
-              "mode": {
-                "type": "string",
-                "enum": [
-                  "count"
-                ]
-              }
-            }
-          }
-        ]
-      },
       "GrammarTriggerResponse": {
         "oneOf": [
           {
@@ -3844,13 +3894,13 @@
               }
             }
           }
-        ]
+        ],
+        "description": "Lazy grammar triggers. The engine's grammars are never lazy, so responses\ncarry none; the shape remains part of the published contract."
       },
       "HardwareDevice": {
         "type": "object",
         "required": [
           "id",
-          "native_index",
           "backend",
           "name",
           "description",
@@ -3860,18 +3910,8 @@
           "id": {
             "$ref": "#/components/schemas/HardwareDeviceId"
           },
-          "native_index": {
-            "type": "integer",
-            "minimum": 0
-          },
           "backend": {
-            "type": "string"
-          },
-          "physical_id": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "$ref": "#/components/schemas/ExecutionBackend"
           },
           "name": {
             "type": "string"
@@ -3891,13 +3931,17 @@
                 "$ref": "#/components/schemas/HardwareDeviceMemoryLimit"
               }
             ]
+          },
+          "unavailable_reason": {
+            "type": "string",
+            "description": "Why discovery found this device but it is not an execution candidate, for example a driver\nbelow its backend's floor. Absent means the device is usable."
           }
         },
         "additionalProperties": false
       },
       "HardwareDeviceId": {
         "type": "string",
-        "description": "Stable identity of one native device view and its device-specific limits."
+        "description": "Stable cross-process identity of one execution device: the serialized Seismic device\nselector (for example `metal:<registry-id>`, `cuda:<uuid>`, `vulkan:<uuid>`, `host-cpu`)."
       },
       "HardwareDeviceKind": {
         "type": "string",
@@ -4055,13 +4099,15 @@
             "$ref": "#/components/schemas/HardwareSystemMemory"
           },
           "native_build": {
-            "type": "string"
+            "type": "string",
+            "description": "Engine build identity: engine version plus kernel bundle identity."
           },
           "enabled_backends": {
             "type": "array",
             "items": {
-              "type": "string"
-            }
+              "$ref": "#/components/schemas/ExecutionBackend"
+            },
+            "description": "Backends compiled into the engine build."
           },
           "topology_fingerprint": {
             "type": "string"
@@ -4362,7 +4408,6 @@
           "version",
           "api_version",
           "native_build",
-          "backend_module_abi",
           "capabilities",
           "target",
           "profile",
@@ -4381,10 +4426,7 @@
           },
           "native_build": {
             "type": "string",
-            "minLength": 1
-          },
-          "backend_module_abi": {
-            "type": "string",
+            "description": "Engine build identity: engine version plus kernel bundle identity.",
             "minLength": 1
           },
           "capabilities": {
@@ -4409,29 +4451,20 @@
           "backends": {
             "type": "array",
             "items": {
-              "type": "string"
+              "$ref": "#/components/schemas/ExecutionBackend"
             },
+            "description": "Backends compiled into the engine build.",
             "minItems": 1
           }
         },
         "additionalProperties": false
       },
-      "IcnInstallationBackend": {
-        "type": "string",
-        "enum": [
-          "cpu",
-          "metal",
-          "cuda",
-          "vulkan"
-        ]
-      },
       "IcnInstallationDeclaration": {
         "type": "object",
+        "description": "Installation declaration written by the installer or the local build beside the installed\nservice. The service selects its execution device at runtime, so the declaration names no\nbackend; it binds the installation to one engine build.",
         "required": [
           "schemaVersion",
-          "backend",
-          "nativeBuild",
-          "backendModuleAbi"
+          "nativeBuild"
         ],
         "properties": {
           "schemaVersion": {
@@ -4440,14 +4473,7 @@
             "maximum": 1,
             "minimum": 1
           },
-          "backend": {
-            "$ref": "#/components/schemas/IcnInstallationBackend"
-          },
           "nativeBuild": {
-            "type": "string",
-            "minLength": 1
-          },
-          "backendModuleAbi": {
             "type": "string",
             "minLength": 1
           }
@@ -4718,86 +4744,6 @@
           "instances"
         ]
       },
-      "IntelligenceEstimateConfidence": {
-        "type": "string",
-        "enum": [
-          "high",
-          "moderate",
-          "low"
-        ]
-      },
-      "IntelligenceProvenance": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "methodologyVersion",
-              "asOfDate",
-              "url",
-              "kind"
-            ],
-            "properties": {
-              "methodologyVersion": {
-                "type": "string"
-              },
-              "asOfDate": {
-                "type": "string"
-              },
-              "url": {
-                "type": "string"
-              },
-              "kind": {
-                "type": "string",
-                "enum": [
-                  "artificialAnalysisIntelligenceIndex"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "target",
-              "methodologyVersion",
-              "asOfDate",
-              "confidence",
-              "methodology",
-              "evidenceUrls",
-              "kind"
-            ],
-            "properties": {
-              "target": {
-                "type": "string"
-              },
-              "methodologyVersion": {
-                "type": "string"
-              },
-              "asOfDate": {
-                "type": "string"
-              },
-              "confidence": {
-                "$ref": "#/components/schemas/IntelligenceEstimateConfidence"
-              },
-              "methodology": {
-                "type": "string"
-              },
-              "evidenceUrls": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                },
-                "minItems": 1
-              },
-              "kind": {
-                "type": "string",
-                "enum": [
-                  "estimate"
-                ]
-              }
-            }
-          }
-        ]
-      },
       "JsonSchemaRequest": {
         "type": "object",
         "required": [
@@ -4979,7 +4925,7 @@
             }
           },
           "tool_choice": {
-            "$ref": "#/components/schemas/ToolChoice"
+            "$ref": "#/components/schemas/AnthropicToolChoice"
           },
           "thinking": {
             "$ref": "#/components/schemas/Thinking"
@@ -4997,42 +4943,6 @@
           }
         },
         "additionalProperties": false
-      },
-      "MetalEligibility": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "state"
-            ],
-            "properties": {
-              "state": {
-                "type": "string",
-                "enum": [
-                  "usable"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "diagnostic",
-              "state"
-            ],
-            "properties": {
-              "diagnostic": {
-                "type": "string"
-              },
-              "state": {
-                "type": "string",
-                "enum": [
-                  "absent"
-                ]
-              }
-            }
-          }
-        ]
       },
       "Modalities": {
         "type": "object",
@@ -5058,6 +4968,7 @@
         "oneOf": [
           {
             "type": "object",
+            "description": "A fitting model, with one decode-speed estimate per requested depth.",
             "required": [
               "profile",
               "assessmentId",
@@ -5133,6 +5044,7 @@
           },
           {
             "type": "object",
+            "description": "The engine cannot execute a discovered model. A catalog model is\nnever unsupported: the pool drops a catalog target the engine cannot\nexecute as a release defect.",
             "required": [
               "profile",
               "failure",
@@ -5148,7 +5060,7 @@
               "_tag": {
                 "type": "string",
                 "enum": [
-                  "Incompatible"
+                  "Unsupported"
                 ]
               }
             }
@@ -5203,32 +5115,9 @@
                 ]
               }
             }
-          },
-          {
-            "type": "object",
-            "required": [
-              "sourceRevision",
-              "failure",
-              "_tag"
-            ],
-            "properties": {
-              "sourceRevision": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "failure": {
-                "$ref": "#/components/schemas/ModelFailure"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Failed"
-                ]
-              }
-            }
           }
-        ]
+        ],
+        "description": "One source's assessments. `Pending` until the source has been read (and, for discovery,\nreconciled)."
       },
       "ModelAssessmentEntry": {
         "type": "object",
@@ -5310,68 +5199,6 @@
       "ModelAssessmentId": {
         "type": "string"
       },
-      "ModelAssessmentPoolState": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "_tag"
-            ],
-            "properties": {
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Preparing"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "environmentId",
-              "catalog",
-              "discovered",
-              "_tag"
-            ],
-            "properties": {
-              "environmentId": {
-                "$ref": "#/components/schemas/AssessmentEnvironmentId"
-              },
-              "catalog": {
-                "$ref": "#/components/schemas/ModelAssessmentDomainSnapshot"
-              },
-              "discovered": {
-                "$ref": "#/components/schemas/ModelAssessmentDomainSnapshot"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Ready"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "failure",
-              "_tag"
-            ],
-            "properties": {
-              "failure": {
-                "$ref": "#/components/schemas/ModelFailure"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Failed"
-                ]
-              }
-            }
-          }
-        ]
-      },
       "ModelAssessmentSubject": {
         "oneOf": [
           {
@@ -5418,9 +5245,12 @@
       },
       "ModelAssessmentsSnapshot": {
         "type": "object",
+        "description": "Every model assessment in the service's one environment, established at service start.",
         "required": [
           "revision",
-          "state"
+          "environmentId",
+          "catalog",
+          "discovered"
         ],
         "properties": {
           "revision": {
@@ -5428,8 +5258,14 @@
             "format": "int64",
             "minimum": 0
           },
-          "state": {
-            "$ref": "#/components/schemas/ModelAssessmentPoolState"
+          "environmentId": {
+            "$ref": "#/components/schemas/AssessmentEnvironmentId"
+          },
+          "catalog": {
+            "$ref": "#/components/schemas/ModelAssessmentDomainSnapshot"
+          },
+          "discovered": {
+            "$ref": "#/components/schemas/ModelAssessmentDomainSnapshot"
           }
         },
         "additionalProperties": false
@@ -5569,8 +5405,6 @@
         "type": "object",
         "required": [
           "contextWindowTokens",
-          "parallelSequences",
-          "physicalContextTokens",
           "memoryDomains"
         ],
         "properties": {
@@ -5579,21 +5413,12 @@
             "format": "int32",
             "minimum": 0
           },
-          "parallelSequences": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
-          },
-          "physicalContextTokens": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
-          },
           "memoryDomains": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/ModelInstanceMemoryDomain"
-            }
+            },
+            "description": "The engine heap's observed standing per memory domain at the last observation. Memory is\nelastic, so this is not a fixed reservation."
           }
         },
         "additionalProperties": false
@@ -5632,12 +5457,11 @@
               "code",
               "message",
               "retryable",
-              "requiredSystemMemoryBytes",
+              "requiredMemoryBytes",
               "allocationHeadroomBytes",
               "systemReserveBytes",
               "loadBoundaryBytes",
               "minimumAdditionalAvailableBytes",
-              "parallelSequences",
               "_tag"
             ],
             "properties": {
@@ -5650,9 +5474,10 @@
               "retryable": {
                 "type": "boolean"
               },
-              "requiredSystemMemoryBytes": {
+              "requiredMemoryBytes": {
                 "type": "integer",
                 "format": "int64",
+                "description": "The load's startup peak claim in the limiting memory domain.",
                 "minimum": 0
               },
               "allocationHeadroomBytes": {
@@ -5663,21 +5488,18 @@
               "systemReserveBytes": {
                 "type": "integer",
                 "format": "int64",
+                "description": "The limiting domain's planning reserve.",
                 "minimum": 0
               },
               "loadBoundaryBytes": {
                 "type": "integer",
                 "format": "int64",
+                "description": "The required memory plus the planning reserve.",
                 "minimum": 0
               },
               "minimumAdditionalAvailableBytes": {
                 "type": "integer",
                 "format": "int64",
-                "minimum": 0
-              },
-              "parallelSequences": {
-                "type": "integer",
-                "format": "int32",
                 "minimum": 0
               },
               "_tag": {
@@ -5699,15 +5521,17 @@
             "type": "object",
             "required": [
               "stage",
+              "fraction",
               "_tag"
             ],
             "properties": {
               "stage": {
                 "$ref": "#/components/schemas/ModelLoadStage"
               },
-              "progress": {
+              "fraction": {
                 "type": "number",
-                "format": "float"
+                "format": "float",
+                "description": "The load's completed fraction in `[0, 1]`, by measured work: tuning, when the load\ntunes, is the first half and weight import the rest. Monotonic within a load; only\n`Ready` means the load is complete."
               },
               "plannedAllocation": {
                 "$ref": "#/components/schemas/ModelLoadPlan"
@@ -5870,46 +5694,58 @@
         },
         "additionalProperties": false
       },
+      "ModelLoadDevice": {
+        "type": "object",
+        "description": "The execution device a model load uses.",
+        "required": [
+          "id",
+          "backend"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/HardwareDeviceId"
+          },
+          "backend": {
+            "$ref": "#/components/schemas/ExecutionBackend"
+          }
+        },
+        "additionalProperties": false
+      },
       "ModelLoadPlan": {
         "type": "object",
         "required": [
           "contextWindowTokens",
-          "parallelSequences",
-          "physicalContextTokens",
-          "requiredSystemMemoryBytes"
+          "requiredMemoryBytes",
+          "device"
         ],
         "properties": {
           "contextWindowTokens": {
             "type": "integer",
             "format": "int32",
+            "description": "The engine-resolved supported maximum context: the serving ceiling.",
             "minimum": 0
           },
-          "parallelSequences": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
-          },
-          "physicalContextTokens": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
-          },
-          "requiredSystemMemoryBytes": {
+          "requiredMemoryBytes": {
             "type": "integer",
             "format": "int64",
+            "description": "The load's startup peak claim in the selected device's allocation domain (system RAM or\ndedicated VRAM). It excludes future context growth, which is claimed as history grows.",
             "minimum": 0
+          },
+          "device": {
+            "$ref": "#/components/schemas/ModelLoadDevice"
           }
         },
         "additionalProperties": false
       },
       "ModelLoadStage": {
         "type": "string",
+        "description": "Where a model load is. The service's model instance status names the same stages.",
         "enum": [
           "queued",
-          "resolving",
-          "unloading",
-          "loading",
-          "verifying"
+          "preparing",
+          "optimizing",
+          "loading_weights",
+          "finalizing"
         ]
       },
       "ModelMetadata": {
@@ -6247,22 +6083,12 @@
           }
         }
       },
-      "PerformanceConfidence": {
-        "type": "string",
-        "enum": [
-          "high",
-          "moderate",
-          "low"
-        ]
-      },
       "PerformanceEvidence": {
         "type": "object",
+        "description": "An estimated decode speed at one context depth: the model's bytes per decode step over the\ndevice's memory bandwidth.",
         "required": [
           "contextTokens",
-          "lowerTokensPerSecond",
-          "estimatedTokensPerSecond",
-          "upperTokensPerSecond",
-          "confidence"
+          "estimatedTokensPerSecond"
         ],
         "properties": {
           "contextTokens": {
@@ -6270,20 +6096,9 @@
             "format": "int32",
             "minimum": 0
           },
-          "lowerTokensPerSecond": {
-            "type": "number",
-            "format": "double"
-          },
           "estimatedTokensPerSecond": {
             "type": "number",
             "format": "double"
-          },
-          "upperTokensPerSecond": {
-            "type": "number",
-            "format": "double"
-          },
-          "confidence": {
-            "$ref": "#/components/schemas/PerformanceConfidence"
           }
         },
         "additionalProperties": false
@@ -6310,7 +6125,6 @@
           "model_size_bytes",
           "default_generation_settings",
           "modalities",
-          "execution",
           "chat_template",
           "template_fingerprint",
           "template_capabilities",
@@ -6342,9 +6156,6 @@
           "modalities": {
             "$ref": "#/components/schemas/Modalities"
           },
-          "execution": {
-            "$ref": "#/components/schemas/ExecutionConfigResponse"
-          },
           "chat_template": {
             "type": "string"
           },
@@ -6364,7 +6175,8 @@
           },
           "sliding_window_tokens": {
             "type": "integer",
-            "format": "int32"
+            "format": "int32",
+            "description": "Sliding-window attention span; 0 when every layer attends over the\nfull context, as in every family the engine executes."
           }
         },
         "additionalProperties": false
@@ -7682,6 +7494,20 @@
               "_tag": {
                 "type": "string",
                 "enum": [
+                  "DFlash2"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
                   "DSpark"
                 ]
               }
@@ -7689,15 +7515,6 @@
           }
         ],
         "description": "Native algorithm used by a speculative decoding stage.\n\nMethod and artifact packaging are intentionally independent. The enclosing speculative bundle\ndeclares whether the selected method is embedded in the target or supplied by a separate draft\npackage."
-      },
-      "SplitModeResponse": {
-        "type": "string",
-        "enum": [
-          "none",
-          "layer",
-          "row",
-          "tensor"
-        ]
       },
       "StopRequest": {
         "oneOf": [
@@ -7805,6 +7622,7 @@
         "oneOf": [
           {
             "type": "object",
+            "description": "Enables reasoning with a hard reasoning-token budget.",
             "required": [
               "budget_tokens",
               "type"
@@ -7916,7 +7734,7 @@
           "sampler_ms": {
             "type": "number",
             "format": "double",
-            "description": "Time spent inside the native sampler for this request."
+            "description": "Time spent inside the sampler for this request."
           },
           "parser_ms": {
             "type": "number",
@@ -7962,79 +7780,6 @@
           "cache_control": {}
         },
         "additionalProperties": false
-      },
-      "ToolChoice": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "type"
-            ],
-            "properties": {
-              "disable_parallel_tool_use": {
-                "type": "boolean"
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "auto"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "type"
-            ],
-            "properties": {
-              "disable_parallel_tool_use": {
-                "type": "boolean"
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "any"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "name",
-              "type"
-            ],
-            "properties": {
-              "name": {
-                "type": "string"
-              },
-              "disable_parallel_tool_use": {
-                "type": "boolean"
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "tool"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "type"
-            ],
-            "properties": {
-              "type": {
-                "type": "string",
-                "enum": [
-                  "none"
-                ]
-              }
-            }
-          }
-        ]
       },
       "ToolChoiceModeRequest": {
         "type": "string",
@@ -8173,67 +7918,7 @@
           }
         }
       },
-      "Value": {},
-      "VulkanEligibility": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "loaderApi",
-              "state"
-            ],
-            "properties": {
-              "loaderApi": {
-                "type": "integer",
-                "format": "int32",
-                "minimum": 1
-              },
-              "state": {
-                "type": "string",
-                "enum": [
-                  "usable"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "diagnostic",
-              "state"
-            ],
-            "properties": {
-              "diagnostic": {
-                "type": "string"
-              },
-              "state": {
-                "type": "string",
-                "enum": [
-                  "absent"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "diagnostic",
-              "state"
-            ],
-            "properties": {
-              "diagnostic": {
-                "type": "string"
-              },
-              "state": {
-                "type": "string",
-                "enum": [
-                  "failed"
-                ]
-              }
-            }
-          }
-        ]
-      }
+      "Value": {}
     }
   }
 }

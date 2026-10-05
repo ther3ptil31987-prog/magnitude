@@ -1,6 +1,6 @@
 ---
 applies_to:
-  - inference/**
+  - inference/service/**
   - packages/icn/**
   - packages/icn-protocol/**
   - packages/acn/**
@@ -31,6 +31,12 @@ harness-specific multiplexing proxies under `/inference/v1/proxies/codex/**` and
 
 ## ICN responsibility
 
+ICN is the TypeScript-side name of the inference service, `magnitude-inference`. The service hosts
+the inference engine: it owns the product-facing inference API, model inventory, assessment
+publication, residency and instance supervision, and runs every loaded model in a contained engine
+worker process. The engine owns model interpretation, execution, memory accounting and serving
+semantics inside that worker; Seismic, below the engine, is the only device and byte authority.
+
 ICN owns physical inference truth: native models and packages, installation and download
 occurrences, hardware observations, planning, assessment, safety, instance lifecycle, residency
 policy, and inference execution. ICN operations revalidate native preconditions at admission.
@@ -45,8 +51,8 @@ independently of command attribution.
 ACN owns the complete client-facing model contract:
 
 - `ModelCatalog`: the unified local and remote product view. A catalog local row carries one
-  `acquisitionState` union covering managed installation, update, transfer failure, removal, and
-  residency. A discovered local row instead carries observed discovery truth and no managed
+  `acquisitionState` union covering managed installation, update, post-installation optimization,
+  transfer failure, removal, and residency. A discovered local row instead carries observed discovery truth and no managed
   acquisition lifecycle. Every variant is a reachable product state; progress and failure payloads
   exist only under the states they belong to, and native occurrence identities never appear;
 - `ModelSlots`: durable selection resolved to truthful client-ready Slot states;
