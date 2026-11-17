@@ -321,7 +321,7 @@ impl TemplateBundle {
         let variant = self.select(!request.tools.is_empty(), selection)?;
         let template =
             Template::new(&variant.source, &self.special_tokens).map_err(|e| e.to_string())?;
-        // The default renders exactly as the template's own default, so it
+        // The default renders with no reasoning arguments, so it
         // needs no inspection; every other intent resolves against the profile.
         let reasoning = if *intent == ReasoningIntent::ModelDefault {
             ResolvedReasoning {
@@ -442,6 +442,11 @@ impl TemplateBundle {
         let template =
             Template::new(&default.source, &self.special_tokens).map_err(|e| e.to_string())?;
         let reasoning = super::reasoning::inspect_reasoning(&template, &Default::default())?;
+        if reasoning.default_effort.is_none() {
+            return Err(
+                "the chat template's default reasoning is not exactly one of its efforts".into(),
+            );
+        }
         let question = serde_json::json!({"role":"user","content":"What is the weather in Paris?"});
         let mut tool_request = ChatRequest::new(vec![question.clone()], 946684800);
         tool_request.tools = vec![serde_json::json!({"type":"function","function":{

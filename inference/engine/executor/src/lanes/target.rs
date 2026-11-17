@@ -2,10 +2,11 @@
 //! planned device leases.
 
 use crate::{
-    ConditioningRef, FeatureSpan, GraphOutputTensor, InvariantError, NativeGraphOutputLease,
-    NativeGraphWorkspaceLease, PoolClass, ResourceDomainId, TargetGraphOutputLease,
-    TargetGraphWorkspaceLease,
+    ConditioningRef, FeatureRef, FeatureSpan, GraphOutputTensor, InvariantError,
+    NativeGraphOutputLease, NativeGraphWorkspaceLease, PoolClass, ResourceDomainId,
+    TargetGraphOutputLease, TargetGraphWorkspaceLease,
 };
+use crate::operation::LaunchWork;
 use magnitude_batching::ValidatedTargetBatch;
 use magnitude_state::{StateStore, TentativeAdvance};
 use std::rc::Rc;
@@ -22,12 +23,21 @@ pub enum TargetTokens {
 
 pub struct TargetLaunchInputs {
     batch: ValidatedTargetBatch,
+    /// What its rows are (`LaunchWork::of` its requests' kinds).
+    work: LaunchWork,
     tokens: TargetTokens,
     advances: Vec<TentativeAdvance>,
     conditioning: Vec<Option<ConditioningRef>>,
     conditioning_slices: Vec<Vec<ConditioningSlice>>,
+    boundary: Option<FeatureRef>,
+    /// Per slot, the accepted tokens its sequence holds before the slot's
+    /// first row, oldest first, as many as the model's row rules read (none
+    /// of a model without one): the host's form of the n-gram token window.
+    preceding: Vec<Vec<u64>>,
     graph_workspace: TargetGraphWorkspaceLease,
-    graph_outputs: [TargetGraphOutputLease; 2],
+    /// The launch's place in its chain's output rotation
+    /// (`TargetProgram::submit`).
+    graph_output: TargetGraphOutputLease,
     readout_workspace: NativeGraphWorkspaceLease,
     readout_output: Option<NativeGraphOutputLease>,
 }
@@ -43,26 +53,42 @@ pub struct ConditioningSlice {
 impl TargetLaunchInputs {
     pub fn new(
         batch: ValidatedTargetBatch,
+        work: LaunchWork,
         tokens: TargetTokens,
         advances: Vec<TentativeAdvance>,
         conditioning: Vec<Option<ConditioningRef>>,
         conditioning_slices: Vec<Vec<ConditioningSlice>>,
         graph_workspace: TargetGraphWorkspaceLease,
-        graph_outputs: [TargetGraphOutputLease; 2],
+        graph_output: TargetGraphOutputLease,
         readout_workspace: NativeGraphWorkspaceLease,
         readout_output: NativeGraphOutputLease,
     ) -> Self {
         Self {
             batch,
+            work,
             tokens,
             advances,
             conditioning,
             conditioning_slices,
             graph_workspace,
-            graph_outputs,
+            graph_output,
             readout_workspace,
             readout_output: Some(readout_output),
+            boundary: None,
+            preceding: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_boundary(mut self, boundary: Option<FeatureRef>) -> Self {
+        self.boundary = boundary;
+        self
+    }
+
+    /// Per slot, the accepted tokens before its first row
+    /// (`TargetLaunchCore::preceding`).
+    pub(crate) fn with_preceding(mut self, preceding: Vec<Vec<u64>>) -> Self {
+        self.preceding = preceding;
+        self
     }
 
     pub(crate) fn into_parts(
@@ -86,15 +112,35 @@ impl TargetLaunchInputs {
         store: &Rc<StateStore>,
         domain: &ResourceDomainId,
         hidden_width: usize,
+        boundary_width: usize,
     ) -> Result<(), InvariantError> {
         let invalid = |detail: String| InvariantError {
             context: "target launch",
             detail,
         };
+        if let Some(boundary) = &self.boundary {
+            if self.batch.actual_slots() != 1
+                || boundary.domain() != domain
+                || boundary.allocation().rows() != 1
+                || boundary.allocation().width() != boundary_width
+                || boundary.allocation().is_graph_backed()
+                || boundary.allocation().tensor().is_err()
+                || !self
+                    .batch
+                    .class()
+                    .demand()
+                    .contains(magnitude_batching::Demand::FEATURES)
+            {
+                return Err(invalid(
+                    "invalid independent boundary feature destination".into(),
+                ));
+            }
+        }
         let slots = self.batch.actual_slots();
         if slots != self.advances.len()
             || slots != self.conditioning.len()
             || slots != self.conditioning_slices.len()
+            || !(self.preceding.is_empty() || self.preceding.len() == slots)
         {
             return Err(invalid(
                 "slot, advance, and conditioning counts disagree".into(),
@@ -112,10 +158,7 @@ impl TargetLaunchInputs {
             }
         }
         if self.graph_workspace.domain() != domain
-            || self
-                .graph_outputs
-                .iter()
-                .any(|lease| lease.domain() != domain)
+            || self.graph_output.domain() != domain
             || self.readout_workspace.domain() != domain
             || self
                 .readout_output
@@ -148,7 +191,7 @@ impl TargetLaunchInputs {
                     "slot {index} publishes to another recurrent successor bank"
                 )));
             }
-            if slot.history_domains() != store.history_reads() {
+            if slot.history_domains() != store.history_reads().len() {
                 return Err(invalid(format!(
                     "slot {index} history domain count differs from its store"
                 )));
@@ -156,36 +199,27 @@ impl TargetLaunchInputs {
             // A Shared source domain's reads: its accepted rows, then rows its
             // source appends in this advance.
             for (read, domain) in store
-                .shared_source_domains()
-                .into_iter()
+                .history_reads()
+                .shared_sources()
+                .iter()
+                .copied()
                 .enumerate()
                 .map(|(position, domain)| (store.history_domains().count() + position, domain))
             {
                 let packed = slot
                     .history(read)
                     .ok_or_else(|| invalid(format!("slot {index} lacks a shared history read")))?;
-                let appended = &binding.destinations[domain.0];
+                let appended = crate::domain::AppendedRuns::of(store, advance, domain);
                 for (row, visible) in packed.visible.iter().enumerate() {
                     let (accepted, _) =
                         crate::domain::accepted_history(store, advance, domain, row)
                             .map_err(invalid)?;
-                    let appends_only = |ranges: &[[i32; 2]]| {
-                        ranges.iter().all(|&[start, end]| {
-                            (start..end).all(|row| {
-                                usize::try_from(row)
-                                    .is_ok_and(|row| appended.contains(&row))
-                            })
-                        })
-                    };
                     if visible.len() < accepted.len()
                         || visible[..accepted.len()] != accepted
-                        || !appends_only(
-                            &visible[accepted.len()..]
-                                .iter()
-                                .copied()
-                                .filter(|range| *range != [0, 0])
-                                .collect::<Vec<_>>(),
-                        )
+                        || !visible[accepted.len()..]
+                            .iter()
+                            .filter(|range| **range != [0, 0])
+                            .all(|&[start, end]| appended.covers(start, end))
                     {
                         return Err(invalid(format!(
                             "slot {index} shared visibility differs from accepted state"
@@ -197,11 +231,36 @@ impl TargetLaunchInputs {
                 let packed = slot
                     .history(domain.0)
                     .ok_or_else(|| invalid(format!("slot {index} lacks a history domain")))?;
+                // An indexer's rows read as `indexer_history` forms them.
+                if store.is_produced_domain(domain) {
+                    let appended = crate::domain::AppendedRuns::of(store, advance, domain);
+                    for (row, (destination, visible)) in
+                        packed.destinations.iter().zip(packed.visible).enumerate()
+                    {
+                        let expected = crate::domain::indexer_history(
+                            store, advance, &appended, domain, row, 0,
+                        )
+                        .map_err(invalid)?;
+                        if expected.destination != *destination
+                            || visible.iter().filter(|range| **range != [0, 0]).ne(expected
+                                .visible
+                                .iter()
+                                .filter(|range| **range != [0, 0]))
+                        {
+                            return Err(invalid(format!(
+                                "slot {index} row {row} indexer history differs from its state"
+                            )));
+                        }
+                    }
+                    continue;
+                }
                 let destinations = &binding.destinations[domain.0];
                 if !destinations.is_empty() && destinations.len() != packed.destinations.len() {
                     return Err(invalid(format!("slot {index} destination count differs")));
                 }
                 let kind = store.history_domain_kind(domain);
+                let appended = crate::domain::cached_causal_domain(store, domain)
+                    .then(|| crate::domain::AppendedRuns::of(store, advance, domain));
                 for (row, (destination, visible)) in
                     packed.destinations.iter().zip(packed.visible).enumerate()
                 {
@@ -230,11 +289,24 @@ impl TargetLaunchInputs {
                                 "slot {index} history range exceeds packed coordinates"
                             ))
                         })?;
-                    if visible.len() < expected.len()
-                        || visible[..expected.len()] != expected
-                        || visible[expected.len()..]
-                            .iter()
-                            .any(|padding| *padding != [0, 0])
+                    let supplied = visible
+                        .iter()
+                        .copied()
+                        .filter(|range| *range != [0, 0])
+                        .collect::<Vec<_>>();
+                    let mut prepared = expected.clone();
+                    if let Some(appended) = &appended {
+                        // The row's first fresh row in the slot, as
+                        // `accepted_history` reports it.
+                        let fresh_start = from.saturating_sub(advance.position());
+                        prepared.extend(appended.causal_prior(fresh_start, row).map_err(invalid)?);
+                    }
+                    // Media rows retain their declared dense fresh block;
+                    // causal compressed rows may additionally see exactly
+                    // their own earlier destinations, never a future row.
+                    if supplied != expected
+                        && (supplied != prepared
+                            || packed.fresh[row][1] - packed.fresh[row][0] != 1)
                     {
                         return Err(invalid(format!(
                             "slot {index} visibility differs from accepted state"
@@ -294,7 +366,7 @@ impl TargetLaunchInputs {
 pub struct ValidatedTargetLaunch {
     core: TargetLaunchCore,
     graph_workspace: TargetGraphWorkspaceLease,
-    graph_outputs: [TargetGraphOutputLease; 2],
+    graph_output: TargetGraphOutputLease,
     readout_workspace: NativeGraphWorkspaceLease,
     readout_output: Option<NativeGraphOutputLease>,
 }
@@ -305,33 +377,40 @@ impl ValidatedTargetLaunch {
         store: &Rc<StateStore>,
         domain: &ResourceDomainId,
         hidden_width: usize,
+        boundary_width: usize,
     ) -> Result<Self, (TargetLaunchInputs, InvariantError)> {
-        if let Err(error) = inputs.validate(store, domain, hidden_width) {
+        if let Err(error) = inputs.validate(store, domain, hidden_width, boundary_width) {
             return Err((inputs, error));
         }
         let TargetLaunchInputs {
             batch,
+            work,
             tokens,
             advances,
             conditioning,
             conditioning_slices,
+            boundary,
+            preceding,
             graph_workspace,
-            graph_outputs,
+            graph_output,
             readout_workspace,
             readout_output,
         } = inputs;
         Ok(Self {
             core: TargetLaunchCore {
                 batch,
+                work,
                 tokens,
                 advances,
                 conditioning,
                 conditioning_slices,
+                boundary,
+                preceding,
                 store: store.clone(),
                 domain: domain.clone(),
             },
             graph_workspace,
-            graph_outputs,
+            graph_output,
             readout_workspace,
             readout_output,
         })
@@ -341,8 +420,22 @@ impl ValidatedTargetLaunch {
         PoolClass::Target(self.core.batch.class())
     }
 
+    pub(crate) fn batch(&self) -> &ValidatedTargetBatch {
+        self.core.batch()
+    }
+
+    pub(crate) fn work(&self) -> LaunchWork {
+        self.core.work
+    }
+
     pub fn domain(&self) -> &ResourceDomainId {
         &self.core.domain
+    }
+
+    /// The launch's state advances, one per slot: a step chained behind it
+    /// follows them.
+    pub(crate) fn advances(&self) -> &[TentativeAdvance] {
+        self.core.advances()
     }
 
     pub(crate) fn submission_parts_mut(
@@ -350,14 +443,14 @@ impl ValidatedTargetLaunch {
     ) -> (
         &TargetLaunchCore,
         &mut TargetGraphWorkspaceLease,
-        &mut [TargetGraphOutputLease; 2],
+        &mut TargetGraphOutputLease,
         &mut NativeGraphWorkspaceLease,
         &mut Option<NativeGraphOutputLease>,
     ) {
         (
             &self.core,
             &mut self.graph_workspace,
-            &mut self.graph_outputs,
+            &mut self.graph_output,
             &mut self.readout_workspace,
             &mut self.readout_output,
         )
@@ -365,9 +458,9 @@ impl ValidatedTargetLaunch {
 
     /// The reconciliation payload and the device leases the submitted work
     /// uses; the leases stay held until the submission is finished. The
-    /// residual pair returns to its pool now: every reader of it was queued
-    /// by this submission, and the device runs the next launch that takes the
-    /// pair after this one.
+    /// launch's output returns to its pool now: every reader of it was
+    /// queued by this submission, and the device runs the next launch that
+    /// takes it after this one.
     pub(crate) fn into_submission_parts(self) -> (TargetLaunchCore, TargetLaunchWorkspace) {
         (
             self.core,
@@ -392,11 +485,16 @@ pub struct TargetLaunchWorkspace {
 /// physical finish.
 pub struct TargetLaunchCore {
     batch: ValidatedTargetBatch,
+    /// What its rows are: policy that tells a prompt from generation reads
+    /// this, never the launch's form.
+    work: LaunchWork,
     /// Selected tokens stay held until the launch that reads them completes.
     tokens: TargetTokens,
     advances: Vec<TentativeAdvance>,
     conditioning: Vec<Option<ConditioningRef>>,
     conditioning_slices: Vec<Vec<ConditioningSlice>>,
+    boundary: Option<FeatureRef>,
+    preceding: Vec<Vec<u64>>,
     /// The store every advance belongs to: it names each attention layer's
     /// history domain and the layer whose regions it binds.
     store: Rc<StateStore>,
@@ -404,8 +502,16 @@ pub struct TargetLaunchCore {
 }
 
 impl TargetLaunchCore {
+    pub fn boundary(&self) -> Option<&FeatureRef> {
+        self.boundary.as_ref()
+    }
+
     pub fn batch(&self) -> &ValidatedTargetBatch {
         &self.batch
+    }
+
+    pub fn work(&self) -> LaunchWork {
+        self.work
     }
 
     pub fn store(&self) -> &Rc<StateStore> {
@@ -426,6 +532,13 @@ impl TargetLaunchCore {
 
     pub fn conditioning_slices(&self) -> &[Vec<ConditioningSlice>] {
         &self.conditioning_slices
+    }
+
+    /// Per slot, the accepted tokens its sequence holds before the slot's
+    /// first row, oldest first, as many as the model's row rules read;
+    /// empty of a model without one.
+    pub fn preceding(&self) -> &[Vec<u64>] {
+        &self.preceding
     }
 
     pub fn into_parts(

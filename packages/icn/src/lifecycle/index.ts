@@ -8,13 +8,13 @@ import * as HttpClientError from "@effect/platform/HttpClientError";
 import * as Path from "@effect/platform/Path";
 import {
   IcnBinaryIdentity,
-  IcnStartupProgressRecord,
   IcnStartupRecord,
 } from "@magnitudedev/icn-protocol";
 import { GeneratedClientTransportError } from "@magnitudedev/openapi-effect/client-runtime";
 import { FSM } from "@magnitudedev/utils";
 import { openLogFile, type LogFile } from "@magnitudedev/utils/log-file";
 import { dirname, join } from "node:path";
+import { LocalModelsConfiguration } from "@magnitudedev/icn-protocol/schemas";
 import {
   Context,
   Deferred,
@@ -39,6 +39,7 @@ import {
   IcnExitedBeforeReady,
   IcnHealthIdentityMismatch,
   IcnIdentityProbeTimedOut,
+  IcnLocalModelsConfigurationUnwritable,
   IcnNativeBuildIncompatible,
   IcnReadinessCommitRejected,
   IcnReadinessTimedOut,
@@ -57,12 +58,12 @@ import {
 import { resolveReleaseIcnInstallation } from "./release-installation.js";
 import {
   IcnPreparationReporter,
-  icnPreparationBackend,
   type IcnPreparationReporter as IcnPreparationReporterService,
 } from "./preparation.js";
 
 export * from "./preparation.js";
 export * from "./errors.js";
+export { ReleaseIcnInstallationError } from "./release-installation.js";
 
 const PositiveInt = Schema.Int.pipe(Schema.greaterThan(0));
 const NonEmpty = Schema.String.pipe(Schema.minLength(1));
@@ -97,7 +98,8 @@ export class IcnStorageConfig extends Schema.Class<IcnStorageConfig>(
 )({
   modelStore: Schema.optionalWith(NonEmpty, { as: "Option", exact: true }),
   cacheRoot: Schema.optionalWith(NonEmpty, { as: "Option", exact: true }),
-  huggingFaceCaches: Schema.Array(NonEmpty),
+  localModelsConfigurationFile: NonEmpty,
+  localModels: LocalModelsConfiguration,
 }) {}
 
 export class IcnLifecycleConfig extends Schema.Class<IcnLifecycleConfig>(
@@ -117,6 +119,7 @@ export class IcnLifecycleConfig extends Schema.Class<IcnLifecycleConfig>(
   ),
   outputLimitBytes: PositiveInt,
   logFile: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
+  echoOutput: Schema.Boolean,
 }) {}
 
 export interface ResolvedIcnBinary {
@@ -372,8 +375,37 @@ export const renderIcnArguments = (
     onNone: () => [],
     onSome: (value) => ["--cache-root", value],
   }),
-  ...config.storage.huggingFaceCaches.flatMap((value) => ["--hf-cache", value]),
+  "--local-models-config",
+  config.storage.localModelsConfigurationFile,
 ];
+
+/** ICN's first scan reads this snapshot, so it must exist before the child starts. */
+export const writeLocalModelsConfiguration = (storage: IcnStorageConfig) =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const file = storage.localModelsConfigurationFile;
+    const encoded = yield* Schema.encode(Schema.parseJson(LocalModelsConfiguration))(storage.localModels);
+    yield* fs.makeDirectory(dirname(file), { recursive: true });
+    yield* fs.writeFileString(`${file}.pending`, encoded);
+    yield* fs.rename(`${file}.pending`, file);
+  });
+
+/**
+ * ICN's output is recorded, not shown: plain text, and a per-request line only on failure. ICN never
+ * reads a token from its environment or a token file; ACN delivers the Hugging Face credential at
+ * runtime.
+ */
+export const icnChildEnvironment = (
+  binaryEnvironment: Readonly<Record<string, string>>,
+  authorization: string,
+  inherited: Readonly<Record<string, string | undefined>> = globalThis.process.env,
+): Record<string, string> => ({
+  ...(inherited.RUST_LOG ? {} : { RUST_LOG: "info,tower_http=warn" }),
+  NO_COLOR: "1",
+  ...binaryEnvironment,
+  MAGNITUDE_ICN_AUTH_TOKEN: authorization,
+  HF_HUB_DISABLE_IMPLICIT_TOKEN: "1",
+});
 
 const acquireIcn = (input: IcnLifecycleConfig) =>
   Effect.gen(function* () {
@@ -382,6 +414,12 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
     const resolver = yield* IcnBinaryResolver;
     const reporter = yield* IcnPreparationReporter;
     const binary = yield* resolver.resolve(config.binary);
+    yield* writeLocalModelsConfiguration(config.storage).pipe(
+      Effect.mapError((cause) => new IcnLocalModelsConfigurationUnwritable({
+        path: config.storage.localModelsConfigurationFile,
+        detail: String(cause),
+      })),
+    );
     yield* reporter.report({ _tag: "Starting" });
     const instanceId = yield* opaqueInstanceId;
     const authorization = yield* opaqueInstanceId;
@@ -394,14 +432,7 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
         const process = yield* children.spawn(new IcnChildLaunch({
           executable: installationNativePath(binary.path),
           arguments: renderIcnArguments(config, instanceId, binary.installation),
-          // Output is recorded, not shown: plain text, and a per-request line only on failure.
-          environment: {
-            ...(globalThis.process.env.RUST_LOG ? {} : { RUST_LOG: "info,tower_http=warn" }),
-            NO_COLOR: "1",
-            ...binary.environment,
-            MAGNITUDE_ICN_AUTH_TOKEN: authorization,
-            HF_HUB_DISABLE_IMPLICIT_TOKEN: "1",
-          },
+          environment: icnChildEnvironment(binary.environment, authorization),
           gracefulShutdownTimeout: config.gracefulShutdownTimeout,
           forceShutdownTimeout: config.forceShutdownTimeout,
         }));
@@ -423,8 +454,12 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
       onNone: () => Effect.succeed(Option.none<LogFile>()),
       onSome: (file) => openLogFile(file, 10 * 1024 * 1024).pipe(Effect.map(Option.some)),
     });
+    // Echoed output reaches whatever collects this process's standard error, such as `docker logs`.
+    const echo = (text: string) => config.echoOutput
+      ? Effect.sync(() => { globalThis.process.stderr.write(text) })
+      : Effect.void;
     const logged = (text: string) =>
-      Option.match(log, { onNone: () => Effect.void, onSome: (file) => file.append(text) });
+      Option.match(log, { onNone: () => Effect.void, onSome: (file) => file.append(text) }).pipe(Effect.zipRight(echo(text)));
     const record = (note: string) => logged(`[${new Date().toISOString()}] ${note}\n`);
     yield* record(`magnitude-inference started (pid ${process.pid})`);
     const startupRecord = yield* Deferred.make<
@@ -440,17 +475,6 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
         Effect.gen(function* () {
           yield* appendBounded(output, `${line}\n`, config.outputLimitBytes);
           yield* logged(`${line}\n`);
-          if (line.startsWith("MAGNITUDE_ICN_PROGRESS ")) {
-            const encoded = line.slice("MAGNITUDE_ICN_PROGRESS ".length);
-            const record = yield* Schema.decodeUnknown(
-              Schema.parseJson(IcnStartupProgressRecord)
-            )(encoded);
-            yield* reporter.report({
-              _tag: "PreparingBackend",
-              backend: icnPreparationBackend(record.backend),
-            });
-            return;
-          }
           if (!line.startsWith("MAGNITUDE_ICN_READY ")) return;
           const encoded = line.slice("MAGNITUDE_ICN_READY ".length);
           const record = yield* Schema.decodeUnknown(

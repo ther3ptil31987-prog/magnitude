@@ -295,13 +295,51 @@ impl std::fmt::Display for Formation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "nvrtc {}.{};sm_{};{}",
+            "nvrtc {}.{};{};{}",
             self.release.0,
             self.release.1,
-            self.architecture,
+            target(self.architecture),
             self.options.join(" ")
         )
     }
+}
+
+/// The NVRTC target of `sm_<architecture>`: from compute capability 9.0 its
+/// architecture-specific feature set (`sm_<architecture>a`), so a kernel may
+/// use every instruction of the device it is compiled for (FP4 block-scaled
+/// MMA on sm_120 and sm_121). The CUBIN runs on that architecture alone, as
+/// every formation's does.
+fn target(architecture: u32) -> String {
+    if architecture_specific(architecture) {
+        format!("sm_{architecture}a")
+    } else {
+        format!("sm_{architecture}")
+    }
+}
+
+/// Whether the target of `sm_<architecture>` is its architecture-specific
+/// feature set ([`target`]).
+fn architecture_specific(architecture: u32) -> bool {
+    architecture >= 90
+}
+
+/// The macros the device compilation of `sm_<architecture>`'s target
+/// predefines, with their values: `__CUDA_ARCH__`, and for an
+/// architecture-specific target also `__CUDA_ARCH_SPECIFIC__` and
+/// `__CUDA_ARCH_FAMILY_SPECIFIC__`, each the same value.
+pub const ARCHITECTURE_MACROS: [&str; 3] = [
+    "__CUDA_ARCH__",
+    "__CUDA_ARCH_SPECIFIC__",
+    "__CUDA_ARCH_FAMILY_SPECIFIC__",
+];
+
+/// [`ARCHITECTURE_MACROS`] as `sm_<architecture>`'s target defines them.
+pub fn architecture_macros(architecture: u32) -> Vec<(&'static str, u32)> {
+    let defined = if architecture_specific(architecture) { 3 } else { 1 };
+    ARCHITECTURE_MACROS[..defined]
+        .iter()
+        .map(|&name| (name, architecture * 10))
+        .collect()
 }
 
 /// A CUBIN and the formation that produced it.
@@ -350,6 +388,14 @@ pub fn release() -> Result<(u32, u32), NvrtcError> {
 /// plain `extern "C"` name or a template instance). NVRTC gives their linker
 /// symbols back in request order; callers retain those symbols alongside the
 /// image when keeping it.
+///
+/// The compile runs on the thread that asks for it. A compile allocates and
+/// frees tens of megabytes of host heap, which an allocator keeps for the
+/// thread that freed it, so whoever owns a span of formation owns the
+/// threads it compiles on and returns what they freed when it is done
+/// ([`seismic_native_target::workers::Workers`],
+/// [`seismic_native_target::process::return_freed_pages`]): this module
+/// starts no thread and keeps none.
 pub fn compile_cubin_named(
     source: &str,
     name: &str,
@@ -418,7 +464,7 @@ impl Nvrtc {
                 "add name expression",
             )?;
         }
-        let arch = CString::new(format!("-arch=sm_{architecture}")).expect("no NUL");
+        let arch = CString::new(format!("-arch={}", target(architecture))).expect("no NUL");
         let fixed = COMPILE_OPTIONS
             .iter()
             .map(|option| CString::new(*option).expect("no NUL"))
@@ -469,6 +515,11 @@ impl Nvrtc {
             unsafe { (nvrtc.cubin)(owned.1, image.as_mut_ptr().cast()) },
             "CUBIN",
         )?;
+        // The compile holds its program and what it formed: a reading of
+        // the footprint here is in the peak where the peak is of readings.
+        if seismic_native_target::process::ProcessMemory::PEAK_IS_SAMPLED {
+            seismic_native_target::process::ProcessMemory::footprint_now();
+        }
         Ok(Cubin {
             image,
             lowered_names,
@@ -487,6 +538,24 @@ mod tests {
 
     fn installation_root() -> PathBuf {
         std::env::temp_dir().join("seismic-nvrtc-installation")
+    }
+
+    /// An architecture-specific target also predefines the specific and
+    /// family macros, each `__CUDA_ARCH__`'s value (as `nvcc -arch=sm_121a`
+    /// compiles device code); an earlier architecture's only `__CUDA_ARCH__`.
+    #[test]
+    fn the_architecture_macros_are_those_of_the_formation_target() {
+        assert_eq!(target(86), "sm_86");
+        assert_eq!(architecture_macros(86), [("__CUDA_ARCH__", 860)]);
+        assert_eq!(target(121), "sm_121a");
+        assert_eq!(
+            architecture_macros(121),
+            [
+                ("__CUDA_ARCH__", 1210),
+                ("__CUDA_ARCH_SPECIFIC__", 1210),
+                ("__CUDA_ARCH_FAMILY_SPECIFIC__", 1210),
+            ]
+        );
     }
 
     #[test]

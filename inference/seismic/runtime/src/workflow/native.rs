@@ -2,7 +2,7 @@
 use crate::driver::workflow::{
     AccessMode, AllocationDescription, AllocationKind, ArgumentBinding, BoundInvocation, BoundNode,
     ByteRange, OutputDescription, OutputRef, PlanError, PreparedPolicy, ResourceId,
-    ScalarDescriptor, ScalarValue, TensorDescriptor, WorkflowId, WorkflowPlanDraft,
+    ScalarDescriptor, TensorDescriptor, WorkflowId, WorkflowPlanDraft,
 };
 use crate::driver::AdmittedCommand;
 use crate::driver::*;
@@ -147,8 +147,11 @@ impl<T: TargetFamily, E: NativeExecutor<T>> PreparedPolicy for InvocationTarget<
             .iter()
             .map(|parameter| match &parameter.kind {
                 ParameterKind::Tensor { access, .. } => Some(match access {
-                    TensorAccess::Shared => AccessMode::Read,
-                    TensorAccess::Owned | TensorAccess::Mutable => AccessMode::ReadWrite,
+                    TensorAccess::Shared | TensorAccess::Host { write: false } => AccessMode::Read,
+                    // Ordered as the host's rewrite once it sees the launch.
+                    TensorAccess::Owned | TensorAccess::Mutable | TensorAccess::Host { write: true } => {
+                        AccessMode::ReadWrite
+                    }
                 }),
                 ParameterKind::Scalar { .. }
                 | ParameterKind::Index { .. }
@@ -249,25 +252,12 @@ fn descriptor_argument(
             })
         }
         crate::driver::workflow::ValueDescriptor::Scalar(ScalarDescriptor::HostReady(value)) => {
-            scalar_argument(value.clone())
+            value.value()
         }
         crate::driver::workflow::ValueDescriptor::PendingTensor { .. }
         | crate::driver::workflow::ValueDescriptor::Scalar(ScalarDescriptor::DeviceProduced) => {
             unreachable!("device-produced scalars are rejected at the workflow boundary")
         }
-    }
-}
-
-fn scalar_argument(value: ScalarValue) -> ArgumentValue {
-    match value {
-        ScalarValue::F32Bits(bits) => ArgumentValue::F32(f32::from_bits(bits)),
-        ScalarValue::F16(value) => ArgumentValue::F16(value),
-        ScalarValue::BF16(value) => ArgumentValue::BF16(value),
-        ScalarValue::I32(value) => ArgumentValue::I32(value),
-        ScalarValue::U32(value) => ArgumentValue::U32(value),
-        ScalarValue::Bool(value) => ArgumentValue::Bool(value),
-        ScalarValue::Index(value) => ArgumentValue::Index(value),
-        ScalarValue::Range { start, end } => ArgumentValue::Range { start, end },
     }
 }
 
@@ -526,18 +516,13 @@ fn preclaim_resources<T: TargetFamily, E: NativeExecutor<T>>(
     let access = requests
         .into_values()
         .map(|(allocation, write, _)| allocation.acquire(write))
-        .collect();
+        .collect::<Result<_, _>>()
+        .map_err(CallError::Execution)?;
     let claims = keys
         .iter()
         .map(|(key, table)| (*key, table.claim_growth((key.1, key.2))))
         .collect();
-    let reservation = device.memory.reserve(0).map_err(|capacity| {
-        CallError::Invocation(InvocationError::AllocationCapacity {
-            required: capacity.required.into(),
-            available: capacity.available,
-        })
-    })?;
-    let mut resources = AdmittedResources::new(reservation, access);
+    let mut resources = AdmittedResources::new(access);
     resources.retain_preclaims(claims);
     drop(guard);
     Ok(resources)
@@ -587,16 +572,12 @@ fn admit_reached_node<T: TargetFamily, E: NativeExecutor<T>>(
     resources
         .check_reached_capacity(required)
         .map_err(CallError::Execution)?;
-    let mut reservation = device.memory.reserve(required).map_err(|capacity| {
-        CallError::Invocation(InvocationError::AllocationCapacity {
-            required: capacity.required.into(),
-            available: capacity.available,
-        })
-    })?;
+    // Each allocation's backend charges it as it is made; a refusal drops
+    // those made before it, freeing their charges.
     let mut replacements = Vec::new();
     for (requirement, bytes) in demands {
         let allocation = device
-            .allocate_reserved(bytes, requirement.alignment, &mut reservation)
+            .allocate_storage(bytes, requirement.alignment)
             .map_err(CallError::Execution)?;
         if let ResourceId::Persistent {
             owner,
@@ -606,12 +587,7 @@ fn admit_reached_node<T: TargetFamily, E: NativeExecutor<T>>(
         {
             let key = (owner, variant as usize, slot as usize);
             if let Some(old) = resources.preclaimed_binding(key) {
-                copy_between::<T, E>(
-                    &*device.service,
-                    typed_buffer::<T, E>(&old.allocation),
-                    typed_buffer::<T, E>(&allocation),
-                    old.capacity,
-                )
+                copy_between(&old.allocation, &allocation, old.capacity)
                 .map_err(CallError::Execution)?;
             }
             replacements.push((
@@ -751,10 +727,10 @@ impl<T: TargetFamily, E: NativeExecutor<T>> WorkflowGraphDraft<T, E> {
         let mut keys = BTreeMap::new();
         for queued in self.nodes {
             let mut bindings = Vec::new();
-            for argument in queued.args.into_arguments() {
+            for (ordinal, argument) in queued.args.into_arguments().into_iter().enumerate() {
                 bindings.push(match argument {
                     EncodedWorkflowArgument::Tensor(WorkflowTensorArgument::External(tensor)) => {
-                        let descriptor = tensor_descriptor(&tensor);
+                        let descriptor = tensor_descriptor(&tensor, ordinal)?;
                         physical
                             .entry(descriptor.resource)
                             .or_insert_with(|| tensor.allocation().clone());
@@ -768,6 +744,7 @@ impl<T: TargetFamily, E: NativeExecutor<T>> WorkflowGraphDraft<T, E> {
                     EncodedWorkflowArgument::Tensor(WorkflowTensorArgument::ResultView {
                         result,
                         operations,
+                        ..
                     }) => ArgumentBinding::ResultView {
                         result: output_ref(result),
                         operations,
@@ -884,10 +861,10 @@ pub(crate) fn admit_trial<T: TargetFamily, E: NativeExecutor<T>>(
 ) -> Result<AdmittedRun<T, E>, CallError> {
     let mut physical = BTreeMap::new();
     let mut descriptors = Vec::new();
-    for argument in args.into_workflow().into_arguments() {
+    for (ordinal, argument) in args.into_workflow().into_arguments().into_iter().enumerate() {
         descriptors.push(match argument {
             EncodedWorkflowArgument::Tensor(WorkflowTensorArgument::External(tensor)) => {
-                let descriptor = tensor_descriptor(&tensor);
+                let descriptor = tensor_descriptor(&tensor, ordinal)?;
                 physical.insert(descriptor.resource, tensor.allocation().clone());
                 crate::driver::workflow::ValueDescriptor::Tensor(descriptor)
             }
@@ -934,9 +911,10 @@ fn output_ref(reference: crate::api::kernel::WorkflowResultRef) -> OutputRef {
     OutputRef::from_raw(reference.workflow, reference.node, reference.result)
 }
 
-fn tensor_descriptor(tensor: &TensorInner) -> TensorDescriptor {
+/// The binding of `tensor`, argument `ordinal` of a language kernel.
+fn tensor_descriptor(tensor: &TensorInner, ordinal: usize) -> Result<TensorDescriptor, CallError> {
     let source = tensor.descriptor();
-    TensorDescriptor {
+    Ok(TensorDescriptor {
         device: source.device,
         resource: ResourceId::External(tensor.allocation().identity()),
         representation: source.representation,
@@ -946,7 +924,7 @@ fn tensor_descriptor(tensor: &TensorInner) -> TensorDescriptor {
             offset: source.byte_offset,
             len: source.byte_len,
         },
-    }
+    })
 }
 
 fn plan_error(error: PlanError<CallError>) -> CallError {
@@ -1145,8 +1123,10 @@ mod preclaim_tests {
 
     #[test]
     fn opposite_graph_key_orders_preclaim_without_deadlock_or_unused_capacity() {
-        let catalog = crate::devices::Catalog::discover().unwrap();
-        let device = catalog.open_backend(registry::BackendName::Cpu).unwrap();
+        let devices = crate::devices::Devices::discover(&[]).unwrap();
+        let id = devices.executor_of(registry::BackendName::Cpu).unwrap();
+        let tally = crate::memory::Tally::unbounded(seismic_topology::StoreIdentity::HostRam);
+        let device = devices.open_own(id, Default::default(), vec![Arc::new(tally.clone())]).unwrap();
         let crate::backends::OpenedKind::Cpu(opened) = &device.kind else {
             unreachable!()
         };
@@ -1159,8 +1139,8 @@ mod preclaim_tests {
             capacity: 16,
         });
         drop(prior);
-        let baseline = opened.memory_usage().charged;
-        opened.memory.set_limit(Some(baseline));
+        let baseline = tally.held();
+        tally.bound(baseline);
         let gate = Arc::new(std::sync::Barrier::new(3));
         let (send, receive) = std::sync::mpsc::channel();
         let mut workers = Vec::new();
@@ -1171,6 +1151,7 @@ mod preclaim_tests {
             let second = second.clone();
             let gate = gate.clone();
             let send = send.clone();
+            let tally = tally.clone();
             workers.push(std::thread::spawn(move || {
                 let mut keys = BTreeMap::new();
                 for slot in if reverse { [1, 0] } else { [0, 1] } {
@@ -1188,7 +1169,7 @@ mod preclaim_tests {
                 gate.wait();
                 let resources = preclaim_resources(&opened, &keys, &external).unwrap();
                 assert_eq!(resources.reached_allocated(), 0);
-                assert_eq!(opened.memory_usage().charged, baseline);
+                assert_eq!(tally.held(), baseline);
                 // The absent key belongs to an unselected portfolio arm. No
                 // allocation is made even though the memory limit is full.
                 assert!(resources.preclaimed_binding((1, 0, 1)).is_none());
@@ -1209,6 +1190,6 @@ mod preclaim_tests {
             table.preclaim_availability((0, 1)),
             PersistentAvailability::Grow { old: None }
         ));
-        assert_eq!(opened.memory_usage().charged, baseline);
+        assert_eq!(tally.held(), baseline);
     }
 }

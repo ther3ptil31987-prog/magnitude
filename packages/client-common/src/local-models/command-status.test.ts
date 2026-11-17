@@ -1,8 +1,8 @@
 import { Cause, FiberId, Option } from "effect"
-import { CatalogFormModelIdSchema, LocalModelMutationFailed } from "@magnitudedev/sdk"
+import { CatalogFormModelIdSchema, LocalInferenceDeviceIdSchema, LocalModelMutationFailed } from "@magnitudedev/sdk"
 import { describe, expect, it } from "vitest"
 import { localModelCommandStatus, localModelCommandFailure, type LocalModelCommand } from "./service"
-import { makeSetupModel } from "../desktop/fixtures/model"
+import { makeSetupModel } from "../application/fixtures/model"
 const first = CatalogFormModelIdSchema.make("first:gguf:q4")
 const second = CatalogFormModelIdSchema.make("second:gguf:q4")
 const failure = (operation: LocalModelCommand, code = "memory_shortage") => localModelCommandFailure(operation, Cause.fail(new LocalModelMutationFailed({ code, message: "private diagnostics", retryable: true })))
@@ -27,7 +27,7 @@ describe("model-specific command feedback", () => {
   })
   it("retires load feedback when the model is observed ready without erasing other commands", () => {
     const base = makeSetupModel(true)
-    const model = { ...base, modelId: first, acquisitionState: { ...base.acquisitionState, residencyState: { _tag: "Ready" as const, allocation: { contextWindowTokens: 4096, memoryDomains: [] } } } }
+    const model = { ...base, modelId: first, acquisitionState: { ...base.acquisitionState, residencyState: { _tag: "Ready" as const, allocation: { contextWindowTokens: 4096, memoryDomains: [], promptGroupPlaces: { held: 1, capacity: 1 }, streaming: Option.none() }, device: { deviceId: LocalInferenceDeviceIdSchema.make("cuda:0"), backend: "cuda" as const } } } }
     expect(localModelCommandStatus(first, [[observation("load")], [observation("remove")]], Option.some(model)).failures).toEqual([failure("remove")])
   })
   it("shows removal failure once while retaining a separate load rejection", () => {

@@ -3,17 +3,40 @@ import { Rpc } from "@effect/rpc"
 import { replaySafe, atMostOnce } from "../transport/recovery"
 import { Option, Schema } from "effect"
 import { ProviderIdSchema } from "@magnitudedev/ai/provider/model"
+import { OpenAiModelsResponse } from "@magnitudedev/icn-protocol/schemas"
 import {
+  CustomModelMutationError,
   LocalInferenceError,
+  LocalModelMutationFailed,
+  ModelCandidateError,
+  ModelLocationError,
   ModelPreferenceMutationFailed,
   ModelSlotUpdateError,
+  ModelVersionNotRunnable,
+  ServableModelsUnavailable,
 } from "../errors"
 import {
+  AutomaticModelLocationKindSchema,
+  AddedModelSchema,
+  CatalogComponentSchema,
+  CandidateInspectionUpdateSchema,
+  CandidateInspectionSchema,
+  CustomFormModelIdSchema,
+  DrafterCandidateSchema,
+  DrafterChoiceSchema,
+  DrafterTargetSchema,
+  HuggingFaceRepositoryCheckSchema,
+  HuggingFaceRepositoryIdSchema,
+  HuggingFaceSearchQuerySchema,
+  HuggingFaceSearchResponseSchema,
   LocalInferenceHardwareSchema,
-  CatalogFormModelIdSchema,
+  LocalModelSyncOutcomeSchema,
   ModelIdSchema,
+  ModelLocationSchema,
   ModelCatalogStateSchema,
+  CountryCodeSchema,
   ModelLoadPlanSchema,
+  RecommendationsSchema,
   ModelSlotsStateSchema,
   ProviderModelIdentitySchema,
   SlotIdSchema,
@@ -22,9 +45,27 @@ import {
 
 const GetServingUsage = Rpc.make("GetServingUsage", { payload: ServingUsageRequest, success: ServingUsageSnapshot }).pipe(replaySafe)
 
+/** The models the inference service serves now, with what each accepts and produces. */
+const ListServableModels = Rpc.make("ListServableModels", {
+  payload: Schema.Struct({}),
+  success: OpenAiModelsResponse,
+  error: ServableModelsUnavailable,
+}).pipe(replaySafe)
+
 const GetCatalog = Rpc.make("GetModelCatalog", {
   payload: Schema.Struct({}),
   success: ModelCatalogStateSchema,
+}).pipe(replaySafe)
+
+/**
+ * The tested models in the order they are recommended for this machine, each with its chosen rung, and the
+ * families Magnitude runs. With `developerCountry`, only models whose developer is from that country.
+ */
+const GetRecommendations = Rpc.make("GetRecommendations", {
+  payload: Schema.Struct({
+    developerCountry: Schema.optionalWith(CountryCodeSchema, { as: "Option", exact: true }),
+  }),
+  success: RecommendationsSchema,
 }).pipe(replaySafe)
 
 const GetSlots = Rpc.make("GetModelSlots", {
@@ -63,14 +104,22 @@ const SetFavorite = Rpc.make("SetModelFavorite", {
   error: ModelPreferenceMutationFailed,
 }).pipe(replaySafe)
 
+/** A catalog model not yet on this computer that needs more memory than it can provide is refused (ModelVersionNotRunnable). */
 const SyncLocalModel = Rpc.make("SyncLocalModel", {
-  payload: Schema.Struct({ modelId: CatalogFormModelIdSchema }),
-  success: Schema.Struct({ outcome: Schema.Literal("Started", "AlreadyCurrent") }),
+  payload: Schema.Struct({ modelId: ModelIdSchema }),
+  success: Schema.Struct({ outcome: LocalModelSyncOutcomeSchema }),
+  error: Schema.Union(LocalInferenceError, ModelVersionNotRunnable),
+}).pipe(atMostOnce)
+
+/** Fetches only one component a catalog model lacks (see CatalogMissingComponent); false when it is already here. */
+const DownloadCatalogComponent = Rpc.make("DownloadCatalogComponent", {
+  payload: Schema.Struct({ modelId: ModelIdSchema, component: CatalogComponentSchema }),
+  success: Schema.Struct({ started: Schema.Boolean }),
   error: LocalInferenceError,
 }).pipe(atMostOnce)
 
 const CancelLocalModelSync = Rpc.make("CancelLocalModelSync", {
-  payload: Schema.Struct({ modelId: CatalogFormModelIdSchema }),
+  payload: Schema.Struct({ modelId: ModelIdSchema }),
   success: Schema.Struct({}),
   error: LocalInferenceError,
 }).pipe(atMostOnce)
@@ -78,27 +127,35 @@ const CancelLocalModelSync = Rpc.make("CancelLocalModelSync", {
 const AcknowledgeLocalModelSyncFailure = Rpc.make(
   "AcknowledgeLocalModelSyncFailure",
   {
-    payload: Schema.Struct({ modelId: CatalogFormModelIdSchema }),
+    payload: Schema.Struct({ modelId: ModelIdSchema }),
     success: Schema.Struct({}),
     error: LocalInferenceError,
   }
 ).pipe(atMostOnce)
 
+/** `keptComponents`: the parts Magnitude stores for a found catalog model that the removal kept for another model. */
 const RemoveLocalModel = Rpc.make("RemoveLocalModel", {
-  payload: Schema.Struct({ modelId: CatalogFormModelIdSchema }),
-  success: Schema.Struct({}),
+  payload: Schema.Struct({ modelId: ModelIdSchema }),
+  success: Schema.Struct({ keptComponents: Schema.Array(CatalogComponentSchema) }),
   error: LocalInferenceError,
 }).pipe(atMostOnce)
 
 const LoadLocalModel = Rpc.make("LoadLocalModel", {
   payload: Schema.Struct({ modelId: ModelIdSchema }),
   success: Schema.Struct({}),
-  error: LocalInferenceError,
+  error: Schema.Union(LocalInferenceError, ModelVersionNotRunnable),
 }).pipe(atMostOnce)
 
 const StopActiveLocalModel = Rpc.make("StopActiveLocalModel", {
   payload: Schema.Struct({}),
   success: Schema.Struct({}),
+  error: LocalInferenceError,
+}).pipe(atMostOnce)
+
+/** `stopped` is false when the model wasn't loading, running or stopping, so there was nothing to stop. */
+const StopLocalModel = Rpc.make("StopLocalModel", {
+  payload: Schema.Struct({ modelId: ModelIdSchema }),
+  success: Schema.Struct({ stopped: Schema.Boolean }),
   error: LocalInferenceError,
 }).pipe(atMostOnce)
 
@@ -120,9 +177,143 @@ const PreviewSlotLoad = Rpc.make("PreviewModelSlotLoad", {
   error: LocalInferenceError,
 }).pipe(replaySafe)
 
+const optional = <A, I, R>(schema: Schema.Schema<A, I, R>) =>
+  Schema.optionalWith(schema, { as: "Option", exact: true })
+
+const NonEmptyString = Schema.String.pipe(Schema.minLength(1))
+
+/**
+ * One page of GGUF repositories on Hugging Face, as it lists them, without reading any file: each is checked on its own
+ * (`CheckHuggingFaceRepository`). `cursor` is a previous page's `nextCursor`.
+ */
+const SearchHuggingFaceModels = Rpc.make("SearchHuggingFaceModels", {
+  payload: Schema.Struct({
+    query: HuggingFaceSearchQuerySchema,
+    limit: optional(Schema.Int.pipe(Schema.between(1, 50))),
+    cursor: optional(NonEmptyString),
+  }),
+  success: HuggingFaceSearchResponseSchema,
+  error: ModelCandidateError,
+}).pipe(replaySafe)
+
+/**
+ * What a repository search listed holds on this machine: its model file's header, then the version its inspection
+ * would recommend. `architecture` is the one the search listed, which decides only when the header can't be read;
+ * `restricted` is whether it listed the repository as gated or private.
+ */
+const CheckHuggingFaceRepository = Rpc.make("CheckHuggingFaceRepository", {
+  payload: Schema.Struct({
+    repository: HuggingFaceRepositoryIdSchema,
+    commit: NonEmptyString,
+    architecture: optional(NonEmptyString),
+    restricted: Schema.Boolean,
+  }),
+  success: HuggingFaceRepositoryCheckSchema,
+  error: ModelCandidateError,
+}).pipe(replaySafe)
+
+/**
+ * A Hugging Face URL, `owner/repo`, `owner/repo:QUANT`, or local GGUF path, inspected without changes:
+ * its progress in order, then the inspection itself. Like every ACN subscription, it stays open after
+ * the inspection until the subscriber leaves.
+ */
+const StreamModelCandidateInspection = Rpc.make("StreamModelCandidateInspection", {
+  payload: Schema.Struct({ reference: NonEmptyString }),
+  success: CandidateInspectionUpdateSchema,
+  error: ModelCandidateError,
+  stream: true,
+})
+
+/**
+ * The same inspection answered once it is done, without its progress: a request that ends, so it holds no connection
+ * after it is answered.
+ */
+const InspectModelCandidate = Rpc.make("InspectModelCandidate", {
+  payload: Schema.Struct({ reference: NonEmptyString }),
+  success: CandidateInspectionSchema,
+  error: ModelCandidateError,
+}).pipe(replaySafe)
+
+/** Drafters for a target in preselection order; `other` adds any reference with the engine's verdict. */
+/** A target's drafter choices; with `other`, also the listed candidate that different drafter is. */
+const ListDrafterCandidates = Rpc.make("ListDrafterCandidates", {
+  payload: Schema.Struct({
+    target: DrafterTargetSchema,
+    other: optional(NonEmptyString),
+  }),
+  success: Schema.Struct({
+    candidates: Schema.Array(DrafterCandidateSchema),
+    entered: optional(DrafterCandidateSchema),
+  }),
+  error: ModelCandidateError,
+}).pipe(replaySafe)
+
+const ListModelLocations = Rpc.make("ListModelLocations", {
+  payload: Schema.Struct({}),
+  success: Schema.Struct({ locations: Schema.Array(ModelLocationSchema) }),
+  error: LocalModelMutationFailed,
+}).pipe(replaySafe)
+
+/**
+ * Pins the repository's commit, picks the recommended version when none is named, and starts the download. A
+ * version the engine can't run is refused, and one that needs more memory than this computer can provide is
+ * refused unless `force` is set (ModelVersionNotRunnable). A version that is exactly a catalog model is never
+ * declared as a custom model: the catalog model is installed instead, with its own drafter.
+ */
+const AddHuggingFaceModel = Rpc.make("AddHuggingFaceModel", {
+  payload: Schema.Struct({
+    repository: HuggingFaceRepositoryIdSchema,
+    revision: optional(NonEmptyString),
+    version: optional(NonEmptyString),
+    drafter: DrafterChoiceSchema,
+    force: Schema.Boolean,
+  }),
+  success: AddedModelSchema,
+  error: CustomModelMutationError,
+}).pipe(atMostOnce)
+
+/** Adds, changes, or turns off a custom model's drafter; downloads only the drafter when needed. */
+const SetModelDrafter = Rpc.make("SetModelDrafter", {
+  payload: Schema.Struct({ modelId: CustomFormModelIdSchema, drafter: DrafterChoiceSchema }),
+  success: Schema.Struct({ drafter: optional(DrafterCandidateSchema), drafterDownloadStarted: Schema.Boolean }),
+  error: CustomModelMutationError,
+}).pipe(atMostOnce)
+
+const HideModel = Rpc.make("HideModel", {
+  payload: Schema.Struct({ modelId: ModelIdSchema }),
+  success: Schema.Struct({}),
+  error: LocalModelMutationFailed,
+}).pipe(atMostOnce)
+
+const UnhideModel = Rpc.make("UnhideModel", {
+  payload: Schema.Struct({ modelId: ModelIdSchema }),
+  success: Schema.Struct({}),
+  error: LocalModelMutationFailed,
+}).pipe(atMostOnce)
+
+const AddModelFolder = Rpc.make("AddModelFolder", {
+  payload: Schema.Struct({ path: NonEmptyString }),
+  success: Schema.Struct({}),
+  error: ModelLocationError,
+}).pipe(atMostOnce)
+
+const RemoveModelFolder = Rpc.make("RemoveModelFolder", {
+  payload: Schema.Struct({ path: NonEmptyString }),
+  success: Schema.Struct({}),
+  error: ModelLocationError,
+}).pipe(atMostOnce)
+
+const SetModelLocationEnabled = Rpc.make("SetModelLocationEnabled", {
+  payload: Schema.Struct({ kind: AutomaticModelLocationKindSchema, enabled: Schema.Boolean }),
+  success: Schema.Struct({}),
+  error: LocalModelMutationFailed,
+}).pipe(atMostOnce)
+
 export const Models = {
   getServingUsage: GetServingUsage,
+  listServableModels: ListServableModels,
   getCatalog: GetCatalog,
+  getRecommendations: GetRecommendations,
   getSlots: GetSlots,
   getLocalEnvironment: GetLocalEnvironment,
   refreshCatalog: RefreshCatalog,
@@ -130,12 +321,27 @@ export const Models = {
   clearSlot: ClearSlot,
   setFavorite: SetFavorite,
   syncLocalModel: SyncLocalModel,
+  downloadCatalogComponent: DownloadCatalogComponent,
   cancelLocalModelSync: CancelLocalModelSync,
   acknowledgeLocalModelSyncFailure: AcknowledgeLocalModelSyncFailure,
   removeLocalModel: RemoveLocalModel,
   load: LoadLocalModel,
   stop: StopActiveLocalModel,
+  stopModel: StopLocalModel,
   loadSlot: LoadSlot,
   stopSlot: StopSlot,
   previewSlotLoad: PreviewSlotLoad,
+  searchHuggingFaceModels: SearchHuggingFaceModels,
+  checkHuggingFaceRepository: CheckHuggingFaceRepository,
+  streamModelCandidateInspection: StreamModelCandidateInspection,
+  inspectModelCandidate: InspectModelCandidate,
+  listDrafterCandidates: ListDrafterCandidates,
+  listModelLocations: ListModelLocations,
+  addHuggingFaceModel: AddHuggingFaceModel,
+  setModelDrafter: SetModelDrafter,
+  hideModel: HideModel,
+  unhideModel: UnhideModel,
+  addModelFolder: AddModelFolder,
+  removeModelFolder: RemoveModelFolder,
+  setModelLocationEnabled: SetModelLocationEnabled,
 }

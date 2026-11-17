@@ -95,10 +95,20 @@ export const formatMemorySize = (
   options: FormatMemorySizeOptions = {},
 ): string =>
   formatScaledSize(bytes, {
-    base: 1024,
+    base: 1000,
     minimumUnit: "MB",
     fractionDigits: () => 1,
     rounding: options.rounding,
+  })
+
+/**
+ * A memory capacity as hardware is sold: binary units named GB, so 64 GiB of RAM reads 64 GB, not 68.7 GB.
+ */
+export const formatMemoryCapacity = (bytes: number): string =>
+  formatScaledSize(bytes, {
+    base: 1024,
+    minimumUnit: "MB",
+    fractionDigits: (amount) => amount >= 10 || Number.isInteger(amount) ? 0 : 1,
   })
 
 export const formatStorageSize = (
@@ -120,3 +130,12 @@ export const formatTransferRate = (bytesPerSecond: number): string => {
   const megabytes = bytesPerSecond / DECIMAL_MEGABYTE
   return `${megabytes >= 10 ? Math.round(megabytes) : megabytes.toFixed(1)} MB/s`
 }
+
+/** A context length as people name it: 32K for 32,768 tokens, 1M for 1,048,576. */
+export const formatContext = (tokens: number): string => tokens < 1_000
+  ? String(tokens)
+  : tokens % 1_048_576 === 0
+    ? `${tokens / 1_048_576}M`
+    : tokens % 1_024 === 0
+      ? `${tokens / 1_024}K`
+      : `${Math.round(tokens / 1_000)}K`

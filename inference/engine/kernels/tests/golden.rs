@@ -11,9 +11,9 @@
 //! nondeterministic outputs); `compare` requires identical hashes for the
 //! same key set.
 //!
-//! Sources are read from `kernels/` (or `GOLDEN_KERNELS`) at run time through
-//! the dynamic API, so a record, an edit of the kernel sources and a compare
-//! run use one test binary.
+//! Sources are read from `kernels/` under the run-time `CARGO_MANIFEST_DIR`
+//! through the dynamic API, so a record, an edit of the kernel sources and a
+//! compare run use one test binary.
 //!
 //! ```text
 //! GOLDEN_MODE=record|compare GOLDEN_DIR=<dir> GOLDEN_FAMILIES=projection,readout \
@@ -25,8 +25,9 @@
 //! import, state, vision, plus `library` (every entry built on the projection
 //! library) and `all`.
 
+use magnitude_ggml::Encoding;
 use seismic::dynamic::{Function, Module, Scalar, SignatureType, Tensor, TensorAccess, Value};
-use seismic::{BackendName, Device, DeviceCatalog, Element, Layout, NativeSpecialization};
+use seismic::{BackendName, Device, Element, Layout, NativeSpecialization};
 use seismic_lang::checked::{CheckedModule, NativeImplementation};
 use seismic_lang::registry::{bf16_round, f16_bits};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -35,32 +36,22 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+mod gguf_formats;
+
+use gguf_formats::{Format, Rng};
+
 // ---------------------------------------------------------------------------
 // Values
 // ---------------------------------------------------------------------------
 
-struct Rng(u64);
-
 impl Rng {
-    fn new(seed: u64) -> Self {
+    /// The generator for `seed` as golden's records were drawn: the seed
+    /// keyed straight into the state, without `new`'s step.
+    fn keyed(seed: u64) -> Self {
         Self(seed ^ 0x9e37_79b9_7f4a_7c15)
-    }
-    fn next(&mut self) -> u32 {
-        self.0 = self
-            .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        (self.0 >> 33) as u32
     }
     fn below(&mut self, bound: usize) -> usize {
         self.next() as usize % bound
-    }
-    /// Uniform in [-1, 1).
-    fn unit(&mut self) -> f32 {
-        (self.next() as f32 / (1u64 << 31) as f32) * 2.0 - 1.0
-    }
-    fn byte(&mut self) -> u8 {
-        self.next() as u8
     }
 }
 
@@ -70,7 +61,7 @@ fn activations(rng: &mut Rng, rows: usize, width: usize, scale: f32) -> Vec<f32>
     let outliers = [width / 7, width / 3, width / 2 + 1, width - 5];
     (0..rows * width)
         .map(|index| {
-            let value = rng.unit() * scale;
+            let value = rng.uniform(-1.0, 1.0) * scale;
             if width > 64 && outliers.contains(&(index % width)) {
                 value * 40.0
             } else {
@@ -82,7 +73,7 @@ fn activations(rng: &mut Rng, rows: usize, width: usize, scale: f32) -> Vec<f32>
 
 fn uniform(rng: &mut Rng, count: usize, low: f32, high: f32) -> Vec<f32> {
     (0..count)
-        .map(|_| low + (high - low) * (rng.unit() + 1.0) * 0.5)
+        .map(|_| low + (high - low) * (rng.uniform(-1.0, 1.0) + 1.0) * 0.5)
         .collect()
 }
 
@@ -138,92 +129,22 @@ fn hash(bytes: &[u8]) -> String {
 // Weights
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Format {
-    Q4K,
-    Q5K,
-    Q6K,
-    Q8,
-    Iq4,
-}
+/// The magnitude of synthetic weights' values, packed and dense.
+const WEIGHT_SCALE: f32 = 0.04;
+
+/// The formats `repack_weight` covers.
+const REPACKED: [Format; 5] = [
+    Format::Q4K,
+    Format::Q5K,
+    Format::Q6K,
+    Format::Q8,
+    Format::IQ4_XS,
+];
 
 impl Format {
+    /// The format of GGUF tensor type `kind`.
     fn from_gguf(kind: u32) -> Self {
-        match kind {
-            12 => Self::Q4K,
-            13 => Self::Q5K,
-            14 => Self::Q6K,
-            8 => Self::Q8,
-            23 => Self::Iq4,
-            other => panic!("GGUF type {other}"),
-        }
-    }
-    fn external(self) -> Element {
-        Element::named(match self {
-            Self::Q4K => "gguf_q4_k",
-            Self::Q5K => "gguf_q5_k",
-            Self::Q6K => "gguf_q6_k",
-            Self::Q8 => "gguf_q8_0",
-            Self::Iq4 => "gguf_iq4_xs",
-        })
-        .unwrap()
-    }
-    fn representation(self) -> &'static str {
-        match self {
-            Self::Q4K => "q4k",
-            Self::Q5K => "q5k",
-            Self::Q6K => "q6k",
-            Self::Q8 => "q8g32s",
-            Self::Iq4 => "iq4g32",
-        }
-    }
-    fn block_values(self) -> usize {
-        match self {
-            Self::Q8 => 32,
-            _ => 256,
-        }
-    }
-    fn block_bytes(self) -> usize {
-        match self {
-            Self::Q4K => 144,
-            Self::Q5K => 176,
-            Self::Q6K => 210,
-            Self::Q8 => 34,
-            Self::Iq4 => 136,
-        }
-    }
-    /// One pseudo-random GGUF block with GGUF-like (small positive) factors.
-    fn block(self, rng: &mut Rng) -> Vec<u8> {
-        let f16 = |value: f32| f16_bits(value).to_le_bytes();
-        let mut block = Vec::new();
-        let factor =
-            |rng: &mut Rng, low: f32, high: f32| low + (high - low) * (rng.unit() + 1.0) * 0.5;
-        match self {
-            Self::Q4K | Self::Q5K => {
-                block.extend(f16(factor(rng, 0.0005, 0.003)));
-                block.extend(f16(factor(rng, 0.0, 0.002)));
-                let bytes = if self == Self::Q4K {
-                    12 + 128
-                } else {
-                    12 + 32 + 128
-                };
-                block.extend((0..bytes).map(|_| rng.byte()));
-            }
-            Self::Q6K => {
-                block.extend((0..128 + 64).map(|_| rng.byte()));
-                block.extend((0..16).map(|_| (rng.next() % 128) as u8 ^ 0xC0));
-                block.extend(f16(factor(rng, 0.0002, 0.001)));
-            }
-            Self::Q8 => {
-                block.extend(f16(factor(rng, 0.001, 0.005)));
-                block.extend((0..32).map(|_| rng.byte()));
-            }
-            Self::Iq4 => {
-                block.extend(f16(factor(rng, 0.0005, 0.003)));
-                block.extend((0..2 + 4 + 128).map(|_| rng.byte()));
-            }
-        }
-        block
+        Format::rounded(Encoding::from_id(kind).unwrap_or_else(|| panic!("GGUF type {kind}")))
     }
 }
 
@@ -410,11 +331,7 @@ struct Ctx {
 
 impl Ctx {
     fn layout(&self) -> Layout {
-        match self.backend {
-            BackendName::Cuda => Layout::Mma16,
-            BackendName::Metal => Layout::Rows32,
-            _ => Layout::Rows16,
-        }
+        self.backend.resident_layout()
     }
     fn tensor(&self, element: Element, shape: &[u64], bytes: &[u8]) -> Tensor {
         Tensor::from_host(&self.device, element, shape, bytes)
@@ -434,13 +351,13 @@ impl Ctx {
         Arg::Shared(self.tensor(Element::i32(), shape, &i32_bytes(values)))
     }
     fn resident(&self, format: Format) -> Element {
-        Element::stored(format.representation(), self.layout()).unwrap()
+        format.element(self.layout())
     }
     /// A resident packed weight of `shape` from external GGUF bytes.
     fn packed(&self, format: Format, shape: &[u64], external: &[u8]) -> Tensor {
         let resident = self.resident(format);
         let bytes = resident
-            .repack_host(format.external(), shape, external)
+            .repack_host(format.source(), shape, external)
             .unwrap_or_else(|| panic!("{format:?} {shape:?} repack"));
         self.tensor(resident, shape, &bytes)
     }
@@ -448,12 +365,12 @@ impl Ctx {
     /// A dense weight of `shape` with GGUF-like magnitudes (the host decode
     /// of a packed weight is far too slow at model widths).
     fn dense_weight(&self, shape: &[u64], seed: u64, element: Element) -> Tensor {
-        let mut rng = Rng::new(seed);
+        let mut rng = Rng::keyed(seed);
         let values = uniform(
             &mut rng,
             shape.iter().product::<u64>() as usize,
-            -0.04,
-            0.04,
+            -WEIGHT_SCALE,
+            WEIGHT_SCALE,
         );
         self.tensor(element, shape, &dense_bytes(element, &values))
     }
@@ -496,11 +413,8 @@ impl Ctx {
         if let Some(element) = dense {
             return self.dense_weight(shape, seed, element);
         }
-        let mut rng = Rng::new(seed);
-        let values = shape.iter().product::<u64>() as usize;
-        let external = (0..values / format.block_values())
-            .flat_map(|_| format.block(&mut rng))
-            .collect::<Vec<_>>();
+        let mut rng = Rng::keyed(seed);
+        let external = format.external(&mut rng, shape, WEIGHT_SCALE);
         self.packed(format, shape, &external)
     }
     fn norm(&self, name: &str, element: Element) -> Arg {
@@ -585,7 +499,7 @@ fn dense_expand(ctx: &Ctx) -> Vec<Variant> {
             let (up, uf) = ctx.real("blk.0.ffn_up.weight", FFN, dense);
             let norm = ctx.norm("blk.0.post_attention_norm.weight", nw);
             let weight_element = |f: Format| dense.unwrap_or_else(|| ctx.resident(f));
-            let mut rng = Rng::new(1);
+            let mut rng = Rng::keyed(1);
             let cases = PROJECTION_ROWS
                 .iter()
                 .map(|&(m, o)| Case {
@@ -627,7 +541,7 @@ fn dense_output(ctx: &Ctx) -> Vec<Variant> {
         .into_iter()
         .map(|(label, a, _, dense, every)| {
             let (down, df) = ctx.real("blk.0.ffn_down.weight", HIDDEN, dense);
-            let mut rng = Rng::new(2);
+            let mut rng = Rng::keyed(2);
             let cases = PROJECTION_ROWS
                 .iter()
                 .map(|&(m, o)| Case {
@@ -679,7 +593,7 @@ fn attention_project(ctx: &Ctx) -> Vec<Variant> {
             // Qwen's form: the gate is interleaved in the query segment, so
             // the gate segment is zero rows of the query's element.
             let gate = ctx.tensor(element(qf), &[0, HIDDEN as u64], &[]);
-            let mut rng = Rng::new(3);
+            let mut rng = Rng::keyed(3);
             let cases = rows_only()
                 .into_iter()
                 .map(|m| Case {
@@ -709,6 +623,7 @@ fn attention_project(ctx: &Ctx) -> Vec<Variant> {
                     ("KW", element(kf)),
                     ("VW", element(vf)),
                     ("A", a),
+                    ("Y", a),
                 ],
                 statics: vec![
                     ("D", HIDDEN as u64),
@@ -729,7 +644,7 @@ fn attention_output(ctx: &Ctx) -> Vec<Variant> {
         .into_iter()
         .map(|(label, a, _, dense, every)| {
             let (weight, wf) = ctx.real("blk.3.attn_output.weight", HIDDEN, dense);
-            let mut rng = Rng::new(4);
+            let mut rng = Rng::keyed(4);
             let q = KV * GROUP;
             let cases = rows_only()
                 .into_iter()
@@ -788,7 +703,7 @@ fn recurrent_project(ctx: &Ctx) -> Vec<Variant> {
             let (beta, bf) = ctx.real("blk.0.ssm_beta.weight", VALUE_HEADS, dense);
             let norm = ctx.norm("blk.0.attn_norm.weight", nw);
             let element = |f: Format| dense.unwrap_or_else(|| ctx.resident(f));
-            let mut rng = Rng::new(5);
+            let mut rng = Rng::keyed(5);
             let cases = rows_only()
                 .into_iter()
                 .map(|m| Case {
@@ -833,7 +748,7 @@ fn recurrent_output(ctx: &Ctx) -> Vec<Variant> {
         .into_iter()
         .map(|(label, a, _, dense, every)| {
             let (weight, wf) = ctx.real("blk.0.ssm_out.weight", HIDDEN, dense);
-            let mut rng = Rng::new(6);
+            let mut rng = Rng::keyed(6);
             let cases = rows_only()
                 .into_iter()
                 .map(|m| Case {
@@ -886,15 +801,15 @@ fn recurrent_case(
     grouped: bool,
     seed: u64,
 ) -> Case {
-    let mut rng = Rng::new(seed);
+    let mut rng = Rng::keyed(seed);
     let channels = recurrent_channels();
     let width = recurrent_width();
     let gates = channels + VALUE_HEADS * STATE;
-    let mut projection = (0..rows * width).map(|_| rng.unit()).collect::<Vec<_>>();
+    let mut projection = (0..rows * width).map(|_| rng.uniform(-1.0, 1.0)).collect::<Vec<_>>();
     for row in 0..rows {
         for head in 0..VALUE_HEADS {
-            projection[row * width + gates + head] = rng.unit() * 3.0;
-            projection[row * width + gates + VALUE_HEADS + head] = rng.unit() * 4.0;
+            projection[row * width + gates + head] = rng.uniform(-1.0, 1.0) * 3.0;
+            projection[row * width + gates + VALUE_HEADS + head] = rng.uniform(-1.0, 1.0) * 4.0;
         }
     }
     // Two tape rows per bank: slots that stop early record them. Every slot
@@ -912,10 +827,10 @@ fn recurrent_case(
     for slot in slots {
         if slot.previous > 0 {
             for value in &mut window[slot.previous * window_bank..][..window_bank] {
-                *value = rng.unit();
+                *value = rng.uniform(-1.0, 1.0);
             }
             for value in &mut delta[slot.previous * delta_bank..][..delta_bank] {
-                *value = rng.unit() * 0.3;
+                *value = rng.uniform(-1.0, 1.0) * 0.3;
             }
         }
     }
@@ -1071,15 +986,16 @@ fn features_rows(ctx: &Ctx) -> Vec<Variant> {
     .into_iter()
     .map(|(label, a, nw)| {
         let norm = ctx.norm("output_norm.weight", nw);
-        let mut rng = Rng::new(7);
+        let mut rng = Rng::keyed(7);
         let cases = readout_rows()
             .into_iter()
             .map(|(m, o)| Case {
                 label: format!("m{m}o{o}"),
                 args: vec![
+                    // The rows as their `[M, PT, D]` parts (one part).
                     ctx.dense(
                         f32e(),
-                        &[m as u64, HIDDEN as u64],
+                        &[m as u64, 1, HIDDEN as u64],
                         &activations(&mut rng, m, HIDDEN, 1.0),
                     ),
                     norm.clone(),
@@ -1105,7 +1021,7 @@ fn head_rows(ctx: &Ctx) -> Vec<Variant> {
         .map(|(label, a, nw, dense, every)| {
             let (weight, wf) = ctx.real("token_embd.weight", VOCABULARY_SLICE, dense);
             let norm = ctx.norm("output_norm.weight", nw);
-            let mut rng = Rng::new(8);
+            let mut rng = Rng::keyed(8);
             let cases = PROJECTION_ROWS
                 .iter()
                 .map(|&(m, o)| Case {
@@ -1146,7 +1062,7 @@ fn selected_rows(ctx: &Ctx) -> Vec<Variant> {
         .map(|(label, a, nw, dense, every)| {
             let (weight, wf) = ctx.real("token_embd.weight", VOCABULARY_SLICE, dense);
             let norm = ctx.norm("output_norm.weight", nw);
-            let mut rng = Rng::new(9);
+            let mut rng = Rng::keyed(9);
             let cases = PROJECTION_ROWS
                 .iter()
                 .flat_map(|&(m, o)| [(m, o, 37usize), (m, o, 300)])
@@ -1187,12 +1103,12 @@ fn selected_rows(ctx: &Ctx) -> Vec<Variant> {
         .collect()
 }
 
-fn head_logits_rows(ctx: &Ctx) -> Vec<Variant> {
+fn readout_project_rows(ctx: &Ctx) -> Vec<Variant> {
     projection_variants()
         .into_iter()
         .map(|(label, a, _, dense, every)| {
             let (weight, wf) = ctx.real("token_embd.weight", VOCABULARY_SLICE, dense);
-            let mut rng = Rng::new(10);
+            let mut rng = Rng::keyed(10);
             let cases = rows_only()
                 .into_iter()
                 .map(|o| Case {
@@ -1236,18 +1152,21 @@ fn draft_rows(ctx: &Ctx) -> Vec<Variant> {
             dense,
         );
         let element = |f: Format| dense.unwrap_or_else(|| ctx.resident(f));
-        let mut rng = Rng::new(11);
+        let mut rng = Rng::keyed(11);
         let cases = [1usize, 2, 4, 8, 16]
             .into_iter()
             .map(|m| Case {
                 label: format!("m{m}"),
                 args: vec![
+                    // (token, status) rows, the `sample_rows` result layout.
                     ctx.ints(
-                        &[m as u64],
+                        &[m as u64, 2],
                         &(0..m)
-                            .map(|_| rng.below(VOCABULARY_SLICE) as i32)
+                            .flat_map(|_| [rng.below(VOCABULARY_SLICE) as i32, 0])
                             .collect::<Vec<_>>(),
                     ),
+                    // An empty directory: the tokens are the table's rows.
+                    ctx.ints(&[0, 1], &[]),
                     Arg::Shared(table.clone()),
                     ctx.dense(
                         a,
@@ -1266,6 +1185,7 @@ fn draft_rows(ctx: &Ctx) -> Vec<Variant> {
             elements: vec![
                 ("EW", element(tf)),
                 ("A", a),
+                ("C", a),
                 ("EN", norm_element),
                 ("HN", norm_element),
                 ("CW", element(combine_format)),
@@ -1290,7 +1210,7 @@ fn embedding_rows(ctx: &Ctx) -> Vec<Variant> {
     .into_iter()
     .map(|(label, a, dense)| {
         let (table, tf) = ctx.real("token_embd.weight", VOCABULARY_SLICE, dense);
-        let mut rng = Rng::new(12);
+        let mut rng = Rng::keyed(12);
         let cases = [1usize, 3, 8, 64]
             .into_iter()
             .map(|m| Case {
@@ -1304,6 +1224,8 @@ fn embedding_rows(ctx: &Ctx) -> Vec<Variant> {
                             .flat_map(|_| [rng.below(VOCABULARY_SLICE) as i32, 0])
                             .collect::<Vec<_>>(),
                     ),
+                    // An empty directory: the tokens are the table's rows.
+                    ctx.ints(&[0, 1], &[]),
                     // The Qwen entry: unscaled, not normalized.
                     f32s(1.0),
                     i32s(0),
@@ -1334,7 +1256,7 @@ const ROUTED_TILE: usize = 32;
 
 /// Distinct experts per row, skewed so some experts fill several tiles.
 fn routes(rows: usize, experts: usize, seed: u64) -> Vec<i32> {
-    let mut rng = Rng::new(seed);
+    let mut rng = Rng::keyed(seed);
     let mut routes = Vec::with_capacity(rows * ROUTED_CHOICES);
     for row in 0..rows {
         let mut chosen = Vec::new();
@@ -1390,8 +1312,9 @@ fn routed_route(ctx: &Ctx) -> Vec<Variant> {
         ("f16", f16(), f32e(), f16(), false),
     ]
     .into_iter()
+    .filter(|(_, a, ..)| ctx.device.backend() == BackendName::Cpu || *a != f32e())
     .map(|(label, a, nw, rw, every)| {
-        let mut rng = Rng::new(13);
+        let mut rng = Rng::keyed(13);
         let router = ctx.dense(
             rw,
             &[ROUTED_EXPERTS as u64, ROUTED_HIDDEN as u64],
@@ -1442,7 +1365,7 @@ fn routed_route(ctx: &Ctx) -> Vec<Variant> {
             .collect();
         Variant {
             label: label.into(),
-            elements: vec![("NW", nw), ("RW", rw), ("A", a)],
+            elements: vec![("NW", nw), ("RW", rw), ("SRW", f32e()), ("A", a)],
             statics: vec![
                 ("H", ROUTED_HIDDEN as u64),
                 ("E", ROUTED_EXPERTS as u64),
@@ -1484,12 +1407,12 @@ fn routed_weights(ctx: &Ctx, formats: [Format; 6], dense: Option<Element>) -> Ro
 }
 
 fn routed_weight_variants() -> Vec<(&'static str, Element, [Format; 6], Option<Element>, bool)> {
-    use Format::*;
+    let (q4k, q5k, q6k, q8) = (Format::Q4K, Format::Q5K, Format::Q6K, Format::Q8);
     vec![
-        ("35b-mix", bf16(), [Q4K, Q4K, Q5K, Q8, Q8, Q8], None, true),
-        ("k-mix", bf16(), [Q5K, Q6K, Q4K, Q4K, Q6K, Q5K], None, false),
-        ("f16", f16(), [Q4K, Q4K, Q5K, Q8, Q8, Q8], None, false),
-        ("dense-bf16", bf16(), [Q4K; 6], Some(bf16()), false),
+        ("35b-mix", bf16(), [q4k, q4k, q5k, q8, q8, q8], None, true),
+        ("k-mix", bf16(), [q5k, q6k, q4k, q4k, q6k, q5k], None, false),
+        ("f16", f16(), [q4k, q4k, q5k, q8, q8, q8], None, false),
+        ("dense-bf16", bf16(), [q4k; 6], Some(bf16()), false),
     ]
 }
 
@@ -1498,7 +1421,7 @@ fn routed_expand(ctx: &Ctx) -> Vec<Variant> {
         .into_iter()
         .map(|(label, a, formats, dense, every)| {
             let weights = routed_weights(ctx, formats, dense);
-            let mut rng = Rng::new(14);
+            let mut rng = Rng::keyed(14);
             let cases = [1usize, 2, 3, 8]
                 .into_iter()
                 .map(|m| Case {
@@ -1548,7 +1471,7 @@ fn routed_output(ctx: &Ctx) -> Vec<Variant> {
         .into_iter()
         .map(|(label, a, formats, dense, every)| {
             let weights = routed_weights(ctx, formats, dense);
-            let mut rng = Rng::new(15);
+            let mut rng = Rng::keyed(15);
             let cases = [1usize, 2, 3, 8]
                 .into_iter()
                 .map(|m| {
@@ -1561,6 +1484,8 @@ fn routed_output(ctx: &Ctx) -> Vec<Variant> {
                                 &[m as u64, ROUTED_HIDDEN as u64],
                                 &activations(&mut rng, m, ROUTED_HIDDEN, 1.0),
                             ),
+                            // No inject: the single residual stream (`IN` 0).
+                            ctx.dense(f32e(), &[m as u64, 0], &[]),
                             ctx.dense(
                                 a,
                                 &[m as u64, k as u64, ROUTED_FFN as u64],
@@ -1575,6 +1500,8 @@ fn routed_output(ctx: &Ctx) -> Vec<Variant> {
                                 &[m as u64, k as u64],
                                 &routes(m, ROUTED_EXPERTS_SMALL, 70 + m as u64),
                             ),
+                            // No sources (`XS` 0): each choice reads its expert's stack row.
+                            ctx.ints(&[0, m as u64, k as u64], &[]),
                             ctx.dense(
                                 f32e(),
                                 &[m as u64, k as u64],
@@ -1582,6 +1509,8 @@ fn routed_output(ctx: &Ctx) -> Vec<Variant> {
                             ),
                             ctx.dense(f32e(), &[m as u64], &uniform(&mut rng, m, 0.1, 0.9)),
                             Arg::Shared(weights.tensors[2].clone()),
+                            // No host tier (`TR` 0): a view of none of the down records.
+                            Arg::Shared(ctx.tensor(weights.elements[2], &[0, ROUTED_HIDDEN as u64, ROUTED_FFN as u64], &[])),
                             Arg::Shared(weights.tensors[5].clone()),
                         ],
                     }
@@ -1596,6 +1525,7 @@ fn routed_output(ctx: &Ctx) -> Vec<Variant> {
                     ("K", ROUTED_CHOICES as u64),
                     ("F", ROUTED_FFN as u64),
                     ("S", ROUTED_SHARED as u64),
+                    ("TR", 0),
                 ],
                 every_configuration: every,
                 cases,
@@ -1613,6 +1543,8 @@ fn routed_group(ctx: &Ctx) -> Vec<Variant> {
             Case {
                 label: format!("m{m}e{e}"),
                 args: vec![
+                    ctx.ints(&[1], &[0]),
+                    ctx.ints(&[1], &[m as i32]),
                     ctx.ints(&[m as u64, k as u64], &routes(m, e, 80 + m as u64)),
                     Arg::Mutable {
                         element: Element::i32(),
@@ -1633,6 +1565,11 @@ fn routed_group(ctx: &Ctx) -> Vec<Variant> {
                         element: Element::i32(),
                         shape: vec![b as u64],
                         bytes: i32_bytes(&vec![-5; b]),
+                    },
+                    Arg::Mutable {
+                        element: Element::i32(),
+                        shape: vec![1],
+                        bytes: i32_bytes(&[-5]),
                     },
                 ],
             }
@@ -1661,7 +1598,7 @@ fn routed_experts(ctx: &Ctx) -> Vec<Variant> {
         .into_iter()
         .map(|(label, a, formats, dense, every)| {
             let weights = routed_weights(ctx, formats, dense);
-            let mut rng = Rng::new(16);
+            let mut rng = Rng::keyed(16);
             let e = ROUTED_EXPERTS_SMALL;
             let cases = [9usize, 64, 300]
                 .into_iter()
@@ -1669,9 +1606,12 @@ fn routed_experts(ctx: &Ctx) -> Vec<Variant> {
                     let b = group_blocks(m, e);
                     let routes = routes(m, e, 90 + m as u64);
                     let (order, _, blocks) = host_group(&routes, e, b);
+                    let used = blocks.iter().filter(|expert| **expert >= 0).count() as i32;
                     Case {
                         label: format!("m{m}"),
                         args: vec![
+                            ctx.ints(&[1], &[0]),
+                            ctx.ints(&[1], &[m as i32]),
                             ctx.dense(
                                 a,
                                 &[m as u64, ROUTED_HIDDEN as u64],
@@ -1679,6 +1619,13 @@ fn routed_experts(ctx: &Ctx) -> Vec<Variant> {
                             ),
                             ctx.ints(&[b as u64, ROUTED_TILE as u64], &order),
                             ctx.ints(&[b as u64], &blocks),
+                            ctx.ints(&[1], &[used]),
+                            Arg::Shared(weights.tensors[0].clone()),
+                            Arg::Shared(weights.tensors[1].clone()),
+                            Arg::Shared(weights.tensors[2].clone()),
+                            // No slot map: the stacks also bind as the
+                            // records, never read.
+                            ctx.ints(&[0], &[]),
                             Arg::Shared(weights.tensors[0].clone()),
                             Arg::Shared(weights.tensors[1].clone()),
                             Arg::Shared(weights.tensors[2].clone()),
@@ -1705,7 +1652,7 @@ fn routed_combine(ctx: &Ctx) -> Vec<Variant> {
         .into_iter()
         .map(|(label, a, formats, dense, every)| {
             let weights = routed_weights(ctx, formats, dense);
-            let mut rng = Rng::new(17);
+            let mut rng = Rng::keyed(17);
             let e = ROUTED_EXPERTS_SMALL;
             let k = ROUTED_CHOICES;
             let cases = [9usize, 64, 300]
@@ -1768,7 +1715,7 @@ fn logits(rng: &mut Rng, rows: usize, vocabulary: usize) -> Vec<f32> {
         .map(|i| match i % 97 {
             0 => f32::NEG_INFINITY,
             1 | 2 => 3.5,
-            _ => (rng.unit() * 8.0 * 64.0).round() / 64.0,
+            _ => (rng.uniform(-1.0, 1.0) * 8.0 * 64.0).round() / 64.0,
         })
         .collect()
 }
@@ -1787,7 +1734,7 @@ fn shape_rows(ctx: &Ctx) -> Vec<Variant> {
     [1000usize, 248320]
         .into_iter()
         .map(|v| {
-            let mut rng = Rng::new(18 + v as u64);
+            let mut rng = Rng::keyed(18 + v as u64);
             let cases = [1usize, 6]
                 .into_iter()
                 .map(|sx| {
@@ -1841,7 +1788,7 @@ fn sample_rows(ctx: &Ctx) -> Vec<Variant> {
     [1000usize, 248320]
         .into_iter()
         .map(|v| {
-            let mut rng = Rng::new(19 + v as u64);
+            let mut rng = Rng::keyed(19 + v as u64);
             let words = v.div_ceil(32);
             let cases = [1usize, 5]
                 .into_iter()
@@ -1909,7 +1856,7 @@ fn import_dense(ctx: &Ctx) -> Vec<Variant> {
     ]
     .into_iter()
     .map(|(e, u)| {
-        let mut rng = Rng::new(20);
+        let mut rng = Rng::keyed(20);
         let cases = [[1u64, 1, 2560], [1, 37, 768], [3, 16, 512]]
             .into_iter()
             .map(|shape| {
@@ -1936,31 +1883,23 @@ fn import_dense(ctx: &Ctx) -> Vec<Variant> {
 }
 
 fn repack_weight(ctx: &Ctx) -> Vec<Variant> {
-    use Format::*;
-    [Q4K, Q5K, Q6K, Q8, Iq4]
+    REPACKED
         .into_iter()
         .map(|format| {
-            let mut rng = Rng::new(21);
+            let mut rng = Rng::keyed(21);
             let cases = [[1u64, 48, 512], [1, 37, 768], [3, 16, 256], [1, 1, 2560]]
                 .into_iter()
                 .map(|shape| {
-                    let n = shape.iter().product::<u64>() as usize;
-                    let external = (0..n / format.block_values())
-                        .flat_map(|_| format.block(&mut rng))
-                        .collect::<Vec<_>>();
+                    let external = format.external(&mut rng, &shape, WEIGHT_SCALE);
                     Case {
                         label: format!("{shape:?}"),
-                        args: vec![Arg::Shared(ctx.tensor(
-                            format.external(),
-                            &shape,
-                            &external,
-                        ))],
+                        args: vec![Arg::Shared(ctx.tensor(format.source(), &shape, &external))],
                     }
                 })
                 .collect();
             Variant {
-                label: format.representation().into(),
-                elements: vec![("E", format.external()), ("U", ctx.resident(format))],
+                label: format.name(),
+                elements: vec![("E", format.source()), ("U", ctx.resident(format))],
                 statics: vec![],
                 every_configuration: true,
                 cases,
@@ -1973,7 +1912,7 @@ fn copy_rows(ctx: &Ctx) -> Vec<Variant> {
     [Element::u32(), bf16(), f16(), f32e(), Element::i32()]
         .into_iter()
         .map(|element| {
-            let mut rng = Rng::new(22);
+            let mut rng = Rng::keyed(22);
             let cases = [
                 (2usize, 6usize, 4usize, 64usize),
                 (5, 40, 4, 256),
@@ -2018,7 +1957,7 @@ fn copy_rows(ctx: &Ctx) -> Vec<Variant> {
 }
 
 fn conditioning_overlay(ctx: &Ctx) -> Vec<Variant> {
-    let mut rng = Rng::new(23);
+    let mut rng = Rng::keyed(23);
     let cases = [(1usize, 2560usize), (7, 2560), (3, 100)]
         .into_iter()
         .map(|(m, d)| Case {
@@ -2049,7 +1988,7 @@ fn vision_stem(ctx: &Ctx) -> Vec<Variant> {
     [("f16", f16(), f32e()), ("bf16", bf16(), bf16())]
         .into_iter()
         .map(|(label, w, b)| {
-            let mut rng = Rng::new(24);
+            let mut rng = Rng::keyed(24);
             let cases = [1usize, 5]
                 .into_iter()
                 .map(|m| Case {
@@ -2109,7 +2048,7 @@ fn vision_norm(ctx: &Ctx) -> Vec<Variant> {
         .into_iter()
         .flat_map(|(label, a, n)| {
             [1usize, 4].into_iter().map(move |g| {
-                let mut rng = Rng::new(25);
+                let mut rng = Rng::keyed(25);
                 let cases = [2usize, 70]
                     .into_iter()
                     .map(|cells| Case {
@@ -2125,6 +2064,7 @@ fn vision_norm(ctx: &Ctx) -> Vec<Variant> {
                             ctx.ints(&[0, (cells * g) as u64], &[]),
                             f32s(1e-6),
                             i32s(1),
+                            i32s(0),
                             i32s(0),
                         ],
                     })
@@ -2168,7 +2108,7 @@ fn vision_linear(ctx: &Ctx) -> Vec<Variant> {
         forms
             .into_iter()
             .map(move |(form, activation, residual, f32_output)| {
-                let mut rng = Rng::new(26);
+                let mut rng = Rng::keyed(26);
                 let nr = u64::from(residual);
                 let cases = [2usize, 70]
                     .into_iter()
@@ -2229,7 +2169,7 @@ fn vision_attention(ctx: &Ctx) -> Vec<Variant> {
     [("f16", f16()), ("bf16", bf16())]
         .into_iter()
         .map(|(label, a)| {
-            let mut rng = Rng::new(27);
+            let mut rng = Rng::keyed(27);
             let cases = [2usize, 70]
                 .into_iter()
                 .map(|m| {
@@ -2364,11 +2304,11 @@ const ENTRIES: &[EntrySpec] = &[
         build: selected_rows,
     },
     EntrySpec {
-        id: "head_logits_rows",
-        names: &["head_logits_rows"],
+        id: "readout_project_rows",
+        names: &["readout_project_rows"],
         family: "readout",
         library: true,
-        build: head_logits_rows,
+        build: readout_project_rows,
     },
     EntrySpec {
         id: "draft_rows",
@@ -2538,7 +2478,18 @@ fn configurations(
 ) -> Vec<Vec<(String, u64)>> {
     let params = &parameters(native);
     let total = params.iter().map(|p| p.values.len()).product::<usize>();
-    let default = params.iter().map(|p| p.values[0]).collect::<Vec<_>>();
+    // Each parameter's declared default at the statics, in `parameters`' order.
+    let dimension = |name: &str| {
+        statics
+            .iter()
+            .find(|(static_name, _)| *static_name == name)
+            .map(|(_, value)| *value)
+    };
+    let default = native
+        .device_independent()
+        .expect("a golden declaration's defaults read no device property")
+        .parameter_defaults(&dimension)
+        .expect("a declared default has a listed value at the case's statics");
     let mut chosen: Vec<Vec<u64>> = Vec::new();
     let push = |config: Vec<u64>, chosen: &mut Vec<Vec<u64>>| {
         if !chosen.contains(&config) {
@@ -2575,13 +2526,13 @@ fn configurations(
     } else {
         push(default.clone(), &mut chosen);
         for (i, parameter) in params.iter().enumerate() {
-            for value in &parameter.values[1..] {
+            for value in parameter.values.iter().filter(|value| **value != default[i]) {
                 let mut config = default.clone();
                 config[i] = *value;
                 push(config, &mut chosen);
             }
         }
-        let mut rng = Rng::new(
+        let mut rng = Rng::keyed(
             seed.bytes()
                 .fold(7u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b))),
         );
@@ -2760,11 +2711,20 @@ fn run_entry(
     let mut lines: BTreeMap<String, String> = BTreeMap::new();
     let mut prepared = 0usize;
     for variant in &variants {
-        // A variant names the statics of either backend's declaration.
+        // A variant names the statics of either backend's declaration. The
+        // golden entries run over the single residual stream: those of the
+        // streams' join (`SN` 1, `IN` 0) and input form (`PT` 1, `NM` the
+        // row width, `D` or `H`) that the declaration names.
+        let width = variant
+            .statics
+            .iter()
+            .find(|(name, _)| *name == "D" || *name == "H")
+            .map_or(0, |(_, value)| *value);
         let statics = variant
             .statics
             .iter()
             .copied()
+            .chain([("SN", 1), ("IN", 0), ("PT", 1), ("NM", width)])
             .filter(|(name, _)| native.statics.iter().any(|s| s == name))
             .collect::<Vec<_>>();
         let mut configs = configurations(native, &statics, spec.id);
@@ -2904,7 +2864,7 @@ fn golden() {
         Ok("compare") => Mode::Compare,
         other => panic!("GOLDEN_MODE must be record or compare, got {other:?}"),
     };
-    let catalog = DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     // `GOLDEN_BACKEND=vulkan` selects Vulkan (never chosen by default: a CUDA
     // host also has a Vulkan device).
     let backends = match std::env::var("GOLDEN_BACKEND").ok().as_deref() {
@@ -2941,10 +2901,10 @@ fn golden() {
         gguf,
         weights: Default::default(),
     };
-    // A harness built from a snapshot of the tree may check the live sources.
-    let kernels = std::env::var_os("GOLDEN_KERNELS")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("kernels"));
+    let kernels = PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
+    )
+    .join("kernels");
     // `GOLDEN_SOURCES` names the declaration files to load (so another
     // family's in-progress declarations cannot block a run); default: all.
     let sources = match std::env::var("GOLDEN_SOURCES")

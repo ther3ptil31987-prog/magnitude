@@ -17,11 +17,14 @@
 // Lane layout of the scalar softmax: lane l owns row l % 16 and keys
 // 16 (l / 16) .. + 15 of the tile.
 //
+// The whole workgroup reaches every barrier.
+//
 // This file is independent of any entry ABI.
 #include <seismic/element.glsl>
-#include <seismic/slab.glsl>
+#include "../core/matrix.glsl"
 
 #define FLASH_KEYS 32u
+REQUIRE_DIVISOR_BELOW_2_16(flash_keys_below_2_16, FLASH_KEYS);
 #define FLASH_MAX_W 256u
 // Floats of shared scratch per subgroup: the scores 16 x 32; then the f16 P
 // (16 x 32) in its first half, the rescale factors (16 x 16) in its second
@@ -30,19 +33,14 @@
 #define FLASH_FACTORS 256u
 #define FLASH_INF uintBitsToFloat(0x7f800000u)
 // The widest output window a device takes in one pass: the whole head, or 4
-// accumulator fragments where the compiler mishandles wider cooperative-matrix
-// accumulator arrays (NVIDIA 580, `SEISMIC_HAS_WIDE_ACCUMULATORS` 0). The FMA
+// accumulator fragments where the device's `wide_accumulators` probe has not
+// shown wider cooperative-matrix accumulator arrays correct
+// (`SEISMIC_HAS_WIDE_ACCUMULATORS` 0). The FMA
 // path's accumulators are plain floats, so it always takes the whole head.
 #if SEISMIC_HAS_WIDE_ACCUMULATORS || !SEISMIC_HAS_MATRIX
 #define FLASH_WINDOW FLASH_MAX_W
 #else
 #define FLASH_WINDOW 64u
-#endif
-
-#if SEISMIC_HAS_MATRIX
-#define FLASH_FRAGMENT_A coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
-#define FLASH_FRAGMENT_B coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
-#define FLASH_FRAGMENT_C coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
 #endif
 
 layout(buffer_reference, scalar, buffer_reference_align = 2) readonly buffer flash_f16_rows { float16_t v[]; };
@@ -74,38 +72,13 @@ void flash_stage(const int kind, uint64_t plane, uint64_t row_stride, uint64_t c
     }
 }
 
-// Stages a component whose rows live in separately allocated slabs: the w
-// columns from `column` of rows of `row_elements` elements. Each table
-// address already points to the component's region of its slab.
-void flash_stage_slab(const int kind, uint64_t table, uint64_t slab_rows, uint row_elements, uint column,
-    uint w, int first, int end, uint base) {
-    const uint pieces = w / 8u;
-    for (uint item = gl_LocalInvocationIndex; item < FLASH_KEYS * pieces; item += gl_WorkGroupSize.x) {
-        const uint k = item / pieces;
-        const uint c = (item % pieces) * 8u;
-        const int t = first + int(k);
-        uvec4 bits = uvec4(0u);
-        if (t < end) {
-            const uint64_t row = slab_row(table, uint(t), uint(slab_rows),
-                uint64_t(row_elements) * ELEMENT_BYTES(kind));
-            bits = element_uvec4_at(row + uint64_t(column + c) * ELEMENT_BYTES(kind));
-            if (kind == ELEMENT_BF16) {
-                vec4 even, odd;
-                element_split8(ELEMENT_BF16, bits, even, odd);
-                bits = element_pack8(ELEMENT_F16, even, odd);
-            }
-        }
-        seismic_shared_uvec4[(base + k * flash_pitch(w) + c) / 8u] = bits;
-    }
-}
-
 // The block's scores S = Q K^T (16 rows x FLASH_KEYS keys, F32), held in
 // registers while they accumulate: a head wider than FLASH_MAX_W is scored
 // over column chunks staged in turn (`flash_scores_add` per chunk), then
 // published to the block's shared scratch (row-major, 32 floats per row).
 struct flash_scores_state {
 #if SEISMIC_HAS_MATRIX
-    FLASH_FRAGMENT_C s[2];
+    MATRIX_FRAGMENT_C s[2];
 #else
     float s[16];
 #endif
@@ -113,8 +86,8 @@ struct flash_scores_state {
 
 void flash_scores_clear(out flash_scores_state state) {
 #if SEISMIC_HAS_MATRIX
-    state.s[0] = FLASH_FRAGMENT_C(0.0);
-    state.s[1] = FLASH_FRAGMENT_C(0.0);
+    state.s[0] = matrix_zero();
+    state.s[1] = matrix_zero();
 #else
     [[unroll]] for (uint j = 0u; j < 16u; ++j)
         state.s[j] = 0.0;
@@ -129,10 +102,10 @@ void flash_scores_add(uint64_t q, uint64_t q_stride, const uint w, uint k_base, 
 #if SEISMIC_HAS_MATRIX
     [[unroll]] for (uint d = 0u; d < FLASH_MAX_W; d += 16u) {
         if (d < w) {
-            FLASH_FRAGMENT_A a;
+            MATRIX_FRAGMENT_A a;
             coopMatLoad(a, flash_f16_rows(q).v, d, uint(q_stride), gl_CooperativeMatrixLayoutRowMajor);
             [[unroll]] for (uint j = 0u; j < 2u; ++j) {
-                FLASH_FRAGMENT_B b;
+                MATRIX_FRAGMENT_B b;
                 coopMatLoad(b, seismic_shared_f16, k_base + j * 16u * pitch + d, pitch, gl_CooperativeMatrixLayoutColumnMajor);
                 state.s[j] = coopMatMulAdd(a, b, state.s[j]);
             }
@@ -145,7 +118,7 @@ void flash_scores_add(uint64_t q, uint64_t q_stride, const uint w, uint k_base, 
         const vec2 x = vec2(element_at(ELEMENT_F16, q, uint64_t(r) * q_stride + d),
             element_at(ELEMENT_F16, q, uint64_t(r) * q_stride + d + 1u));
         [[unroll]] for (uint j = 0u; j < 16u; ++j) {
-            const vec2 k = unpackHalf2x16(seismic_shared_u32[(k_base + (16u * h + j) * pitch + d) / 2u]);
+            const vec2 k = seismic_unpack_f16x2(seismic_shared_u32[(k_base + (16u * h + j) * pitch + d) / 2u]);
             state.s[j] = seismic_fma_rn(x.x, k.x, state.s[j]);
             state.s[j] = seismic_fma_rn(x.y, k.y, state.s[j]);
         }
@@ -176,10 +149,10 @@ void flash_scores_add_shared(uint q_half, uint q_pitch, const uint w, uint k_bas
 #if SEISMIC_HAS_MATRIX
     [[unroll]] for (uint d = 0u; d < FLASH_MAX_W; d += 16u) {
         if (d < w) {
-            FLASH_FRAGMENT_A a;
+            MATRIX_FRAGMENT_A a;
             coopMatLoad(a, seismic_shared_f16, q_half + d, q_pitch, gl_CooperativeMatrixLayoutRowMajor);
             [[unroll]] for (uint j = 0u; j < 2u; ++j) {
-                FLASH_FRAGMENT_B b;
+                MATRIX_FRAGMENT_B b;
                 coopMatLoad(b, seismic_shared_f16, k_base + j * 16u * pitch + d, pitch, gl_CooperativeMatrixLayoutColumnMajor);
                 state.s[j] = coopMatMulAdd(a, b, state.s[j]);
             }
@@ -189,9 +162,9 @@ void flash_scores_add_shared(uint q_half, uint q_pitch, const uint w, uint k_bas
     const uint lane = SEISMIC_LANE;
     const uint r = lane % 16u, h = lane / 16u;
     for (uint d = 0u; d < w; d += 2u) {
-        const vec2 x = unpackHalf2x16(seismic_shared_u32[(q_half + r * q_pitch + d) / 2u]);
+        const vec2 x = seismic_unpack_f16x2(seismic_shared_u32[(q_half + r * q_pitch + d) / 2u]);
         [[unroll]] for (uint j = 0u; j < 16u; ++j) {
-            const vec2 k = unpackHalf2x16(seismic_shared_u32[(k_base + (16u * h + j) * pitch + d) / 2u]);
+            const vec2 k = seismic_unpack_f16x2(seismic_shared_u32[(k_base + (16u * h + j) * pitch + d) / 2u]);
             state.s[j] = seismic_fma_rn(x.x, k.x, state.s[j]);
             state.s[j] = seismic_fma_rn(x.y, k.y, state.s[j]);
         }
@@ -273,7 +246,7 @@ uint flash_window(const uint w, const uint window) { return min(window, w); }
 
 struct flash_output {
 #if SEISMIC_HAS_MATRIX
-    FLASH_FRAGMENT_C c[FLASH_MAX_W / 16u];
+    MATRIX_FRAGMENT_C c[FLASH_MAX_W / 16u];
 #else
     float c[FLASH_MAX_W / 2u];
 #endif
@@ -284,7 +257,7 @@ void flash_output_clear(const uint w, const uint window, inout flash_output o) {
 #if SEISMIC_HAS_MATRIX
     [[unroll]] for (uint d = 0u; d < FLASH_MAX_W / 16u; ++d)
         if (d < flash_window(w, window) / 16u)
-            o.c[d] = FLASH_FRAGMENT_C(0.0);
+            o.c[d] = matrix_zero();
 #else
     [[unroll]] for (uint d = 0u; d < FLASH_MAX_W / 2u; ++d)
         if (d < flash_window(w, window) / 2u)
@@ -293,29 +266,33 @@ void flash_output_clear(const uint w, const uint window, inout flash_output o) {
 }
 
 // O <- diag(alpha) O for the lane rows' factors `alpha` (from
-// `flash_online`). Skipped when no row's maximum grew. Every lane of the
-// subgroup calls it, after `flash_publish_probabilities`.
+// `flash_online`). The product is skipped when no row's maximum grew, the
+// barriers never: every subgroup passes them whatever its rows' maxima did.
+// Every lane of the subgroup calls it, after `flash_publish_probabilities`.
 void flash_rescale(uint scratch, float alpha, const uint w, const uint window, inout flash_output o) {
-    if (seismic_subgroup_all(alpha == 1.0))
-        return;
+    const bool grew = !seismic_subgroup_all(alpha == 1.0);
 #if SEISMIC_HAS_MATRIX
     // The factors as a 16 x 16 accumulator fragment, row r all alpha_r: each
     // lane writes half of its row.
     const uint lane = SEISMIC_LANE;
-    [[unroll]] for (uint i = 0u; i < 8u; ++i)
-        seismic_shared_f32[scratch + FLASH_FACTORS + (lane % 16u) * 16u + 8u * (lane / 16u) + i] = alpha;
+    if (grew)
+        [[unroll]] for (uint i = 0u; i < 8u; ++i)
+            seismic_shared_f32[scratch + FLASH_FACTORS + (lane % 16u) * 16u + 8u * (lane / 16u) + i] = alpha;
     subgroupMemoryBarrierShared();
     subgroupBarrier();
-    FLASH_FRAGMENT_C factors;
-    coopMatLoad(factors, seismic_shared_f32, scratch + FLASH_FACTORS, 16u, gl_CooperativeMatrixLayoutRowMajor);
-    [[unroll]] for (uint d = 0u; d < FLASH_MAX_W / 16u; ++d)
-        if (d < flash_window(w, window) / 16u)
-            o.c[d] = o.c[d] * factors;
+    if (grew) {
+        MATRIX_FRAGMENT_C factors;
+        coopMatLoad(factors, seismic_shared_f32, scratch + FLASH_FACTORS, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        [[unroll]] for (uint d = 0u; d < FLASH_MAX_W / 16u; ++d)
+            if (d < flash_window(w, window) / 16u)
+                o.c[d] = o.c[d] * factors;
+    }
     subgroupBarrier();
 #else
-    [[unroll]] for (uint d = 0u; d < FLASH_MAX_W / 2u; ++d)
-        if (d < flash_window(w, window) / 2u)
-            o.c[d] *= alpha;
+    if (grew)
+        [[unroll]] for (uint d = 0u; d < FLASH_MAX_W / 2u; ++d)
+            if (d < flash_window(w, window) / 2u)
+                o.c[d] *= alpha;
 #endif
 }
 
@@ -325,13 +302,13 @@ void flash_accumulate(uint p_half, uint v_base, const uint w, const uint window,
     const uint pitch = flash_pitch(w);
     const uint width = flash_window(w, window);
 #if SEISMIC_HAS_MATRIX
-    FLASH_FRAGMENT_A p[2];
+    MATRIX_FRAGMENT_A p[2];
     coopMatLoad(p[0], seismic_shared_f16, p_half, 32u, gl_CooperativeMatrixLayoutRowMajor);
     coopMatLoad(p[1], seismic_shared_f16, p_half + 16u, 32u, gl_CooperativeMatrixLayoutRowMajor);
     [[unroll]] for (uint d = 0u; d < FLASH_MAX_W / 16u; ++d) {
         if (d < width / 16u) {
             [[unroll]] for (uint j = 0u; j < 2u; ++j) {
-                FLASH_FRAGMENT_B v;
+                MATRIX_FRAGMENT_B v;
                 coopMatLoad(v, seismic_shared_f16, v_base + j * 16u * pitch + column0 + 16u * d, pitch,
                     gl_CooperativeMatrixLayoutRowMajor);
                 o.c[d] = coopMatMulAdd(p[j], v, o.c[d]);
@@ -346,7 +323,7 @@ void flash_accumulate(uint p_half, uint v_base, const uint w, const uint window,
         const float p = seismic_f16_to_f32(seismic_shared_u16[p_half + r * 32u + j]);
         [[unroll]] for (uint c = 0u; c < FLASH_MAX_W / 2u; c += 2u) {
             if (c < columns) {
-                const vec2 v = unpackHalf2x16(seismic_shared_u32[(v_base + j * pitch + column0 + h * columns + c) / 2u]);
+                const vec2 v = seismic_unpack_f16x2(seismic_shared_u32[(v_base + j * pitch + column0 + h * columns + c) / 2u]);
                 o.c[c] = seismic_fma_rn(p, v.x, o.c[c]);
                 o.c[c + 1u] = seismic_fma_rn(p, v.y, o.c[c + 1u]);
             }

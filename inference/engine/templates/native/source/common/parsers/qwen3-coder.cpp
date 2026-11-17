@@ -6,8 +6,9 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
 
     const std::string GEN_PREFIX = "<|im_start|>assistant\n";
 
-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
-    data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs);
+    auto rendered          = common_chat_template_render_prompt(tmpl, inputs);
+    data.prompt            = std::move(rendered.prompt);
+    data.generation_prompt = std::move(rendered.generation_prompt);
     data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
 
     auto supports_reasoning = tmpl.source().find("<think>") != std::string::npos;
@@ -75,9 +76,10 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
 
         auto reasoning = p.eps();
         if (supports_reasoning && extract_reasoning) {
+            // Reasoning closes with </think>, at a tool call, or with the output.
             reasoning = p.optional("<think>" + p.space() +
                                    p.rule("reasoning-text", p.reasoning(p.until_one_of({ "</think>", "<tool_call>" }))) +
-                                   (p.literal("</think>") | p.peek(p.literal("<tool_call>"))));
+                                   (p.literal("</think>") | p.peek(p.literal("<tool_call>")) | p.end()));
         }
 
         // Response format parser. Without tool calls, only </think> closes
@@ -207,16 +209,17 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
                 std::string text          = min_calls == 0 ? " space content-text space" : " space";
                 std::string before_calls  = think + " (\"</think>\"" + text + ")?";
                 std::string without_calls = closed + text;
-                // Reasoning the generation prompt opens is only reasoning: it
-                // closes before the turn ends, as the parser requires of text
-                // it has streamed as reasoning. Otherwise it may be skipped.
+                // Reasoning the generation prompt opens is only reasoning:
+                // content follows only its close. Otherwise it may be skipped.
                 if (data.generation_prompt.find("<think>") == std::string::npos) {
                     before_calls += " |" + text;
                     without_calls = "(" + closed + ")?" + text;
                 }
                 std::string grammar = "((" + before_calls + ") tool-calls";
                 if (min_calls == 0) {
-                    grammar += " | " + without_calls;
+                    // Without a required call, the output may also end in
+                    // reasoning that never closes.
+                    grammar += " | " + without_calls + " | " + think;
                 }
                 body = p.gbnf(body, grammar + ")");
             }

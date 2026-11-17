@@ -61,6 +61,8 @@ export const projectModelCatalog = (
     models,
     failures,
     localModelPreparation: local.preparation,
+    unsupportedLocalModels: local.unsupported,
+    hiddenLocalModels: local.hidden,
   }
   if (failures.length > 0) return { _tag: "Degraded", ...fields }
   if (providers._tag === "Loading" || providers._tag === "Refreshing" || !local.preparation.discovery.complete) {
@@ -84,6 +86,11 @@ export const ModelCatalogLive: Layer.Layer<
   )
   yield* sourceChanges.pipe(
     Stream.runForEach(() => changes.publish({ operation: Models.getCatalog._tag })),
+    Effect.forkScoped,
+  )
+  // A rescan follows a location becoming readable or disappearing, so its state is read again.
+  yield* local.changes.pipe(
+    Stream.runForEach(() => Effect.all([changes.publish({ operation: Models.listModelLocations._tag }), changes.publish({ operation: Models.listServableModels._tag })])),
     Effect.forkScoped,
   )
   return ModelCatalog.of({

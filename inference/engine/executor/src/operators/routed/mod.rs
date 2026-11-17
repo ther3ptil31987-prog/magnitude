@@ -21,32 +21,61 @@
 
 pub(crate) mod fused_graph;
 pub(crate) mod graph;
+pub(crate) mod grouped;
+pub(crate) mod split;
+pub(crate) mod streamed;
 
 use crate::error::PlanError;
+use crate::programs::graph::facts::Numbers;
+use seismic::Argument;
 use crate::{DenseScales, RoutedBinding, ScalableWeight};
 use magnitude_family_contracts::{
-    ActivationFunction, ExpertSelection, FeedForwardUp, RouteNormalization, RoutedFfn,
-    RouterInput, ScoreFunction, SharedExpert, SharedExpertGate, WeightKind,
+    ActivationFunction, Decoder, ExpertSelection, FeedForwardUp, GluLimit, Operator,
+    RouteNormalization, RoutedFfn, RouterInput, ScoreFunction, SharedExpert, SharedExpertGate,
+    WeightKind,
 };
-use seismic::Element;
+use seismic::{Dim, Element};
 
 use super::dense_ffn::activation_code;
 
-/// An expansion's form and activation code.
+/// An expansion's form, activation code and clamp.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Expansion {
     /// Gated (`act(gate) · up`) or up-only (`act(up)`).
     pub gated: bool,
     pub activation: i32,
+    /// The gated expansion's clamp (`glu`'s, its entries' LB).
+    pub limit: Option<GluLimit>,
 }
 
 impl Expansion {
-    fn of(up: &FeedForwardUp) -> Self {
+    pub(crate) fn of(up: &FeedForwardUp) -> Self {
         Self {
             gated: up.gate().is_some(),
             activation: activation_code(up.activation()),
+            limit: up.limit(),
         }
     }
+
+    /// What its graph branches on: its form and clamp (the clamp sets its
+    /// entries' `LB` static).
+    pub(crate) fn form(self) -> ExpansionForm {
+        ExpansionForm { gated: self.gated, limit: self.limit }
+    }
+
+    /// Its activation code as a number, which reaches only its entries'
+    /// `activation` argument.
+    pub(crate) fn activation_number(self) -> u64 {
+        crate::operators::code(self.activation)
+    }
+}
+
+/// An [`Expansion`]'s structure: gated or up-only, and its clamp. Its
+/// activation code is a number of its graph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ExpansionForm {
+    pub gated: bool,
+    pub limit: Option<GluLimit>,
 }
 
 /// Every static axis and numerical parameter of a general routed operator
@@ -63,7 +92,7 @@ pub struct GeneralRoutedShape {
     pub experts_expansion: Expansion,
     /// The shared expert's width and expansion.
     pub shared: Option<(u64, Expansion)>,
-    /// `routed_select`'s `score` code: 0 softmax, 1 sigmoid.
+    /// `routed_select`'s `score` code: 0 softmax, 1 sigmoid, 2 sqrt(softplus).
     pub score: i32,
     /// `routed_select`'s `normalization` code: 0 none, 1 sum, 2 sum + ε,
     /// 3 max(sum, ε).
@@ -106,9 +135,7 @@ impl GeneralRoutedShape {
             score: match router.score {
                 ScoreFunction::Softmax => 0,
                 ScoreFunction::Sigmoid => 1,
-                ScoreFunction::SqrtSoftplus => {
-                    return Err(PlanError::Unsupported("sqrt-softplus expert scores"))
-                }
+                ScoreFunction::SqrtSoftplus => 2,
             },
             normalization,
             normalization_epsilon: (epsilon as f32).to_bits(),
@@ -119,24 +146,168 @@ impl GeneralRoutedShape {
         })
     }
 
-    /// `routed_select`'s dimensions.
+    /// The operator's numbers as constant dimensions.
+    fn numbers(&self) -> GeneralRoutedNumbers {
+        crate::programs::graph::facts::constant(self.split().1)
+    }
+
+    /// The operator's topology and its numbers: every static axis apart
+    /// from its form.
+    pub(crate) fn split(&self) -> (GeneralRoutedForm<f64>, GeneralRoutedNumbers<u64>) {
+        (
+            GeneralRoutedForm {
+                latent: self.latent,
+                experts_expansion: self.experts_expansion.form(),
+                shared: self.shared.map(|(_, expansion)| expansion.form()),
+                normalization_epsilon: f64::from(f32::from_bits(self.normalization_epsilon)),
+                scale: f64::from(f32::from_bits(self.scale)),
+                bias: self.bias,
+                expert_scale: self.expert_scale,
+                router_norm: self.router_norm,
+            },
+            GeneralRoutedNumbers {
+                hidden: self.hidden,
+                experts: self.experts,
+                selected: self.selected,
+                intermediate: self.intermediate,
+                expert_hidden: self.expert_hidden,
+                activation: self.experts_expansion.activation_number(),
+                score: crate::operators::code(self.score),
+                normalization: crate::operators::code(self.normalization),
+                shared: self.shared.map(|(features, expansion)| SharedExpertNumbers {
+                    features,
+                    activation: expansion.activation_number(),
+                }),
+            },
+        )
+    }
+
+    /// [`GeneralRoutedNumbers::expert_scale_extent`] of the operator.
+    pub fn expert_scale_extent(&self, down: u64) -> u64 {
+        let (form, numbers) = (self.split().0, self.numbers());
+        numbers.expert_scale_extent(&form, Dim::from(down)).fixed()
+    }
+
+    /// [`GeneralRoutedNumbers::select_dimensions`] of the operator.
     pub fn select_dimensions(&self, rows: u64) -> [(&'static str, u64); 4] {
+        self.numbers().select_dimensions(&Dim::from(rows)).map(|(name, dim)| (name, dim.fixed()))
+    }
+
+    /// [`GeneralRoutedNumbers::expert_dimensions`] of the operator.
+    pub fn expert_dimensions(&self, rows: u64) -> [(&'static str, u64); 5] {
+        self.numbers().expert_dimensions(&Dim::from(rows)).map(|(name, dim)| (name, dim.fixed()))
+    }
+}
+
+/// What decides a general routed operator's graph beside its numbers
+/// ([`GeneralRoutedNumbers`]): every form of its [`GeneralRoutedShape`].
+/// Its reals `R`: the model's (`f64`), a key's (`RealIndex`), or its
+/// builder's arguments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct GeneralRoutedForm<R = Argument<f64>> {
+    pub latent: bool,
+    pub experts_expansion: ExpansionForm,
+    /// The shared expert's expansion, where it has one.
+    pub shared: Option<ExpansionForm>,
+    pub normalization_epsilon: R,
+    pub scale: R,
+    pub bias: bool,
+    pub expert_scale: bool,
+    pub router_norm: bool,
+}
+
+impl<R> Numbers<R> for GeneralRoutedForm<R> {
+    type Of<E> = GeneralRoutedForm<E>;
+    fn map<E>(self, f: &mut impl FnMut(R) -> E) -> GeneralRoutedForm<E> {
+        GeneralRoutedForm {
+            latent: self.latent,
+            experts_expansion: self.experts_expansion,
+            shared: self.shared,
+            normalization_epsilon: f(self.normalization_epsilon),
+            scale: f(self.scale),
+            bias: self.bias,
+            expert_scale: self.expert_scale,
+            router_norm: self.router_norm,
+        }
+    }
+}
+
+/// The numbers of a general routed operator ([`GeneralRoutedShape`]): its
+/// residual's width, experts, selected experts, expert features, the width
+/// its experts act in, the codes its entries take as arguments (the
+/// experts' activation, `routed_select`'s `score` and `normalization`), and
+/// its shared expert's.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct GeneralRoutedNumbers<D = Dim> {
+    pub hidden: D,
+    pub experts: D,
+    pub selected: D,
+    pub intermediate: D,
+    pub expert_hidden: D,
+    pub activation: D,
+    pub score: D,
+    pub normalization: D,
+    pub shared: Option<SharedExpertNumbers<D>>,
+}
+
+/// A shared expert's features and activation code.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct SharedExpertNumbers<D = Dim> {
+    pub features: D,
+    pub activation: D,
+}
+
+/// A form's code as a number of its graph.
+impl<D> Numbers<D> for GeneralRoutedNumbers<D> {
+    type Of<E> = GeneralRoutedNumbers<E>;
+    fn map<E>(self, f: &mut impl FnMut(D) -> E) -> GeneralRoutedNumbers<E> {
+        GeneralRoutedNumbers {
+            hidden: f(self.hidden),
+            experts: f(self.experts),
+            selected: f(self.selected),
+            intermediate: f(self.intermediate),
+            expert_hidden: f(self.expert_hidden),
+            activation: f(self.activation),
+            score: f(self.score),
+            normalization: f(self.normalization),
+            shared: self.shared.map(|shared| SharedExpertNumbers {
+                features: f(shared.features),
+                activation: f(shared.activation),
+            }),
+        }
+    }
+}
+
+impl GeneralRoutedNumbers {
+    /// The extent of the combine's per-expert scale port (`routed_select`'s
+    /// ES) given the down weight's per-expert scale extent `down`: the stored
+    /// output scales' (E) where the operator has them, else `down` (plan
+    /// admission refuses both at once).
+    pub fn expert_scale_extent<R>(&self, form: &GeneralRoutedForm<R>, down: Dim) -> Dim {
+        match form.expert_scale {
+            true => self.experts.clone(),
+            false => down,
+        }
+    }
+
+    /// `routed_select`'s dimensions.
+    pub fn select_dimensions(&self, rows: &Dim) -> [(&'static str, Dim); 4] {
         [
-            ("M", rows),
-            ("H", self.hidden),
-            ("E", self.experts),
-            ("K", self.selected),
+            ("M", rows.clone()),
+            ("H", self.hidden.clone()),
+            ("E", self.experts.clone()),
+            ("K", self.selected.clone()),
         ]
     }
 
     /// The decode expert entries' dimensions, in the experts' width.
-    pub fn expert_dimensions(&self, rows: u64) -> [(&'static str, u64); 5] {
+    pub fn expert_dimensions(&self, rows: &Dim) -> [(&'static str, Dim); 5] {
         [
-            ("M", rows),
-            ("H", self.expert_hidden),
-            ("E", self.experts),
-            ("K", self.selected),
-            ("F", self.intermediate),
+            ("M", rows.clone()),
+            ("H", self.expert_hidden.clone()),
+            ("E", self.experts.clone()),
+            ("K", self.selected.clone()),
+            ("F", self.intermediate.clone()),
         ]
     }
 }
@@ -163,22 +334,44 @@ pub struct GeneralRoutedBinding {
     pub scales: GeneralRoutedScales,
 }
 
+/// The extents of the routed entries' per-expert scale ports (`[S] f32`,
+/// `routed.seismic`): each stacked expert weight's resident second-level
+/// scales, E where it has them, else 0.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ExpertScales {
+    /// The gate and up weights': the expansions scale each expert's
+    /// accumulators (GS, US).
+    pub gate: u64,
+    pub up: u64,
+    /// The down weight's: the route folds it into each choice's combine
+    /// weight (ES), as it does stored per-expert output scales.
+    pub down: u64,
+}
+
 /// The extents of a general routed operator's accumulator-scale ports: its
 /// projection weights' resident second-level scales, 0 where a weight has
-/// none. Gated experts and the router bind no scale.
+/// none. The router binds no scale.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct GeneralRoutedScales {
-    /// Up-only experts' up weight, per expert (E): `routed_up` and
-    /// `routed_experts_up` scale each expert's accumulator.
-    pub expert_up: u64,
-    /// The experts' down weight, per expert (E): `routed_select` folds it
-    /// into each choice's combine weight, as it does stored expert scales.
-    pub expert_down: u64,
+    pub experts: ExpertScales,
     /// The shared expert's dense entries.
     pub shared: DenseScales,
     /// A latent operator's `(down, up)` projections, per tensor.
     pub latent: (u64, u64),
 }
+
+/// The routed feed-forward of a feed-forward operator: its own, or a
+/// parallel sublayer's routed branch's.
+pub(crate) fn routed_ffn(op: &Operator) -> Option<&RoutedFfn> {
+    match op {
+        Operator::RoutedFfn(routed) => Some(routed),
+        Operator::Parallel(branches) => branches.iter().find_map(|branch| routed_ffn(&branch.op)),
+        _ => None,
+    }
+}
+
+/// The expansion function of the fused form's experts (`is_fused`).
+pub(crate) const FUSED_ACTIVATION: i32 = magnitude_kernels::cpu_library::cpu::lib::core::functions::SILU;
 
 /// The routed form Qwen's fused entries implement: a softmax top-k router on
 /// the normalized input without bias, the plain sum normalization, SiLU-gated
@@ -190,6 +383,7 @@ pub(crate) fn is_fused(routed: &RoutedFfn) -> bool {
             up,
             FeedForwardUp::Gated {
                 activation: ActivationFunction::Silu,
+                limit: None,
                 ..
             }
         )
@@ -210,18 +404,31 @@ pub(crate) fn is_fused(routed: &RoutedFfn) -> bool {
         })
 }
 
-/// The forms the general routed entries implement: softmax or sigmoid
-/// scores with top-k selection, any normalization and finite scale, a router
-/// input norm of the sublayer's epsilon, gated or up-only experts, and an
-/// ungated shared expert.
+/// The weights a streamed layer's decode route reads of the layer it
+/// predicts in place of its own, in its hint ports' order: the fused
+/// route's input norm and router; the general selection's router norm
+/// (its own where the router reads the residual, else the input norm),
+/// router and selection bias.
+pub(crate) fn hint_kinds(routed: &RoutedFfn) -> Vec<WeightKind> {
+    match is_fused(routed) {
+        true => vec![WeightKind::InputNorm, WeightKind::Router],
+        false => vec![
+            match routed.router.input {
+                RouterInput::Residual(_) => WeightKind::RouterInputNorm,
+                _ => WeightKind::InputNorm,
+            },
+            WeightKind::Router,
+            WeightKind::RouterSelectionBias,
+        ],
+    }
+}
+
+/// The forms the general routed entries implement: every score function
+/// with top-k selection, any normalization and finite scale, a router input
+/// norm of the sublayer's epsilon, gated or up-only experts, and an ungated
+/// shared expert.
 pub(crate) fn admit(routed: &RoutedFfn) -> Result<(), PlanError> {
     let router = &routed.router;
-    if !matches!(router.selection, ExpertSelection::TopK { .. }) {
-        return Err(PlanError::Unsupported("expert selection"));
-    }
-    if !matches!(router.score, ScoreFunction::Softmax | ScoreFunction::Sigmoid) {
-        return Err(PlanError::Unsupported("expert score function"));
-    }
     if !router.scale.is_finite() {
         return Err(PlanError::Unsupported("expert router scale"));
     }
@@ -230,9 +437,28 @@ pub(crate) fn admit(routed: &RoutedFfn) -> Result<(), PlanError> {
         .as_ref()
         .is_some_and(|shared| shared.gate != SharedExpertGate::None)
     {
-        return Err(PlanError::Unsupported("gated shared expert with general routing"));
+        return Err(PlanError::Unsupported(
+            "gated shared expert with general routing",
+        ));
     }
     Ok(())
+}
+
+/// Media rows of a decoder whose routers rank them on their own selection
+/// bias (`Router::media_bias`): no selection reads that bias yet, so a
+/// decoder with a vision component and one is refused, rather than ranking
+/// its media rows on the text bias. Without a vision component there are no
+/// media rows, and text rows never read it.
+pub(crate) fn admit_media(decoder: &Decoder, vision: bool) -> Result<(), PlanError> {
+    let media_biased = decoder.sublayers().any(|(_, sublayer)| {
+        routed_ffn(&sublayer.op).is_some_and(|routed| routed.router.media_bias.is_some())
+    });
+    match vision && media_biased {
+        true => Err(PlanError::Unsupported(
+            "media rows ranked on their own expert selection bias",
+        )),
+        false => Ok(()),
+    }
 }
 
 /// The weights the operator binds, in the order its entries consume them.
@@ -287,13 +513,21 @@ pub(super) fn fused_shape_key(routed: &RoutedFfn) -> String {
 }
 
 /// The program binding of Qwen's fused form (`is_fused`); `lookup` resolves
-/// the planned element of a role in its scope.
+/// the planned element of a role in its scope that its entry binds without
+/// an accumulator-scale port (the shared expert's), `scalable` one it binds
+/// with one (the experts').
 pub(super) fn fused_binding(
     routed: &RoutedFfn,
     hidden: u64,
     lookup: impl Fn(WeightKind) -> Result<Element, PlanError>,
+    scalable: impl Fn(WeightKind) -> Result<ScalableWeight, PlanError>,
     activation: Element,
 ) -> Result<RoutedBinding, PlanError> {
+    let (gate, up, down) = (
+        scalable(WeightKind::ExpertGate)?,
+        scalable(WeightKind::ExpertUp)?,
+        scalable(WeightKind::ExpertDown)?,
+    );
     Ok(RoutedBinding {
         hidden,
         experts: routed.experts,
@@ -302,18 +536,25 @@ pub(super) fn fused_binding(
         shared: routed
             .shared
             .as_ref()
-            .ok_or(PlanError::Unsupported("routed feed-forward without shared expert"))?
+            .ok_or(PlanError::Unsupported(
+                "routed feed-forward without shared expert",
+            ))?
             .intermediate,
         normalize_selected: routed.router.normalization == RouteNormalization::Sum,
         norm: lookup(WeightKind::InputNorm)?,
         router: lookup(WeightKind::Router)?,
-        expert_gate: lookup(WeightKind::ExpertGate)?,
-        expert_up: lookup(WeightKind::ExpertUp)?,
-        expert_down: lookup(WeightKind::ExpertDown)?,
+        expert_gate: gate.element,
+        expert_up: up.element,
+        expert_down: down.element,
         shared_gate: lookup(WeightKind::SharedGate)?,
         shared_up: lookup(WeightKind::SharedUp)?,
         shared_down: lookup(WeightKind::SharedDown)?,
         activation,
+        scales: ExpertScales {
+            gate: gate.scale,
+            up: up.scale,
+            down: down.scale,
+        },
     })
 }
 
@@ -330,24 +571,25 @@ pub(super) fn binding(
     let shape = GeneralRoutedShape::of(hidden, routed)?;
     let norm = lookup(WeightKind::InputNorm)?;
     let mut scales = GeneralRoutedScales::default();
-    // `routed_gate_up` and `routed_experts` have no scale ports.
-    let (expert_gate, expert_up) = if shape.experts_expansion.gated {
-        (
-            Some(lookup(WeightKind::ExpertGate)?),
-            lookup(WeightKind::ExpertUp)?,
-        )
-    } else {
-        let up = scalable(WeightKind::ExpertUp)?;
-        scales.expert_up = up.scale;
-        (None, up.element)
-    };
+    let expert_gate = shape
+        .experts_expansion
+        .gated
+        .then(|| scalable(WeightKind::ExpertGate))
+        .transpose()?;
+    let expert_up = scalable(WeightKind::ExpertUp)?;
     let expert_down = scalable(WeightKind::ExpertDown)?;
+    // The route's one per-expert scale port holds either.
     if expert_down.scale != 0 && shape.expert_scale {
         return Err(PlanError::Unsupported(
             "a scaled expert down weight beside stored per-expert output scales",
         ));
     }
-    scales.expert_down = expert_down.scale;
+    scales.experts = ExpertScales {
+        gate: expert_gate.map_or(0, |gate| gate.scale),
+        up: expert_up.scale,
+        down: expert_down.scale,
+    };
+    let (expert_gate, expert_up) = (expert_gate.map(|gate| gate.element), expert_up.element);
     let latent = if shape.latent {
         let (down, up) = (
             scalable(WeightKind::LatentDown)?,
@@ -394,4 +636,111 @@ pub(super) fn binding(
         activation,
         scales,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::planning::fixtures::descriptor;
+    use magnitude_family_contracts::Router;
+
+    /// DeepSeek V4.1 Flash's routed feed-forward (engine map §7): sqrt-softplus
+    /// scores ranked with a selection bias, weights over sum + 1e-20 scaled by
+    /// 1.5, 384 SiLU-gated experts clamped at 10 of which 6 are selected, and
+    /// one ungated shared expert clamped the same.
+    fn deepseek41() -> RoutedFfn {
+        const HIDDEN: u64 = 5120;
+        const EXPERTS: u64 = 384;
+        const FEATURES: u64 = 2304;
+        let silu = |gate, up| FeedForwardUp::Gated {
+            activation: ActivationFunction::Silu,
+            limit: Some(GluLimit::new(10.0).unwrap()),
+            gate,
+            up,
+        };
+        RoutedFfn {
+            experts: EXPERTS,
+            selected: 6,
+            intermediate: FEATURES,
+            router: Router {
+                weight: descriptor("ffn_gate_inp", &[EXPERTS, HIDDEN]),
+                input: RouterInput::Operator,
+                score: ScoreFunction::SqrtSoftplus,
+                selection: ExpertSelection::TopK {
+                    bias: Some(descriptor("exp_probs_b", &[EXPERTS])),
+                },
+                media_bias: None,
+                normalization: RouteNormalization::SumPlusEpsilon(1e-20),
+                scale: 1.5,
+            },
+            expert_up: silu(
+                descriptor("ffn_gate_exps", &[EXPERTS, FEATURES, HIDDEN]),
+                descriptor("ffn_up_exps", &[EXPERTS, FEATURES, HIDDEN]),
+            ),
+            expert_down: descriptor("ffn_down_exps", &[EXPERTS, HIDDEN, FEATURES]),
+            expert_scale: None,
+            latent: None,
+            shared: Some(SharedExpert {
+                intermediate: FEATURES,
+                up: silu(
+                    descriptor("ffn_gate_shexp", &[FEATURES, HIDDEN]),
+                    descriptor("ffn_up_shexp", &[FEATURES, HIDDEN]),
+                ),
+                down: descriptor("ffn_down_shexp", &[HIDDEN, FEATURES]),
+                gate: SharedExpertGate::None,
+            }),
+        }
+    }
+
+    /// Until a selection reads it, a router's media-row bias admits a
+    /// text-only decoder (its text rows never read it) and refuses one with
+    /// a vision component by name: no media row is ranked on the text bias.
+    #[test]
+    fn a_media_row_bias_is_refused_beside_vision_and_ignored_without_it() {
+        let mut definition = crate::planning::fixtures::sinkhorn_fixture_definition(1);
+        let decoder = &mut definition.decoder;
+        assert_eq!(admit_media(decoder, true), Ok(()));
+        let Operator::RoutedFfn(routed) = &mut decoder.blocks[0].sublayers[1].op else {
+            panic!("the fixture's feed-forward is routed");
+        };
+        routed.router.media_bias = Some(descriptor("exp_probs_b_vl", &[routed.experts]));
+        assert_eq!(admit_media(decoder, false), Ok(()));
+        assert_eq!(
+            admit_media(decoder, true),
+            Err(PlanError::Unsupported(
+                "media rows ranked on their own expert selection bias"
+            ))
+        );
+    }
+
+    #[test]
+    fn sqrt_softplus_routing_takes_the_general_path() {
+        let routed = deepseek41();
+        assert!(!is_fused(&routed));
+        let silu_gated = Expansion {
+            gated: true,
+            activation: 0,
+            limit: Some(GluLimit::new(10.0).unwrap()),
+        };
+        assert_eq!(
+            GeneralRoutedShape::of(5120, &routed).unwrap(),
+            GeneralRoutedShape {
+                hidden: 5120,
+                experts: 384,
+                selected: 6,
+                intermediate: 2304,
+                expert_hidden: 5120,
+                latent: false,
+                experts_expansion: silu_gated,
+                shared: Some((2304, silu_gated)),
+                score: 2,
+                normalization: 2,
+                normalization_epsilon: 1e-20_f32.to_bits(),
+                scale: 1.5_f32.to_bits(),
+                bias: true,
+                expert_scale: false,
+                router_norm: false,
+            }
+        );
+    }
 }

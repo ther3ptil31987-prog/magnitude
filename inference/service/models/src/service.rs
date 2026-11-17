@@ -4,11 +4,12 @@ use std::path::{Path, PathBuf};
 
 use futures_util::future::BoxFuture;
 use magnitude_service_contracts::{
-    DeletePlan, DeletedModel, InventoryEntryId, InventoryError, InventoryModel, ModelAvailability,
+    DeletePlan, DeletedModel, ExternalOrigin, InventoryEntryId, InventoryError, InventoryModel, ModelAvailability,
     ModelInventory, ModelLocation, ModelSource, ResolvedComponent, ResolvedModel,
 };
 
-use crate::inventory::{ManagedModelStore, hf_repo_dir, repository_lock_path};
+use crate::inventory::{LinkedFiles, ManagedModelStore, hf_repo_dir, repository_lock_path};
+use crate::snapshot_blobs::{BlobStorage, RepositoryBlobs};
 use crate::store_fs::acquire_exclusive_lock;
 
 impl ModelInventory for ManagedModelStore {
@@ -63,15 +64,13 @@ impl ModelInventory for ManagedModelStore {
                 ModelLocation::MagnitudeCache { components, .. } => {
                     plan_managed_delete(&self.config.root, &model, components)
                 }
-                ModelLocation::HuggingFaceCache { cache_root, .. } => {
-                    plan_hf_cache_delete(&model, cache_root)
-                }
-                ModelLocation::Directory { .. } | ModelLocation::File { .. } => Ok(DeletePlan {
+                ModelLocation::HuggingFaceCache { .. }
+                | ModelLocation::External { .. }
+                | ModelLocation::Directory { .. }
+                | ModelLocation::File { .. } => Ok(DeletePlan {
                     model_id: id,
                     supported: false,
-                    reason: Some(
-                        "configured directories and ad-hoc files are read-only".to_owned(),
-                    ),
+                    reason: Some(EXTERNAL_READ_ONLY.to_owned()),
                     reclaimable_bytes: 0,
                     retained_shared_bytes: 0,
                     paths: Vec::new(),
@@ -83,72 +82,10 @@ impl ModelInventory for ManagedModelStore {
     fn delete(&self, id: &InventoryEntryId) -> BoxFuture<'_, Result<DeletedModel, InventoryError>> {
         let id = id.clone();
         Box::pin(async move {
-            self.ensure_installed_model_inventory().await?;
-            let observed = self
-                .models
-                .read()
-                .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))?
-                .get(&id)
-                .cloned()
-                .ok_or_else(|| InventoryError::NotFound(id.0.clone()))?;
-            let lock_path = match (&observed.location, &observed.source) {
-                (
-                    ModelLocation::MagnitudeCache { .. },
-                    ModelSource::HuggingFace { repository, .. },
-                ) => repository_lock_path(&self.config.root, repository),
-                _ => self
-                    .config
-                    .root
-                    .join("locks")
-                    .join(format!("{}.lock", id.0)),
-            };
-            let lock = acquire_delete_lock(&lock_path)?;
-            let model = self
-                .models
-                .read()
-                .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))?
-                .get(&id)
-                .cloned()
-                .ok_or_else(|| InventoryError::NotFound(id.0.clone()))?;
-            ensure_deletable_status(&model)?;
-            let plan = match &model.location {
-                ModelLocation::MagnitudeCache { components, .. } => {
-                    plan_managed_delete(&self.config.root, &model, components)?
-                }
-                ModelLocation::HuggingFaceCache { cache_root, .. } => {
-                    plan_hf_cache_delete(&model, cache_root)?
-                }
-                ModelLocation::Directory { .. } | ModelLocation::File { .. } => {
-                    return Err(InventoryError::Unsupported(
-                        "configured directories and ad-hoc files are read-only".to_owned(),
-                    ));
-                }
-            };
-            if !plan.supported {
-                return Err(InventoryError::Unsupported(
-                    plan.reason
-                        .clone()
-                        .unwrap_or_else(|| "deletion unsupported".to_owned()),
-                ));
-            }
-            let freed_bytes = match &model.location {
-                ModelLocation::MagnitudeCache { components, .. } => {
-                    delete_managed(&self.config.root, &model, components)?
-                }
-                ModelLocation::HuggingFaceCache { cache_root, .. } => {
-                    delete_hf_cache(&model, cache_root)?
-                }
-                ModelLocation::Directory { .. } | ModelLocation::File { .. } => unreachable!(),
-            };
-            drop(lock);
-            self.remove_published_model(&id).await?;
-            Ok(DeletedModel {
-                id: id.clone(),
-                deleted: true,
-                freed_bytes,
-                retained_shared_bytes: plan.retained_shared_bytes,
-                plan,
-            })
+            self.delete_entries(std::slice::from_ref(&id))
+                .await?
+                .pop()
+                .ok_or_else(|| InventoryError::NotFound(id.0.clone()))
         })
     }
 
@@ -191,11 +128,16 @@ fn ensure_deletable_status(model: &InventoryModel) -> Result<(), InventoryError>
     }
 }
 
+/// The files a model is served from, each contained in the root its location scans. A file found
+/// in a user folder (or listed by its own path, which its folder contains) or in LM Studio's folder
+/// lies there itself or as a link to anywhere. Ollama's files are the blobs its manifests name,
+/// read through whatever links lead to them, as people move Ollama's storage to another drive by
+/// linking a blob, its blobs folder or the store.
 pub(crate) fn resolve_components(
     root: &Path,
     model: &InventoryModel,
 ) -> Result<Vec<ResolvedComponent>, InventoryError> {
-    let (base, containment) = match (&model.location, &model.source) {
+    let (base, containment, linked_files) = match (&model.location, &model.source) {
         (
             ModelLocation::MagnitudeCache { .. },
             ModelSource::HuggingFace {
@@ -205,19 +147,40 @@ pub(crate) fn resolve_components(
             let repository_root = root.join("hub").join(hf_repo_dir(repository));
             (
                 repository_root.join("snapshots").join(commit),
-                repository_root,
+                Some(repository_root),
+                LinkedFiles::WithinRoot,
             )
         }
-        (ModelLocation::HuggingFaceCache { cache_root, .. }, _) => {
-            (cache_root.clone(), hf_repo_root(cache_root)?)
+        (ModelLocation::HuggingFaceCache { cache_root, .. }, _) => (
+            cache_root.clone(),
+            Some(hf_hub_root(cache_root)?),
+            LinkedFiles::WithinRoot,
+        ),
+        (
+            ModelLocation::External {
+                origin: ExternalOrigin::Folder | ExternalOrigin::LmStudio { .. },
+                root,
+                ..
+            },
+            _,
+        ) => (root.clone(), Some(root.clone()), LinkedFiles::Anywhere),
+        (
+            ModelLocation::External {
+                origin: ExternalOrigin::Ollama { .. },
+                root,
+                ..
+            },
+            _,
+        ) => (root.clone(), None, LinkedFiles::Anywhere),
+        (ModelLocation::Directory { root, .. } | ModelLocation::External { root, .. }, _) => {
+            (root.clone(), Some(root.clone()), LinkedFiles::WithinRoot)
         }
-        (ModelLocation::Directory { root, .. }, _) => (root.clone(), root.clone()),
         (ModelLocation::File { path, .. }, _) => {
             let parent = path
                 .parent()
                 .ok_or_else(|| InventoryError::Internal("ad-hoc model has no parent".to_owned()))?
                 .to_path_buf();
-            (parent.clone(), parent)
+            (parent.clone(), Some(parent), LinkedFiles::WithinRoot)
         }
         _ => {
             return Err(InventoryError::Internal(
@@ -225,7 +188,9 @@ pub(crate) fn resolve_components(
             ));
         }
     };
-    let canonical_containment = containment.canonicalize().map_err(io_error)?;
+    let canonical_containment = containment
+        .map(|containment| containment.canonicalize().map_err(io_error))
+        .transpose()?;
     let resolved = model
         .location
         .components()
@@ -235,12 +200,19 @@ pub(crate) fn resolve_components(
                 ModelLocation::File { path, .. } => path.clone(),
                 _ => base.join(&component.path),
             };
-            let canonical = path.canonicalize().map_err(io_error)?;
-            if !canonical.starts_with(&canonical_containment) {
-                return Err(InventoryError::DeletionUnsafe(format!(
-                    "model component escaped its source root: {}",
-                    path.display()
-                )));
+            if let Some(containment) = &canonical_containment {
+                let contained = match (linked_files, path.parent(), path.file_name()) {
+                    (LinkedFiles::Anywhere, Some(parent), Some(name)) => {
+                        parent.canonicalize().map_err(io_error)?.join(name)
+                    }
+                    _ => path.canonicalize().map_err(io_error)?,
+                };
+                if !contained.starts_with(containment) {
+                    return Err(InventoryError::DeletionUnsafe(format!(
+                        "model component escaped its source root: {}",
+                        path.display()
+                    )));
+                }
             }
             Ok(ResolvedComponent {
                 path,
@@ -308,6 +280,115 @@ fn invalid_split_layout(role: &magnitude_service_contracts::ComponentRole) -> In
     }
 }
 
+/// A file of a Magnitude snapshot: its repository, commit and path within the snapshot.
+type SnapshotFile = (String, String, PathBuf);
+
+impl ManagedModelStore {
+    /// Deletes Magnitude's copies of `ids` as one removal. A snapshot file stays while a model
+    /// outside `ids` is served from it (a variant's target holding the projector its sibling
+    /// variant shares); a file several of `ids` hold goes with the first of them.
+    pub(crate) async fn delete_entries(
+        &self,
+        ids: &[InventoryEntryId],
+    ) -> Result<Vec<DeletedModel>, InventoryError> {
+        self.ensure_installed_model_inventory().await?;
+        let removing = ids.iter().collect::<BTreeSet<_>>();
+        let in_use = self
+            .models
+            .read()
+            .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))?
+            .values()
+            .filter(|model| !removing.contains(&model.id))
+            .flat_map(|model| snapshot_files(model).into_iter().map(|(file, _)| file))
+            .collect::<BTreeSet<_>>();
+        let mut deleted_files = BTreeSet::new();
+        let mut deleted = Vec::new();
+        for id in ids {
+            deleted.push(self.delete_entry(id, &in_use, &mut deleted_files).await?);
+        }
+        Ok(deleted)
+    }
+
+    async fn delete_entry(
+        &self,
+        id: &InventoryEntryId,
+        in_use: &BTreeSet<SnapshotFile>,
+        deleted_files: &mut BTreeSet<SnapshotFile>,
+    ) -> Result<DeletedModel, InventoryError> {
+        let observed = self
+            .models
+            .read()
+            .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))?
+            .get(id)
+            .cloned()
+            .ok_or_else(|| InventoryError::NotFound(id.0.clone()))?;
+        let lock_path = match (&observed.location, &observed.source) {
+            (
+                ModelLocation::MagnitudeCache { .. },
+                ModelSource::HuggingFace { repository, .. },
+            ) => repository_lock_path(&self.config.root, repository),
+            _ => self
+                .config
+                .root
+                .join("locks")
+                .join(format!("{}.lock", id.0)),
+        };
+        let lock = acquire_delete_lock(&lock_path)?;
+        let model = self
+            .models
+            .read()
+            .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))?
+            .get(id)
+            .cloned()
+            .ok_or_else(|| InventoryError::NotFound(id.0.clone()))?;
+        ensure_deletable_status(&model)?;
+        // Magnitude deletes only from its own store. Every other location belongs to the
+        // user or another tool, whatever the request.
+        if !matches!(model.location, ModelLocation::MagnitudeCache { .. }) {
+            return Err(InventoryError::Unsupported(EXTERNAL_READ_ONLY.to_owned()));
+        }
+        let mut shared = Vec::new();
+        let mut owned = Vec::new();
+        for (file, component) in snapshot_files(&model) {
+            if in_use.contains(&file) {
+                shared.push(component.clone());
+            } else if deleted_files.insert(file) {
+                owned.push(component.clone());
+            }
+        }
+        let mut plan = plan_managed_delete(&self.config.root, &model, &owned)?;
+        plan.retained_shared_bytes = shared.iter().fold(plan.retained_shared_bytes, |total, component| {
+            total.saturating_add(component.size_bytes)
+        });
+        let freed_bytes = delete_managed(&self.config.root, &model, &owned)?;
+        drop(lock);
+        self.remove_published_model(id).await?;
+        Ok(DeletedModel {
+            id: id.clone(),
+            deleted: true,
+            freed_bytes,
+            retained_shared_bytes: plan.retained_shared_bytes,
+            plan,
+        })
+    }
+}
+
+/// The snapshot files a Magnitude-stored model is served from, with their components.
+fn snapshot_files(model: &InventoryModel) -> Vec<(SnapshotFile, &magnitude_service_contracts::ModelComponent)> {
+    match (&model.location, &model.source) {
+        (
+            ModelLocation::MagnitudeCache { components, .. },
+            ModelSource::HuggingFace {
+                repository, commit, ..
+            },
+        ) => components
+            .iter()
+            .map(|component| ((repository.clone(), commit.clone(), component.path.clone()), component))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn plan_managed_delete(
     root: &Path,
     model: &InventoryModel,
@@ -324,18 +405,10 @@ fn plan_managed_delete(
             "managed location is missing Hugging Face identity".to_owned(),
         ));
     };
-    let repo_root = root.join("hub").join(hf_repo_dir(repository));
-    let snapshot = repo_root.join("snapshots").join(commit);
-    let links = components
-        .iter()
-        .map(|component| snapshot.join(&component.path))
-        .collect::<BTreeSet<_>>();
-    let referenced = other_snapshot_blob_references(&repo_root, &links)?;
-    for component in components {
-        let link = snapshot.join(&component.path);
-        let blob = link.canonicalize().map_err(io_error)?;
+    let entries = managed_snapshot_entries(root, repository, commit, components)?;
+    for (component, ManagedSnapshotEntry { link, blob }) in components.iter().zip(entries.entries) {
         paths.push(link);
-        if referenced.contains(&blob) {
+        if entries.referenced.contains(&blob) {
             retained = retained.saturating_add(component.size_bytes);
         } else {
             reclaimable = reclaimable.saturating_add(component.size_bytes);
@@ -367,46 +440,97 @@ fn delete_managed(
     };
     let repo_root = root.join("hub").join(hf_repo_dir(repository));
     let snapshot = repo_root.join("snapshots").join(commit);
-    let links = components
-        .iter()
-        .map(|component| snapshot.join(&component.path))
-        .collect::<BTreeSet<_>>();
-    let referenced = other_snapshot_blob_references(&repo_root, &links)?;
+    let ManagedSnapshotEntries {
+        entries,
+        referenced,
+    } = managed_snapshot_entries(root, repository, commit, components)?;
     let mut freed = 0_u64;
-    for component in components {
-        let link = snapshot.join(&component.path);
-        let blob = link.canonicalize().map_err(io_error)?;
+    for ManagedSnapshotEntry { link, blob } in entries {
         if link.symlink_metadata().is_ok() {
             fs::remove_file(&link).map_err(io_error)?;
         }
-        if !referenced.contains(&blob) {
-            if let Ok(metadata) = blob.metadata() {
-                fs::remove_file(blob).map_err(io_error)?;
-                freed = freed.saturating_add(metadata.len());
-            }
+        if !referenced.contains(&blob)
+            && let Ok(metadata) = blob.metadata()
+        {
+            fs::remove_file(&blob).map_err(io_error)?;
+            freed = freed.saturating_add(metadata.len());
+            let mut checkpoint = blob.into_os_string();
+            checkpoint.push(".integrity");
+            let _ = fs::remove_file(checkpoint);
         }
     }
     remove_empty_parents(&snapshot, &repo_root.join("snapshots"));
+    crate::store_fs::prune_empty_repository(&repo_root);
     Ok(freed)
 }
 
-fn other_snapshot_blob_references(
-    repo_root: &Path,
-    excluded_links: &BTreeSet<PathBuf>,
-) -> Result<BTreeSet<PathBuf>, InventoryError> {
-    let mut references = BTreeSet::new();
+struct ManagedSnapshotEntry {
+    link: PathBuf,
+    blob: PathBuf,
+}
+
+struct ManagedSnapshotEntries {
+    entries: Vec<ManagedSnapshotEntry>,
+    referenced: BTreeSet<PathBuf>,
+}
+
+/// Resolve a managed package's snapshot entries to their blobs, plus the blobs other snapshot
+/// entries of the repository still publish. Every entry must resolve to a repository blob.
+fn managed_snapshot_entries(
+    root: &Path,
+    repository: &str,
+    commit: &str,
+    components: &[magnitude_service_contracts::ModelComponent],
+) -> Result<ManagedSnapshotEntries, InventoryError> {
+    let repo_root = root.join("hub").join(hf_repo_dir(repository));
+    let snapshot = repo_root.join("snapshots").join(commit);
+    let blobs = RepositoryBlobs::open(&repo_root).map_err(io_error)?;
+    let entries = components
+        .iter()
+        .map(|component| {
+            let link = snapshot.join(&component.path);
+            let blob = repository_blob(&blobs, &link)?;
+            Ok(ManagedSnapshotEntry { link, blob })
+        })
+        .collect::<Result<Vec<_>, InventoryError>>()?;
+    let links = entries
+        .iter()
+        .map(|entry| entry.link.clone())
+        .collect::<BTreeSet<_>>();
+    let mut referenced = BTreeSet::new();
     collect_other_snapshot_blobs(
         &repo_root.join("snapshots"),
-        repo_root,
-        excluded_links,
-        &mut references,
+        &blobs,
+        &links,
+        &mut referenced,
     )?;
-    Ok(references)
+    Ok(ManagedSnapshotEntries {
+        entries,
+        referenced,
+    })
+}
+
+/// The blob a managed snapshot entry owns. Magnitude deletes only bytes its repository keeps
+/// itself, never a blob store shared with other repositories.
+fn repository_blob(blobs: &RepositoryBlobs, link: &Path) -> Result<PathBuf, InventoryError> {
+    let blob = blobs.resolve(link).map_err(io_error)?.ok_or_else(|| {
+        InventoryError::DeletionUnsafe(format!(
+            "snapshot entry does not resolve to repository blobs: {}",
+            link.display()
+        ))
+    })?;
+    match blob.storage {
+        BlobStorage::Repository => Ok(blob.entry),
+        BlobStorage::Shared => Err(InventoryError::DeletionUnsafe(format!(
+            "snapshot entry links into a shared blob store: {}",
+            link.display()
+        ))),
+    }
 }
 
 fn collect_other_snapshot_blobs(
     path: &Path,
-    repo_root: &Path,
+    blobs: &RepositoryBlobs,
     excluded_links: &BTreeSet<PathBuf>,
     output: &mut BTreeSet<PathBuf>,
 ) -> Result<(), InventoryError> {
@@ -418,75 +542,20 @@ fn collect_other_snapshot_blobs(
         let path = entry.path();
         let kind = entry.file_type().map_err(io_error)?;
         if kind.is_dir() {
-            collect_other_snapshot_blobs(&path, repo_root, excluded_links, output)?;
+            collect_other_snapshot_blobs(&path, blobs, excluded_links, output)?;
         } else if !excluded_links.contains(&path) && (kind.is_symlink() || kind.is_file()) {
-            let canonical = path.canonicalize().map_err(io_error)?;
-            if !canonical.starts_with(repo_root.join("blobs")) {
-                return Err(InventoryError::DeletionUnsafe(format!(
-                    "snapshot entry does not resolve to repository blobs: {}",
-                    path.display()
-                )));
-            }
-            output.insert(canonical);
+            output.insert(repository_blob(blobs, &path)?);
         }
     }
     Ok(())
 }
 
-fn plan_hf_cache_delete(
-    model: &InventoryModel,
-    snapshot: &Path,
-) -> Result<DeletePlan, InventoryError> {
-    let repo_root = hf_repo_root(snapshot)?;
-    let (target_blobs, remaining_blobs) = hf_blob_reference_sets(&repo_root, snapshot)?;
-    let mut reclaimable = 0_u64;
-    let mut retained = 0_u64;
-    let mut paths = vec![snapshot.to_path_buf()];
-    for blob in target_blobs {
-        let size = blob.metadata().map(|metadata| metadata.len()).unwrap_or(0);
-        if remaining_blobs.contains(&blob) {
-            retained = retained.saturating_add(size);
-        } else {
-            reclaimable = reclaimable.saturating_add(size);
-            paths.push(blob);
-        }
-    }
-    Ok(DeletePlan {
-        model_id: model.id.clone(),
-        supported: true,
-        reason: None,
-        reclaimable_bytes: reclaimable,
-        retained_shared_bytes: retained,
-        paths,
-    })
-}
+const EXTERNAL_READ_ONLY: &str =
+    "files outside Magnitude's model store are read-only and are never deleted";
 
-fn delete_hf_cache(model: &InventoryModel, snapshot: &Path) -> Result<u64, InventoryError> {
-    let repo_root = hf_repo_root(snapshot)?;
-    let plan = plan_hf_cache_delete(model, snapshot)?;
-    let commit = snapshot
-        .file_name()
-        .and_then(|value| value.to_str())
-        .ok_or_else(|| InventoryError::DeletionUnsafe("snapshot has no commit name".to_owned()))?;
-    remove_refs_to_commit(&repo_root.join("refs"), commit)?;
-    let (target_blobs, remaining_blobs) = hf_blob_reference_sets(&repo_root, snapshot)?;
-    fs::remove_dir_all(snapshot).map_err(io_error)?;
-    let mut freed = 0_u64;
-    for blob in target_blobs.difference(&remaining_blobs) {
-        if let Ok(metadata) = blob.metadata() {
-            fs::remove_file(blob).map_err(io_error)?;
-            freed = freed.saturating_add(metadata.len());
-        }
-    }
-    let snapshots = repo_root.join("snapshots");
-    if fs::read_dir(&snapshots).map_err(io_error)?.next().is_none() {
-        let _ = fs::remove_dir_all(&repo_root);
-    }
-    let _ = plan;
-    Ok(freed)
-}
-
-fn hf_repo_root(snapshot: &Path) -> Result<PathBuf, InventoryError> {
+/// The hub a recognized Hugging Face snapshot belongs to: its files may resolve into the blob
+/// store the hub shares between repositories.
+fn hf_hub_root(snapshot: &Path) -> Result<PathBuf, InventoryError> {
     let canonical = snapshot.canonicalize().map_err(io_error)?;
     let snapshots = canonical.parent().ok_or_else(|| {
         InventoryError::DeletionUnsafe("snapshot has no snapshots root".to_owned())
@@ -498,68 +567,9 @@ fn hf_repo_root(snapshot: &Path) -> Result<PathBuf, InventoryError> {
     }
     snapshots
         .parent()
+        .and_then(Path::parent)
         .map(Path::to_path_buf)
-        .ok_or_else(|| InventoryError::DeletionUnsafe("snapshot has no repository root".to_owned()))
-}
-
-fn hf_blob_reference_sets(
-    repo_root: &Path,
-    target_snapshot: &Path,
-) -> Result<(BTreeSet<PathBuf>, BTreeSet<PathBuf>), InventoryError> {
-    let mut target = BTreeSet::new();
-    let mut remaining = BTreeSet::new();
-    let snapshots = repo_root.join("snapshots");
-    for entry in fs::read_dir(&snapshots).map_err(io_error)? {
-        let snapshot = entry.map_err(io_error)?.path();
-        let destination = if snapshot == target_snapshot {
-            &mut target
-        } else {
-            &mut remaining
-        };
-        collect_snapshot_blobs(&snapshot, repo_root, destination)?;
-    }
-    Ok((target, remaining))
-}
-
-fn collect_snapshot_blobs(
-    path: &Path,
-    repo_root: &Path,
-    output: &mut BTreeSet<PathBuf>,
-) -> Result<(), InventoryError> {
-    for entry in fs::read_dir(path).map_err(io_error)? {
-        let entry = entry.map_err(io_error)?;
-        let path = entry.path();
-        let kind = entry.file_type().map_err(io_error)?;
-        if kind.is_dir() {
-            collect_snapshot_blobs(&path, repo_root, output)?;
-        } else if kind.is_symlink() || kind.is_file() {
-            let canonical = path.canonicalize().map_err(io_error)?;
-            if !canonical.starts_with(repo_root.join("blobs")) {
-                return Err(InventoryError::DeletionUnsafe(format!(
-                    "snapshot entry does not resolve to repository blobs: {}",
-                    path.display()
-                )));
-            }
-            output.insert(canonical);
-        }
-    }
-    Ok(())
-}
-
-fn remove_refs_to_commit(refs: &Path, commit: &str) -> Result<(), InventoryError> {
-    if !refs.is_dir() {
-        return Ok(());
-    }
-    for entry in fs::read_dir(refs).map_err(io_error)? {
-        let entry = entry.map_err(io_error)?;
-        let path = entry.path();
-        if entry.file_type().map_err(io_error)?.is_dir() {
-            remove_refs_to_commit(&path, commit)?;
-        } else if fs::read_to_string(&path).is_ok_and(|value| value.trim() == commit) {
-            fs::remove_file(path).map_err(io_error)?;
-        }
-    }
-    Ok(())
+        .ok_or_else(|| InventoryError::DeletionUnsafe("snapshot has no hub root".to_owned()))
 }
 
 fn remove_empty_parents(path: &Path, stop: &Path) {
@@ -590,6 +600,39 @@ mod tests {
         ComponentRole, ContentId, ContentIdentity, Integrity, InventoryEntryId,
         InventoryProperties, ModelComponent,
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_deletion_refuses_entries_that_link_into_a_shared_blob_store() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("temp store");
+        let repository = "owner/repo";
+        let hub = root.path().join("hub");
+        let repository_root = hub.join(hf_repo_dir(repository));
+        let snapshot = repository_root.join("snapshots/commit");
+        fs::create_dir_all(repository_root.join("blobs")).expect("blobs");
+        fs::create_dir_all(hub.join("blobs/ab")).expect("shared store");
+        fs::create_dir_all(&snapshot).expect("snapshot");
+        fs::write(hub.join("blobs/ab/abcd"), b"weights").expect("shared blob");
+        symlink("../../blobs/ab/abcd", repository_root.join("blobs/hash")).expect("blob link");
+        symlink("../../blobs/hash", snapshot.join("model.gguf")).expect("snapshot link");
+        let component = ModelComponent {
+            path: PathBuf::from("model.gguf"),
+            role: ComponentRole::Weights,
+            size_bytes: 7,
+            content: ContentIdentity::Sha256 {
+                value: "0".repeat(64),
+            },
+            shard_index: None,
+            relationship: None,
+        };
+
+        let refused = managed_snapshot_entries(root.path(), repository, "commit", &[component]);
+
+        assert!(matches!(refused, Err(InventoryError::DeletionUnsafe(_))));
+        assert!(hub.join("blobs/ab/abcd").is_file());
+    }
 
     #[cfg(unix)]
     #[test]

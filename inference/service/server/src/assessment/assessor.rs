@@ -9,31 +9,41 @@ use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
 use magnitude_engine::assessment::{
+    AssessmentSetup, AssessmentStructure, DrafterVerdict as EngineDrafterVerdict,
+    HeaderExtent as EngineHeaderExtent,
     ModelAssessment as EngineAssessment, ModelAssessmentError,
-    ModelCapabilities as EngineCapabilities, ModelPackagePaths, PreparedModelAssessment,
-    finish_model_assessment, prepare_model_assessment,
+    ModelCapabilities as EngineCapabilities, ModelExecution, ModelPackagePaths,
+    ModelResidency as EngineResidency, Performance, PreparedModelAssessment,
+    ProjectorVerdict as EngineProjectorVerdict, SpeculativeMethod as EngineSpeculativeMethod,
+    finish_model_assessment, header_refusal, prepare_model_assessment,
 };
-use magnitude_engine::error::UnsupportedModel;
-use magnitude_engine::options::ModelMethod;
-use magnitude_executor::assessment::{DomainFit, ExecutionAssessment, PerformanceEstimate};
+use magnitude_artifacts::gguf::Directory;
+use magnitude_engine::error::{UnsupportedModel, UnsupportedReason as EngineUnsupportedReason};
+use magnitude_engine::fingerprint::ModelFingerprint as EngineModelFingerprint;
+use magnitude_engine::options::{ModelMethod, PROFILE_SEQUENCES};
+use magnitude_executor::assessment::{DomainFit, ExecutionFit, ExecutionShortfall, PerformanceEstimate};
 use magnitude_service_contracts::models::{
-    AssessmentEnvironmentId, InstalledModelPackages as _, MemoryAssessment, ModelAssessment,
-    ModelAssessmentId, ModelAssessmentProfile, ModelBundleInput, ModelCapabilities, ModelFailure,
-    ModelPackageOperand, ModelReasoningCapabilities, ModelServingConfiguration,
-    PerformanceEvidence, ResolvedServableModelBundle, ServableModelBundle,
+    AssessmentEnvironmentId, DrafterVerdict, InstalledModelPackages as _, KernelStatic,
+    KnownUnsupportedReason, MemoryAssessment, MemoryBreakdown, ModelAssessment, ModelPlacement, ModelAssessmentId,
+    ModelAssessmentProfile, ModelBundleInput, ModelCapabilities, ModelFailure, ModelFingerprint,
+    ModelPackageOperand, ModelPerformance, ModelReasoningCapabilities, ModelResidency,
+    ModelServingConfiguration, PerformanceEvidence, ProjectorVerdict, ResolvedServableModelBundle, ServableModelBundle,
     SpeculativeDraftSource, SpeculativeDraftSourceInput, SpeculativeMethod,
+    ColdExperts, StreamedBank, StreamedBankParts, UnsupportedReason, WeightTypeCount,
 };
 use magnitude_service_contracts::{ComponentRole, InventoryError, MemoryDomainId, ResolvedModel};
 use magnitude_service_models::{
-    CachedModelAssessment, ManagedModelStore, ModelDomainResolver, ReleaseCatalog,
-    ServableModelBundleKey, servable_model_bundle_key_for_bundle,
+    CachedModelAssessment, HeaderExtent, HeaderVerdicts, ManagedModelStore, ModelDomainResolver,
+    ReleaseCatalog, ServableModelBundleKey, servable_model_bundle_key_for_bundle,
 };
 use sha2::{Digest, Sha256};
 
 use super::environment::AssessmentEnvironment;
 
 /// The service's performance depths: 25K, 50K and 75K where the context admits them, then the
-/// full context. ACN ranking reads `min(50_000, context)`, which this set contains.
+/// full context. ACN ranking reads `min(50_000, context)`, which this set contains. A profile
+/// asks for the depths of its ceiling; a model is estimated at those of the context it is served
+/// at.
 pub fn performance_depths(context_length: u32) -> Vec<u32> {
     let mut depths = [25_000, 50_000, 75_000]
         .into_iter()
@@ -47,6 +57,7 @@ pub fn performance_depths(context_length: u32) -> Vec<u32> {
 #[derive(Clone)]
 pub struct AssessmentWork {
     pub key: AssessmentWorkKey,
+    pub environment: Arc<AssessmentEnvironment>,
     pub profile: ModelAssessmentProfile,
     pub configuration: ModelServingConfiguration,
     pub preparation: Arc<tokio::sync::OnceCell<PreparationResult>>,
@@ -54,18 +65,24 @@ pub struct AssessmentWork {
 
 pub type PreparationResult = Result<Arc<PreparedModelAssessment>, ModelFailure>;
 
-fn preparation_task_failure(error: impl std::fmt::Display) -> ModelFailure {
-    inventory_model_failure(InventoryError::Internal(format!(
-        "model preparation task failed: {error}"
-    )))
+fn preparation_failure(error: ModelAssessmentError) -> ModelFailure {
+    inventory_model_failure(preparation_error(error))
 }
 
-fn preparation_failure(error: ModelAssessmentError) -> ModelFailure {
-    inventory_model_failure(InventoryError::ModelOperation {
-        code: "assessment_failed".to_owned(),
+/// An engine failure that produced no verdict. Material that is truncated or not a GGUF is never
+/// worth retrying; other failures may be.
+pub(crate) fn preparation_error(error: ModelAssessmentError) -> InventoryError {
+    let (code, retryable) = match &error {
+        ModelAssessmentError::Artifact(artifact) if artifact.unreadable() => {
+            ("unreadable_artifact", false)
+        }
+        _ => ("assessment_failed", true),
+    };
+    InventoryError::ModelOperation {
+        code: code.to_owned(),
         message: error.to_string(),
-        retryable: true,
-    })
+        retryable,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -89,16 +106,18 @@ pub struct AssessmentOutcome {
     pub result: Result<CachedModelAssessment, ModelFailure>,
 }
 
-/// Assesses resolved targets in one environment.
+/// Assesses resolved targets in the current environment: one structure, under whatever the
+/// measurement job has stored of the machine.
 pub struct ModelAssessor {
     models: Arc<ManagedModelStore>,
     model_domains: Arc<ModelDomainResolver>,
     release_catalog: Arc<ReleaseCatalog>,
-    environment: Arc<AssessmentEnvironment>,
+    environment: std::sync::RwLock<Arc<AssessmentEnvironment>>,
     work_gates: tokio::sync::Mutex<BTreeMap<String, Weak<tokio::sync::Mutex<()>>>>,
 }
 
 impl ModelAssessor {
+    /// The assessor of targets in `environment`.
     pub fn new(
         models: Arc<ManagedModelStore>,
         model_domains: Arc<ModelDomainResolver>,
@@ -109,14 +128,59 @@ impl ModelAssessor {
             models,
             model_domains,
             release_catalog,
-            environment,
+            environment: std::sync::RwLock::new(environment),
             work_gates: tokio::sync::Mutex::new(BTreeMap::new()),
         }
     }
 
-    /// The environment every model is assessed in.
-    pub fn environment(&self) -> &Arc<AssessmentEnvironment> {
-        &self.environment
+    /// The environment new work is assessed in.
+    pub fn environment(&self) -> Arc<AssessmentEnvironment> {
+        Arc::clone(
+            &self
+                .environment
+                .read()
+                .expect("assessment environment lock poisoned"),
+        )
+    }
+
+    /// Assess new work under `stored`, what the stored records give assessment now
+    /// ([`AssessmentEnvironment::stored`]). The new environment when its identity differs from
+    /// the current one's; `None` when the records change nothing of it.
+    pub fn adopt(&self, stored: AssessmentSetup) -> Option<Arc<AssessmentEnvironment>> {
+        let mut current = self
+            .environment
+            .write()
+            .expect("assessment environment lock poisoned");
+        let next = current.stored(stored);
+        let moved = next.id != current.id;
+        *current = Arc::new(next);
+        moved.then(|| Arc::clone(&current))
+    }
+
+    pub fn models(&self) -> &Arc<ManagedModelStore> {
+        &self.models
+    }
+
+    pub fn release_catalog(&self) -> &Arc<ReleaseCatalog> {
+        &self.release_catalog
+    }
+
+    /// Resolve a bundle's exact material: release headers for a catalog bundle, installed files
+    /// or source-backed previews for everything else.
+    pub async fn resolve_material(
+        &self,
+        bundle: ServableModelBundle,
+    ) -> Result<ResolvedServableModelBundle, InventoryError> {
+        let bundle_key = servable_model_bundle_key_for_bundle(&bundle);
+        self.resolve(&bundle_key, bundle).await
+    }
+
+    /// Whether `subject`'s configuration still waits on its catalog drafter's fit.
+    pub fn awaits_catalog_drafter_fit(
+        &self,
+        subject: &magnitude_service_contracts::models::ModelAssessmentSubject,
+    ) -> bool {
+        self.model_domains.awaits_catalog_drafter_fit(subject)
     }
 
     pub fn configuration_for(
@@ -126,42 +190,47 @@ impl ModelAssessor {
         self.model_domains.assessment_configuration(subject)
     }
 
+    /// The work of assessing `configuration` at `profile` in `environment`.
     pub fn work_for(
-        &self,
+        environment: &Arc<AssessmentEnvironment>,
         configuration: ModelServingConfiguration,
         profile: magnitude_service_contracts::models::ServingProfile,
         preparation: Arc<tokio::sync::OnceCell<PreparationResult>>,
-    ) -> Result<AssessmentWork, InventoryError> {
+    ) -> AssessmentWork {
         let profile = ModelAssessmentProfile {
             performance_context_tokens: performance_depths(profile.context_length),
             profile,
         };
         let bundle = servable_model_bundle_key_for_bundle(&configuration.bundle);
-        Ok(AssessmentWork {
-            key: AssessmentWorkKey::new(&self.environment.id, &bundle, &profile),
+        AssessmentWork {
+            key: AssessmentWorkKey::new(&environment.id, &bundle, &profile),
+            environment: Arc::clone(environment),
             profile,
             configuration,
             preparation,
-        })
+        }
     }
 
-    /// Resolve and prepare one bundle from its headers.
-    pub async fn prepare_bundle(&self, configuration: ModelServingConfiguration) -> PreparationResult {
-        let environment = Arc::clone(&self.environment);
+    /// Resolve and prepare one bundle from its headers on `structure`, all a preparation reads
+    /// of its environment.
+    pub async fn prepare_bundle(
+        &self,
+        structure: Arc<AssessmentStructure>,
+        configuration: ModelServingConfiguration,
+    ) -> PreparationResult {
         let bundle_key = servable_model_bundle_key_for_bundle(&configuration.bundle);
         let resolved = self
             .resolve(&bundle_key, configuration.bundle)
             .await
             .map_err(assessment_drop_failure)?;
         let package = engine_material(&resolved).map_err(assessment_drop_failure)?;
-        let prepared = crate::spawn_blocking_traced(move || {
+        let prepared = magnitude_service_utils::blocking::run(move || {
             // The resolved material (a catalog bundle's materialized headers) lives until
             // preparation has read it.
             let _material = resolved;
-            prepare_model_assessment(&package, &environment.setup)
+            prepare_model_assessment(&package, &structure)
         })
         .await
-        .map_err(preparation_task_failure)?
         .map_err(preparation_failure)?;
         Ok(Arc::new(prepared))
     }
@@ -169,15 +238,15 @@ impl ModelAssessor {
     /// One attempt at `work`. `Ok` carries the target's terminal disposition; `Err` is an
     /// operational failure the pool records as `Dropped`.
     pub async fn assess(&self, work: AssessmentWork) -> Result<AssessmentOutcome, InventoryError> {
-        let environment = Arc::clone(&self.environment);
         let AssessmentWork {
             key,
+            environment,
             profile,
             configuration,
             preparation,
         } = work;
         let bundle_key = servable_model_bundle_key_for_bundle(&configuration.bundle);
-        // The exact work identity is the whole assessment identity, so it keys the cache.
+        // The exact work identity is the assessment's identity, so it keys the cache.
         let evidence = key.0.clone();
         if let Some(cached) = self.models.read_model_assessment(&evidence) {
             return Ok(AssessmentOutcome {
@@ -196,10 +265,10 @@ impl ModelAssessor {
                 result: Ok(cached),
             });
         }
-        let prepared = preparation
-            .get_or_init(|| self.prepare_bundle(configuration))
-            .await;
-        let prepared = match prepared {
+        let prepared = match preparation
+            .get_or_init(|| self.prepare_bundle(Arc::clone(&environment.setup.structure), configuration))
+            .await
+        {
             Ok(prepared) => Arc::clone(prepared),
             Err(failure) => {
                 return Ok(AssessmentOutcome {
@@ -237,14 +306,8 @@ impl ModelAssessor {
         let release_catalog = Arc::clone(&self.release_catalog);
         let release_key = bundle_key.clone();
         let release =
-            crate::spawn_blocking_traced(move || release_catalog.resolve_bundle(&release_key))
-                .await
-                .map_err(|error| {
-                    InventoryError::Internal(format!(
-                        "release model material task failed for {}: {error}",
-                        bundle_key.0
-                    ))
-                })??;
+            magnitude_service_utils::blocking::run(move || release_catalog.resolve_bundle(&release_key))
+                .await?;
         match release {
             Some(resolved) => Ok(resolved),
             None => self.models.resolve_bundle(bundle_input(bundle)).await,
@@ -254,14 +317,15 @@ impl ModelAssessor {
 
 /// The components the engine reads: the target GGUF (a split target by its first shard, beside
 /// which the engine finds the others), its projector and a separate draft, with the method the
-/// bundle declares. A standalone package resolves its method from the package (`Auto`); a
-/// speculative bundle declares its method, and the engine rejects a draft that does not implement
-/// it rather than serving the target plain.
+/// bundle declares. A standalone package is served plain, even when its file carries MTP heads:
+/// heads are used only through a bundle that declares them. A speculative bundle declares its
+/// method, and the engine rejects a draft that does not implement it rather than serving the
+/// target plain.
 pub(crate) fn engine_material(
     resolved: &ResolvedServableModelBundle,
 ) -> Result<ModelPackagePaths, InventoryError> {
     let (method, draft) = match &resolved.bundle {
-        ServableModelBundle::Standalone { .. } => (ModelMethod::Auto, None),
+        ServableModelBundle::Standalone { .. } => (ModelMethod::Plain, None),
         ServableModelBundle::SpeculativeDecoding {
             draft_source,
             method,
@@ -275,18 +339,14 @@ pub(crate) fn engine_material(
                     SpeculativeMethod::DFlash => ModelMethod::DFlash,
                     SpeculativeMethod::DFlash2 => ModelMethod::DFlash2,
                     SpeculativeMethod::DSpark => ModelMethod::DSpark,
-                    SpeculativeMethod::Mtp => {
-                        return Err(InventoryError::InvalidRequest(
-                            "MTP drafts with the target's own head, not a separate draft"
-                                .to_owned(),
-                        ));
-                    }
+                    SpeculativeMethod::LiLiCorr => ModelMethod::LiLiCorr,
+                    SpeculativeMethod::Mtp => ModelMethod::Mtp,
                 };
                 (method, Some(draft_weights(draft)?))
             }
             (SpeculativeDraftSource::Embedded, _, _) => {
                 return Err(InventoryError::InvalidRequest(
-                    "an embedded draft is an MTP head; DFlash, DFlash2 and DSpark need a separate draft"
+                    "an embedded draft is an MTP head; DFlash, DFlash2, DSpark and LiLiCorr need a separate draft"
                         .to_owned(),
                 ));
             }
@@ -364,11 +424,11 @@ async fn assess_prepared(
     let depths = profile.performance_context_tokens.clone();
     let engine_environment = Arc::clone(&environment);
     let started = std::time::Instant::now();
-    let assessed = crate::spawn_blocking_traced(move || {
-        finish_model_assessment(&prepared, &engine_environment.setup, &depths)
+    let assessed = magnitude_service_utils::blocking::run(move || {
+        let setup = &engine_environment.setup;
+        finish_model_assessment(&prepared, setup, &depths, PROFILE_SEQUENCES)
     })
-    .await
-    .map_err(|error| InventoryError::Internal(format!("model assessment task failed: {error}")))?;
+    .await;
     tracing::info!(
         target.id = %bundle_key.0,
         assessment_microseconds = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
@@ -391,21 +451,22 @@ async fn assess_prepared(
 }
 
 /// Map the engine's complete result onto the service contract.
-fn model_assessment(
+pub(crate) fn model_assessment(
     assessed: EngineAssessment,
     bundle_key: &ServableModelBundleKey,
     requested: ModelAssessmentProfile,
     environment: &AssessmentEnvironment,
 ) -> Result<CachedModelAssessment, InventoryError> {
     let (facts, execution) = match assessed {
-        EngineAssessment::Unsupported(unsupported) => {
-            let code = match &unsupported {
-                UnsupportedModel::Family { .. } => "unsupported_family",
-                UnsupportedModel::Representation { .. } => "unsupported_representation",
-                UnsupportedModel::Backend { .. } => "unsupported_backend",
-                UnsupportedModel::KernelDomain { .. } => "unsupported_kernel_domain",
-            };
-            return Ok(unsupported_model(requested, code, unsupported.to_string()));
+        EngineAssessment::Unsupported {
+            unsupported,
+            fingerprint,
+        } => {
+            return Ok(unsupported_model(
+                requested,
+                unsupported,
+                fingerprint.as_ref().map(model_fingerprint),
+            ));
         }
         EngineAssessment::Assessed { facts, execution } => (facts, execution),
     };
@@ -419,64 +480,251 @@ fn model_assessment(
             retryable: false,
         });
     }
+    let projector = projector_verdict(facts.projector);
+    let drafter = drafter_verdict(facts.drafter);
     let assessment_id = assessment_id(bundle_key, &requested, &environment.id);
-    let ModelAssessmentProfile {
-        profile,
-        performance_context_tokens,
-    } = requested;
+    let profile = requested.profile;
     let assessment = match execution {
-        ExecutionAssessment::Fits {
-            domains,
-            performance,
-            ..
-        } => {
-            let performance = performance
-                .iter()
-                .map(performance_evidence)
-                .collect::<Vec<_>>();
-            if performance
-                .iter()
-                .map(|sample| sample.context_tokens)
-                .ne(performance_context_tokens.iter().copied())
-            {
-                return Err(InventoryError::ModelOperation {
-                    code: "assessment_incomplete".to_owned(),
-                    message: "the engine did not estimate every requested depth".to_owned(),
-                    retryable: false,
-                });
-            }
-            ModelAssessment::Fits {
-                profile,
-                assessment_id,
-                memory: memory_assessments(&domains, environment),
-                performance,
-            }
-        }
-        ExecutionAssessment::DoesNotFit {
+        ModelExecution::Fits {
+            fit:
+                ExecutionFit {
+                    fit_context_tokens,
+                    domains,
+                    breakdown,
+                    placement,
+                    ..
+                },
+            residency,
+        } => ModelAssessment::Fits {
+            profile,
+            served: magnitude_service_contracts::models::ServingProfile {
+                context_length: fit_context_tokens,
+            },
+            assessment_id,
+            memory: memory_assessments(&domains, environment),
+            memory_breakdown: MemoryBreakdown {
+                weights_bytes: breakdown.weights_bytes,
+                context_bytes: breakdown.context_bytes,
+                overhead_bytes: breakdown.overhead_bytes,
+            },
+            placement: ModelPlacement {
+                device_bytes: placement.device_bytes,
+                host_bytes: placement.host_bytes,
+                disk_bytes: placement.disk_bytes,
+                lookup_disk_bytes: placement.lookup_disk_bytes,
+            },
+            residency: model_residency(residency, &performance_depths(fit_context_tokens))?,
+            projector,
+            drafter,
+        },
+        ModelExecution::DoesNotFit(ExecutionShortfall {
+            fit_context_tokens,
             domains,
             limiting,
             deficit_bytes,
-            ..
-        } => ModelAssessment::DoesNotFit {
+        }) => ModelAssessment::DoesNotFit {
             profile,
+            shortfall: magnitude_service_contracts::models::ServingProfile {
+                context_length: fit_context_tokens,
+            },
             assessment_id,
             memory: memory_assessments(&domains, environment),
             limiting_resource: domain_id(limiting, environment).as_str().to_owned(),
-            deficit_bytes,
+            deficit_bytes: deficit_bytes.get(),
+            projector,
+            drafter,
         },
     };
     Ok(CachedModelAssessment {
         capabilities: capabilities(facts.capabilities),
         template_fingerprint: facts.template_fingerprint,
+        fingerprint: facts.fingerprint.as_ref().map(model_fingerprint),
         profile: assessment,
     })
 }
 
 /// A package the engine cannot execute has no engine-derived capabilities or template.
+fn unsupported_reason(reason: EngineUnsupportedReason) -> UnsupportedReason {
+    UnsupportedReason::Known(match reason {
+        EngineUnsupportedReason::Architecture { architecture } => {
+            KnownUnsupportedReason::Architecture { architecture }
+        }
+        EngineUnsupportedReason::WeightTypes { types } => KnownUnsupportedReason::WeightTypes {
+            types: types
+                .into_iter()
+                .map(|count| WeightTypeCount {
+                    ggml_type: count.ggml_type,
+                    tensor_count: count.tensor_count,
+                })
+                .collect(),
+        },
+        EngineUnsupportedReason::RopeScaling { kind } => {
+            KnownUnsupportedReason::RopeScaling { kind }
+        }
+        EngineUnsupportedReason::UnrecognizedTensor { name } => {
+            KnownUnsupportedReason::UnrecognizedTensor { name }
+        }
+        EngineUnsupportedReason::UnrecognizedMetadata { key } => {
+            KnownUnsupportedReason::UnrecognizedMetadata { key }
+        }
+        EngineUnsupportedReason::Tokenizer { model, pre } => {
+            KnownUnsupportedReason::Tokenizer { model, pre }
+        }
+        EngineUnsupportedReason::MissingMetadata { key } => {
+            KnownUnsupportedReason::MissingMetadata { key }
+        }
+        EngineUnsupportedReason::ChatTemplate => KnownUnsupportedReason::ChatTemplate,
+        EngineUnsupportedReason::KernelDomain {
+            backend,
+            entry,
+            statics,
+        } => KnownUnsupportedReason::KernelDomain {
+            backend,
+            entry,
+            statics: statics
+                .into_iter()
+                .map(|(name, value)| KernelStatic { name, value })
+                .collect(),
+        },
+        EngineUnsupportedReason::Backend { backend } => KnownUnsupportedReason::Backend { backend },
+        EngineUnsupportedReason::Unreadable => KnownUnsupportedReason::Unreadable,
+        EngineUnsupportedReason::TargetMismatch { detail } => {
+            KnownUnsupportedReason::TargetMismatch { detail }
+        }
+        EngineUnsupportedReason::TiedOutputHead => KnownUnsupportedReason::TiedOutputHead,
+        EngineUnsupportedReason::DraftArchitecture { architecture } => {
+            KnownUnsupportedReason::DraftArchitecture { architecture }
+        }
+    })
+}
+
+/// The engine's refusal of a model file's header alone, which search shows on a result: the
+/// header interpretation assessment admits a target by, without weight types or this machine.
+pub struct EngineHeaderVerdicts;
+
+impl HeaderVerdicts for EngineHeaderVerdicts {
+    fn identity(&self) -> String {
+        crate::build_identity::native_build()
+    }
+
+    fn refusal(&self, header: &Directory, extent: HeaderExtent) -> Vec<UnsupportedReason> {
+        let extent = match extent {
+            HeaderExtent::Whole => EngineHeaderExtent::Whole,
+            HeaderExtent::Leading => EngineHeaderExtent::Leading,
+        };
+        header_refusal(header, extent)
+            .map(|unsupported| unsupported_reasons(unsupported).0)
+            .unwrap_or_default()
+    }
+}
+
+fn unsupported_reasons(unsupported: UnsupportedModel) -> (Vec<UnsupportedReason>, String) {
+    (
+        unsupported
+            .reasons
+            .into_iter()
+            .map(unsupported_reason)
+            .collect(),
+        unsupported.detail,
+    )
+}
+
+fn projector_verdict(verdict: EngineProjectorVerdict) -> ProjectorVerdict {
+    match verdict {
+        EngineProjectorVerdict::None => ProjectorVerdict::None,
+        EngineProjectorVerdict::Bound => ProjectorVerdict::Bound,
+        EngineProjectorVerdict::Rejected(unsupported) => {
+            let (reasons, detail) = unsupported_reasons(unsupported);
+            ProjectorVerdict::Rejected { reasons, detail }
+        }
+    }
+}
+
+fn drafter_verdict(verdict: EngineDrafterVerdict) -> DrafterVerdict {
+    match verdict {
+        EngineDrafterVerdict::None => DrafterVerdict::None,
+        EngineDrafterVerdict::Bound {
+            method,
+            memory_bytes,
+        } => DrafterVerdict::Bound {
+            method: match method {
+                EngineSpeculativeMethod::Mtp => SpeculativeMethod::Mtp,
+                EngineSpeculativeMethod::DFlash => SpeculativeMethod::DFlash,
+                EngineSpeculativeMethod::DFlash2 => SpeculativeMethod::DFlash2,
+                EngineSpeculativeMethod::DSpark => SpeculativeMethod::DSpark,
+                EngineSpeculativeMethod::LiLiCorr => SpeculativeMethod::LiLiCorr,
+            },
+            memory_bytes,
+        },
+        EngineDrafterVerdict::Rejected(unsupported) => {
+            let (reasons, detail) = unsupported_reasons(unsupported);
+            DrafterVerdict::Rejected { reasons, detail }
+        }
+    }
+}
+
+/// The contract's form of the engine's fingerprint, which shares its every field: it
+/// destructures its source and builds its target whole, so a field either form gains or loses
+/// fails to compile until it follows.
+pub(crate) fn model_fingerprint(fingerprint: &EngineModelFingerprint) -> ModelFingerprint {
+    let EngineModelFingerprint {
+        architecture,
+        block_count,
+        embedding_length,
+        head_count,
+        head_count_kv,
+        key_length,
+        vocab_size,
+        expert_count,
+        tokenizer_digest,
+    } = fingerprint.clone();
+    ModelFingerprint {
+        architecture,
+        block_count,
+        embedding_length,
+        head_count,
+        head_count_kv,
+        key_length,
+        vocab_size,
+        expert_count,
+        tokenizer_digest,
+    }
+}
+
 fn unsupported_model(
     requested: ModelAssessmentProfile,
-    code: &str,
-    message: String,
+    unsupported: UnsupportedModel,
+    fingerprint: Option<ModelFingerprint>,
+) -> CachedModelAssessment {
+    let (reasons, detail) = unsupported_reasons(unsupported);
+    // A file the engine refused before establishing a context (and with no training context in its
+    // header) has no serving profile, never a zero-token one.
+    let profile = Some(requested.profile).filter(|profile| profile.context_length > 0);
+    unsupported_assessment(profile, reasons, detail, fingerprint)
+}
+
+/// A file whose header or bytes cannot be read: refused before the engine sees it, without a
+/// serving profile.
+pub(crate) fn unreadable_assessment(detail: String) -> CachedModelAssessment {
+    refused_assessment(
+        vec![UnsupportedReason::Known(KnownUnsupportedReason::Unreadable)],
+        detail,
+    )
+}
+
+/// A model refused for `reasons` before the engine sees it, without a serving profile.
+pub(crate) fn refused_assessment(
+    reasons: Vec<UnsupportedReason>,
+    detail: String,
+) -> CachedModelAssessment {
+    unsupported_assessment(None, reasons, detail, None)
+}
+
+fn unsupported_assessment(
+    profile: Option<magnitude_service_contracts::models::ServingProfile>,
+    reasons: Vec<UnsupportedReason>,
+    detail: String,
+    fingerprint: Option<ModelFingerprint>,
 ) -> CachedModelAssessment {
     CachedModelAssessment {
         capabilities: ModelCapabilities {
@@ -490,13 +738,11 @@ fn unsupported_model(
             },
         },
         template_fingerprint: String::new(),
+        fingerprint,
         profile: ModelAssessment::Unsupported {
-            profile: requested.profile,
-            failure: ModelFailure {
-                code: code.to_owned(),
-                message,
-                retryable: false,
-            },
+            profile,
+            reasons,
+            detail,
         },
     }
 }
@@ -514,8 +760,81 @@ fn capabilities(capabilities: EngineCapabilities) -> ModelCapabilities {
     }
 }
 
-fn domain_id(domain: seismic::MemoryPoolId, environment: &AssessmentEnvironment) -> MemoryDomainId {
-    crate::memory_domains::pool_domain_id(&environment.setup.topology, domain)
+fn domain_id(domain: seismic::StoreId, environment: &AssessmentEnvironment) -> MemoryDomainId {
+    crate::memory_domains::store_domain_id(&environment.setup.structure.topology, domain)
+}
+
+/// How a fitting model holds its weights on the contract, with its speed held so.
+fn model_residency(
+    residency: EngineResidency,
+    depths: &[u32],
+) -> Result<ModelResidency, InventoryError> {
+    Ok(match residency {
+        EngineResidency::Resident { performance } => ModelResidency::Resident {
+            performance: model_performance(performance, depths)?,
+        },
+        EngineResidency::Streamed {
+            shares,
+            performance,
+            floor_performance,
+            ..
+        } => ModelResidency::Streamed {
+            bank: streamed_bank(shares),
+            performance: model_performance(performance, depths)?.into(),
+            floor_performance: model_performance(floor_performance, depths)?.into(),
+        },
+    })
+}
+
+/// A streamed fit's bank on the contract, whose bounds its shares uphold.
+fn streamed_bank(shares: magnitude_executor::assessment::ExpertShares) -> StreamedBank {
+    StreamedBankParts {
+        experts: shares.experts(),
+        slots: shares.slots(),
+        floor_slots: shares.floor(),
+        cold_experts: match shares.cold() {
+            magnitude_executor::assessment::ColdSource::HostTier { cache_bytes, .. } => ColdExperts::HostRam { cache_bytes: *cache_bytes },
+            magnitude_executor::assessment::ColdSource::File(_) => ColdExperts::Disk,
+        },
+    }
+    .try_into()
+    .expect("expert shares uphold a streamed bank's bounds")
+}
+
+/// A fitting model's speed on the contract: estimated at exactly the requested depths, pending,
+/// or unavailable with why.
+fn model_performance(
+    performance: Performance,
+    depths: &[u32],
+) -> Result<ModelPerformance, InventoryError> {
+    Ok(match performance {
+        Performance::Pending => ModelPerformance::Pending,
+        Performance::Unavailable { reason } => ModelPerformance::Unavailable {
+            failure: ModelFailure {
+                code: "performance_unavailable".to_owned(),
+                message: reason,
+                retryable: false,
+            },
+        },
+        Performance::Estimated(estimates) => {
+            let samples = estimates
+                .iter()
+                .map(performance_evidence)
+                .collect::<Vec<_>>();
+            if samples
+                .iter()
+                .map(|sample| sample.context_tokens)
+                .ne(depths.iter().copied())
+            {
+                return Err(InventoryError::ModelOperation {
+                    code: "assessment_incomplete".to_owned(),
+                    message: "the engine did not estimate every requested depth".to_owned(),
+                    retryable: false,
+                });
+            }
+            ModelPerformance::Estimated { samples }
+        }
+    })
 }
 
 fn memory_assessments(
@@ -528,7 +847,6 @@ fn memory_assessments(
             memory_domain_id: domain_id(domain.domain, environment),
             capacity_bytes: domain.capacity_bytes,
             required_bytes: domain.required_bytes,
-            compatibility_reserve_bytes: domain.reserve_bytes,
             remaining_bytes: domain.remaining_bytes,
         })
         .collect()
@@ -613,6 +931,8 @@ pub fn inventory_model_failure(error: InventoryError) -> ModelFailure {
         InventoryError::Loaded(_) => ("already_loaded".to_owned(), false),
         InventoryError::DeletionUnsafe(_) => ("deletion_unsafe".to_owned(), false),
         InventoryError::Unsupported(_) => ("unsupported".to_owned(), false),
+        InventoryError::DoesNotFit(_) => ("model_does_not_fit".to_owned(), false),
+        InventoryError::ModelUnsupported { .. } => ("model_unsupported".to_owned(), false),
         InventoryError::Io(_) => ("io_failed".to_owned(), true),
         InventoryError::Upstream(_) => ("upstream_failed".to_owned(), true),
         InventoryError::Integrity(_) => ("integrity_failed".to_owned(), false),
@@ -632,6 +952,63 @@ pub fn inventory_model_failure(error: InventoryError) -> ModelFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An unsupported file whose context is unknown has no serving profile, never a zero-token one;
+    /// one with a context keeps it.
+    #[test]
+    fn an_unsupported_model_never_has_a_zero_context_profile() {
+        let profile = |context_length| ModelAssessmentProfile {
+            profile: magnitude_service_contracts::models::ServingProfile { context_length },
+            performance_context_tokens: Vec::new(),
+        };
+        let unsupported = || {
+            UnsupportedModel::reason(
+                EngineUnsupportedReason::Architecture {
+                    architecture: "deepseek4".to_owned(),
+                },
+                "no registered model family",
+            )
+        };
+        let profile_of = |assessment: CachedModelAssessment| match assessment.profile {
+            ModelAssessment::Unsupported { profile, .. } => profile,
+            other => panic!("not unsupported: {other:?}"),
+        };
+        assert_eq!(
+            profile_of(unsupported_model(profile(0), unsupported(), None)),
+            None
+        );
+        assert_eq!(
+            profile_of(unsupported_model(profile(4096), unsupported(), None)),
+            Some(magnitude_service_contracts::models::ServingProfile {
+                context_length: 4096
+            })
+        );
+        assert_eq!(
+            profile_of(unreadable_assessment("truncated".to_owned())),
+            None
+        );
+    }
+
+    /// A readable header that omits a required key names it rather than reading as unreadable.
+    #[test]
+    fn a_missing_key_keeps_its_name_in_the_contract() {
+        let key = "nemotron_h_moe.attention.layer_norm_epsilon";
+        let (reasons, detail) = unsupported_reasons(UnsupportedModel::reason(
+            EngineUnsupportedReason::MissingMetadata {
+                key: key.to_owned(),
+            },
+            format!("missing metadata {key}"),
+        ));
+        assert_eq!(
+            reasons,
+            [UnsupportedReason::Known(
+                KnownUnsupportedReason::MissingMetadata {
+                    key: key.to_owned()
+                }
+            )]
+        );
+        assert_eq!(detail, format!("missing metadata {key}"));
+    }
 
     fn resolved_model(path: &str) -> ResolvedModel {
         use magnitude_service_contracts::{
@@ -667,7 +1044,6 @@ mod tests {
                     training_context_length: None,
                     nextn_predict_layers: None,
                     tokenizer: None,
-                    modalities: vec!["text".to_owned()],
                     base_models: Vec::new(),
                     evidence_fingerprint: "test".to_owned(),
                 },
@@ -714,10 +1090,7 @@ mod tests {
         }
     }
 
-    fn speculative(
-        draft: bool,
-        method: SpeculativeMethod,
-    ) -> ResolvedServableModelBundle {
+    fn speculative(draft: bool, method: SpeculativeMethod) -> ResolvedServableModelBundle {
         ResolvedServableModelBundle::new(
             ServableModelBundle::SpeculativeDecoding {
                 target: package("target"),
@@ -743,25 +1116,87 @@ mod tests {
             (SpeculativeMethod::DFlash, ModelMethod::DFlash),
             (SpeculativeMethod::DFlash2, ModelMethod::DFlash2),
             (SpeculativeMethod::DSpark, ModelMethod::DSpark),
+            (SpeculativeMethod::LiLiCorr, ModelMethod::LiLiCorr),
+            (SpeculativeMethod::Mtp, ModelMethod::Mtp),
         ] {
             let material = engine_material(&speculative(true, method)).unwrap();
             assert_eq!(material.target, PathBuf::from("/models/target.gguf"));
             assert_eq!(material.draft, Some(PathBuf::from("/models/draft.gguf")));
             assert_eq!(material.method, expected);
         }
+        let standalone = engine_material(&ResolvedServableModelBundle::new(
+            ServableModelBundle::Standalone {
+                package: package("target"),
+            },
+            resolved_model("target.gguf"),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(
+            (standalone.draft, standalone.method),
+            (None, ModelMethod::Plain),
+            "a standalone package never drafts with heads its file carries"
+        );
         let embedded = engine_material(&speculative(false, SpeculativeMethod::Mtp)).unwrap();
         assert_eq!((embedded.draft, embedded.method), (None, ModelMethod::Mtp));
         for (draft, method) in [
             (false, SpeculativeMethod::DFlash),
             (false, SpeculativeMethod::DFlash2),
             (false, SpeculativeMethod::DSpark),
-            (true, SpeculativeMethod::Mtp),
+            (false, SpeculativeMethod::LiLiCorr),
         ] {
             assert!(matches!(
                 engine_material(&speculative(draft, method)),
                 Err(InventoryError::InvalidRequest(_))
             ));
         }
+    }
+
+    /// A streamed fit reaches the contract with its bank's shares of each routed layer's experts
+    /// and its speeds; a resident fit keeps its speed.
+    #[test]
+    fn a_streamed_fit_reaches_the_contract_with_its_shares() {
+        let shares = magnitude_executor::assessment::ExpertShares::new(
+            64,
+            192,
+            std::num::NonZeroU64::new(256).unwrap(),
+            magnitude_executor::assessment::ColdSource::HostTier { slots: 256, cache_bytes: 9_000_000_000 },
+        );
+        assert_eq!(
+            model_residency(
+                EngineResidency::Streamed {
+                    shares,
+                    performance: Performance::Pending,
+                    floor_performance: Performance::Pending,
+                },
+                &[25_000],
+            )
+            .unwrap(),
+            ModelResidency::Streamed {
+                bank: StreamedBankParts {
+                    experts: std::num::NonZeroU64::new(256).unwrap(),
+                    slots: 192,
+                    floor_slots: 64,
+                    cold_experts: ColdExperts::HostRam { cache_bytes: 9_000_000_000 },
+                }
+                .try_into()
+                .unwrap(),
+                performance: ModelPerformance::Pending,
+                floor_performance: ModelPerformance::Pending,
+            }
+        );
+        assert_eq!(
+            model_residency(
+                EngineResidency::Resident {
+                    performance: Performance::Pending,
+                },
+                &[25_000],
+            )
+            .unwrap(),
+            ModelResidency::Resident {
+                performance: ModelPerformance::Pending,
+            }
+        );
     }
 
     #[test]
@@ -816,6 +1251,25 @@ mod tests {
         });
         assert_eq!(operational.code, "assessment_failed");
         assert!(operational.retryable);
+    }
+
+    #[test]
+    fn unreadable_material_is_not_retried() {
+        let unreadable = preparation_error(ModelAssessmentError::Artifact(
+            magnitude_artifacts::Error::Invalid("truncated header".to_owned()),
+        ));
+        assert!(matches!(
+            unreadable,
+            InventoryError::ModelOperation { retryable: false, ref code, .. } if code == "unreadable_artifact"
+        ));
+        let operational = preparation_error(ModelAssessmentError::Planning("busy".to_owned()));
+        assert!(matches!(
+            operational,
+            InventoryError::ModelOperation {
+                retryable: true,
+                ..
+            }
+        ));
     }
 
     #[test]

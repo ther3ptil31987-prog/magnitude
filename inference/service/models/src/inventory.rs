@@ -7,25 +7,35 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use hf_hub::HFClient;
 use magnitude_service_contracts::models::{
-    CatalogPackageRole, InstalledModelPackage, InstalledModelPackagesResponse,
-    ModelFileRelationship, ModelFileRole, ModelPackage, ModelPackageId, ModelPackageSource,
-    RecommendableModel, ServableModelBundle, SpeculativeDraftSource,
+    CatalogPackageRole, FoundSource, InstalledCatalogAttribution,
+    InstalledModelPackage, InstalledModelPackagesResponse, PackageValidation, LocalModelsConfiguration, ModelFileRelationship, ModelFileRole,
+    ModelPackage, ModelPackageId, ModelPackageInstallationOrigin, ModelPackageSource, ModelRoot,
+    ModelRootKind, RecommendableModel, ServableModelBundle, SpeculativeDraftSource,
 };
 use magnitude_service_contracts::{
-    ComponentRole, ContentIdentity, Integrity, InventoryEntryId, InventoryError, InventoryModel,
-    InventoryProperties, LocalDeclaration, ModelAvailability, ModelComponent, ModelLocation,
-    ModelOperation, ModelSource,
+    ComponentRelationship, ComponentRole, ContentIdentity, HubCacheOwner, Integrity,
+    InventoryEntryId, InventoryError, InventoryModel, InventoryProperties, LocalDeclaration,
+    ModelAvailability, ModelComponent, ModelLocation, ModelOperation, ModelSource,
+    ResolvedComponent, ResolvedModel,
 };
 use magnitude_service_utils::file_cache::recover_map;
 use sha2::{Digest, Sha256};
 
 use crate::cache::{ModelCache, ModelIndexKind};
+use crate::candidate_files::RecognizedArchitectures;
 use crate::catalog_affiliations::CatalogAffiliations;
 use crate::download::blob_key;
 use crate::gguf;
+use crate::hugging_face::HubCredential;
 use crate::identity::{content_id, fingerprint, inventory_entry_id};
+use crate::package_service::PrimaryEvidence;
+use crate::snapshot_blobs::{RepositoryBlob, RepositoryBlobs};
 use crate::store_fs::ensure_store_layout;
 
+/// The failure code of a model whose files are in a format the engine can't read.
+pub(crate) const UNSUPPORTED_FORMAT_CODE: &str = "unsupported_format";
+/// The failure code of a found model whose file can't be opened.
+const UNREADABLE_CODE: &str = "unreadable";
 const MAX_SCAN_ENTRIES: usize = 100_000;
 const MAX_SCAN_DEPTH: usize = 8;
 const BACKGROUND_RECONCILIATION_RETRY_DELAY: std::time::Duration =
@@ -62,11 +72,45 @@ type HydratedInventory = (
 pub(crate) struct InstalledPackageRecord {
     pub(crate) installed: InstalledModelPackage,
     pub(crate) model: InventoryModel,
+    pub(crate) primary: Option<PrimaryEvidence>,
 }
 
+/// Every installed package occurrence, and every directory inside a location that could not be
+/// read. An unreadable directory is skipped so the rest of its location is still listed.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct InstalledPackageSnapshot {
     pub(crate) records: BTreeMap<InventoryEntryId, InstalledPackageRecord>,
+    pub(crate) unreadable_directories: BTreeSet<UnreadableDirectory>,
+}
+
+/// A directory inside the location `source` names, rooted at `root`, that Magnitude could not
+/// read, with why.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub(crate) struct UnreadableDirectory {
+    pub(crate) source: FoundSource,
+    pub(crate) root: PathBuf,
+    pub(crate) path: PathBuf,
+    pub(crate) detail: String,
+}
+
+impl UnreadableDirectory {
+    fn of(root: &ModelRoot, path: PathBuf, detail: String) -> Self {
+        let source = match root.kind {
+            ModelRootKind::HuggingFaceCache => FoundSource::HuggingFaceCache,
+            ModelRootKind::LmStudio => FoundSource::LmStudio,
+            ModelRootKind::LlamaCpp => FoundSource::LlamaCpp,
+            ModelRootKind::Ollama => FoundSource::Ollama,
+            ModelRootKind::Folder => FoundSource::Folder {
+                path: root.path.clone(),
+            },
+        };
+        Self {
+            source,
+            root: root.path.clone(),
+            path,
+            detail,
+        }
+    }
 }
 
 impl InstalledPackageSnapshot {
@@ -75,37 +119,133 @@ impl InstalledPackageSnapshot {
         revision: u64,
         reconciliation_complete: bool,
     ) -> InstalledModelPackagesResponse {
-        let packages = self.records.values().fold(
-            BTreeMap::<ModelPackageId, InstalledModelPackage>::new(),
-            |mut packages, record| {
-                packages
-                    .entry(record.installed.package.id.clone())
-                    .and_modify(|selected| {
-                        if selected.origin == magnitude_service_contracts::models::ModelPackageInstallationOrigin::HuggingFaceCache
-                            && record.installed.origin == magnitude_service_contracts::models::ModelPackageInstallationOrigin::Magnitude
-                        {
-                            *selected = record.installed.clone();
-                        }
-                    })
-                    .or_insert_with(|| record.installed.clone());
-                packages
-            },
-        );
+        self.response_of(revision, reconciliation_complete, |_| true)
+    }
+
+    /// One package per content among the occurrences `include` keeps, each represented by its
+    /// highest-precedence occurrence.
+    pub(crate) fn response_of(
+        &self,
+        revision: u64,
+        reconciliation_complete: bool,
+        include: impl Fn(&InstalledPackageRecord) -> bool,
+    ) -> InstalledModelPackagesResponse {
+        let packages = self
+            .records
+            .values()
+            .filter(|record| include(record))
+            .fold(
+                BTreeMap::<ModelPackageId, InstalledModelPackage>::new(),
+                |mut packages, record| {
+                    packages
+                        .entry(record.installed.package.id.clone())
+                        .and_modify(|selected| {
+                            if origin_precedence(record.installed.origin)
+                                < origin_precedence(selected.origin)
+                            {
+                                *selected = record.installed.clone();
+                            }
+                        })
+                        .or_insert_with(|| record.installed.clone());
+                    packages
+                },
+            );
         InstalledModelPackagesResponse {
             revision,
             reconciliation_complete,
             packages: packages.into_values().collect(),
         }
     }
+
+    /// The snapshot files Magnitude's copies of `package_id` are made of, each by repository,
+    /// commit and path.
+    fn managed_entries(&self, package_id: &ModelPackageId) -> BTreeSet<(String, String, PathBuf)> {
+        self.records
+            .values()
+            .filter(|record| &record.installed.package.id == package_id)
+            .flat_map(occurrence_entries)
+            .collect()
+    }
+
+    /// Whether deleting Magnitude's copies of `package_id` would unlink a snapshot file that a
+    /// Magnitude package outside `removing` is served from too. Two packages can name the same
+    /// file in one snapshot (a target with its projector, and the same weights found on their own
+    /// when the snapshot has several projectors); deleting one deletes the other's file.
+    pub(crate) fn shares_managed_files(
+        &self,
+        package_id: &ModelPackageId,
+        removing: &BTreeSet<ModelPackageId>,
+    ) -> bool {
+        let removed = self.managed_entries(package_id);
+        self.records
+            .values()
+            .filter(|record| {
+                &record.installed.package.id != package_id
+                    && !removing.contains(&record.installed.package.id)
+            })
+            .flat_map(occurrence_entries)
+            .any(|entry| removed.contains(&entry))
+    }
 }
+
+/// The snapshot files of a Magnitude occurrence, each by repository, commit and path; none for an
+/// occurrence elsewhere.
+fn occurrence_entries(record: &InstalledPackageRecord) -> Vec<(String, String, PathBuf)> {
+    let (
+        ModelPackageInstallationOrigin::Magnitude,
+        ModelLocation::MagnitudeCache { components, .. },
+        ModelSource::HuggingFace {
+            repository, commit, ..
+        },
+    ) = (
+        record.installed.origin,
+        &record.model.location,
+        &record.model.source,
+    )
+    else {
+        return Vec::new();
+    };
+    components
+        .iter()
+        .map(|component| {
+            (
+                repository.to_lowercase(),
+                commit.clone(),
+                component.path.clone(),
+            )
+        })
+        .collect()
+}
+
+/// Which occurrence of the same content represents it: the managed store, then the Hugging Face
+/// cache, LM Studio, llama.cpp, Ollama, and user folders and files.
+pub(crate) fn origin_precedence(origin: ModelPackageInstallationOrigin) -> u8 {
+    match origin {
+        ModelPackageInstallationOrigin::Magnitude => 0,
+        ModelPackageInstallationOrigin::HuggingFaceCache => 1,
+        ModelPackageInstallationOrigin::LmStudio => 2,
+        ModelPackageInstallationOrigin::LlamaCpp => 3,
+        ModelPackageInstallationOrigin::Ollama => 4,
+        ModelPackageInstallationOrigin::Folder => 5,
+    }
+}
+
+/// Inventory settings. `local_models` is the local-models configuration in effect before ACN
+/// supplies one at runtime: the model roots to scan, added models, hidden models and drafters.
 #[derive(Debug, Clone)]
 pub struct InventoryConfig {
     pub root: PathBuf,
     pub cache_root: PathBuf,
-    pub hf_cache_dirs: Vec<PathBuf>,
+    pub local_models: LocalModelsConfiguration,
     pub max_concurrent_downloads: usize,
-    pub disk_reserve_bytes: u64,
     pub catalog_models: Vec<RecommendableModel>,
+    pub catalog_header_digests: BTreeMap<String, String>,
+    pub hub_endpoint: Option<String>,
+    pub architectures: RecognizedArchitectures,
+    pub header_cache_capacity: u64,
+    /// The threads root scans may run at once: the service's share of the machine for
+    /// background work; one unless the service sets it.
+    pub scan_threads: std::num::NonZeroUsize,
 }
 
 pub(crate) fn catalog_target(model: &RecommendableModel) -> &ModelPackage {
@@ -133,7 +273,60 @@ pub(crate) fn catalog_packages(
     target.chain(dependency)
 }
 
+/// A catalog target's projector as a package of its own: what Magnitude stores when the target's
+/// weights are found in another app's location, so those weights are never copied. Its one file
+/// is the target's projector file, so the target composed of the found weights and this package
+/// is exactly the catalog's target package.
+pub(crate) fn catalog_projector_package(target: &ModelPackage) -> Option<ModelPackage> {
+    let projector = target
+        .files
+        .iter()
+        .find(|file| file.role == ModelFileRole::Projector)?;
+    let files = vec![projector.clone()];
+    Some(ModelPackage {
+        id: crate::package_service::canonical_package_id(&files, &[]),
+        source: target.source.clone(),
+        files,
+        relationships: Vec::new(),
+        properties: target.properties.clone(),
+    })
+}
+
+/// Every package Magnitude's store may hold for a catalog model: its bundle's packages and its
+/// target's projector package.
+pub(crate) fn catalog_store_packages(
+    model: &RecommendableModel,
+) -> impl Iterator<Item = (ModelPackage, CatalogPackageRole)> + '_ {
+    catalog_packages(model)
+        .map(|(package, role)| (package.clone(), role))
+        .chain(
+            catalog_projector_package(catalog_target(model))
+                .map(|package| (package, CatalogPackageRole::Dependency)),
+        )
+}
+
+/// The file a store package is known by: its first weights file, or the projector of a projector
+/// package.
+pub(crate) fn package_primary_path(root: &Path, components: &[ModelComponent]) -> Option<PathBuf> {
+    primary_path(root, components).or_else(|| match components {
+        [component] if component.role == ComponentRole::Projector => {
+            Some(root.join(&component.path))
+        }
+        _ => None,
+    })
+}
+
 impl InventoryConfig {
+    /// Validate the configuration and establish the paths the store serves, which hardware
+    /// volume discovery reads ([`ManagedModelStore::served_paths`]).
+    async fn prepare_roots(&self) -> Result<(), InventoryError> {
+        validate_config(self)?;
+        ensure_store_layout(&self.root).await?;
+        tokio::fs::create_dir_all(&self.cache_root)
+            .await
+            .map_err(io_error)
+    }
+
     pub fn default_root() -> Result<PathBuf, InventoryError> {
         let home = std::env::var_os("HOME").ok_or_else(|| {
             InventoryError::InvalidRequest(
@@ -152,6 +345,17 @@ impl InventoryConfig {
         Ok(PathBuf::from(home).join(".magnitude/cache"))
     }
 
+    /// Adds enabled Hugging Face cache locations to the initial configuration.
+    pub fn add_hugging_face_caches(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+        self.local_models
+            .roots
+            .extend(paths.into_iter().map(|path| ModelRoot {
+                kind: ModelRootKind::HuggingFaceCache,
+                path,
+                enabled: true,
+            }));
+    }
+
     pub fn with_roots(root: PathBuf, cache_root: PathBuf) -> Result<Self, InventoryError> {
         if !root.is_absolute() || !cache_root.is_absolute() {
             return Err(InventoryError::InvalidRequest(
@@ -161,24 +365,47 @@ impl InventoryConfig {
         Ok(Self {
             root,
             cache_root,
-            hf_cache_dirs: Vec::new(),
+            local_models: LocalModelsConfiguration::default(),
             max_concurrent_downloads: 2,
-            disk_reserve_bytes: 2 * 1024 * 1024 * 1024,
             catalog_models: Vec::new(),
+            catalog_header_digests: BTreeMap::new(),
+            architectures: RecognizedArchitectures::default(),
+            hub_endpoint: None,
+            header_cache_capacity: crate::header_cache::HEADER_CAPACITY_BYTES,
+            scan_threads: std::num::NonZeroUsize::MIN,
         })
     }
 }
 
+/// A Hub client presenting `token`, or an anonymous one. ICN starts with implicit Hub credentials
+/// disabled (`isolate_hub_credentials` in the service), so an anonymous client never picks up a
+/// token from the environment or the Hugging Face token file.
+fn hub_client(config: &InventoryConfig, token: Option<String>) -> Result<HFClient, InventoryError> {
+    let mut builder = HFClient::builder().cache_dir(config.root.join("hub"));
+    if let Some(endpoint) = &config.hub_endpoint {
+        builder = builder.endpoint(endpoint.clone());
+    }
+    if let Some(token) = token {
+        builder = builder.token(token);
+    }
+    builder
+        .build()
+        .map_err(|error| InventoryError::Upstream(error.to_string()))
+}
+
 pub struct ManagedModelStore {
     pub(crate) config: InventoryConfig,
+    pub(crate) volume: Arc<crate::download::VolumeWrites>,
     pub(crate) client: HFClient,
+    hub_credential: Arc<RwLock<Option<HubCredential>>>,
     pub(crate) http: reqwest::Client,
     pub(crate) models: Arc<RwLock<BTreeMap<InventoryEntryId, InventoryModel>>>,
     pub(crate) operations:
         Arc<tokio::sync::Mutex<BTreeMap<String, Arc<crate::download::DownloadOperation>>>>,
     pub(crate) download_slots: Arc<tokio::sync::Semaphore>,
     pub(crate) cache: ModelCache,
-    pub(crate) package_digests: Arc<RwLock<BTreeMap<PathBuf, (u64, SystemTime, String)>>>,
+    pub(crate) local_models: Arc<RwLock<LocalModelsConfiguration>>,
+    root_scans: Arc<std::sync::Mutex<RootScans>>,
     pub(crate) installed_packages: Arc<RwLock<InstalledPackageSnapshot>>,
     pub(crate) model_assessments:
         Arc<RwLock<BTreeMap<String, crate::cache::CachedModelAssessment>>>,
@@ -187,9 +414,42 @@ pub struct ManagedModelStore {
     cache_evidence: Arc<RwLock<BTreeMap<InventoryEntryId, CacheEvidence>>>,
     ensure_gate: Arc<tokio::sync::Mutex<()>>,
     ensure_generation: Arc<AtomicU64>,
+    /// Advances only when the published installed packages change, so a rescan that finds
+    /// nothing new leaves every revision derived from them current.
+    packages_revision: Arc<AtomicU64>,
     reconciliation_running: Arc<AtomicBool>,
     reconciliation_complete: Arc<AtomicBool>,
     installed_packages_observer: Arc<RwLock<Option<Weak<dyn InstalledPackagesObserver>>>>,
+    ollama_hub_resolution: Arc<AtomicBool>,
+}
+
+/// The space the model store's downloads may take on its volume, above the
+/// volume's reserve. The composition root supplies it from the volume's
+/// reserve owner (`magnitude_executor::platform::volume_space`).
+pub trait DownloadSpace: Send + Sync {
+    /// The bytes the store's downloads may still write to the volume now,
+    /// having written `written` bytes there so far, which the reserve tells
+    /// from other programs' writes.
+    fn available_bytes(&self, written: u64) -> Result<u64, InventoryError>;
+}
+
+impl<F, E> DownloadSpace for F
+where
+    F: Fn(u64) -> Result<u64, E> + Send + Sync,
+    E: std::fmt::Display,
+{
+    fn available_bytes(&self, written: u64) -> Result<u64, InventoryError> {
+        self(written).map_err(|error| InventoryError::Internal(error.to_string()))
+    }
+}
+
+#[cfg(test)]
+impl ManagedModelStore {
+    /// [`Self::open`] with download space without bound, for tests that
+    /// download nothing.
+    pub(crate) async fn open_unbounded(config: InventoryConfig) -> Result<Self, InventoryError> {
+        Self::open(config, Arc::new(|_| Ok::<_, InventoryError>(u64::MAX))).await
+    }
 }
 
 pub(crate) trait InstalledPackagesObserver: Send + Sync {
@@ -208,13 +468,16 @@ impl Clone for ManagedModelStore {
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
+            volume: Arc::clone(&self.volume),
             client: self.client.clone(),
+            hub_credential: Arc::clone(&self.hub_credential),
             http: self.http.clone(),
             models: Arc::clone(&self.models),
             operations: Arc::clone(&self.operations),
             download_slots: Arc::clone(&self.download_slots),
             cache: self.cache.clone(),
-            package_digests: Arc::clone(&self.package_digests),
+            local_models: Arc::clone(&self.local_models),
+            root_scans: Arc::clone(&self.root_scans),
             installed_packages: Arc::clone(&self.installed_packages),
             model_assessments: Arc::clone(&self.model_assessments),
             catalog_affiliations: Arc::clone(&self.catalog_affiliations),
@@ -222,9 +485,11 @@ impl Clone for ManagedModelStore {
             cache_evidence: Arc::clone(&self.cache_evidence),
             ensure_gate: Arc::clone(&self.ensure_gate),
             ensure_generation: Arc::clone(&self.ensure_generation),
+            packages_revision: Arc::clone(&self.packages_revision),
             reconciliation_running: Arc::clone(&self.reconciliation_running),
             reconciliation_complete: Arc::clone(&self.reconciliation_complete),
             installed_packages_observer: Arc::clone(&self.installed_packages_observer),
+            ollama_hub_resolution: Arc::clone(&self.ollama_hub_resolution),
         }
     }
 }
@@ -248,7 +513,7 @@ impl ManagedModelStore {
             .ok()
             .and_then(|observer| observer.as_ref().and_then(Weak::upgrade));
         if let Some(observer) = observer {
-            observer.installed_packages_changed(self.ensure_generation.load(Ordering::Acquire));
+            observer.installed_packages_changed(self.packages_revision.load(Ordering::Acquire));
         }
     }
 
@@ -262,10 +527,143 @@ impl ManagedModelStore {
             })
             .map(|snapshot| {
                 snapshot.response(
-                    self.ensure_generation.load(Ordering::Acquire),
+                    self.packages_revision.load(Ordering::Acquire),
                     self.reconciliation_complete.load(Ordering::Acquire),
                 )
             })
+    }
+
+    /// The installed packages catalog models are made of: every occurrence except hidden found
+    /// copies (see `hidden_occurrence`).
+    pub(crate) fn catalog_packages_response(
+        &self,
+    ) -> Result<InstalledModelPackagesResponse, InventoryError> {
+        self.installed_packages
+            .read()
+            .map_err(|_| {
+                InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
+            })
+            .map(|snapshot| {
+                let mut response = snapshot.response_of(
+                    self.packages_revision.load(Ordering::Acquire),
+                    self.reconciliation_complete.load(Ordering::Acquire),
+                    |record| !self.hidden_occurrence(record),
+                );
+                for (composed, _, _) in self.composed_catalog_targets(&snapshot) {
+                    if !response.packages.iter().any(|installed| installed.package.id == composed.package.id) {
+                        response.packages.push(composed);
+                    }
+                }
+                response
+            })
+    }
+
+    /// Catalog targets composed of a found exact copy of their weights and Magnitude's projector
+    /// package (see `catalog_projector_package`): each the target's own package, installed where its
+    /// weights are, plus the records of its weights and projector. Hidden copies compose nothing.
+    pub(crate) fn composed_catalog_targets(
+        &self,
+        records: &InstalledPackageSnapshot,
+    ) -> Vec<(InstalledModelPackage, InstalledPackageRecord, InstalledPackageRecord)> {
+        self.config
+            .catalog_models
+            .iter()
+            .filter_map(|model| {
+                let target = catalog_target(model);
+                let projector = catalog_projector_package(target)?;
+                let visible = |record: &&InstalledPackageRecord| !self.hidden_occurrence(record);
+                let weights = records
+                    .records
+                    .values()
+                    .filter(visible)
+                    .filter(|record| {
+                        record.installed.package.id != target.id
+                            && crate::package_service::exact_target_weights(target, &record.installed.package)
+                    })
+                    .min_by_key(|record| origin_precedence(record.installed.origin))?;
+                let stored = records.records.values().find(|record| {
+                    record.installed.package.id == projector.id
+                        && record.installed.origin == ModelPackageInstallationOrigin::Magnitude
+                })?;
+                let validation = [&weights.installed.validation, &stored.installed.validation]
+                    .into_iter()
+                    .find(|validation| !matches!(validation, PackageValidation::Valid))
+                    .cloned()
+                    .unwrap_or(PackageValidation::Valid);
+                Some((
+                    InstalledModelPackage {
+                        path: weights.installed.path.clone(),
+                        package: target.clone(),
+                        origin: weights.installed.origin,
+                        validation,
+                        catalog_attribution: InstalledCatalogAttribution::Attributed {
+                            model_id: model.model_id.clone(),
+                            variant_id: model.variant_id.clone(),
+                        },
+                    },
+                    weights.clone(),
+                    stored.clone(),
+                ))
+            })
+            .collect()
+    }
+
+    /// The composed catalog target `package_id` resolved for serving: its found weights' components
+    /// and Magnitude's projector.
+    pub(crate) fn composed_catalog_target(
+        &self,
+        package_id: &ModelPackageId,
+    ) -> Result<(ModelPackage, ResolvedModel), InventoryError> {
+        let snapshot = self
+            .installed_packages
+            .read()
+            .map_err(|_| InventoryError::Internal("installed package snapshot lock poisoned".to_owned()))?
+            .clone();
+        let (composed, weights, stored) = self
+            .composed_catalog_targets(&snapshot)
+            .into_iter()
+            .find(|(composed, _, _)| composed.package.id == *package_id)
+            .ok_or_else(|| InventoryError::NotFound(package_id.0.clone()))?;
+        let resolve = |record: &InstalledPackageRecord| {
+            crate::service::resolve_components(&self.config.root, &record.model).map_err(|error| {
+                match error {
+                    InventoryError::Io(_) => InventoryError::NotFound(package_id.0.clone()),
+                    other => other,
+                }
+            })
+        };
+        let mut components = resolve(&weights)?;
+        let weights_path = composed
+            .package
+            .files
+            .iter()
+            .filter(|file| file.role == ModelFileRole::Weights)
+            .map(|file| file.path.clone())
+            .min()
+            .ok_or_else(|| InventoryError::NotFound(package_id.0.clone()))?;
+        for projector in resolve(&stored)? {
+            let declared = stored
+                .installed
+                .package
+                .files
+                .first()
+                .map(|file| file.path.clone())
+                .unwrap_or_else(|| projector.path.clone());
+            components.push(ResolvedComponent {
+                relationship: Some(ComponentRelationship::ProjectorFor {
+                    projector: declared,
+                    model: weights_path.clone(),
+                }),
+                ..projector
+            });
+        }
+        Ok((
+            composed.package,
+            ResolvedModel {
+                model: weights.model,
+                components,
+            },
+        ))
     }
 
     #[must_use]
@@ -273,31 +671,29 @@ impl ManagedModelStore {
         &self.cache
     }
 
-    pub async fn open(config: InventoryConfig) -> Result<Self, InventoryError> {
-        validate_config(&config)?;
-        ensure_store_layout(&config.root).await?;
-        let client_builder = HFClient::builder().cache_dir(config.root.join("hub"));
-        let explicit_token = std::env::var("HF_TOKEN")
-            .ok()
-            .filter(|token| !token.trim().is_empty());
-        let client_builder = match explicit_token {
-            Some(token) => client_builder.token(token),
-            None => client_builder,
-        };
-        let client = client_builder
-            .build()
-            .map_err(|error| InventoryError::Upstream(error.to_string()))?;
-        let cache = ModelCache::new(&config.cache_root);
+    /// Open the store of `config`, whose downloads take the space
+    /// `download_space` reports.
+    pub async fn open(
+        config: InventoryConfig,
+        download_space: Arc<dyn DownloadSpace>,
+    ) -> Result<Self, InventoryError> {
+        config.prepare_roots().await?;
+        let client = hub_client(&config, None)?;
+        let cache = ModelCache::with_header_capacity(&config.cache_root, config.header_cache_capacity);
         let catalog_affiliations = CatalogAffiliations::load(&config.root);
+        let local_models = Arc::new(RwLock::new(config.local_models.clone()));
         let manager = Self {
+            volume: Arc::new(crate::download::VolumeWrites::new(download_space)),
             download_slots: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_downloads)),
             config,
             client,
+            hub_credential: Arc::new(RwLock::new(None)),
             http: reqwest::Client::new(),
             models: Arc::new(RwLock::new(BTreeMap::new())),
             operations: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
             cache,
-            package_digests: Arc::new(RwLock::new(BTreeMap::new())),
+            local_models,
+            root_scans: Arc::default(),
             installed_packages: Arc::new(RwLock::new(InstalledPackageSnapshot::default())),
             model_assessments: Arc::new(RwLock::new(BTreeMap::new())),
             catalog_affiliations: Arc::new(RwLock::new(catalog_affiliations)),
@@ -305,12 +701,36 @@ impl ManagedModelStore {
             cache_evidence: Arc::new(RwLock::new(BTreeMap::new())),
             ensure_gate: Arc::new(tokio::sync::Mutex::new(())),
             ensure_generation: Arc::new(AtomicU64::new(0)),
+            packages_revision: Arc::new(AtomicU64::new(0)),
             reconciliation_running: Arc::new(AtomicBool::new(false)),
             reconciliation_complete: Arc::new(AtomicBool::new(false)),
             installed_packages_observer: Arc::new(RwLock::new(None)),
+            ollama_hub_resolution: Arc::new(AtomicBool::new(false)),
         };
         manager.request_installed_model_reconciliation();
         Ok(manager)
+    }
+
+    /// Resolves the Hub files of unresolved `hf.co` Ollama pulls in the background, and rescans the
+    /// Ollama locations when any resolved, so their models take their Hub identity.
+    fn request_ollama_hub_resolution(&self) {
+        if self
+            .ollama_hub_resolution
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let store = self.clone();
+        magnitude_service_utils::owner::spawn("the Ollama hub's resolution", async move {
+            let _lease = ReconciliationLease(Arc::clone(&store.ollama_hub_resolution));
+            let roots = store.resolve_ollama_hub_files().await;
+            if !roots.is_empty()
+                && let Err(error) = store.rescan_model_roots(roots).await
+            {
+                tracing::warn!(%error, "rescanning Ollama after resolving Hub files failed");
+            }
+        });
     }
 
     pub(crate) fn request_installed_model_reconciliation(&self) {
@@ -322,7 +742,7 @@ impl ManagedModelStore {
             return;
         }
         let reconciliation = self.clone();
-        tokio::spawn(async move {
+        magnitude_service_utils::owner::spawn("the inventory's reconciliation", async move {
             let _lease = ReconciliationLease(Arc::clone(&reconciliation.reconciliation_running));
             while !reconciliation
                 .reconciliation_complete
@@ -344,17 +764,85 @@ impl ManagedModelStore {
     }
 
     pub async fn ensure_model_inventory(&self) -> Result<(), InventoryError> {
-        self.reconcile_model_inventory().await
+        self.reconcile_model_inventory(false, &ScanScope::All).await
     }
 
     pub(crate) async fn ensure_installed_model_inventory(&self) -> Result<(), InventoryError> {
-        self.reconcile_model_inventory().await
+        self.reconcile_model_inventory(false, &ScanScope::All).await
     }
 
-    async fn reconcile_model_inventory(&self) -> Result<(), InventoryError> {
+    /// Reconciles even when another reconciliation completed meanwhile, because the filesystem or
+    /// the configuration changed after it started.
+    pub(crate) async fn rescan_model_inventory(&self) -> Result<(), InventoryError> {
+        self.reconcile_model_inventory(true, &ScanScope::All).await
+    }
+
+    /// Rescans only the named locations; every other location keeps its last scan.
+    pub(crate) async fn rescan_model_roots(
+        &self,
+        roots: BTreeSet<PathBuf>,
+    ) -> Result<(), InventoryError> {
+        self.reconcile_model_inventory(true, &ScanScope::Roots(roots))
+            .await
+    }
+
+    pub(crate) fn local_models_configuration(
+        &self,
+    ) -> Result<LocalModelsConfiguration, InventoryError> {
+        self.local_models
+            .read()
+            .map(|configuration| configuration.clone())
+            .map_err(|_| {
+                InventoryError::Internal("local-models configuration lock poisoned".to_owned())
+            })
+    }
+
+    /// Applies a whole configuration and rescans when it differs from the current one. Applying
+    /// the same configuration again does nothing. A configuration whose rescan fails is not
+    /// applied, so sending it again rescans again.
+    pub(crate) async fn configure_local_models(
+        &self,
+        configuration: LocalModelsConfiguration,
+    ) -> Result<bool, InventoryError> {
+        validate_local_models(&configuration)?;
+        let (previous, roots) = {
+            let mut current = self.local_models.write().map_err(|_| {
+                InventoryError::Internal("local-models configuration lock poisoned".to_owned())
+            })?;
+            if *current == configuration {
+                return Ok(false);
+            }
+            let roots = configuration
+                .roots
+                .iter()
+                .filter(|root| !current.roots.contains(root))
+                .map(|root| canonical_or_self(&root.path))
+                .collect::<BTreeSet<_>>();
+            (
+                std::mem::replace(&mut *current, configuration.clone()),
+                roots,
+            )
+        };
+        if let Err(error) = self.rescan_model_roots(roots).await {
+            let mut current = self.local_models.write().map_err(|_| {
+                InventoryError::Internal("local-models configuration lock poisoned".to_owned())
+            })?;
+            if *current == configuration {
+                *current = previous;
+            }
+            return Err(error);
+        }
+        Ok(true)
+    }
+
+    async fn reconcile_model_inventory(
+        &self,
+        force: bool,
+        scope: &ScanScope,
+    ) -> Result<(), InventoryError> {
         let observed_generation = self.ensure_generation.load(Ordering::Acquire);
         let _guard = self.ensure_gate.lock().await;
-        if self.ensure_generation.load(Ordering::Acquire) != observed_generation {
+        if !force && self.ensure_generation.load(Ordering::Acquire) != observed_generation {
             return Ok(());
         }
 
@@ -364,71 +852,96 @@ impl ManagedModelStore {
             .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))?
             .clone();
         let mut attempt = 0_u8;
-        let (discovered, next_evidence, installed_packages) = loop {
-            let config = self.config.clone();
-            let cache = self.cache.clone();
-            let scan_live_models = live_models.clone();
-            let scan_result =
-                tokio::task::spawn_blocking(move || scan(&config, &cache, &scan_live_models))
-                    .await
-                    .map_err(|error| InventoryError::Internal(error.to_string()))??;
-            let discovered = scan_result.models;
-
-            let mut next_evidence = BTreeMap::new();
-
-            for model in discovered.values() {
-                if !is_cacheable_model(model)? {
-                    continue;
-                }
-                let evidence = CacheEvidence {
-                    content_id: model.content_id.0.clone(),
-                    observation_key: scan_result
-                        .observations
-                        .get(&model.id)
-                        .cloned()
-                        .ok_or_else(|| {
-                            InventoryError::Internal(format!(
-                                "ready model {} has no discovery observation",
-                                model.id.0
-                            ))
-                        })?,
-                    metadata_key: scan_result
-                        .metadata_keys
-                        .get(&model.id)
-                        .cloned()
-                        .ok_or_else(|| {
-                            InventoryError::Internal(format!(
-                                "ready model {} has no metadata evidence",
-                                model.id.0
-                            ))
-                        })?,
+        let (discovered, next_evidence, installed_packages) =
+            loop {
+                let config = self.config.clone();
+                let local = self.local_models_configuration()?;
+                let cache = self.cache.clone();
+                let scan_live_models = live_models.clone();
+                let previous = self
+                    .root_scans
+                    .lock()
+                    .map_err(|_| InventoryError::Internal("root scan lock poisoned".to_owned()))?
+                    .clone();
+                let scan_scope = if attempt == 0 {
+                    scope.clone()
+                } else {
+                    ScanScope::All
                 };
-                next_evidence.insert(model.id.clone(), evidence);
-            }
+                let scan_result = magnitude_service_utils::blocking::run(move || {
+                    scan(
+                        &config,
+                        &local,
+                        &cache,
+                        &scan_live_models,
+                        &ScannedRoots {
+                            scope: scan_scope,
+                            previous,
+                        },
+                    )
+                })
+                .await?;
+                *self.root_scans.lock().map_err(|_| {
+                    InventoryError::Internal("root scan lock poisoned".to_owned())
+                })? = scan_result.root_scans.clone();
+                let discovered = scan_result.models;
 
-            let package_manager = self.clone();
-            let package_models = discovered.clone();
-            let installed_packages = tokio::task::spawn_blocking(move || {
-                package_manager.build_installed_package_snapshot(&package_models)
-            })
-            .await
-            .map_err(|error| InventoryError::Internal(error.to_string()))??;
+                let mut next_evidence = BTreeMap::new();
 
-            if inventory_snapshot_is_current(
-                &self.config.root,
-                &discovered,
-                &scan_result.observations,
-            ) {
-                break (discovered, next_evidence, installed_packages);
-            }
-            attempt += 1;
-            if attempt >= 3 {
-                return Err(InventoryError::ConcurrentMutation(
-                    "model artifacts changed during three consecutive inventory attempts"
-                        .to_owned(),
-                ));
-            }
-        };
+                for model in discovered.values() {
+                    if !is_cacheable_model(model)? {
+                        continue;
+                    }
+                    let evidence = CacheEvidence {
+                        content_id: model.content_id.0.clone(),
+                        observation_key: scan_result
+                            .observations
+                            .get(&model.id)
+                            .cloned()
+                            .ok_or_else(|| {
+                                InventoryError::Internal(format!(
+                                    "ready model {} has no discovery observation",
+                                    model.id.0
+                                ))
+                            })?,
+                        metadata_key: scan_result
+                            .metadata_keys
+                            .get(&model.id)
+                            .cloned()
+                            .ok_or_else(|| {
+                                InventoryError::Internal(format!(
+                                    "ready model {} has no metadata evidence",
+                                    model.id.0
+                                ))
+                            })?,
+                    };
+                    next_evidence.insert(model.id.clone(), evidence);
+                }
+
+                let package_manager = self.clone();
+                let package_models = discovered.clone();
+                let unreadable_directories = scan_result.unreadable_directories;
+                let installed_packages = magnitude_service_utils::blocking::run(move || {
+                    package_manager
+                        .build_installed_package_snapshot(&package_models, unreadable_directories)
+                })
+                .await?;
+
+                if inventory_snapshot_is_current(
+                    &self.config.root,
+                    &discovered,
+                    &scan_result.observations,
+                ) {
+                    break (discovered, next_evidence, installed_packages);
+                }
+                attempt += 1;
+                if attempt >= 3 {
+                    return Err(InventoryError::ConcurrentMutation(
+                        "model artifacts changed during three consecutive inventory attempts"
+                            .to_owned(),
+                    ));
+                }
+            };
 
         persist_inventory_index(
             &self.cache,
@@ -454,22 +967,88 @@ impl ManagedModelStore {
             *current = installed_packages;
             changed
         };
-        let revision = self.ensure_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.ensure_generation.fetch_add(1, Ordering::AcqRel);
+        self.request_ollama_hub_resolution();
         let became_authoritative = !self.reconciliation_complete.swap(true, Ordering::AcqRel);
-        if (installed_packages_changed || became_authoritative)
-            && let Some(observer) = self
-                .installed_packages_observer
-                .read()
-                .ok()
-                .and_then(|observer| observer.as_ref().and_then(Weak::upgrade))
+        if !(installed_packages_changed || became_authoritative) {
+            return Ok(());
+        }
+        let revision = self.packages_revision.fetch_add(1, Ordering::AcqRel) + 1;
+        if let Some(observer) = self
+            .installed_packages_observer
+            .read()
+            .ok()
+            .and_then(|observer| observer.as_ref().and_then(Weak::upgrade))
         {
             observer.installed_packages_changed(revision);
         }
         Ok(())
     }
 
+    /// Who a saved read of a gated or private repository's files belongs to: the anonymous caller, or
+    /// the credential that read them. Public repositories share one scope (empty), so their reads are
+    /// cached for everyone; a restricted repository's reads are served again only to the same
+    /// credential, so signing out (or into another account) never shows files it can no longer read.
+    pub(crate) fn restricted_access_scope(&self, restricted: bool) -> String {
+        if !restricted {
+            return String::new();
+        }
+        self.hub_token().map_or_else(
+            || ":anonymous".to_owned(),
+            |token| {
+                use sha2::{Digest, Sha256};
+                format!(":credential-{:x}", Sha256::digest(token.as_bytes()))
+            },
+        )
+    }
+
+    /// The Hugging Face token presented on Hub requests, when one is configured.
+    #[must_use]
+    pub fn hub_token(&self) -> Option<String> {
+        self.hub_credential().map(|credential| credential.token)
+    }
+
+    pub(crate) fn hub_credential(&self) -> Option<HubCredential> {
+        self.hub_credential
+            .read()
+            .ok()
+            .and_then(|credential| credential.clone())
+    }
+
+    /// Replaces the Hugging Face token presented on every later Hub request; `None` makes them
+    /// anonymous. Every clone of this store shares the credential.
+    pub fn configure_hub_credential(&self, token: Option<String>) -> Result<(), InventoryError> {
+        let credential = match token {
+            Some(token) => {
+                let token = token.trim().to_owned();
+                if token.is_empty() {
+                    return Err(InventoryError::InvalidRequest(
+                        "a Hugging Face token must not be empty".to_owned(),
+                    ));
+                }
+                Some(HubCredential {
+                    client: hub_client(&self.config, Some(token.clone()))?,
+                    token,
+                })
+            }
+            None => None,
+        };
+        *self
+            .hub_credential
+            .write()
+            .map_err(|_| InventoryError::Internal("Hub credential lock poisoned".to_owned()))? =
+            credential;
+        Ok(())
+    }
+
     pub fn root(&self) -> &Path {
         &self.config.root
+    }
+
+    /// The paths the store serves, which exist once it is open: the volumes of its own root,
+    /// which downloads write, and of the derived cache. Discovery serves them.
+    pub fn served_paths(&self) -> Vec<PathBuf> {
+        vec![self.config.root.clone(), self.config.cache_root.clone()]
     }
 
     /// Ensure the model currently selected by the process has an inventory
@@ -569,7 +1148,15 @@ impl ManagedModelStore {
         } else {
             cache.remove(&model.id);
         }
-        let installed = self.build_installed_package_snapshot(&models)?;
+        let unreadable_directories = self
+            .installed_packages
+            .read()
+            .map_err(|_| {
+                InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
+            })?
+            .unreadable_directories
+            .clone();
+        let installed = self.build_installed_package_snapshot(&models, unreadable_directories)?;
         persist_inventory_index(&self.cache, &models, &cache, &installed);
         *self
             .models
@@ -584,6 +1171,7 @@ impl ManagedModelStore {
             InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
         })? = installed;
         self.ensure_generation.fetch_add(1, Ordering::Release);
+        self.packages_revision.fetch_add(1, Ordering::Release);
         self.notify_installed_packages_changed();
         Ok(model)
     }
@@ -627,6 +1215,7 @@ impl ManagedModelStore {
             InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
         })? = installed;
         self.ensure_generation.fetch_add(1, Ordering::Release);
+        self.packages_revision.fetch_add(1, Ordering::Release);
         self.notify_installed_packages_changed();
         Ok(())
     }
@@ -750,7 +1339,9 @@ fn model_primary_path(root: &Path, model: &InventoryModel) -> Option<PathBuf> {
             .join(commit)
             .join(&component.path),
         (ModelLocation::HuggingFaceCache { cache_root, .. }, _) => cache_root.join(&component.path),
-        (ModelLocation::Directory { root, .. }, _) => root.join(&component.path),
+        (ModelLocation::Directory { root, .. } | ModelLocation::External { root, .. }, _) => {
+            root.join(&component.path)
+        }
         (ModelLocation::File { path, .. }, _) => path.clone(),
         _ => return None,
     };
@@ -773,11 +1364,15 @@ fn validate_config(config: &InventoryConfig) -> Result<(), InventoryError> {
             "max_concurrent_downloads must be positive".to_owned(),
         ));
     }
-    for root in &config.hf_cache_dirs {
-        if !root.is_absolute() {
+    validate_local_models(&config.local_models)
+}
+
+fn validate_local_models(configuration: &LocalModelsConfiguration) -> Result<(), InventoryError> {
+    for root in &configuration.roots {
+        if !root.path.is_absolute() {
             return Err(InventoryError::InvalidRequest(format!(
-                "configured Hugging Face cache root must be absolute: {}",
-                root.display()
+                "model location must be absolute: {}",
+                root.path.display()
             )));
         }
     }
@@ -788,52 +1383,150 @@ struct InventoryScan {
     models: BTreeMap<InventoryEntryId, InventoryModel>,
     observations: BTreeMap<InventoryEntryId, String>,
     metadata_keys: BTreeMap<InventoryEntryId, String>,
+    root_scans: RootScans,
+    unreadable_directories: BTreeSet<UnreadableDirectory>,
+}
+
+/// Which locations a reconciliation scans. `Roots` names canonical location paths.
+#[derive(Debug, Clone)]
+pub(crate) enum ScanScope {
+    All,
+    Roots(BTreeSet<PathBuf>),
+}
+
+/// The last scan of each location, by kind and canonical path, reused for locations outside a
+/// reconciliation's scope.
+type RootScans = BTreeMap<(ModelRootKind, PathBuf), LocationScan>;
+
+/// Directories a scan could not read, each with why.
+pub(crate) type UnreadableDirectories = BTreeMap<PathBuf, String>;
+
+/// What scanning one location found: its candidates, and the directories inside it that could not
+/// be read, which the scan skipped.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LocationScan {
+    pub(crate) candidates: Vec<DiscoveryCandidate>,
+    pub(crate) unreadable: UnreadableDirectories,
+}
+
+struct ScannedRoots {
+    scope: ScanScope,
+    previous: RootScans,
+}
+
+impl ScannedRoots {
+    /// The previous scan of a location outside the scope, while all its files are still there.
+    fn reusable(
+        &self,
+        key: &(ModelRootKind, PathBuf),
+        inventory_root: &Path,
+    ) -> Option<&LocationScan> {
+        let in_scope = match &self.scope {
+            ScanScope::All => true,
+            ScanScope::Roots(roots) => roots.contains(&key.1),
+        };
+        if in_scope {
+            return None;
+        }
+        self.previous.get(key).filter(|scan| {
+            scan.candidates
+                .iter()
+                .all(|DiscoveryCandidate::Artifact(candidate)| {
+                    artifact_observation_key(inventory_root, &candidate.source, &candidate.location)
+                        .is_ok()
+                })
+        })
+    }
 }
 
 fn scan(
     config: &InventoryConfig,
+    local: &LocalModelsConfiguration,
     cache: &ModelCache,
     live_models: &BTreeMap<InventoryEntryId, InventoryModel>,
+    scanned: &ScannedRoots,
 ) -> Result<InventoryScan, InventoryError> {
+    let declared = DeclaredProjectors::new(local);
     let mut discovered = Vec::new();
-    scan_managed(config, &mut discovered)?;
+    scan_managed(config, &declared, cache, &mut discovered)?;
 
-    let mut distinct_hf = BTreeSet::new();
-    let mut roots = Vec::new();
-    for cache in &config.hf_cache_dirs {
-        let canonical = cache.canonicalize().unwrap_or_else(|_| cache.clone());
-        if canonical != config.root.join("hub") && distinct_hf.insert(canonical.clone()) {
-            roots.push(canonical);
+    // Roots scan in precedence order, so the first occurrence of a path is the preferred one. A
+    // root that cannot be read is skipped for this reconciliation rather than hiding every other
+    // location's models; a directory inside a root that cannot be read is skipped and reported,
+    // rather than hiding the rest of its root.
+    let managed_hub = canonical_or_self(&config.root.join("hub"));
+    let mut distinct = BTreeSet::new();
+    let mut roots = local
+        .roots
+        .iter()
+        .filter(|root| root.enabled)
+        .cloned()
+        .collect::<Vec<_>>();
+    roots.sort_by_key(|root| root.kind);
+    roots.retain(|root| {
+        let canonical = canonical_or_self(&root.path);
+        canonical != managed_hub && distinct.insert(canonical)
+    });
+    let mut root_scans = RootScans::new();
+    let mut stale_roots = Vec::new();
+    for root in &roots {
+        let key = (root.kind, canonical_or_self(&root.path));
+        match scanned.reusable(&key, &config.root) {
+            Some(scan) => {
+                root_scans.insert(key, scan.clone());
+            }
+            None => stale_roots.push(root.clone()),
         }
     }
-    let concurrency = std::thread::available_parallelism()
-        .map(|value| value.get())
-        .unwrap_or(1)
-        .clamp(1, 8);
-    for roots in roots.chunks(concurrency) {
+    let concurrency = config.scan_threads.get().min(8);
+    for roots in stale_roots.chunks(concurrency) {
         let root_results = std::thread::scope(|scope| {
             roots
                 .iter()
                 .map(|root| {
+                    let declared = &declared;
                     scope.spawn(move || {
-                        let mut models = Vec::new();
-                        scan_hf_cache(root, &mut models)?;
-                        Ok::<_, InventoryError>(models)
+                        crate::local_roots::scan_root(
+                            root,
+                            declared,
+                            cache,
+                            &config.architectures,
+                        )
                     })
                 })
                 .collect::<Vec<_>>()
                 .into_iter()
-                .map(|handle| {
-                    handle.join().map_err(|_| {
+                .zip(roots)
+                .map(|(handle, root)| {
+                    let result = handle.join().map_err(|_| {
                         InventoryError::Internal("model discovery worker panicked".to_owned())
-                    })?
+                    })?;
+                    Ok::<_, InventoryError>(result.unwrap_or_else(|error| {
+                        tracing::warn!(
+                            root = %root.path.display(),
+                            kind = ?root.kind,
+                            %error,
+                            "model location could not be scanned"
+                        );
+                        LocationScan::default()
+                    }))
                 })
                 .collect::<Result<Vec<_>, InventoryError>>()
         })?;
-        for models in root_results {
-            discovered.extend(models);
+        for (root, scan) in roots.iter().zip(root_results) {
+            root_scans.insert((root.kind, canonical_or_self(&root.path)), scan);
         }
     }
+    let mut unreadable_directories = BTreeSet::new();
+    for root in &roots {
+        if let Some(scan) = root_scans.get(&(root.kind, canonical_or_self(&root.path))) {
+            discovered.extend(scan.candidates.iter().cloned());
+            unreadable_directories.extend(scan.unreadable.iter().map(|(path, detail)| {
+                UnreadableDirectory::of(root, path.clone(), detail.clone())
+            }));
+        }
+    }
+    crate::local_roots::scan_attached_drafters(local, &mut discovered);
     let (mut cached_models, cached_evidence, _) =
         load_inventory_index(&ModelCache::new(&config.cache_root));
     // The durable entry controls cache validity. Overlay only transient runtime state for an entry
@@ -927,13 +1620,19 @@ fn scan(
         models,
         observations,
         metadata_keys,
+        root_scans,
+        unreadable_directories,
     })
 }
 
 fn scan_managed(
     config: &InventoryConfig,
+    declared: &DeclaredProjectors,
+    cache: &ModelCache,
     output: &mut Vec<DiscoveryCandidate>,
 ) -> Result<(), InventoryError> {
+    #[cfg(test)]
+    tests::failing_scan(&config.root)?;
     let managed = config.root.join("hub");
     if !managed.is_dir() {
         return Ok(());
@@ -959,11 +1658,20 @@ fn scan_managed(
             }
             let snapshot = snapshot_entry.path();
             let commit = snapshot_entry.file_name().to_string_lossy().into_owned();
-            append_discovered_groups(&repository, &repository_root, &snapshot, &commit, output)?;
+            append_discovered_groups(
+                &repository,
+                &repository_root,
+                &snapshot,
+                &commit,
+                &declared.for_snapshot(&repository, &commit, &snapshot),
+                cache,
+                &config.architectures,
+                output,
+            )?;
             for package in config
                 .catalog_models
                 .iter()
-                .flat_map(catalog_packages)
+                .flat_map(catalog_store_packages)
                 .map(|(package, _)| package)
             {
                 let ModelPackageSource::HuggingFace {
@@ -976,11 +1684,11 @@ fn scan_managed(
                 if package_repository != &repository {
                     continue;
                 }
-                let components = components_for_catalog_package(package)?;
+                let components = components_for_catalog_package(&package)?;
                 if !catalog_components_present(&snapshot, &repository_root, &components) {
                     continue;
                 }
-                let primary = match primary_path(&snapshot, &components) {
+                let primary = match package_primary_path(&snapshot, &components) {
                     Some(path) => path,
                     None => continue,
                 };
@@ -1007,6 +1715,7 @@ fn scan_managed(
                     },
                     primary,
                     deletable: true,
+                    unsupported_format: None,
                 })));
             }
         }
@@ -1014,7 +1723,7 @@ fn scan_managed(
     Ok(())
 }
 
-fn components_for_catalog_package(
+pub(crate) fn components_for_catalog_package(
     package: &ModelPackage,
 ) -> Result<Vec<ModelComponent>, InventoryError> {
     let paths = package
@@ -1043,12 +1752,12 @@ fn components_for_catalog_package(
                         ModelFileRelationship::ProjectorFor {
                             projector_file_id,
                             weights_file_id,
-                        } if projector_file_id == &file.id => {
-                            Some(magnitude_service_contracts::ComponentRelationship::ProjectorFor {
+                        } if projector_file_id == &file.id => Some(
+                            magnitude_service_contracts::ComponentRelationship::ProjectorFor {
                                 projector: paths.get(projector_file_id)?.clone(),
                                 model: paths.get(weights_file_id)?.clone(),
-                            })
-                        }
+                            },
+                        ),
                         ModelFileRelationship::MtpFor {
                             mtp_file_id,
                             weights_file_id,
@@ -1062,13 +1771,13 @@ fn components_for_catalog_package(
                             draft_file_id,
                             weights_file_id,
                             method,
-                        } if draft_file_id == &file.id => {
-                            Some(magnitude_service_contracts::ComponentRelationship::DraftFor {
+                        } if draft_file_id == &file.id => Some(
+                            magnitude_service_contracts::ComponentRelationship::DraftFor {
                                 draft: paths.get(draft_file_id)?.clone(),
                                 model: paths.get(weights_file_id)?.clone(),
                                 method: method.clone(),
-                            })
-                        }
+                            },
+                        ),
                         _ => None,
                     });
             Ok(ModelComponent {
@@ -1092,7 +1801,7 @@ fn components_for_catalog_package(
         .collect()
 }
 
-fn catalog_components_present(
+pub(crate) fn catalog_components_present(
     snapshot: &Path,
     repository_root: &Path,
     components: &[ModelComponent],
@@ -1124,15 +1833,34 @@ fn catalog_components_present(
     })
 }
 
+// Every complete group is published, drafters included: a drafter downloaded on its own is a
+// package a custom model's configuration resolves, and it survives rescans like any other.
 fn append_discovered_groups(
     repository: &str,
     repository_root: &Path,
     snapshot: &Path,
     commit: &str,
+    declared: &BTreeMap<PathBuf, PathBuf>,
+    cache: &ModelCache,
+    architectures: &RecognizedArchitectures,
     output: &mut Vec<DiscoveryCandidate>,
 ) -> Result<(), InventoryError> {
-    for group in discover_groups(snapshot, repository_root)? {
-        let components = components_for_group(snapshot, &group)?;
+    let blobs = RepositoryBlobs::open(repository_root).map_err(io_error)?;
+    let mut unreadable = UnreadableDirectories::new();
+    let groups = discover_groups(
+        snapshot,
+        repository_root,
+        LinkedFiles::WithinRoot,
+        cache,
+        architectures,
+        declared,
+        &mut unreadable,
+    )?;
+    for (path, detail) in unreadable {
+        tracing::warn!(path = %path.display(), %detail, "managed snapshot directory could not be read");
+    }
+    for group in groups {
+        let components = components_for_group(snapshot, &group, Some(&blobs))?;
         let Some(primary) = primary_path(snapshot, &components) else {
             continue;
         };
@@ -1159,17 +1887,28 @@ fn append_discovered_groups(
             },
             primary,
             deletable: true,
+            unsupported_format: None,
         })));
     }
     Ok(())
 }
 
-fn scan_hf_cache(cache: &Path, output: &mut Vec<DiscoveryCandidate>) -> Result<(), InventoryError> {
+/// Snapshot entries may link anywhere inside the hub: current `huggingface_hub` keeps the bytes in
+/// a blob store every repository shares. A repository or snapshot that can't be read is skipped
+/// and recorded, so it never hides the rest of the cache.
+pub(crate) fn scan_hf_cache(
+    owner: HubCacheOwner,
+    cache: &Path,
+    declared: &DeclaredProjectors,
+    inspections: &ModelCache,
+    architectures: &RecognizedArchitectures,
+    output: &mut LocationScan,
+) -> Result<(), InventoryError> {
     if !cache.is_dir() {
         return Ok(());
     }
     let mut count = 0;
-    for repo_entry in read_dir_sorted(cache)? {
+    for repo_entry in readable_entries(cache, &mut output.unreadable) {
         let repo_name = repo_entry.file_name().to_string_lossy().into_owned();
         let Some(repository) = parse_hf_repo_dir(&repo_name) else {
             continue;
@@ -1180,7 +1919,7 @@ fn scan_hf_cache(cache: &Path, output: &mut Vec<DiscoveryCandidate>) -> Result<(
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty());
         let snapshots = repo_root.join("snapshots");
-        for snapshot_entry in read_dir_sorted(&snapshots)? {
+        for snapshot_entry in readable_entries(&snapshots, &mut output.unreadable) {
             count += 1;
             if count > MAX_SCAN_ENTRIES {
                 return Err(InventoryError::Io(
@@ -1189,17 +1928,36 @@ fn scan_hf_cache(cache: &Path, output: &mut Vec<DiscoveryCandidate>) -> Result<(
             }
             let commit = snapshot_entry.file_name().to_string_lossy().into_owned();
             let snapshot = snapshot_entry.path();
-            let groups = discover_groups(&snapshot, &repo_root)?;
+            let groups = discover_groups(
+                &snapshot,
+                cache,
+                LinkedFiles::WithinRoot,
+                inspections,
+                architectures,
+                &declared.for_snapshot(&repository, &commit, &snapshot),
+                &mut output.unreadable,
+            )?;
+            let blobs = match RepositoryBlobs::open(&repo_root) {
+                Ok(blobs) => blobs,
+                Err(error) => {
+                    output.unreadable.insert(repo_root.clone(), error.to_string());
+                    continue;
+                }
+            };
             for group in groups {
-                let components = components_for_group(&snapshot, &group)?;
+                let components = components_for_group(&snapshot, &group, Some(&blobs))?;
                 let primary = match primary_path(&snapshot, &components) {
                     Some(path) => path,
                     None => continue,
                 };
                 let content = content_id(&components);
-                let id = inventory_entry_id("hugging-face-cache", &snapshot, &content);
+                let kind = match owner {
+                    HubCacheOwner::HuggingFace => "hugging-face-cache",
+                    HubCacheOwner::LlamaCpp => "llama-cpp",
+                };
+                let id = inventory_entry_id(kind, &snapshot, &content);
                 let created = modified_seconds(&snapshot).unwrap_or_else(now);
-                output.push(DiscoveryCandidate::Artifact(Box::new(ArtifactCandidate {
+                output.candidates.push(DiscoveryCandidate::Artifact(Box::new(ArtifactCandidate {
                     id,
                     content_id: content,
                     created,
@@ -1215,6 +1973,7 @@ fn scan_hf_cache(cache: &Path, output: &mut Vec<DiscoveryCandidate>) -> Result<(
                         metadata: None,
                     },
                     location: ModelLocation::HuggingFaceCache {
+                        owner,
                         cache_root: snapshot.clone(),
                         repository: repository.clone(),
                         commit: commit.clone(),
@@ -1226,6 +1985,7 @@ fn scan_hf_cache(cache: &Path, output: &mut Vec<DiscoveryCandidate>) -> Result<(
                     },
                     primary,
                     deletable: false,
+                    unsupported_format: None,
                 })));
             }
         }
@@ -1233,20 +1993,21 @@ fn scan_hf_cache(cache: &Path, output: &mut Vec<DiscoveryCandidate>) -> Result<(
     Ok(())
 }
 
-#[derive(Debug)]
-struct ArtifactCandidate {
-    id: InventoryEntryId,
-    content_id: magnitude_service_contracts::ContentId,
-    created: u64,
-    ready_at: u64,
-    source: ModelSource,
-    location: ModelLocation,
-    primary: PathBuf,
-    deletable: bool,
+#[derive(Debug, Clone)]
+pub(crate) struct ArtifactCandidate {
+    pub(crate) id: InventoryEntryId,
+    pub(crate) content_id: magnitude_service_contracts::ContentId,
+    pub(crate) created: u64,
+    pub(crate) ready_at: u64,
+    pub(crate) source: ModelSource,
+    pub(crate) location: ModelLocation,
+    pub(crate) primary: PathBuf,
+    pub(crate) deletable: bool,
+    pub(crate) unsupported_format: Option<String>,
 }
 
-#[derive(Debug)]
-enum DiscoveryCandidate {
+#[derive(Debug, Clone)]
+pub(crate) enum DiscoveryCandidate {
     Artifact(Box<ArtifactCandidate>),
 }
 
@@ -1311,10 +2072,43 @@ fn reuse_metadata(
     })
 }
 
+/// A candidate whose files are in a format the engine can't read is incompatible as found; its
+/// files are never opened. One whose primary file can't be opened, such as a link to a removed
+/// drive, is listed as unreadable, whatever an earlier inspection of the same content found.
 fn enrich_candidate(
     candidate: &ArtifactCandidate,
     cache: &ModelCache,
 ) -> Result<InventoryModel, InventoryError> {
+    if let Err(error) = fs::File::open(&candidate.primary) {
+        return Ok(unavailable_model(
+            candidate.id.clone(),
+            candidate.content_id.clone(),
+            candidate.created,
+            candidate.ready_at,
+            candidate.source.clone(),
+            candidate.location.clone(),
+            &candidate.primary,
+            candidate.deletable,
+            UNREADABLE_CODE,
+            format!("{} can't be read: {error}", candidate.primary.display()),
+            false,
+        ));
+    }
+    if let Some(detail) = &candidate.unsupported_format {
+        return Ok(unavailable_model(
+            candidate.id.clone(),
+            candidate.content_id.clone(),
+            candidate.created,
+            candidate.ready_at,
+            candidate.source.clone(),
+            candidate.location.clone(),
+            &candidate.primary,
+            candidate.deletable,
+            UNSUPPORTED_FORMAT_CODE,
+            detail.clone(),
+            true,
+        ));
+    }
     let model = build_model(
         candidate.id.clone(),
         candidate.content_id.clone(),
@@ -1352,7 +2146,12 @@ pub(crate) fn build_model(
         .read_index::<CachedModelMetadata>(ModelIndexKind::InventoryMetadata, &metadata_evidence);
     let inspected = match cached_metadata {
         Some(inspection) => inspection,
-        None => match gguf::inspect(primary) {
+        None => match primary
+            .metadata()
+            .map_err(gguf::GgufError::from)
+            .and_then(|metadata| local_gguf_of(cache, primary, &metadata, |_| {}))
+            .and_then(gguf::LocalGguf::complete)
+        {
             Ok(inspection) => {
                 let evidence = fingerprint(&inspection.fingerprint_material);
                 let name = inspection.name.clone().unwrap_or_else(|| {
@@ -1373,8 +2172,11 @@ pub(crate) fn build_model(
                         training_context_length: inspection.training_context_length,
                         nextn_predict_layers: inspection.nextn_predict_layers,
                         tokenizer: inspection.tokenizer,
-                        modalities: inspection.modalities,
-                        base_models: inspection.base_models,
+                        base_models: inspection
+                            .base_models
+                            .into_iter()
+                            .filter_map(|base| base.name.or(base.repo_url))
+                            .collect(),
                         evidence_fingerprint: evidence,
                     },
                     supported_parameters: Vec::new(),
@@ -1431,7 +2233,7 @@ fn model_metadata_evidence(
     content_id: &magnitude_service_contracts::ContentId,
     primary_name: &str,
 ) -> Result<String, InventoryError> {
-    serde_json::to_string(&(&content_id.0, primary_name))
+    serde_json::to_string(&(gguf::RULES, &content_id.0, primary_name))
         .map_err(|error| InventoryError::Internal(error.to_string()))
 }
 
@@ -1502,43 +2304,212 @@ fn unavailable_model(
 }
 
 #[derive(Debug)]
-struct ModelGroup {
-    paths: Vec<PathBuf>,
-    projector: Option<PathBuf>,
+pub(crate) struct ModelGroup {
+    pub(crate) paths: Vec<PathBuf>,
+    pub(crate) projector: Option<PathBuf>,
 }
 
-fn discover_groups(
+/// Projectors that added models pair with their targets, by absolute path. An added model names
+/// its projector, so it wins over guessing from the directory.
+pub(crate) struct DeclaredProjectors {
+    added: BTreeMap<(String, String), Vec<(String, String)>>,
+}
+
+impl DeclaredProjectors {
+    pub(crate) fn new(configuration: &LocalModelsConfiguration) -> Self {
+        let mut added = BTreeMap::<(String, String), Vec<(String, String)>>::new();
+        for model in &configuration.added {
+            if let Some(projector) = &model.projector {
+                added
+                    .entry((model.repository.as_str().to_owned(), model.revision.clone()))
+                    .or_default()
+                    .push((model.path.as_str().to_owned(), projector.clone()));
+            }
+        }
+        Self { added }
+    }
+
+    pub(crate) fn for_snapshot(
+        &self,
+        repository: &str,
+        commit: &str,
+        snapshot: &Path,
+    ) -> BTreeMap<PathBuf, PathBuf> {
+        self.added
+            .get(&(repository.to_owned(), commit.to_owned()))
+            .into_iter()
+            .flatten()
+            .map(|(target, projector)| (snapshot.join(target), snapshot.join(projector)))
+            .collect()
+    }
+}
+
+/// Header inspection of a complete file found while scanning (see [`local_gguf_cached`]).
+pub(crate) fn inspect_cached(cache: &ModelCache, path: &Path) -> Option<gguf::GgufInspection> {
+    local_gguf_cached(cache, path, |_| {})
+        .ok()
+        .filter(|gguf| gguf.truncated.is_none())
+        .map(|gguf| gguf.inspection)
+}
+
+/// What one read of a local GGUF establishes, cached by its path, size and modification time, so
+/// an unchanged file is never read again (the inventory's scan, its models and the assessment's
+/// candidates all take it from here). `read` receives the read of a file that had to be read: its
+/// header bytes and their directory.
+pub(crate) fn local_gguf_cached(
+    cache: &ModelCache,
+    path: &Path,
+    read: impl FnOnce(&gguf::LocalGgufRead),
+) -> Result<gguf::LocalGguf, InventoryError> {
+    let metadata = path.metadata().map_err(io_error)?;
+    local_gguf_of(cache, path, &metadata, read)
+        .map_err(|error| InventoryError::Integrity(format!("{}: {error}", path.display())))
+}
+
+/// [`local_gguf_cached`] for a file with this `metadata`.
+fn local_gguf_of(
+    cache: &ModelCache,
+    path: &Path,
+    metadata: &fs::Metadata,
+    read: impl FnOnce(&gguf::LocalGgufRead),
+) -> Result<gguf::LocalGguf, gguf::GgufError> {
+    let evidence = format!(
+        "gguf-file-v9\0{}\0{}",
+        gguf::RULES,
+        file_identity(path, metadata)
+    );
+    if let Some(gguf) = cache.read_index(ModelIndexKind::GgufInspection, &evidence) {
+        return Ok(gguf);
+    }
+    let local = gguf::read_local(path)?;
+    read(&local);
+    cache.write_index(ModelIndexKind::GgufInspection, &evidence, &local.gguf);
+    Ok(local.gguf)
+}
+
+impl ManagedModelStore {
+    /// A local GGUF's identity and header facts, read at most once while the file is unchanged.
+    /// A file that is read has its header kept in the content-addressed header cache, so its
+    /// header is read from there afterwards.
+    pub fn local_gguf(&self, path: &Path) -> Result<gguf::LocalGguf, InventoryError> {
+        local_gguf_cached(&self.cache, path, |read| {
+            self.write_header(&read.header);
+        })
+    }
+
+    /// A local GGUF's facts with its header bytes: from the header cache when it holds them, else
+    /// from one read of the file.
+    pub fn local_gguf_header(
+        &self,
+        path: &Path,
+    ) -> Result<(gguf::LocalGguf, Vec<u8>), InventoryError> {
+        let mut read = None;
+        let gguf = local_gguf_cached(&self.cache, path, |local| {
+            self.write_header(&local.header);
+            read = Some(local.header.to_vec());
+        })?;
+        if let Some(header) = read.or_else(|| self.cache.read_header(&gguf.inspection.header_digest))
+        {
+            return Ok((gguf, header));
+        }
+        let gguf::LocalGgufRead {
+            gguf,
+            header,
+            directory,
+        } = gguf::read_local(path)
+            .map_err(|error| InventoryError::Integrity(format!("{}: {error}", path.display())))?;
+        self.write_header(&header);
+        // The directory's arrays share the header's bytes; without them the bytes are the
+        // header's alone.
+        drop(directory);
+        Ok((gguf, Arc::unwrap_or_clone(header)))
+    }
+
+    /// The GGUF header with this digest, when the header cache holds it.
+    #[must_use]
+    pub fn cached_header(&self, digest: &str) -> Option<Vec<u8>> {
+        self.cache.read_header(digest)
+    }
+
+    /// Discards the GGUF header with this digest from the header cache: a payload of its skeleton
+    /// failed to read ([`magnitude_artifacts::gguf::Array::lost_payload`]).
+    pub fn discard_cached_header(&self, digest: &str) {
+        self.cache.discard_header(digest);
+    }
+
+    /// The directory of the GGUF header with this digest, as reading the header gives it, when
+    /// the header cache holds it: read from the header's skeleton, each large array's payload
+    /// read from the cache only when a reader needs its elements.
+    #[must_use]
+    pub fn cached_header_directory(
+        &self,
+        digest: &str,
+    ) -> Option<Result<magnitude_artifacts::gguf::Directory, magnitude_artifacts::Error>> {
+        self.cache
+            .read_header_skeleton(digest)
+            .map(magnitude_artifacts::gguf::read_skeleton)
+    }
+}
+
+/// Where a symlinked GGUF found under a root may lead. A cache keeps its files inside itself; a
+/// user's folder is often links to model files kept elsewhere, which are read in place through the
+/// link like any found file. A symlinked directory is never descended either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LinkedFiles {
+    WithinRoot,
+    Anywhere,
+}
+
+/// Every complete GGUF group under `root`. Projectors are recognized from their headers and pair
+/// with a model by declaration, else as the only projector in its directory. Drafters and
+/// unreadable files form their own groups; what they are is decided from their headers later,
+/// never from their names. A directory that can't be read is recorded in `unreadable` and the
+/// rest of `root` is still discovered.
+pub(crate) fn discover_groups(
     root: &Path,
     containment_root: &Path,
+    linked_files: LinkedFiles,
+    cache: &ModelCache,
+    architectures: &RecognizedArchitectures,
+    declared: &BTreeMap<PathBuf, PathBuf>,
+    unreadable: &mut UnreadableDirectories,
 ) -> Result<Vec<ModelGroup>, InventoryError> {
     let mut files = Vec::new();
-    collect_gguf(root, containment_root, 0, &mut files)?;
+    collect_gguf(
+        root,
+        &canonical_or_self(containment_root),
+        linked_files,
+        0,
+        &mut files,
+        unreadable,
+    );
     let mut groups: BTreeMap<PathBuf, Vec<(u32, u32, PathBuf)>> = BTreeMap::new();
     let mut standalone = Vec::new();
     let mut projectors = Vec::new();
     for path in files {
-        let name = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if name.contains("mmproj") || name.contains("projector") {
-            projectors.push(path);
-        } else if is_execution_companion(&path, &name) {
-            // Draft and MTP artifacts are not independently loadable chat models. They remain
-            // available at their source path for an explicit paired configuration.
-            continue;
-        } else if let Some((prefix, index, total)) = split_shard_name(&path) {
+        if let Some((prefix, index, total)) = split_shard_name(&path) {
             groups.entry(prefix).or_default().push((index, total, path));
-        } else {
-            standalone.push(path);
+            continue;
+        }
+        let role = inspect_cached(cache, &path).map(|inspection| inspection.role(architectures));
+        match role {
+            Some(gguf::GgufRole::Projector) => projectors.push(path),
+            role => standalone.push((path, role)),
         }
     }
+    let pairing = |path: &Path, role: Option<&gguf::GgufRole>| match role {
+        Some(gguf::GgufRole::Model { .. }) => declared
+            .get(path)
+            .filter(|projector| projectors.contains(projector))
+            .cloned()
+            .or_else(|| unique_projector_for(path, &projectors)),
+        _ => None,
+    };
     let mut output = standalone
-        .into_iter()
-        .map(|path| ModelGroup {
-            projector: unique_projector_for(&path, &projectors),
-            paths: vec![path],
+        .iter()
+        .map(|(path, role)| ModelGroup {
+            projector: pairing(path, role.as_ref()),
+            paths: vec![path.clone()],
         })
         .collect::<Vec<_>>();
     for (_prefix, mut shards) in groups {
@@ -1556,28 +2527,22 @@ fn discover_groups(
             continue;
         }
         let first = shards[0].2.clone();
+        let role = inspect_cached(cache, &first).map(|inspection| inspection.role(architectures));
+        if role == Some(gguf::GgufRole::Projector) {
+            continue;
+        }
         output.push(ModelGroup {
-            projector: unique_projector_for(&first, &projectors),
+            projector: pairing(&first, role.as_ref()),
             paths: shards.into_iter().map(|(_, _, path)| path).collect(),
         });
     }
     Ok(output)
 }
 
-fn is_execution_companion(path: &Path, name: &str) -> bool {
-    gguf::inspect(path).is_ok_and(|inspection| inspection.execution_role.is_some())
-        || is_execution_companion_name(name)
-}
-
-fn is_execution_companion_name(name: &str) -> bool {
-    name.trim_end_matches(".gguf")
-        .split(|character: char| !character.is_ascii_alphanumeric())
-        .any(|part| matches!(part, "dflash" | "dspark" | "draft" | "eagle3" | "mtp"))
-}
-
-fn components_for_group(
+pub(crate) fn components_for_group(
     root: &Path,
     group: &ModelGroup,
+    blobs: Option<&RepositoryBlobs>,
 ) -> Result<Vec<ModelComponent>, InventoryError> {
     let mut components = Vec::new();
     for (offset, path) in group.paths.iter().enumerate() {
@@ -1593,7 +2558,7 @@ fn components_for_group(
                 ComponentRole::Shard
             },
             size_bytes: metadata.len(),
-            content: content_identity_for_file(path, &metadata),
+            content: content_identity_for_file(path, &metadata, blobs),
             shard_index: (group.paths.len() > 1).then_some(offset as u32 + 1),
             relationship: None,
         });
@@ -1607,7 +2572,7 @@ fn components_for_group(
             path: relative.to_path_buf(),
             role: ComponentRole::Projector,
             size_bytes: metadata.len(),
-            content: content_identity_for_file(projector, &metadata),
+            content: content_identity_for_file(projector, &metadata, blobs),
             shard_index: None,
             relationship: components.first().map(|model| {
                 magnitude_service_contracts::ComponentRelationship::ProjectorFor {
@@ -1623,18 +2588,32 @@ fn components_for_group(
 fn collect_gguf(
     directory: &Path,
     containment_root: &Path,
+    linked_files: LinkedFiles,
     depth: usize,
     output: &mut Vec<PathBuf>,
-) -> Result<(), InventoryError> {
+    unreadable: &mut UnreadableDirectories,
+) {
     if depth > MAX_SCAN_DEPTH || output.len() >= MAX_SCAN_ENTRIES {
-        return Ok(());
+        return;
     }
-    for entry in read_dir_sorted(directory)? {
+    for entry in readable_entries(directory, unreadable) {
         let path = entry.path();
-        let file_type = entry.file_type().map_err(io_error)?;
+        if entry.file_name().to_string_lossy().starts_with('.')
+            || crate::local_roots::is_partial_download(&path)
+        {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
         if file_type.is_symlink() {
             let canonical = match path.canonicalize() {
-                Ok(canonical) if canonical.starts_with(containment_root) => canonical,
+                Ok(canonical)
+                    if linked_files == LinkedFiles::Anywhere
+                        || canonical.starts_with(containment_root) =>
+                {
+                    canonical
+                }
                 _ => continue,
             };
             if canonical.is_file()
@@ -1646,7 +2625,14 @@ fn collect_gguf(
                 output.push(path);
             }
         } else if file_type.is_dir() {
-            collect_gguf(&path, containment_root, depth + 1, output)?;
+            collect_gguf(
+                &path,
+                containment_root,
+                linked_files,
+                depth + 1,
+                output,
+                unreadable,
+            );
         } else if file_type.is_file()
             && path
                 .extension()
@@ -1659,10 +2645,9 @@ fn collect_gguf(
             break;
         }
     }
-    Ok(())
 }
 
-fn split_shard_name(path: &Path) -> Option<(PathBuf, u32, u32)> {
+pub(crate) fn split_shard_name(path: &Path) -> Option<(PathBuf, u32, u32)> {
     if !path.extension()?.to_str()?.eq_ignore_ascii_case("gguf") {
         return None;
     }
@@ -1686,7 +2671,7 @@ fn unique_projector_for(model: &Path, projectors: &[PathBuf]) -> Option<PathBuf>
     (matches.len() == 1).then(|| matches[0].clone())
 }
 
-fn primary_path(root: &Path, components: &[ModelComponent]) -> Option<PathBuf> {
+pub(crate) fn primary_path(root: &Path, components: &[ModelComponent]) -> Option<PathBuf> {
     components
         .iter()
         .find(|component| {
@@ -1698,14 +2683,40 @@ fn primary_path(root: &Path, components: &[ModelComponent]) -> Option<PathBuf> {
         .map(|component| root.join(&component.path))
 }
 
-fn read_dir_sorted(path: &Path) -> Result<Vec<fs::DirEntry>, InventoryError> {
+pub(crate) fn read_dir_sorted(path: &Path) -> Result<Vec<fs::DirEntry>, InventoryError> {
     if !path.is_dir() {
         return Ok(Vec::new());
     }
-    let mut entries = fs::read_dir(path)
-        .map_err(io_error)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(io_error)?;
+    list_sorted(path).map_err(io_error)
+}
+
+/// The entries of a directory inside a location, sorted. One that can't be read is recorded in
+/// `unreadable` and walked as empty, so it never hides the rest of its location; one that vanished
+/// during the scan is just empty.
+pub(crate) fn readable_entries(
+    directory: &Path,
+    unreadable: &mut UnreadableDirectories,
+) -> Vec<fs::DirEntry> {
+    let listed = fs::metadata(directory).and_then(|metadata| {
+        if metadata.is_dir() {
+            list_sorted(directory)
+        } else {
+            Ok(Vec::new())
+        }
+    });
+    listed.unwrap_or_else(|error| {
+        if !matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        ) {
+            unreadable.insert(directory.to_path_buf(), error.to_string());
+        }
+        Vec::new()
+    })
+}
+
+fn list_sorted(path: &Path) -> std::io::Result<Vec<fs::DirEntry>> {
+    let mut entries = fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(fs::DirEntry::file_name);
     Ok(entries)
 }
@@ -1725,7 +2736,7 @@ pub(crate) fn repository_lock_path(root: &Path, repository: &str) -> PathBuf {
         .join(format!("{}.lock", hf_repo_dir(repository)))
 }
 
-fn modified_seconds(path: &Path) -> Option<u64> {
+pub(crate) fn modified_seconds(path: &Path) -> Option<u64> {
     path.metadata()
         .ok()?
         .modified()
@@ -1752,7 +2763,9 @@ fn artifact_observation_key(
             .join("snapshots")
             .join(commit),
         (ModelLocation::HuggingFaceCache { cache_root, .. }, _) => cache_root.clone(),
-        (ModelLocation::Directory { root, .. }, _) => root.clone(),
+        (ModelLocation::Directory { root, .. } | ModelLocation::External { root, .. }, _) => {
+            root.clone()
+        }
         (ModelLocation::File { path, .. }, _) => path
             .parent()
             .ok_or_else(|| InventoryError::Internal("ad-hoc model has no parent".to_owned()))?
@@ -1775,16 +2788,19 @@ fn artifact_observation_key(
     let mut digest = Sha256::new();
     digest.update(b"magnitude-filesystem-observation-v1\0");
     for path in paths {
-        let metadata = path.metadata().map_err(io_error)?;
-        if !metadata.is_file() {
-            return Err(InventoryError::Io(format!(
-                "model component is not a regular file: {}",
-                path.display()
-            )));
-        }
+        let identity = match path.metadata() {
+            Ok(metadata) if metadata.is_file() => file_identity(&path, &metadata),
+            Ok(_) => {
+                return Err(InventoryError::Io(format!(
+                    "model component is not a regular file: {}",
+                    path.display()
+                )));
+            }
+            Err(error) => broken_link_identity(&path).ok_or_else(|| io_error(error))?,
+        };
         digest.update(path.to_string_lossy().as_bytes());
         digest.update(b"\0");
-        digest.update(file_identity(&path, &metadata).as_bytes());
+        digest.update(identity.as_bytes());
         digest.update(b"\0");
     }
     Ok(format!("sha256:{:x}", digest.finalize()))
@@ -1795,6 +2811,16 @@ fn model_observation_key(
     model: &InventoryModel,
 ) -> Result<String, InventoryError> {
     artifact_observation_key(inventory_root, &model.source, &model.location)
+}
+
+/// A component that is a link whose target can't be read is still on disk, as the link, and is
+/// observed by where it points; its model is listed as unreadable.
+fn broken_link_identity(path: &Path) -> Option<String> {
+    let target = fs::read_link(path).ok()?;
+    let mut digest = Sha256::new();
+    digest.update(b"broken-link\0");
+    digest.update(target.to_string_lossy().as_bytes());
+    Some(format!("{:x}", digest.finalize()))
 }
 
 fn file_identity(path: &Path, metadata: &fs::Metadata) -> String {
@@ -1814,14 +2840,14 @@ fn file_identity(path: &Path, metadata: &fs::Metadata) -> String {
     format!("{:x}", digest.finalize())
 }
 
-fn content_identity_for_file(path: &Path, metadata: &fs::Metadata) -> ContentIdentity {
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let in_blob_store = canonical
-        .parent()
-        .and_then(Path::file_name)
-        .and_then(|value| value.to_str())
-        == Some("blobs");
-    let name = canonical.file_name().and_then(|value| value.to_str());
+fn content_identity_for_file(
+    path: &Path,
+    metadata: &fs::Metadata,
+    blobs: Option<&RepositoryBlobs>,
+) -> ContentIdentity {
+    let blob = blobs.and_then(|blobs| blobs.resolve(path).ok().flatten());
+    let in_blob_store = blob.is_some();
+    let name = blob.as_ref().and_then(RepositoryBlob::name);
     if in_blob_store
         && let Some(value) = name.and_then(|value| value.strip_prefix("lfs-sha256-"))
         && value.len() == 64
@@ -1861,7 +2887,11 @@ pub(crate) fn now() -> u64 {
         .as_secs()
 }
 
-fn io_error(error: impl std::fmt::Display) -> InventoryError {
+pub(crate) fn canonical_or_self(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+pub(crate) fn io_error(error: impl std::fmt::Display) -> InventoryError {
     InventoryError::Io(error.to_string())
 }
 
@@ -1871,11 +2901,10 @@ mod tests {
     use std::io::Write;
 
     use magnitude_service_contracts::models::{
-        CatalogBaseId, CatalogVariantId, InstalledCatalogAttribution,
-        InstalledModelPackages, ModelFile, ModelFileId, ModelFileRole,
-        ModelPackageInstallationOrigin, ModelPackageProperties, ModelReleaseDate,
-        ModelServingConfiguration, PackageValidation, RecommendableModel, ServableModelBundle,
-        ServingProfile,
+        CatalogBaseId, CatalogVariantId, InstalledCatalogAttribution, InstalledModelPackages,
+        ModelFile, ModelFileId, ModelFileRole, ModelPackageInstallationOrigin,
+        ModelPackageProperties, ModelReleaseDate, ModelServingConfiguration, PackageValidation,
+        RecommendableModel, ServableModelBundle, ServingProfile,
     };
 
     fn catalog_model(package: ModelPackage) -> RecommendableModel {
@@ -1896,9 +2925,18 @@ mod tests {
             parameterization: magnitude_service_contracts::models::ModelParameterization::Dense {
                 total_parameters: 8_000_000_000,
             },
-            intelligence: 0,
-            support: magnitude_service_contracts::models::CatalogSupport::Supported,
-            fidelity_rank: 0,
+            developer: magnitude_service_contracts::models::ModelDeveloper {
+                lab: magnitude_service_contracts::models::LabId("alibaba".to_owned()),
+                name: "Alibaba".to_owned(),
+                country: "CN".to_owned(),
+            },
+            support: magnitude_service_contracts::models::CatalogSupport::Supported {
+                intelligence: 0,
+            },
+            quant: magnitude_service_contracts::models::CatalogQuant {
+                repository: "publisher/model-GGUF".to_owned(),
+                name: "Q4_K_M".to_owned(),
+            },
             quantization_aware: false,
         }
     }
@@ -1911,7 +2949,7 @@ mod tests {
             InventoryConfig::with_roots(root, std::env::temp_dir().join("icn-owned-model-cache"))
                 .expect("absolute model and cache roots");
 
-        assert!(config.hf_cache_dirs.is_empty());
+        assert!(config.local_models.roots.is_empty());
     }
 
     #[test]
@@ -1978,7 +3016,17 @@ mod tests {
             },
         })];
 
-        let result = scan(&config, &cache, &BTreeMap::new()).expect("filesystem-derived inventory");
+        let result = scan(
+            &config,
+            &LocalModelsConfiguration::default(),
+            &cache,
+            &BTreeMap::new(),
+            &ScannedRoots {
+                scope: ScanScope::All,
+                previous: RootScans::new(),
+            },
+        )
+        .expect("filesystem-derived inventory");
 
         assert_eq!(result.models.len(), 1);
         let discovered = result.models.values().next().expect("catalog model");
@@ -1996,14 +3044,33 @@ mod tests {
         );
 
         fs::remove_file(snapshot.join(&artifact_name)).expect("remove installed link");
-        let after_delete = scan(&config, &cache, &BTreeMap::new())
-            .expect("read-only filesystem-derived inventory");
+        let after_delete = scan(
+            &config,
+            &LocalModelsConfiguration::default(),
+            &cache,
+            &BTreeMap::new(),
+            &ScannedRoots {
+                scope: ScanScope::All,
+                previous: RootScans::new(),
+            },
+        )
+        .expect("read-only filesystem-derived inventory");
         assert!(after_delete.models.is_empty());
         assert!(!snapshot.join(&artifact_name).exists());
 
         fs::copy(blobs.join(&artifact_name), snapshot.join(&artifact_name))
             .expect("unlinked copy with identical bytes");
-        let after_copy = scan(&config, &cache, &BTreeMap::new()).expect("scan unlinked copy");
+        let after_copy = scan(
+            &config,
+            &LocalModelsConfiguration::default(),
+            &cache,
+            &BTreeMap::new(),
+            &ScannedRoots {
+                scope: ScanScope::All,
+                previous: RootScans::new(),
+            },
+        )
+        .expect("scan unlinked copy");
         assert!(after_copy.models.is_empty());
     }
 
@@ -2081,13 +3148,32 @@ mod tests {
             },
         })];
 
-        let discovered = scan(&config, &cache, &BTreeMap::new()).expect("single managed revision");
+        let discovered = scan(
+            &config,
+            &LocalModelsConfiguration::default(),
+            &cache,
+            &BTreeMap::new(),
+            &ScannedRoots {
+                scope: ScanScope::All,
+                previous: RootScans::new(),
+            },
+        )
+        .expect("single managed revision");
         assert_eq!(discovered.models.len(), 2);
 
         fs::create_dir_all(repository_root.join("snapshots/other-commit"))
             .expect("second snapshot");
-        let with_incomplete_second_snapshot =
-            scan(&config, &cache, &BTreeMap::new()).expect("managed snapshots");
+        let with_incomplete_second_snapshot = scan(
+            &config,
+            &LocalModelsConfiguration::default(),
+            &cache,
+            &BTreeMap::new(),
+            &ScannedRoots {
+                scope: ScanScope::All,
+                previous: RootScans::new(),
+            },
+        )
+        .expect("managed snapshots");
         assert_eq!(with_incomplete_second_snapshot.models.len(), 2);
     }
 
@@ -2129,6 +3215,95 @@ mod tests {
         (cache, snapshot)
     }
 
+    /// Windows publishes snapshot entries as hard links, and the download assigns the entry id
+    /// before the snapshot exists. Removal must find that id and reclaim the blob.
+    #[tokio::test]
+    async fn hard_linked_catalog_package_is_listed_once_and_removed_with_its_blob() {
+        use magnitude_service_contracts::models::InstalledModelPackages as _;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let store = temporary.path().join("store");
+        let repository = "owner/model";
+        let commit = "commit";
+        let repository_root = store.join("hub").join(hf_repo_dir(repository));
+        let snapshot = repository_root.join("snapshots").join(commit);
+        let blobs = repository_root.join("blobs");
+        fs::create_dir_all(&blobs).unwrap();
+        let source = temporary.path().join("source.gguf");
+        write_minimal_gguf(&source);
+        let bytes = fs::read(&source).unwrap();
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let blob = blobs.join(blob_key(&ContentIdentity::Sha256 {
+            value: digest.clone(),
+        }));
+        let package = ModelPackage {
+            id: ModelPackageId("package_catalog".to_owned()),
+            source: ModelPackageSource::HuggingFace {
+                repository: repository.to_owned(),
+                revision: commit.to_owned(),
+            },
+            files: vec![ModelFile {
+                id: ModelFileId(format!("file_{digest}")),
+                path: PathBuf::from("model.gguf"),
+                role: ModelFileRole::Weights,
+                size_bytes: u64::try_from(bytes.len()).unwrap(),
+                tensor_storage_bytes: None,
+                sha256: digest,
+            }],
+            relationships: Vec::new(),
+            properties: ModelPackageProperties {
+                format: "gguf".to_owned(),
+                quantization: "unknown".to_owned(),
+                quantization_name: "unknown".to_owned(),
+                architecture: "unknown".to_owned(),
+                maximum_context_length: Some(4_096),
+                intrinsic_model_id: None,
+                intrinsic_quality_id: None,
+            },
+        };
+        let download_time_id = inventory_entry_id(
+            "magnitude-cache",
+            &snapshot,
+            &content_id(&components_for_catalog_package(&package).unwrap()),
+        );
+        fs::rename(&source, &blob).unwrap();
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::hard_link(&blob, snapshot.join("model.gguf")).unwrap();
+
+        let mut config =
+            InventoryConfig::with_roots(store, temporary.path().join("cache")).unwrap();
+        config.catalog_models = vec![catalog_model(package.clone())];
+        let manager = ManagedModelStore::open_unbounded(config).await.unwrap();
+        manager.ensure_installed_model_inventory().await.unwrap();
+        let models = manager.list().await.unwrap();
+        assert_eq!(
+            models.len(),
+            1,
+            "a hard-linked snapshot must not add a discovered duplicate"
+        );
+        assert_eq!(models[0].id, download_time_id);
+
+        let installed = manager.list_installed().await.unwrap();
+        assert_eq!(installed.packages.len(), 1);
+        assert_eq!(
+            installed.packages[0].origin,
+            ModelPackageInstallationOrigin::Magnitude
+        );
+        let removed = manager
+            .remove_installed(&installed.packages[0].package.id)
+            .await
+            .unwrap();
+        assert!(removed.removed);
+        assert_eq!(removed.freed_bytes, u64::try_from(bytes.len()).unwrap());
+        assert!(!blob.exists());
+        assert!(!snapshot.join("model.gguf").exists());
+        assert!(
+            !repository_root.exists(),
+            "a repository folder left without a model is removed from Magnitude's store"
+        );
+        assert!(manager.list().await.unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn installed_package_listing_reports_discovered_package() {
         let temporary = tempfile::tempdir().unwrap();
@@ -2138,8 +3313,8 @@ mod tests {
 
         let mut config =
             InventoryConfig::with_roots(store, temporary.path().join("cache")).unwrap();
-        config.hf_cache_dirs.push(hf_cache);
-        let manager = ManagedModelStore::open(config).await.unwrap();
+        config.add_hugging_face_caches([hf_cache]);
+        let manager = ManagedModelStore::open_unbounded(config).await.unwrap();
         manager.ensure_installed_model_inventory().await.unwrap();
         let installed = manager.list_installed().await.unwrap();
 
@@ -2161,8 +3336,8 @@ mod tests {
         write_minimal_gguf(&source.join("model.gguf"));
 
         let mut initial = InventoryConfig::with_roots(store.clone(), cache.clone()).unwrap();
-        initial.hf_cache_dirs.push(hf_cache.clone());
-        let manager = ManagedModelStore::open(initial).await.unwrap();
+        initial.add_hugging_face_caches([hf_cache.clone()]);
+        let manager = ManagedModelStore::open_unbounded(initial).await.unwrap();
         manager.ensure_installed_model_inventory().await.unwrap();
         let package = manager.list_installed().await.unwrap().packages[0]
             .package
@@ -2170,9 +3345,9 @@ mod tests {
         drop(manager);
 
         let mut configured = InventoryConfig::with_roots(store.clone(), cache.clone()).unwrap();
-        configured.hf_cache_dirs.push(hf_cache.clone());
+        configured.add_hugging_face_caches([hf_cache.clone()]);
         configured.catalog_models = vec![catalog_model(package.clone())];
-        let manager = ManagedModelStore::open(configured).await.unwrap();
+        let manager = ManagedModelStore::open_unbounded(configured).await.unwrap();
         manager.ensure_installed_model_inventory().await.unwrap();
         let installed = manager.list_installed().await.unwrap();
         assert_eq!(
@@ -2188,9 +3363,9 @@ mod tests {
         let mut future_package = package;
         future_package.id = ModelPackageId("future-package".to_owned());
         let mut updated = InventoryConfig::with_roots(store, cache).unwrap();
-        updated.hf_cache_dirs.push(hf_cache);
+        updated.add_hugging_face_caches([hf_cache]);
         updated.catalog_models = vec![catalog_model(future_package)];
-        let manager = ManagedModelStore::open(updated).await.unwrap();
+        let manager = ManagedModelStore::open_unbounded(updated).await.unwrap();
         manager.ensure_installed_model_inventory().await.unwrap();
         let installed = manager.list_installed().await.unwrap();
         assert!(matches!(
@@ -2199,12 +3374,231 @@ mod tests {
         ));
     }
 
+    /// The catalog's exact target found in a Hugging Face cache, the same repository, commit and
+    /// weight file, is the catalog model even when the catalog's package also holds a projector
+    /// the cache lacks. Another commit of the same file is not.
+    #[tokio::test]
+    async fn external_exact_catalog_target_weights_are_attributed_without_its_projector() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = temporary.path().join("store");
+        let cache = temporary.path().join("cache");
+        let (hf_cache, source) = create_hf_snapshot(temporary.path());
+        write_minimal_gguf(&source.join("model.gguf"));
+
+        let mut initial = InventoryConfig::with_roots(store.clone(), cache.clone()).unwrap();
+        initial.add_hugging_face_caches([hf_cache.clone()]);
+        let manager = ManagedModelStore::open_unbounded(initial).await.unwrap();
+        manager.ensure_installed_model_inventory().await.unwrap();
+        let found = manager.list_installed().await.unwrap().packages[0]
+            .package
+            .clone();
+        drop(manager);
+
+        let weights = found.files[0].clone();
+        let projector = ModelFile {
+            id: ModelFileId(format!("file_{}", "b".repeat(64))),
+            path: PathBuf::from("mmproj-BF16.gguf"),
+            role: ModelFileRole::Projector,
+            size_bytes: 1_000,
+            tensor_storage_bytes: None,
+            sha256: "b".repeat(64),
+        };
+        let mut target = found.clone();
+        target.id = ModelPackageId("package_catalog_target".to_owned());
+        target.files = vec![weights.clone(), projector.clone()];
+        target.relationships = vec![
+            magnitude_service_contracts::models::ModelFileRelationship::ProjectorFor {
+                projector_file_id: projector.id.clone(),
+                weights_file_id: weights.id.clone(),
+            },
+        ];
+        let attribution =
+            |target: ModelPackage, hidden: Vec<magnitude_service_contracts::models::ModelId>| {
+                let (store, cache, hf_cache) = (store.clone(), cache.clone(), hf_cache.clone());
+                async move {
+                    let mut configured = InventoryConfig::with_roots(store, cache).unwrap();
+                    configured.add_hugging_face_caches([hf_cache]);
+                    configured.local_models.hidden = hidden;
+                    configured.catalog_models = vec![catalog_model(target)];
+                    let manager = ManagedModelStore::open_unbounded(configured).await.unwrap();
+                    manager.ensure_installed_model_inventory().await.unwrap();
+                    manager.list_installed().await.unwrap().packages[0]
+                        .catalog_attribution
+                        .clone()
+                }
+            };
+
+        assert!(matches!(
+            attribution(target.clone(), Vec::new()).await,
+            InstalledCatalogAttribution::Attributed { .. }
+        ));
+        let found_id = crate::package_service::copy_model_id(&found, None).unwrap();
+        assert_eq!(found_id.to_string(), "hf:test/model/model.gguf");
+
+        // Requests and references made before the upgrade, naming the found model's `hf:` ID, are
+        // the catalog model's.
+        let mut configured = InventoryConfig::with_roots(store.clone(), cache.clone()).unwrap();
+        configured.add_hugging_face_caches([hf_cache.clone()]);
+        let definition = catalog_model(target.clone());
+        configured.catalog_models = vec![definition.clone()];
+        let manager = Arc::new(ManagedModelStore::open_unbounded(configured).await.unwrap());
+        manager.ensure_installed_model_inventory().await.unwrap();
+        let resolver = crate::model_domains::ModelDomainResolver::new(
+            manager,
+            magnitude_service_contracts::models::RecommendableModelCatalog {
+                models: vec![definition.clone()],
+                diagnostics: Vec::new(),
+            },
+        );
+        let catalog_id = magnitude_service_contracts::models::ModelId::catalog(
+            &definition.model_id,
+            &definition.variant_id,
+        );
+        assert_eq!(
+            resolver.canonical_model_id(found_id.clone()).unwrap(),
+            catalog_id
+        );
+        assert_eq!(
+            resolver.canonical_model_id(catalog_id.clone()).unwrap(),
+            catalog_id
+        );
+        assert_eq!(
+            resolver.catalog_snapshot().unwrap().models[0].aliases,
+            vec![found_id.clone()]
+        );
+        drop(resolver);
+
+        // Hidden, the copy is a hidden found model, served under its own ID, and the catalog still
+        // lists the alias so the catalog ID can unhide it.
+        let mut hidden = InventoryConfig::with_roots(store.clone(), cache.clone()).unwrap();
+        hidden.add_hugging_face_caches([hf_cache.clone()]);
+        hidden.local_models.hidden = vec![found_id.clone()];
+        hidden.catalog_models = vec![definition.clone()];
+        let manager = Arc::new(ManagedModelStore::open_unbounded(hidden).await.unwrap());
+        manager.ensure_installed_model_inventory().await.unwrap();
+        let resolver = crate::model_domains::ModelDomainResolver::new(
+            manager,
+            magnitude_service_contracts::models::RecommendableModelCatalog {
+                models: vec![definition.clone()],
+                diagnostics: Vec::new(),
+            },
+        );
+        assert_eq!(
+            resolver.canonical_model_id(found_id.clone()).unwrap(),
+            found_id
+        );
+        assert_eq!(
+            resolver.catalog_snapshot().unwrap().models[0].aliases,
+            vec![found_id.clone()]
+        );
+        drop(resolver);
+        assert_eq!(
+            attribution(target.clone(), vec![found_id]).await,
+            InstalledCatalogAttribution::NotCatalogTarget,
+            "a hidden found copy of the catalog target stays a hidden found model"
+        );
+        let mut other_commit = target;
+        other_commit.source = ModelPackageSource::HuggingFace {
+            repository: "test/model".to_owned(),
+            revision: "f".repeat(40),
+        };
+        assert_eq!(
+            attribution(other_commit, Vec::new()).await,
+            InstalledCatalogAttribution::NotCatalogTarget
+        );
+    }
+
+    /// `huggingface_hub` without symlink support (Windows without Developer Mode, or
+    /// `HF_HUB_DISABLE_SYMLINKS`) keeps a plain copy in the snapshot and no blob, so no blob name
+    /// gives the file's Hub SHA-256. A copy at a catalog file's repository, commit and path, with its
+    /// size and header digest, is that file: the catalog's exact target, not a second custom model.
+    #[tokio::test]
+    async fn plain_copy_layout_catalog_target_is_identified_by_its_hub_hash() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = temporary.path().join("store");
+        let cache = temporary.path().join("cache");
+        let hf_cache = temporary.path().join("hub");
+        let commit = "3d55fac80935ae6456986ad2384b5cbcc4d6c948";
+        let repository_root = hf_cache.join("models--Owner--Model-GGUF");
+        let snapshot = repository_root.join("snapshots").join(commit);
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::create_dir_all(repository_root.join("refs")).unwrap();
+        fs::write(repository_root.join("refs/main"), commit).unwrap();
+        let file = snapshot.join("Model-Q4_K_M.gguf");
+        write_minimal_gguf_with_string_metadata(&file, &[("general.name", "Model")]);
+        let bytes = fs::read(&file).unwrap();
+        let sha256 = format!("{:x}", Sha256::digest(&bytes));
+        let header_digest = crate::gguf::inspect_complete(&file).unwrap().header_digest;
+
+        let weights = ModelFile {
+            id: ModelFileId(format!("file_{sha256}")),
+            path: PathBuf::from("Model-Q4_K_M.gguf"),
+            role: ModelFileRole::Weights,
+            size_bytes: bytes.len() as u64,
+            tensor_storage_bytes: None,
+            sha256: sha256.clone(),
+        };
+        let target = ModelPackage {
+            id: crate::package_service::canonical_package_id(std::slice::from_ref(&weights), &[]),
+            source: ModelPackageSource::HuggingFace {
+                repository: "owner/Model-GGUF".to_owned(),
+                revision: commit.to_owned(),
+            },
+            files: vec![weights],
+            relationships: Vec::new(),
+            properties: ModelPackageProperties {
+                format: "gguf".to_owned(),
+                quantization: "unknown".to_owned(),
+                quantization_name: "unknown".to_owned(),
+                architecture: "unknown".to_owned(),
+                maximum_context_length: None,
+                intrinsic_model_id: None,
+                intrinsic_quality_id: None,
+            },
+        };
+        let installed = |header_digests: BTreeMap<String, String>| {
+            let (store, cache, hf_cache, target) = (
+                store.clone(),
+                cache.clone(),
+                hf_cache.clone(),
+                target.clone(),
+            );
+            async move {
+                let mut configured = InventoryConfig::with_roots(store, cache).unwrap();
+                configured.add_hugging_face_caches([hf_cache]);
+                configured.catalog_models = vec![catalog_model(target)];
+                configured.catalog_header_digests = header_digests;
+                let manager = ManagedModelStore::open_unbounded(configured).await.unwrap();
+                manager.ensure_installed_model_inventory().await.unwrap();
+                manager.list_installed().await.unwrap().packages
+            }
+        };
+
+        let packages = installed(BTreeMap::from([(sha256.clone(), header_digest)])).await;
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].package.files[0].sha256, sha256);
+        assert_eq!(packages[0].package.id, target.id);
+        assert!(matches!(
+            packages[0].catalog_attribution,
+            InstalledCatalogAttribution::Attributed { .. }
+        ));
+
+        // A copy whose header differs from the catalog file's is not that file.
+        let packages = installed(BTreeMap::from([(sha256.clone(), "0".repeat(64))])).await;
+        assert_eq!(packages.len(), 1);
+        assert_ne!(packages[0].package.files[0].sha256, sha256);
+        assert_eq!(
+            packages[0].catalog_attribution,
+            InstalledCatalogAttribution::NotCatalogTarget
+        );
+    }
+
     #[tokio::test]
     async fn completed_publication_updates_installed_snapshot_before_returning() {
         let temporary = tempfile::tempdir().unwrap();
         let model_path = temporary.path().join("active.gguf");
         write_minimal_gguf(&model_path);
-        let manager = ManagedModelStore::open(
+        let manager = ManagedModelStore::open_unbounded(
             InventoryConfig::with_roots(
                 temporary.path().join("store"),
                 temporary.path().join("cache"),
@@ -2231,8 +3625,8 @@ mod tests {
 
         let mut config =
             InventoryConfig::with_roots(store, temporary.path().join("cache")).unwrap();
-        config.hf_cache_dirs.push(hf_cache);
-        let manager = ManagedModelStore::open(config).await.unwrap();
+        config.add_hugging_face_caches([hf_cache]);
+        let manager = ManagedModelStore::open_unbounded(config).await.unwrap();
         manager.ensure_installed_model_inventory().await.unwrap();
         assert_eq!(manager.list_installed().await.unwrap().packages.len(), 1);
 
@@ -2249,7 +3643,7 @@ mod tests {
     #[tokio::test]
     async fn installed_package_query_never_waits_for_reconciliation() {
         let temporary = tempfile::tempdir().unwrap();
-        let manager = ManagedModelStore::open(
+        let manager = ManagedModelStore::open_unbounded(
             InventoryConfig::with_roots(
                 temporary.path().join("store"),
                 temporary.path().join("cache"),
@@ -2281,8 +3675,8 @@ mod tests {
 
         let mut config =
             InventoryConfig::with_roots(store, temporary.path().join("cache")).unwrap();
-        config.hf_cache_dirs.push(hf_cache);
-        let manager = ManagedModelStore::open(config).await.unwrap();
+        config.add_hugging_face_caches([hf_cache]);
+        let manager = ManagedModelStore::open_unbounded(config).await.unwrap();
 
         manager.ensure_installed_model_inventory().await.unwrap();
         let installed = manager.list_installed().await.unwrap();
@@ -2313,7 +3707,7 @@ mod tests {
     async fn managed_download_publication_only_requires_structural_inspection() {
         let temporary = tempfile::tempdir().unwrap();
         let store = temporary.path().join("store");
-        let manager = ManagedModelStore::open(
+        let manager = ManagedModelStore::open_unbounded(
             InventoryConfig::with_roots(store.clone(), temporary.path().join("cache")).unwrap(),
         )
         .await
@@ -2422,6 +3816,11 @@ mod tests {
                 .path()
                 .canonicalize()
                 .expect("canonical temporary root"),
+            LinkedFiles::WithinRoot,
+            &ModelCache::new(&temporary.path().join("cache")),
+            &RecognizedArchitectures::default(),
+            &BTreeMap::new(),
+            &mut UnreadableDirectories::new(),
         )
         .unwrap();
 
@@ -2429,34 +3828,132 @@ mod tests {
         assert_eq!(groups[0].paths[0], snapshot.join("MODEL.GGUF"));
     }
 
+    /// A file a download tool is still writing (llama.cpp and browsers name it `*-partial.gguf`)
+    /// is never a model: the watcher ignores its removal, so discovering it would leave it stale.
     #[test]
-    fn excludes_execution_companions_from_standalone_model_groups() {
+    fn partial_downloads_named_gguf_are_not_discovered() {
         let temporary = tempfile::tempdir().unwrap();
-        write_minimal_gguf(&temporary.path().join("laguna-s-2.1-Q4_K_M.gguf"));
-        write_minimal_gguf_with_string_metadata(
-            &temporary.path().join("unlabelled-laguna-companion.gguf"),
-            &[("dflash.decoder_arch", "laguna")],
-        );
-        write_minimal_gguf_with_string_metadata(
-            &temporary.path().join("unlabelled-eagle-companion.gguf"),
-            &[("general.architecture", "eagle3")],
-        );
-        write_minimal_gguf(&temporary.path().join("qwen-MTP-BF16.gguf"));
+        let folder = temporary.path().join("models");
+        fs::create_dir(&folder).unwrap();
+        write_minimal_gguf(&folder.join("model.gguf"));
+        write_minimal_gguf(&folder.join("other.gguf-partial.gguf"));
+        write_minimal_gguf(&folder.join("third-partial.gguf"));
 
-        let groups = discover_groups(temporary.path(), temporary.path()).unwrap();
+        let groups = discover_groups(
+            &folder,
+            &folder,
+            LinkedFiles::WithinRoot,
+            &ModelCache::new(&temporary.path().join("cache")),
+            &RecognizedArchitectures::default(),
+            &BTreeMap::new(),
+            &mut UnreadableDirectories::new(),
+        )
+        .unwrap();
 
-        assert_eq!(groups.len(), 1);
         assert_eq!(
-            groups[0].paths[0]
-                .file_name()
-                .and_then(|value| value.to_str()),
-            Some("laguna-s-2.1-Q4_K_M.gguf"),
+            groups
+                .iter()
+                .map(|group| group.paths.clone())
+                .collect::<Vec<_>>(),
+            vec![vec![folder.join("model.gguf")]]
         );
-        assert!(is_execution_companion_name("laguna-s-2.1-dflash-bf16.gguf"));
-        assert!(is_execution_companion_name("qwen3.5-dspark-q8.gguf"));
-        assert!(is_execution_companion_name("eagle3-qwen-4b.gguf"));
-        assert!(is_execution_companion_name("qwen-mtp-bf16.gguf"));
-        assert!(!is_execution_companion_name("draftsmanship-q4.gguf"));
+    }
+
+    #[test]
+    fn groups_files_by_header_role_not_by_name() {
+        use crate::test_gguf::{
+            write_dflash_drafter, write_model, write_mtp_model, write_projector,
+        };
+        let temporary = tempfile::tempdir().unwrap();
+        let cache = ModelCache::new(&temporary.path().join("cache"));
+        let models = temporary.path().join("models");
+        write_model(&models.join("laguna-s-2.1-Q4_K_M.gguf"), "laguna");
+        write_dflash_drafter(&models.join("unlabelled-companion.gguf"), "drafter");
+        write_mtp_model(&models.join("Qwen3.6-MTP-Q4_K_M.gguf"), "qwen mtp");
+        write_projector(&models.join("vision.gguf"), "projector");
+        fs::write(models.join("partial.gguf.part"), b"partial").unwrap();
+        fs::write(models.join(".hidden.gguf"), b"resource fork").unwrap();
+
+        let groups = discover_groups(
+            &models,
+            &models,
+            LinkedFiles::WithinRoot,
+            &cache,
+            &crate::test_gguf::engine_architectures(),
+            &BTreeMap::new(),
+            &mut UnreadableDirectories::new(),
+        )
+        .unwrap();
+
+        let names = groups
+            .iter()
+            .map(|group| {
+                (
+                    group.paths[0]
+                        .file_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .to_owned(),
+                    group.projector.as_ref().map(|projector| {
+                        projector.file_name().unwrap().to_str().unwrap().to_owned()
+                    }),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            names,
+            BTreeMap::from([
+                (
+                    "Qwen3.6-MTP-Q4_K_M.gguf".to_owned(),
+                    Some("vision.gguf".to_owned())
+                ),
+                (
+                    "laguna-s-2.1-Q4_K_M.gguf".to_owned(),
+                    Some("vision.gguf".to_owned())
+                ),
+                ("unlabelled-companion.gguf".to_owned(), None),
+            ])
+        );
+    }
+
+    #[test]
+    fn declared_projector_wins_over_directory_guess() {
+        use crate::test_gguf::{write_model, write_projector};
+        let temporary = tempfile::tempdir().unwrap();
+        let cache = ModelCache::new(&temporary.path().join("cache"));
+        let models = temporary.path().join("models");
+        write_model(&models.join("model.gguf"), "model");
+        write_projector(&models.join("mmproj-f16.gguf"), "f16");
+        write_projector(&models.join("mmproj-q8.gguf"), "q8");
+
+        let undeclared = discover_groups(
+            &models,
+            &models,
+            LinkedFiles::WithinRoot,
+            &cache,
+            &RecognizedArchitectures::default(),
+            &BTreeMap::new(),
+            &mut UnreadableDirectories::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            undeclared[0].projector, None,
+            "two projectors are ambiguous"
+        );
+
+        let declared = BTreeMap::from([(models.join("model.gguf"), models.join("mmproj-q8.gguf"))]);
+        let groups = discover_groups(
+            &models,
+            &models,
+            LinkedFiles::WithinRoot,
+            &cache,
+            &RecognizedArchitectures::default(),
+            &declared,
+            &mut UnreadableDirectories::new(),
+        )
+        .unwrap();
+        assert_eq!(groups[0].projector, Some(models.join("mmproj-q8.gguf")));
     }
 
     #[test]
@@ -2477,8 +3974,8 @@ mod tests {
         write_minimal_gguf(&source.join("model.gguf"));
 
         let mut config = InventoryConfig::with_roots(store.clone(), cache_root.clone()).unwrap();
-        config.hf_cache_dirs.push(hf_cache);
-        let manager = ManagedModelStore::open(config.clone()).await.unwrap();
+        config.add_hugging_face_caches([hf_cache]);
+        let manager = ManagedModelStore::open_unbounded(config.clone()).await.unwrap();
         assert!(manager.models.read().unwrap().is_empty());
         manager.ensure_model_inventory().await.unwrap();
         let (first, second) = tokio::join!(manager.list(), manager.list());
@@ -2498,7 +3995,9 @@ mod tests {
         assert!(persisted.get("version").is_none());
 
         fs::remove_file(source.join("model.gguf")).unwrap();
-        let reopened = ManagedModelStore::open(config.clone()).await.unwrap();
+        let reopened = ManagedModelStore::open_unbounded(config.clone())
+            .await
+            .unwrap();
         let warm = reopened.list().await.unwrap();
         assert!(warm.is_empty());
         reopened.ensure_model_inventory().await.unwrap();
@@ -2517,27 +4016,92 @@ mod tests {
         assert_eq!(changed.len(), 1);
     }
 
-    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_inspection_persisted_under_earlier_rules_is_derived_again() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = temporary.path().join("store");
+        let cache_root = temporary.path().join("cache");
+        let (hf_cache, source) = create_hf_snapshot(temporary.path());
+        write_minimal_gguf(&source.join("model.gguf"));
+        let mut config = InventoryConfig::with_roots(store, cache_root.clone()).unwrap();
+        config.add_hugging_face_caches([hf_cache]);
+        ManagedModelStore::open_unbounded(config.clone())
+            .await
+            .unwrap()
+            .ensure_installed_model_inventory()
+            .await
+            .unwrap();
+
+        // Rewrite what an install under earlier rules left: the inventory entry, its evidence and
+        // the inspection index, all keyed without the rules and labelled by them.
+        let index_path = cache_root.join("indexes/inventory.json");
+        let mut index: serde_json::Value =
+            serde_json::from_slice(&fs::read(&index_path).unwrap()).unwrap();
+        let (id, model) = index["models"]
+            .as_object_mut()
+            .unwrap()
+            .iter_mut()
+            .next()
+            .unwrap();
+        let id = id.clone();
+        model["properties"]["quantization"] = serde_json::json!("IQ2_XS");
+        let stale: InventoryModel = serde_json::from_value(model.clone()).unwrap();
+        let earlier_key =
+            serde_json::to_string(&(&stale.content_id.0, "model.gguf")).unwrap();
+        index["evidence"][&id]["metadata_key"] = serde_json::json!(earlier_key);
+        fs::write(&index_path, serde_json::to_vec(&index).unwrap()).unwrap();
+        ModelCache::new(&cache_root).write_index(
+            ModelIndexKind::InventoryMetadata,
+            &earlier_key,
+            &CachedModelMetadata {
+                name: stale.name.clone(),
+                properties: stale.properties.clone(),
+                supported_parameters: Vec::new(),
+            },
+        );
+
+        let reopened = ManagedModelStore::open_unbounded(config).await.unwrap();
+        reopened.ensure_installed_model_inventory().await.unwrap();
+        let current = gguf::inspect_complete(&source.join("model.gguf"))
+            .unwrap()
+            .quantization;
+        let models = reopened.list().await.unwrap();
+        assert!(matches!(
+            &models[0].properties,
+            InventoryProperties::Inspected { quantization, .. } if *quantization == current
+        ));
+        let packages = reopened.installed_packages_response().unwrap().packages;
+        assert_eq!(
+            packages[0].package.properties.quantization,
+            current.unwrap_or_else(|| "unknown".to_owned())
+        );
+    }
+
+    /// The store roots whose managed scan fails, so a test can fail a scan by a means no
+    /// privilege bypasses (a directory's mode does not stop root). Keyed by root, so tests
+    /// running in parallel never see each other's failures.
+    static FAILING_SCANS: std::sync::Mutex<BTreeSet<PathBuf>> = std::sync::Mutex::new(BTreeSet::new());
+
+    pub(super) fn failing_scan(root: &Path) -> Result<(), InventoryError> {
+        if FAILING_SCANS.lock().unwrap().contains(root) {
+            return Err(InventoryError::Io("a managed scan failed by its test".to_owned()));
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn startup_reconciliation_retries_after_a_scan_failure() {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let temporary = tempfile::tempdir().unwrap();
-        let hf_cache = temporary.path().join("hf-cache");
-        let snapshots = hf_cache.join("models--owner--model").join("snapshots");
-        fs::create_dir_all(&snapshots).unwrap();
-        fs::set_permissions(&snapshots, fs::Permissions::from_mode(0o000)).unwrap();
+        let store = temporary.path().join("store");
+        fs::create_dir_all(store.join("hub/models--owner--model/snapshots")).unwrap();
+        FAILING_SCANS.lock().unwrap().insert(store.clone());
 
-        let mut config = InventoryConfig::with_roots(
-            temporary.path().join("store"),
-            temporary.path().join("cache"),
-        )
-        .unwrap();
-        config.hf_cache_dirs.push(hf_cache);
-        let manager = ManagedModelStore::open(config).await.unwrap();
+        let config =
+            InventoryConfig::with_roots(store.clone(), temporary.path().join("cache")).unwrap();
+        let manager = ManagedModelStore::open_unbounded(config).await.unwrap();
 
-        // Leave the invalid tree in place beyond the first retry boundary. A one-shot startup
-        // reconciliation would have exited permanently before the tree is repaired.
+        // Keep the scan failing beyond the first retry boundary. A one-shot startup
+        // reconciliation would have exited permanently before the scan recovers.
         tokio::time::sleep(BACKGROUND_RECONCILIATION_RETRY_DELAY.saturating_mul(2)).await;
         assert!(
             !manager
@@ -2545,7 +4109,7 @@ mod tests {
                 .unwrap()
                 .reconciliation_complete
         );
-        fs::set_permissions(&snapshots, fs::Permissions::from_mode(0o755)).unwrap();
+        FAILING_SCANS.lock().unwrap().remove(&store);
 
         tokio::time::timeout(
             BACKGROUND_RECONCILIATION_RETRY_DELAY.saturating_mul(3),
@@ -2576,8 +4140,8 @@ mod tests {
         write_minimal_gguf(&source.join("second.gguf"));
 
         let mut config = InventoryConfig::with_roots(store.clone(), cache_root.clone()).unwrap();
-        config.hf_cache_dirs.push(hf_cache);
-        let manager = ManagedModelStore::open(config.clone()).await.unwrap();
+        config.add_hugging_face_caches([hf_cache]);
+        let manager = ManagedModelStore::open_unbounded(config.clone()).await.unwrap();
         manager.ensure_installed_model_inventory().await.unwrap();
         assert_eq!(manager.list().await.unwrap().len(), 2);
 
@@ -2592,7 +4156,9 @@ mod tests {
         models.insert(malformed_id, serde_json::json!({ "invalid": true }));
         fs::write(&index_path, serde_json::to_vec_pretty(&index).unwrap()).unwrap();
 
-        let reopened = ManagedModelStore::open(config.clone()).await.unwrap();
+        let reopened = ManagedModelStore::open_unbounded(config.clone())
+            .await
+            .unwrap();
         reopened.ensure_installed_model_inventory().await.unwrap();
         assert_eq!(reopened.list().await.unwrap().len(), 2);
 
@@ -2605,13 +4171,15 @@ mod tests {
             .path();
         fs::write(one_metadata, b"not json").unwrap();
         fs::write(&index_path, b"not json").unwrap();
-        let corrupted = ManagedModelStore::open(config.clone()).await.unwrap();
+        let corrupted = ManagedModelStore::open_unbounded(config.clone())
+            .await
+            .unwrap();
         corrupted.ensure_installed_model_inventory().await.unwrap();
         assert_eq!(corrupted.list().await.unwrap().len(), 2);
 
         fs::remove_file(&index_path).unwrap();
         fs::create_dir(&index_path).unwrap();
-        let uncached = ManagedModelStore::open(config).await.unwrap();
+        let uncached = ManagedModelStore::open_unbounded(config).await.unwrap();
         uncached.ensure_installed_model_inventory().await.unwrap();
         assert_eq!(uncached.list().await.unwrap().len(), 2);
     }

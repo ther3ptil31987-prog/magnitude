@@ -1,3 +1,12 @@
+#define ATTENTION_AFFINE_HISTORY 1
+#define ATTENTION_KEY_CODE_WORDS SEISMIC_DIM_KC
+#define ATTENTION_VALUE_CODE_WORDS SEISMIC_DIM_VC
+#define ATTENTION_KEY_COEFFICIENTS SEISMIC_DIM_KP
+// Sink logits (SK): the merge adds each head's sink to its merged denominator
+// (`attention::normalizer`).
+#define ATTENTION_SINKS SEISMIC_DIM_SK
+#define ATTENTION_SINKS_BUFFER reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SINKS))
+#define ATTENTION_SINK_AT(query_head) (static_cast<attention::u64>(query_head) * SEISMIC_SINKS_STRIDE_1)
 #include "lib/attention/inputs.cuh"
 #define ATTENTION_QUERY_GROUP SEISMIC_DIM_G
 #define ATTENTION_INTERLEAVED SEISMIC_DIM_I
@@ -6,14 +15,18 @@
 // affine K8/V4 history.
 //
 // L1 `attention_decode_k8v4_partial`, one block per (kv head, partition, row),
-// partitioned and sliced over the query group exactly as the dense entry. History keys score as the sum over
-// groups of scale * (q . code) + zero * sum(q) and values accumulate
-// (p * scale) * code plus the bias sum(p * zero) of each lane's group, carried
-// through the online softmax by the same factor as the accumulator (`absorb`),
-// so no history element is decoded. The fresh span stays dense; the bias is
-// folded into the accumulator before it. Partition 0 of a layer with fresh
-// rows appends the row's key and value encoded. L2 `attention_decode_k8v4_merge`:
-// the dense entry's merge and gate.
+// partitioned and sliced over the query group exactly as the dense entry. Keys
+// score as the sum over groups of scale * (q . code) + zero * sum(q) and
+// values accumulate (p * scale) * code plus the bias sum(p * zero) of each
+// lane's group, carried through the online softmax by the same factor as the
+// accumulator (`absorb`), so no element is decoded. History rows are read as
+// stored; a fresh row is prepared and quantized in registers exactly as the
+// append encodes it (`AffineHistory::quantize`), so it is absorbed as history
+// holds it. Its batches of TOKENS keys sit at fixed positions of the row's
+// own key sequence (`attention::KeyCursor`), so the order of a row's sums does
+// not depend on which of its keys are still fresh. Partition 0 of a
+// layer with fresh rows appends the row's key and value encoded. L2
+// `attention_decode_k8v4_merge`: the dense entry's merge and gate.
 //
 // Grouped-query matrix form (MATRIX = 1): `attention_decode`'s, over affine
 // history: producer warps decode code tiles into F16 operands beside the MMA
@@ -28,7 +41,7 @@
 
 #define ATTENTION_STAGES SEISMIC_TUNE_STAGES
 #define ATTENTION_COLUMNS SEISMIC_TUNE_COLUMNS
-#define ATTENTION_Q_REGISTERS 0
+#define ATTENTION_Q_REGISTERS SEISMIC_TUNE_QREG
 #define ATTENTION_PRODUCER_WARPS (SEISMIC_TUNE_WARPS * SEISMIC_TUNE_COLUMNS)
 #include "lib/attention/prefill.cuh"
 
@@ -40,10 +53,10 @@ extern "C" __global__ void __launch_bounds__(attention::prefill::MMA_THREADS + a
     attention::prefill::attend(
         ATTENTION_INPUTS(),
         attention::AffineHistory{
-            reinterpret_cast<attention::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY_CODES)),
-            reinterpret_cast<attention::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY_COEFFICIENTS)),
-            reinterpret_cast<attention::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE_CODES)),
-            reinterpret_cast<attention::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE_COEFFICIENTS)),
+            reinterpret_cast<const attention::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY_CODES)),
+            SEISMIC_OUT_HISTORY_KEY_COEFFICIENTS,
+            reinterpret_cast<const attention::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE_CODES)),
+            SEISMIC_OUT_HISTORY_VALUE_COEFFICIENTS,
             SEISMIC_HISTORY_KEY_CODES_STRIDE_0, SEISMIC_HISTORY_KEY_CODES_STRIDE_1,
             SEISMIC_HISTORY_KEY_COEFFICIENTS_STRIDE_0, SEISMIC_HISTORY_KEY_COEFFICIENTS_STRIDE_1,
             SEISMIC_HISTORY_VALUE_CODES_STRIDE_0, SEISMIC_HISTORY_VALUE_CODES_STRIDE_1,
@@ -146,7 +159,7 @@ __device__ __forceinline__ void absorb(State &state, float (&bias)[H],
 }
 
 // Fold the per-head bias into the accumulator (it then carries the whole
-// attended sum), for the dense absorb or the publication.
+// attended sum), for the publication.
 __device__ __forceinline__ void fold(State &state, float (&bias)[H]) {
 #pragma unroll
     for (int h = 0; h < H; ++h) {
@@ -165,10 +178,10 @@ extern "C" __global__ void __launch_bounds__(WARPS * 32)
     seismic_dependents_launch();
     const attention::Inputs in = ATTENTION_INPUTS();
     const attention::AffineHistory history{
-        reinterpret_cast<u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY_CODES)),
-        reinterpret_cast<u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY_COEFFICIENTS)),
-        reinterpret_cast<u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE_CODES)),
-        reinterpret_cast<u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE_COEFFICIENTS)),
+        reinterpret_cast<const u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY_CODES)),
+        SEISMIC_OUT_HISTORY_KEY_COEFFICIENTS,
+        reinterpret_cast<const u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE_CODES)),
+        SEISMIC_OUT_HISTORY_VALUE_COEFFICIENTS,
         SEISMIC_HISTORY_KEY_CODES_STRIDE_0, SEISMIC_HISTORY_KEY_CODES_STRIDE_1,
         SEISMIC_HISTORY_KEY_COEFFICIENTS_STRIDE_0, SEISMIC_HISTORY_KEY_COEFFICIENTS_STRIDE_1,
         SEISMIC_HISTORY_VALUE_CODES_STRIDE_0, SEISMIC_HISTORY_VALUE_CODES_STRIDE_1,
@@ -219,9 +232,9 @@ extern "C" __global__ void __launch_bounds__(WARPS * 32)
     // Equal partitions of the row's keys, then equal key-group ranges of this
     // one.
     const u64 spans = SEISMIC_DIM_R;
-    const long long total = attention::visible_total(in, row, spans);
+    const long long total = attention::visible_total(in, row, spans, lane);
     const attention::Range partition =
-        attention::partition(attention::Range{0, total}, (total + PARTS - 1) / PARTS, part);
+        attention::partition(attention::Range{0, total}, attention::partition_run(total, 1, PARTS), part);
     const attention::Range slice = attention::partition(
         partition, (partition.hi - partition.lo + GROUPS - 1) / GROUPS, warp / SLICES);
 
@@ -231,63 +244,73 @@ extern "C" __global__ void __launch_bounds__(WARPS * 32)
 #pragma unroll
     for (int h = 0; h < H; ++h) bias[h] = 0.0f;
 
-    long long offset = 0;
-    for (u64 span = 0; span <= spans && offset < slice.hi; ++span) {
-        const attention::Span s = attention::span(in, row, span, spans);
-        const long long length = s.hi > s.lo ? s.hi - s.lo : 0;
-        const long long first = max(slice.lo, offset);
-        const long long last = min(slice.hi, offset + length);
-        if (first < last) {
-            const int lo = s.lo + static_cast<int>(first - offset);
-            const int hi = s.lo + static_cast<int>(last - offset);
-            if (span < spans) {
-                // Each slab's part of the span resolves its first rows once;
-                // later rows are row strides past them (a per-token slab
-                // lookup divides 64-bit rows).
-                for (int part_lo = lo; part_lo < hi;) {
-                    const int part_hi = history.slab_end(part_lo, hi);
-                    const u32 *key_rows = history.key_row(part_lo, kv);
-                    const u32 *value_rows = history.value_row(part_lo, kv);
-                    const u32 *key_pairs = history.key_pair(part_lo, kv) + pair;
-                    const u32 *value_pairs = history.value_pair(part_lo, kv) + pair;
-                    const u64 key_step = history.key_codes_row;
-                    const u64 value_step = history.value_codes_row;
-                    const u64 key_pair_step = history.key_pairs_row / 2;
-                    const u64 value_pair_step = history.value_pairs_row / 2;
-                    for (int token = part_lo; token < part_hi; token += TOKENS) {
-                        const int count = min(TOKENS, part_hi - token);
-                        u32 k[TOKENS][KeyCodes::words];
-                        u32 v[TOKENS][ValueCodes::words];
-                        float2 kc[TOKENS];
-                        float2 vc[TOKENS];
+    // The slice's keys absorb in batches of TOKENS at fixed positions
+    // slice.lo + i * TOKENS of the row's own key sequence, read through its
+    // cursor (`attention::KeyCursor`), as the dense entry's: a key's batch,
+    // and so the row's reduction order, depends on its position alone.
+    const attention::AffineReads reads = history.reads();
+    attention::KeyCursor cursor = attention::KeyCursor::at(in, row, spans, reads.slab_rows, slice.lo, lane);
+    // The cursor's slab's first vectors.
+    attention::AffineReads::Vectors slab{};
+    // A history row's lane share of codes and pairs, read as stored.
+    auto read_history = [&](const attention::AffineReads::Vectors &at, u32 (&k)[KeyCodes::words],
+                            u32 (&v)[ValueCodes::words], float2 &kc, float2 &vc) {
+        KeyCodes::load(at.key_codes, lane, k);
+        ValueCodes::load(at.value_codes, lane, v);
+        kc = attention::coefficients(at.key_pairs[pair]);
+        vc = attention::coefficients(at.value_pairs[pair]);
+    };
+    for (long long position = slice.lo; position < slice.hi; position += TOKENS) {
+        const int count = static_cast<int>(min(static_cast<long long>(TOKENS), slice.hi - position));
+        u32 k[TOKENS][KeyCodes::words];
+        u32 v[TOKENS][ValueCodes::words];
+        float2 kc[TOKENS];
+        float2 vc[TOKENS];
+        // The batch's first key; a batch of TOKENS keys inside one history run
+        // (a span's part of one slab) reads straight from the run's rows,
+        // each key a row stride past the first.
+        bool moved;
+        const int first = cursor.seek(position, moved);
+        if (cursor.historical() && moved) slab = reads.slab_vectors(cursor.slab, kv);
+        if (cursor.historical() && count == TOKENS && position + TOKENS <= cursor.run_end) {
+            const attention::AffineReads::Vectors head = slab.at(reads, static_cast<u32>(first) - cursor.slab_lo);
 #pragma unroll
-                        for (int t = 0; t < TOKENS; ++t) {
-                            // Past the part, reload its last key: `absorb`
-                            // skips it.
-                            const u64 at = static_cast<u64>(min(token + t, part_hi - 1) - part_lo);
-                            KeyCodes::load(key_rows + at * key_step, lane, k[t]);
-                            ValueCodes::load(value_rows + at * value_step, lane, v[t]);
-                            kc[t] = attention::coefficients(key_pairs + at * key_pair_step);
-                            vc[t] = attention::coefficients(value_pairs + at * value_pair_step);
-                        }
-                        absorb(state, bias, q, qsum, k, kc, v, vc, count, lane);
-                    }
-                    part_lo = part_hi;
+            for (int t = 0; t < TOKENS; ++t) read_history(head.at(reads, t), k[t], v[t], kc[t], vc[t]);
+        } else {
+#pragma unroll
+            for (int t = 0; t < TOKENS; ++t) {
+                // Past the slice, zero codes and pairs: `absorb` skips them.
+                if (t >= count) {
+#pragma unroll
+                    for (int j = 0; j < KeyCodes::words; ++j) k[t][j] = 0u;
+#pragma unroll
+                    for (int j = 0; j < ValueCodes::words; ++j) v[t][j] = 0u;
+                    kc[t] = vc[t] = make_float2(0.0f, 0.0f);
+                    continue;
                 }
-            } else {
-                fold(state, bias);
-                for (int token = lo; token < hi; ++token) {
-                    float k[1][DPL];
-                    float v[1][DPL];
-                    attention::prepared_key(in, token, kv, k[0], own, lane);
-                    attention::fresh_value(in, token, kv, v[0], lane);
-                    float score[1][H];
-                    attention::scores(q, k, score, lane);
-                    attention::absorb(state, score, v, 1);
+                const int token = cursor.seek(position + t, moved);
+                if (cursor.historical()) {
+                    // A history row, read as stored.
+                    if (moved) slab = reads.slab_vectors(cursor.slab, kv);
+                    read_history(slab.at(reads, static_cast<u32>(token) - cursor.slab_lo), k[t], v[t], kc[t],
+                                 vc[t]);
+                } else {
+                    // A fresh row, encoded in registers as the append encodes it.
+                    float key[DPL];
+                    float value[DPL];
+                    attention::prepared_key(in, token, kv, key, own, lane);
+                    attention::fresh_value(in, token, kv, value, lane);
+                    const attention::AffineHistory::Encoding e = attention::AffineHistory::quantize(key, value);
+#pragma unroll
+                    for (int j = 0; j < KeyCodes::words; ++j) k[t][j] = e.key.codes[j];
+#pragma unroll
+                    for (int j = 0; j < ValueCodes::words; ++j) v[t][j] = e.value.codes[j];
+                    kc[t] = make_float2(e.key.scale, e.key.zero);
+                    vc[t] = make_float2(e.value.scale, e.value.zero);
                 }
             }
         }
-        offset += length;
+        absorb(state, bias, q, qsum, k, kc, v, vc, count, lane);
     }
     fold(state, bias);
     attention::publish<WARPS, PARTS, SLICES>(state, exchange, warp_stats, partials, statistics, row,
@@ -304,5 +327,5 @@ extern "C" __global__ void attention_decode_k8v4_merge(SEISMIC_KERNEL_PARAMS) {
         ATTENTION_INPUTS(),
         reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS)),
         reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATISTICS)),
-        SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), blockIdx.x, blockIdx.y, threadIdx.x);
+        SEISMIC_RESULT_0_OUT, blockIdx.x, blockIdx.y, threadIdx.x);
 }

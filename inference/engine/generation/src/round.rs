@@ -96,15 +96,19 @@ impl RoundState {
         {
             return Err("invalid prefill or replay round".into());
         }
-        let demand = if matches!(kind, WorkKind::Prefill | WorkKind::Replay) {
-            requirements.prefill_demand
-        } else {
-            Demand::NONE
-        } | if select.is_some() {
-            Demand::SELECT
-        } else {
-            Demand::NONE
-        };
+        // Only the chunk closing the prompt selects or forces a token.
+        let closing = select.is_some() || !emitted.is_empty();
+        let demand = requirements.prefill_demand
+            | if closing {
+                requirements.closing_demand
+            } else {
+                Demand::NONE
+            }
+            | if select.is_some() {
+                Demand::SELECT
+            } else {
+                Demand::NONE
+            };
         let round = Self {
             forward: RoundForward {
                 kind,
@@ -145,6 +149,8 @@ impl RoundState {
             .saturating_sub(1)
     }
 
+    /// A decode or verification of `proposal` behind `anchor`, publishing
+    /// its rows' features where `verify_demand` demands them.
     #[allow(clippy::too_many_arguments)]
     pub fn verification(
         anchor: TokenId,
@@ -156,7 +162,7 @@ impl RoundState {
         sampling: Sampling,
         shaping: Shaping,
         seed: u64,
-        requirements: MethodRequirements,
+        verify_demand: Demand,
     ) -> Result<Self, String> {
         if proposal.len() > proposal_limit {
             return Err("method proposal exceeds the round width limit".into());
@@ -181,7 +187,7 @@ impl RoundState {
                     WorkKind::Verify
                 },
                 tokens,
-                demand: Demand::SELECT | requirements.verify_demand,
+                demand: Demand::SELECT | verify_demand,
                 selects,
                 committed: 1,
                 prime: None,
@@ -300,6 +306,7 @@ mod tests {
     fn requirements() -> MethodRequirements {
         MethodRequirements {
             prefill_demand: Demand::NONE,
+            closing_demand: Demand::NONE,
             verify_demand: Demand::NONE,
             head: false,
         }
@@ -319,7 +326,7 @@ mod tests {
                 ..Default::default()
             },
             4,
-            requirements(),
+            Demand::NONE,
         )
         .unwrap()
     }
@@ -440,6 +447,7 @@ mod tests {
     fn replay_reprimes_feature_dependent_methods_without_sampling() {
         let requirements = MethodRequirements {
             prefill_demand: Demand::FEATURES,
+            closing_demand: Demand::NONE,
             verify_demand: Demand::FEATURES,
             head: true,
         };
@@ -461,5 +469,37 @@ mod tests {
                 .method_update,
             MethodUpdate::Prime
         );
+    }
+
+    #[test]
+    fn closing_demand_applies_only_to_the_chunk_closing_the_prompt() {
+        let requirements = MethodRequirements {
+            prefill_demand: Demand::NONE,
+            closing_demand: Demand::FEATURES,
+            verify_demand: Demand::FEATURES,
+            head: true,
+        };
+        let chunk = |emitted: Vec<TokenId>, select: Option<SelectSpec>, kind| {
+            RoundState::progress(kind, vec![TokenId(1), TokenId(2)], emitted, select, None, requirements)
+                .unwrap()
+                .forward()
+                .demand
+        };
+        let select = SelectSpec {
+            sampling: Sampling::Greedy,
+            seed: 0,
+            position: 0,
+            domain: 0,
+            mask: None,
+            shaping: Shaping::default(),
+            history: None,
+        };
+        assert_eq!(chunk(vec![], None, WorkKind::Prefill), Demand::NONE);
+        assert_eq!(chunk(vec![], None, WorkKind::Replay), Demand::NONE);
+        assert_eq!(
+            chunk(vec![], Some(select), WorkKind::Prefill),
+            Demand::FEATURES | Demand::SELECT
+        );
+        assert_eq!(chunk(vec![TokenId(3)], None, WorkKind::Prefill), Demand::FEATURES);
     }
 }

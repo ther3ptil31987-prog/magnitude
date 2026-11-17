@@ -19,27 +19,31 @@
 
 pub(crate) mod graph;
 
+use crate::ScalableWeight;
 use crate::error::PlanError;
 use magnitude_family_contracts::StateSpace;
-use seismic::Element;
+use crate::programs::graph::facts::{Numbers, constant};
+use seismic::{Dim, Element};
 
-/// Every static axis of a state-space mixer over a `hidden`-wide residual.
+/// Every static axis of a state-space mixer over a `hidden`-wide residual:
+/// the model's numbers (`u64`), or a graph's dimensions of them ([`Dim`]),
+/// whose arithmetic is the one owner of every size derived from them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct StateSpaceShape {
+pub struct StateSpaceShape<D = u64> {
     /// `D`: the hidden width.
-    pub hidden: u64,
+    pub hidden: D,
     /// `NH`.
-    pub heads: u64,
+    pub heads: D,
     /// `P`: channels per head.
-    pub head_width: u64,
+    pub head_width: D,
     /// `N`: state columns per head channel.
-    pub state: u64,
+    pub state: D,
     /// `G`: groups of heads sharing `B` and `C`.
-    pub groups: u64,
+    pub groups: D,
     /// `C`: convolution taps, the current row included.
-    pub convolution_width: u64,
+    pub convolution_width: D,
     /// `U`: heads per output norm group.
-    pub norm_heads: u64,
+    pub norm_heads: D,
 }
 
 impl StateSpaceShape {
@@ -57,45 +61,108 @@ impl StateSpaceShape {
         })
     }
 
+    /// Its numbers as constant dimensions.
+    pub fn dims(&self) -> StateSpaceShape<Dim> {
+        constant(*self)
+    }
+
     pub fn inner(&self) -> u64 {
-        self.heads * self.head_width
+        self.dims().inner().fixed()
+    }
+
+    pub fn channels(&self) -> u64 {
+        self.dims().channels().fixed()
+    }
+
+    pub fn projection_width(&self) -> u64 {
+        self.dims().projection_width().fixed()
+    }
+
+    pub fn norm_groups(&self) -> u64 {
+        self.dims().norm_groups().fixed()
+    }
+
+    pub fn tape_width(&self) -> u64 {
+        self.dims().tape_width().fixed()
+    }
+
+    pub fn state_statics(&self) -> [(&'static str, u64); 5] {
+        self.dims().state_statics().map(|(name, dim)| (name, dim.fixed()))
+    }
+
+    pub fn project_dimensions(&self, rows: u64) -> [(&'static str, u64); 6] {
+        self.dims()
+            .project_dimensions(&Dim::from(rows))
+            .map(|(name, dim)| (name, dim.fixed()))
+    }
+
+    pub fn output_dimensions(&self, rows: u64) -> [(&'static str, u64); 6] {
+        self.dims()
+            .output_dimensions(&Dim::from(rows))
+            .map(|(name, dim)| (name, dim.fixed()))
+    }
+}
+
+impl<D> Numbers<D> for StateSpaceShape<D> {
+    type Of<E> = StateSpaceShape<E>;
+    fn map<E>(self, f: &mut impl FnMut(D) -> E) -> StateSpaceShape<E> {
+        StateSpaceShape {
+            hidden: f(self.hidden),
+            heads: f(self.heads),
+            head_width: f(self.head_width),
+            state: f(self.state),
+            groups: f(self.groups),
+            convolution_width: f(self.convolution_width),
+            norm_heads: f(self.norm_heads),
+        }
+    }
+}
+
+impl StateSpaceShape<Dim> {
+    pub fn inner(&self) -> Dim {
+        &self.heads * &self.head_width
     }
 
     /// Convolved channels: `x | B | C`.
-    pub fn channels(&self) -> u64 {
-        self.inner() + 2 * self.groups * self.state
+    pub fn channels(&self) -> Dim {
+        self.inner() + &self.groups * &self.state * 2u64
     }
 
     /// `J`: the projection row, `z | x | B | C | dt`.
-    pub fn projection_width(&self) -> u64 {
-        self.inner() + self.channels() + self.heads
+    pub fn projection_width(&self) -> Dim {
+        self.inner() + self.channels() + &self.heads
     }
 
     /// Output norm groups.
-    pub fn norm_groups(&self) -> u64 {
-        self.heads / self.norm_heads
+    pub fn norm_groups(&self) -> Dim {
+        &self.heads / &self.norm_heads
+    }
+
+    /// Row width of the bank's tape: `u = δ·x | B | decay`.
+    pub fn tape_width(&self) -> Dim {
+        self.inner() + &self.groups * &self.state + &self.heads
     }
 
     /// `attention_project`'s dimensions: the query segment only.
-    pub fn project_dimensions(&self, rows: u64) -> [(&'static str, u64); 6] {
+    pub fn project_dimensions(&self, rows: &Dim) -> [(&'static str, Dim); 6] {
         [
-            ("M", rows),
-            ("D", self.hidden),
+            ("M", rows.clone()),
+            ("D", self.hidden.clone()),
             ("Q", self.projection_width()),
-            ("GR", 0),
-            ("K", 0),
-            ("V", 0),
+            ("GR", Dim::from(0u64)),
+            ("K", Dim::from(0u64)),
+            ("V", Dim::from(0u64)),
         ]
     }
 
     /// The statics the state entries fix.
-    pub fn state_statics(&self) -> [(&'static str, u64); 5] {
+    pub fn state_statics(&self) -> [(&'static str, Dim); 5] {
         [
-            ("NH", self.heads),
-            ("P", self.head_width),
-            ("G", self.groups),
-            ("N", self.state),
-            ("C", self.convolution_width),
+            ("NH", self.heads.clone()),
+            ("P", self.head_width.clone()),
+            ("G", self.groups.clone()),
+            ("N", self.state.clone()),
+            ("C", self.convolution_width.clone()),
         ]
     }
 
@@ -103,49 +170,47 @@ impl StateSpaceShape {
     /// with `tape_rows` tape rows each.
     pub fn state_dimensions(
         &self,
-        rows: u64,
-        slots: u64,
-        banks: u64,
-        tape_rows: u64,
-    ) -> [(&'static str, u64); 9] {
+        rows: &Dim,
+        slots: &Dim,
+        banks: &Dim,
+        tape_rows: &Dim,
+    ) -> [(&'static str, Dim); 9] {
         let [heads, width, groups, state, taps] = self.state_statics();
         [
-            ("M", rows),
-            ("B", slots),
-            ("S", banks),
+            ("M", rows.clone()),
+            ("B", slots.clone()),
+            ("S", banks.clone()),
             heads,
             width,
             groups,
             state,
             taps,
-            ("T", tape_rows),
+            ("T", tape_rows.clone()),
         ]
     }
 
     /// `state_space_gate`'s dimensions.
-    pub fn gate_dimensions(&self, rows: u64) -> [(&'static str, u64); 5] {
+    pub fn gate_dimensions(&self, rows: &Dim) -> [(&'static str, Dim); 5] {
         [
-            ("M", rows),
+            ("M", rows.clone()),
             ("G", self.norm_groups()),
-            ("U", self.norm_heads),
-            ("P", self.head_width),
+            ("U", self.norm_heads.clone()),
+            ("P", self.head_width.clone()),
             ("J", self.projection_width()),
         ]
     }
 
     /// `attention_output`'s dimensions: `heads` heads of `head_width`.
-    pub fn output_dimensions(&self, rows: u64) -> [(&'static str, u64); 4] {
+    pub fn output_dimensions(&self, rows: &Dim) -> [(&'static str, Dim); 6] {
+        // One residual stream (`scatter` without inject).
         [
-            ("M", rows),
-            ("D", self.hidden),
-            ("Q", self.heads),
-            ("W", self.head_width),
+            ("M", rows.clone()),
+            ("D", self.hidden.clone()),
+            ("SN", Dim::from(1u64)),
+            ("IN", Dim::from(0u64)),
+            ("Q", self.heads.clone()),
+            ("W", self.head_width.clone()),
         ]
-    }
-
-    /// Row width of the bank's tape: `u = δ·x | B | decay`.
-    pub fn tape_width(&self) -> u64 {
-        self.inner() + self.groups * self.state + self.heads
     }
 }
 
@@ -160,6 +225,16 @@ pub struct StateSpaceBinding {
     pub projection: Element,
     pub output: Element,
     pub activation: Element,
+    pub scales: StateSpaceScales,
+}
+
+/// The extents of a state-space layer's per-tensor accumulator-scale ports
+/// (`attention_project`'s query segment `QS`, `attention_output`'s `OS`): 1
+/// where the weight has a resident second-level scale, else 0.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct StateSpaceScales {
+    pub projection: u64,
+    pub output: u64,
 }
 
 /// The state-space forms the entries implement: an output norm group of
@@ -167,7 +242,9 @@ pub struct StateSpaceBinding {
 pub(crate) fn admit(space: &StateSpace) -> Result<(), PlanError> {
     if space.head_width == 0
         || !space.norm_group.is_multiple_of(space.head_width)
-        || !space.heads.is_multiple_of(space.norm_group / space.head_width)
+        || !space
+            .heads
+            .is_multiple_of(space.norm_group / space.head_width)
     {
         return Err(PlanError::Unsupported(
             "state-space output norm group of partial heads",
@@ -181,7 +258,10 @@ pub(super) fn weights<'a>(space: &'a StateSpace, push: &mut super::WeightPush<'_
     use magnitude_family_contracts::WeightKind;
     push(WeightKind::StateSpaceProjection, &space.projection);
     push(WeightKind::RecurrentConvolution, &space.convolution);
-    push(WeightKind::RecurrentConvolutionBias, &space.convolution_bias);
+    push(
+        WeightKind::RecurrentConvolutionBias,
+        &space.convolution_bias,
+    );
     push(WeightKind::RecurrentTimeBias, &space.time_bias);
     push(WeightKind::RecurrentDecay, &space.decay);
     push(WeightKind::StateSpaceSkip, &space.skip);
@@ -200,19 +280,29 @@ pub(super) fn shape_key(space: &StateSpace) -> String {
 }
 
 /// The program binding of a state-space sublayer; `lookup` resolves the
-/// planned element of a role in its scope.
+/// planned element of a role in its scope, `scalable` that of a projection
+/// its entries bind with an accumulator-scale port.
 pub(super) fn binding(
     space: &StateSpace,
     hidden: u64,
     lookup: impl Fn(magnitude_family_contracts::WeightKind) -> Result<Element, PlanError>,
+    scalable: impl Fn(magnitude_family_contracts::WeightKind) -> Result<ScalableWeight, PlanError>,
     activation: Element,
 ) -> Result<StateSpaceBinding, PlanError> {
     use magnitude_family_contracts::WeightKind;
+    let (projection, output) = (
+        scalable(WeightKind::StateSpaceProjection)?,
+        scalable(WeightKind::RecurrentOutput)?,
+    );
     Ok(StateSpaceBinding {
         shape: StateSpaceShape::of(hidden, space)?,
         norm: lookup(WeightKind::InputNorm)?,
-        projection: lookup(WeightKind::StateSpaceProjection)?,
-        output: lookup(WeightKind::RecurrentOutput)?,
+        projection: projection.element,
+        output: output.element,
         activation,
+        scales: StateSpaceScales {
+            projection: projection.scale,
+            output: output.scale,
+        },
     })
 }

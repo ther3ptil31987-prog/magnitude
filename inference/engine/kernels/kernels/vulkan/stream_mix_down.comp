@@ -1,0 +1,116 @@
+// stream_mix_down: the per-stream RMS prologue over the S hyper-connection
+// streams, then the `dense` projection (segmented, K in S parts, the
+// streams) down | inject (an inject segment of zero rows, the exit site's,
+// has no tiles), and the streams' inverses. The Vulkan form of
+// `metal/stream_mix_down.metal` on `lib/projection/operator.glsl`. The GEMV
+// classes are the projection's parts GEMV (a workgroup normalizes one stream
+// through the library's GEMV prologue, one norm group a row; the stream's
+// first workgroup publishes its inverses) and `combine` its parts' sum. Past 8
+// rows `stage` normalizes every stream into scratch (and publishes its
+// inverse) for the projection's segmented GEMM.
+#define KERNEL_W0 SEISMIC_DOWN_WEIGHT
+#define KERNEL_W1 SEISMIC_INJECT_WEIGHT
+// The projection's decoding launches stage their weights' tables (`packets.glsl`).
+#define PACKETS_STAGED_TABLES 1
+#include "lib/core/activation.glsl"
+
+#if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
+#define MIX_ACT ELEMENT_ACT
+#else
+#error "stream_mix_down requires a bf16 or f16 activation"
+#endif
+#if defined(SEISMIC_NORM_REPRESENTATION_F32)
+#define MIX_NORM ELEMENT_F32
+#elif defined(SEISMIC_NORM_REPRESENTATION_F16)
+#define MIX_NORM ELEMENT_F16
+#elif defined(SEISMIC_NORM_REPRESENTATION_BF16)
+#define MIX_NORM ELEMENT_BF16
+#else
+#error "stream_mix_down requires a dense norm"
+#endif
+
+
+#include "lib/projection/projection.glsl"
+
+#define MIX_K uint(SEISMIC_DIM_S * SEISMIC_DIM_H)
+#define MIX_LOW_ROWS uint(SEISMIC_DIM_LR)
+#define MIX_INJECT_ROWS uint(SEISMIC_DIM_C * SEISMIC_DIM_S)
+
+projection_prologue stream_mix_down_input() {
+    return projection_rms(MIX_ACT, SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN), SEISMIC_HIDDEN_STRIDE_0,
+        SEISMIC_HIDDEN_STRIDE_2, SEISMIC_PTR(SEISMIC_BUFFER_NORM), SEISMIC_NORM_STRIDE_1, MIX_NORM,
+        element_word_f32(SEISMIC_PARAM_EPSILON), MIX_K, 0ul);
+}
+
+projection_weights stream_mix_down_down() {
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_DOWN_WEIGHT), PACKETS_W0_ROWS, MIX_K, 0ul, 1ul, 0u);
+}
+projection_weights stream_mix_down_inject() {
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_INJECT_WEIGHT), PACKETS_W1_ROWS, MIX_K, 0ul, 1ul, 0u);
+}
+
+projection_epilogue stream_mix_down_low_out() {
+    return projection_mix_low(SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_1_OUT, SEISMIC_RESULT_0_STRIDE_0,
+        SEISMIC_RESULT_0_STRIDE_1, uint(SEISMIC_DIM_S));
+}
+projection_epilogue stream_mix_down_inject_out() {
+    return projection_mix_inject(SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_1_OUT, SEISMIC_RESULT_1_STRIDE_0,
+        SEISMIC_RESULT_1_STRIDE_1, uint(SEISMIC_DIM_S));
+}
+
+#define PROJECTION_M uint(SEISMIC_DIM_M)
+#define PROJECTION_K MIX_K
+#define PROJECTION_NORM PROJECTION_NORM_SHARED
+#define PROJECTION_STAGED SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED)
+#define PROJECTION_PARTS SEISMIC_DIM_S
+#define PROJECTION_PARTIALS SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS)
+#define PROJECTION_N0 MIX_LOW_ROWS
+#define PROJECTION_N1 MIX_INJECT_ROWS
+#define PROJECTION_WEIGHT0 stream_mix_down_down()
+#define PROJECTION_WEIGHT1 stream_mix_down_inject()
+#define PROJECTION_OUTPUT0 stream_mix_down_low_out()
+#define PROJECTION_OUTPUT1 stream_mix_down_inject_out()
+
+projection_prologue projected_input(uint g) { return stream_mix_down_input(); }
+
+projection_prologue projected_rows(uint g) {
+    return projection_plain(MIX_ACT, PROJECTION_STAGED, uint64_t(MIX_K), 1ul, MIX_K, 0ul);
+}
+
+// Stream `part`'s rows under its own norm group.
+projection_prologue projected_part(uint part) {
+    const uint64_t first = uint64_t(part) * uint(SEISMIC_DIM_H);
+    return projection_rms(MIX_ACT, SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN) + first * SEISMIC_HIDDEN_STRIDE_2 * 4ul,
+        SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_2,
+        SEISMIC_PTR(SEISMIC_BUFFER_NORM) + first * SEISMIC_NORM_STRIDE_1 * ELEMENT_BYTES(MIX_NORM),
+        SEISMIC_NORM_STRIDE_1, MIX_NORM, element_word_f32(SEISMIC_PARAM_EPSILON), uint(SEISMIC_DIM_H), 0ul);
+}
+
+// The stream's first workgroup publishes its rows' inverses.
+void projected_part_first(uint part, projection_prologue x) {
+    if (gl_LocalInvocationIndex < PROJECTION_M)
+        out_put(SEISMIC_RESULT_2_OUT, uint64_t(gl_LocalInvocationIndex)
+            * SEISMIC_RESULT_2_STRIDE_0 + uint64_t(part) * SEISMIC_RESULT_2_STRIDE_1,
+            projection_gemv_inverse(x, gl_LocalInvocationIndex));
+}
+
+#include "lib/projection/operator.glsl"
+
+// Workgroup m * S + s normalizes stream s of row m and publishes its inverse.
+void stream_mix_down_stage() {
+    const uint streams = uint(SEISMIC_DIM_S);
+    const uint m = gl_WorkGroupID.x / streams, stream = gl_WorkGroupID.x % streams;
+    const float inverse = projection_stage_stream(stream_mix_down_input(), m, stream, uint(SEISMIC_DIM_H),
+        PROJECTION_STAGED, MIX_K);
+    if (gl_LocalInvocationIndex == 0u)
+        out_put(SEISMIC_RESULT_2_OUT,
+            uint64_t(m) * SEISMIC_RESULT_2_STRIDE_0 + uint64_t(stream) * SEISMIC_RESULT_2_STRIDE_1, inverse);
+}
+
+// The `dense` projection's launches (`lib/projection/operator.glsl`).
+void stream_mix_down_gemv1() { projection_parts_gemv(1u); }
+void stream_mix_down_gemv2() { projection_parts_gemv(2u); }
+void stream_mix_down_gemv4() { projection_parts_gemv(4u); }
+void stream_mix_down_gemv8() { projection_parts_gemv(8u); }
+void stream_mix_down_combine() { projection_parts_combine(); }
+void stream_mix_down_gemm() { projection_segmented_gemm(); }

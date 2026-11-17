@@ -14,7 +14,7 @@ use magnitude_engine::{
     options::{ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection},
 };
 use magnitude_executor::{
-    platform::{DeviceRequest, MemoryReserves},
+    platform::{DeviceRequest, ReleaseRate},
     Demand, ExecutionPath, ExecutorDomain, Operation, Outcome, PhysicalDecision, RequestId,
     ReservedResources, RowResult, StateBindings, TokenId, WorkKind,
 };
@@ -37,12 +37,14 @@ fn open_domain() -> Option<(ExecutorDomain, StateBindings, usize)> {
             draft: None,
         },
         model: ModelPolicy {
+            draft_policy: None,
             method: ModelMethod::Mtp,
             mtp_proposals: Some(PROPOSALS),
-            kv_codec: KvCodec::AffineK8V4,
+            kv_codec: Some(KvCodec::AffineK8V4),
             lookahead: false,
             exported_logits_rows: 64,
-            error_classes: Vec::new(),
+            numerical_profile: None,
+            weight_bound: None,
         },
         context_tokens: Some(1024),
         service: ServiceLimits {
@@ -50,11 +52,12 @@ fn open_domain() -> Option<(ExecutorDomain, StateBindings, usize)> {
             decode_tokens: 16,
             decode_share: 0.5,
             locality_seconds: 1.0,
+            conversations: std::num::NonZeroUsize::MIN,
         },
         path: ExecutionPath::Native,
         device: DeviceRequest::Automatic,
         kernel_cache: std::env::var_os("MAGNITUDE_TEST_KERNEL_CACHE").map(PathBuf::from),
-        reserves: MemoryReserves::standard(),
+        release: ReleaseRate::of_machine(None),
     }
     .resolve()
     .unwrap();
@@ -204,7 +207,7 @@ fn tape_versions_continue_exactly_like_runs_that_stopped_there() {
         domain
             .install_input(request, PreparedModelInput::continuation_only())
             .unwrap();
-        domain.open_state(bindings, request, None).unwrap();
+        domain.open_served(bindings, request, None).unwrap();
         Sequence {
             request,
             position: 0,

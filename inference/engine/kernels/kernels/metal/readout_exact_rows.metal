@@ -19,8 +19,9 @@ kernel void readout_exact_rows_gather(
     device const float *temperature [[buffer(SEISMIC_BUFFER_TEMPERATURE)]],
     device const uint *mask [[buffer(SEISMIC_BUFFER_MASK)]],
     device const int *constrained [[buffer(SEISMIC_BUFFER_CONSTRAINED)]],
-    device float *logits [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    SEISMIC_RESULT_0_PARAM(logits),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
+    threadgroup uchar *shared [[threadgroup(0)]],
     uint tile [[threadgroup_position_in_grid]],
     uint tiles [[threadgroups_per_grid]],
     uint tid [[thread_index_in_threadgroup]],
@@ -28,17 +29,17 @@ kernel void readout_exact_rows_gather(
     uint simdgroups [[simdgroups_per_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup uint4 stage[PROGRESSIVE_STAGE_WORDS];
+    threadgroup uint4 *stage = reinterpret_cast<threadgroup uint4 *>(shared);
     const progressive::Planes planes{top, SEISMIC_TOP_STRIDE_0, bit3, SEISMIC_BIT3_STRIDE_0, rest,
         SEISMIC_REST_STRIDE_0, SEISMIC_REST_STRIDE_1, SEISMIC_REST_STRIDE_2, scales, SEISMIC_SCALES_STRIDE_0};
     const progressive::Selection selection{draws, SEISMIC_DRAWS_STRIDE_0, SEISMIC_DRAWS_STRIDE_1, temperature,
         SEISMIC_TEMPERATURE_STRIDE_0, mask, SEISMIC_MASK_STRIDE_0, SEISMIC_MASK_STRIDE_1, constrained,
-        SEISMIC_CONSTRAINED_STRIDE_0};
+        SEISMIC_CONSTRAINED_STRIDE_0, as_type<float>(uint(SEISMIC_PARAM_SOFTCAP))};
     // Radius column 1: the 5-bit view's.
     progressive::gather<false>(features, SEISMIC_FEATURES_STRIDE_0, planes, radius + SEISMIC_RADIUS_STRIDE_1,
         nullptr, SEISMIC_RADIUS_STRIDE_0, fine, SEISMIC_FINE_STRIDE_0, SEISMIC_FINE_STRIDE_1, floor,
-        SEISMIC_FLOOR_STRIDE_0, lengths, SEISMIC_LENGTH_STRIDE_0, selection, logits, SEISMIC_RESULT_0_STRIDE_0,
-        SEISMIC_RESULT_0_STRIDE_1, nullptr, 0, nullptr, uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_V),
+        SEISMIC_FLOOR_STRIDE_0, lengths, SEISMIC_LENGTH_STRIDE_0, selection, element::Out<element::F32>(logits),
+        SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, element::Out<element::F32>(nullptr), 0, nullptr, uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_V),
         uint(SEISMIC_DIM_D), nullptr, nullptr, stage, tile, tiles, tid, threads, simdgroups, sg, lane);
 }
 #endif

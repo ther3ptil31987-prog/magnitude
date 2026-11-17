@@ -1,22 +1,25 @@
 use super::scalar;
 use super::tensor::{read_bits, write_bits};
-use super::value::{row_major, Backing, TensorValue, Value};
+use super::value::{Backing, TensorValue, Value, row_major};
 use super::{Arg, EvalError, Interpreter, OracleError, TensorData};
 use crate::entry::{
     Candidate, LoopKind, NumericalRole, ParameterKind, RegionKind, ScalarRef, SemanticFunction,
     SemanticNodeView, SemanticType, TensorStorage, ViewTransform,
 };
 use crate::expr::{
-    compiled::InvocationValues, Assignment, ExprArena, PartialAssignment, SymbolId, SymbolKind,
-    SymbolValue,
+    Assignment, ExprArena, PartialAssignment, SymbolId, SymbolKind, SymbolSort, SymbolValue,
+    compiled::InvocationValues,
 };
 use crate::failure::{SourceFailure, SourceFailureCause};
 use crate::ids::{FamilyId, RepresentationConversionId, SemanticValueId};
 use crate::intrinsics::{
-    reduce_schema, AtomicOp, CombineLaw, PrimitiveId, ReduceIdentity, ReduceOp,
+    AtomicOp, CombineLaw, PrimitiveId, ReduceIdentity, ReduceOp, reduce_schema,
 };
 use crate::reference_math::ReferenceScalar;
-use crate::registry::{self, PlaneRepackRecipe, RepackExpr, RepresentationKind};
+use crate::registry::{
+    self, ConversionLayout, PlaneRepackRecipe, RepackExpr, RepresentationConversion,
+    RepresentationKind,
+};
 use crate::types::DType;
 use num_bigint::BigInt;
 use num_traits::{Euclid, ToPrimitive, Zero};
@@ -26,30 +29,46 @@ use std::rc::Rc;
 type Environment = BTreeMap<SemanticValueId, Value>;
 
 /// The `RuntimeValue` symbol of every semantic value that has one. The entry
-/// graph mints at most one per value, so the map is exact.
-pub(super) type RuntimeSymbols = Rc<HashMap<SemanticValueId, SymbolId>>;
+/// graph mints at most one per value, retaining its quantity or scalar sort.
+pub(super) type RuntimeSymbols = Rc<HashMap<SemanticValueId, (SymbolId, SymbolSort)>>;
 
 pub(super) fn runtime_symbols(arena: &ExprArena) -> RuntimeSymbols {
-    Rc::new(
-        arena
-            .symbols()
-            .filter_map(|symbol| match arena.symbol_kind(symbol) {
-                SymbolKind::RuntimeValue(value) => Some((value, symbol)),
-                _ => None,
-            })
-            .collect(),
-    )
+    let mut symbols = HashMap::new();
+    for symbol in arena.symbols() {
+        if let SymbolKind::RuntimeValue(value) = arena.symbol_kind(symbol) {
+            assert!(
+                symbols
+                    .insert(value, (symbol, arena.symbol_sort(symbol)))
+                    .is_none(),
+                "semantic value has conflicting runtime symbol interpretations"
+            );
+        }
+    }
+    Rc::new(symbols)
 }
 
 /// The values and symbol assignment of one executing function body. Every
 /// value enters through [`Frame::bind`], which also binds the value's
 /// `RuntimeValue` symbol, so extents and symbolic expressions of this body
 /// evaluate against exactly the values reached in it.
-#[derive(Clone)]
+///
+/// A nested region (a branch, a loop iteration) runs in a scope of the same
+/// frame ([`Frame::scoped`]): it sees every value bound before it, and what
+/// it binds is undone when it ends, so no region copies its enclosing values.
 struct Frame {
     environment: Environment,
     assignment: Assignment,
     runtime_symbols: RuntimeSymbols,
+    /// What the open scopes bound, latest last, each with what it replaced.
+    undo: Vec<Undo>,
+    /// Open scopes; bindings outside any are never undone, so not recorded.
+    scopes: usize,
+}
+
+/// One binding of a scope and what it replaced ([`Frame::scoped`]).
+enum Undo {
+    Value(SemanticValueId, Option<Value>),
+    Symbol(SymbolId, Option<(usize, SymbolValue)>),
 }
 
 impl Frame {
@@ -58,17 +77,60 @@ impl Frame {
             environment: Environment::new(),
             assignment,
             runtime_symbols,
+            undo: Vec::new(),
+            scopes: 0,
+        }
+    }
+
+    /// `body` in a scope of this frame: the frame as `body` leaves it while
+    /// it runs, and as it was before once it returns.
+    fn scoped<T>(&mut self, body: impl FnOnce(&mut Self) -> T) -> T {
+        let mark = self.undo.len();
+        self.scopes += 1;
+        let result = body(self);
+        self.scopes -= 1;
+        for undo in self.undo.drain(mark..).rev() {
+            match undo {
+                Undo::Value(id, Some(previous)) => {
+                    self.environment.insert(id, previous);
+                }
+                Undo::Value(id, None) => {
+                    self.environment.remove(&id);
+                }
+                Undo::Symbol(symbol, previous) => self.assignment.restore(symbol, previous),
+            }
+        }
+        result
+    }
+
+    fn bind_symbol(&mut self, symbol: SymbolId, value: SymbolValue) {
+        let previous = self.assignment.replace(symbol, value);
+        if self.scopes > 0 {
+            self.undo.push(Undo::Symbol(symbol, previous));
         }
     }
 
     fn bind(&mut self, id: SemanticValueId, value: Value) {
-        if let Some(symbol) = self.runtime_symbols.get(&id) {
-            // RuntimeValue expressions have the mathematical Int sort,
-            // independently of the producing scalar's storage dtype.
-            self.assignment
-                .bind(*symbol, SymbolValue::Int(value.as_integer()));
+        if let Some((symbol, sort)) = self.runtime_symbols.get(&id) {
+            let published = match sort {
+                SymbolSort::Int => SymbolValue::Int(value.as_integer()),
+                SymbolSort::Nat => SymbolValue::Nat(value.as_nat()),
+                SymbolSort::Scalar(dtype) => {
+                    let scalar = value.as_scalar();
+                    assert_eq!(
+                        scalar.dtype(),
+                        *dtype,
+                        "runtime scalar publication changed dtype"
+                    );
+                    scalar_symbol(scalar)
+                }
+            };
+            self.bind_symbol(*symbol, published);
         }
-        self.environment.insert(id, value);
+        let previous = self.environment.insert(id, value);
+        if self.scopes > 0 {
+            self.undo.push(Undo::Value(id, previous));
+        }
     }
 
     fn value(&self, id: SemanticValueId) -> &Value {
@@ -148,7 +210,7 @@ impl Interpreter<'_> {
                     return Err(OracleError::InvalidInvocation(format!(
                         "argument kind mismatch for `{}`",
                         parameter.name
-                    )))
+                    )));
                 }
             };
             values.push(value);
@@ -513,15 +575,22 @@ impl Interpreter<'_> {
                     } => {
                         let condition = frame.value(condition).as_scalar().bits() != 0;
                         let child = if condition { then } else { otherwise };
-                        let mut child_frame = frame.clone();
-                        bind_region_parameters(function, child, captures, &mut child_frame, frame);
-                        self.execute_region(function, child, &mut child_frame)?;
                         let results = function.region(child).results();
                         if results.len() != outputs.len() {
                             unreachable!("checked if branch result arity mismatch")
                         }
-                        for (output, result) in outputs.iter().zip(results) {
-                            frame.bind(*output, child_frame.value(*result).clone());
+                        let values = frame.scoped(|frame| {
+                            bind_region_parameters(function, child, captures, frame);
+                            self.execute_region(function, child, frame)?;
+                            Ok::<_, EvalError>(
+                                results
+                                    .iter()
+                                    .map(|result| frame.value(*result).clone())
+                                    .collect::<Vec<_>>(),
+                            )
+                        })?;
+                        for (output, value) in outputs.iter().zip(values) {
+                            frame.bind(*output, value);
                         }
                     }
                     SemanticNodeView::Loop {
@@ -551,16 +620,24 @@ impl Interpreter<'_> {
                         let mut coordinate = start;
                         while coordinate < end {
                             self.charge_work(1)?;
-                            let mut child = frame.clone();
-                            child.bind(parameters[0], Value::Index(coordinate.clone()));
-                            for (parameter, value) in parameters[1..].iter().zip(&current) {
-                                child.bind(*parameter, value.clone());
-                            }
-                            child
-                                .assignment
-                                .bind(*binder_symbol, SymbolValue::Nat(coordinate.clone()));
-                            self.execute_region(function, body, &mut child)?;
-                            for carry in carries {
+                            let yielded = frame.scoped(|frame| {
+                                frame.bind(parameters[0], Value::Index(coordinate.clone()));
+                                for (parameter, value) in parameters[1..].iter().zip(&current) {
+                                    frame.bind(*parameter, value.clone());
+                                }
+                                frame.bind_symbol(
+                                    *binder_symbol,
+                                    SymbolValue::Nat(coordinate.clone()),
+                                );
+                                self.execute_region(function, body, frame)?;
+                                Ok::<_, EvalError>(
+                                    carries
+                                        .iter()
+                                        .map(|carry| frame.value(carry.yielded).clone())
+                                        .collect::<Vec<_>>(),
+                                )
+                            })?;
+                            for (carry, value) in carries.iter().zip(yielded) {
                                 let parameter = parameters[1..]
                                     .iter()
                                     .position(|parameter| *parameter == carry.parameter)
@@ -569,7 +646,7 @@ impl Interpreter<'_> {
                                             "checked carry parameter is not a loop capture"
                                         )
                                     });
-                                current[parameter] = child.value(carry.yielded).clone();
+                                current[parameter] = value;
                             }
                             coordinate += 1u8;
                         }
@@ -621,9 +698,12 @@ impl Interpreter<'_> {
                         let extent = frame.value(tensor).as_tensor().shape[axis as usize];
                         let value = match function.value(output).ty {
                             SemanticType::Integer => Value::Integer(extent.into()),
-                            // Authored extent keeps its existing source value
-                            // path; only the hidden call-dimension capture is
-                            // an exact mathematical Integer result.
+                            // Authored `extent(t, axis)` is the `i32` word of
+                            // the mathematical extent (its two's-complement
+                            // projection), as the checker types it.
+                            SemanticType::Scalar(dtype) => {
+                                Value::Scalar(word_literal(dtype, &BigInt::from(extent)))
+                            }
                             _ => Value::Index(extent.into()),
                         };
                         frame.bind(output, value);
@@ -648,6 +728,23 @@ impl Interpreter<'_> {
         frame: &Frame,
     ) -> Result<Value, EvalError> {
         match primitive {
+            PrimitiveId::QuantizedComponentRead { component, .. } => {
+                let tensor = frame.value(inputs[0]).as_tensor();
+                let logical = self.element_index(tensor, &inputs[1..], frame)?;
+                self.charge_work(1)?;
+                let info = registry::representation_info(tensor.representation);
+                let recipe = registry::decode_recipe(tensor.representation, info.decoded)
+                    .expect("checked packed component");
+                let _decode = self.reserve_elements::<ReferenceScalar>(recipe.temporary_count())?;
+                let flat = tensor.positions[logical];
+                Ok(Value::Scalar(match &tensor.backing {
+                    Backing::Argument(index) => {
+                        self.tensors[*index].read_component(flat, *component)
+                    }
+                    Backing::Owned(data) => data.borrow().read_component(flat, *component),
+                }))
+            }
+
             PrimitiveId::RangeMake => Ok(Value::Range(
                 frame.value(inputs[0]).as_nat(),
                 frame.value(inputs[1]).as_nat(),
@@ -790,6 +887,10 @@ impl Interpreter<'_> {
                     _ => scalar::cast(*dtype, value.as_scalar()),
                 }))
             }
+            PrimitiveId::Bitcast(dtype) => Ok(Value::Scalar(ReferenceScalar::from_bits(
+                *dtype,
+                frame.value(inputs[0]).as_scalar().bits(),
+            ))),
             PrimitiveId::Math(operation) => {
                 let arguments = inputs
                     .iter()
@@ -813,6 +914,7 @@ impl Interpreter<'_> {
             | PrimitiveId::SliceView { .. }
             | PrimitiveId::ElementRead { .. }
             | PrimitiveId::Extent { .. }
+            | PrimitiveId::Operands
             | PrimitiveId::Atomic { .. }
             | PrimitiveId::Reduce { .. } => {
                 unreachable!("structural primitive survived semantic canonicalization")
@@ -1046,7 +1148,66 @@ impl Interpreter<'_> {
         Ok(())
     }
 
+    /// A store into encoded storage: whole trailing matrices of the same
+    /// representation, copied as their encoded bytes (the checker admits no
+    /// other store into packed storage, `registry::record_writable`).
+    fn store_records(&mut self, destination: &TensorValue, source: &TensorValue) -> Result<(), EvalError> {
+        let defect = |detail: &str| -> EvalError {
+            OracleError::InterpreterDefect(format!("packed record store: {detail}")).into()
+        };
+        if source.representation != destination.representation || source.shape != destination.shape {
+            return Err(defect("the value is not the selection's representation and shape"));
+        }
+        // The records a view selects: contiguous whole trailing matrices of
+        // its backing.
+        let records = |value: &TensorValue, data: &TensorData| -> Option<std::ops::Range<usize>> {
+            let shape = data.shape();
+            let leading = shape.len().checked_sub(2)?;
+            let matrix: usize = shape[leading..].iter().product();
+            let first = *value.positions.first()?;
+            let count = value.positions.len();
+            (value.shape.len() >= 2
+                && value.shape[value.shape.len() - 2..] == shape[leading..]
+                && first % matrix == 0
+                && count % matrix == 0
+                && value.positions.iter().copied().eq(first..first + count))
+            .then(|| first / matrix..(first + count) / matrix)
+        };
+        let read = |value: &TensorValue, data: &mut TensorData| -> Option<Vec<u8>> {
+            let range = records(value, data)?;
+            data.record_bytes(range).map(|bytes| bytes.to_vec())
+        };
+        let bytes = match &source.backing {
+            Backing::Argument(index) => read(source, &mut self.tensors[*index]),
+            Backing::Owned(data) => read(source, &mut data.borrow_mut()),
+        }
+        .ok_or_else(|| defect("the value is not whole records"))?;
+        self.charge_work(bytes.len() as u64)?;
+        let write = |data: &mut TensorData| {
+            let range = records(destination, data)?;
+            let target = data.record_bytes(range)?;
+            (target.len() == bytes.len()).then(|| target.copy_from_slice(&bytes))
+        };
+        match &destination.backing {
+            Backing::Argument(index) => write(&mut self.tensors[*index]),
+            Backing::Owned(data) => write(&mut data.borrow_mut()),
+        }
+        .ok_or_else(|| defect("the selection is not whole records"))
+    }
+
     fn store_tensor(&mut self, destination: &TensorValue, source: &Value) -> Result<(), EvalError> {
+        match registry::store_rule(destination.representation) {
+            registry::StoreRule::Any => {}
+            registry::StoreRule::Records(_) => {
+                let Value::Tensor(source) = source else {
+                    return Err(OracleError::InterpreterDefect("packed record store of a scalar".into()).into());
+                };
+                return self.store_records(destination, source);
+            }
+            registry::StoreRule::Refused(_) => {
+                return Err(OracleError::InterpreterDefect("store into storage that takes none".into()).into());
+            }
+        }
         self.charge_tensor(&destination.shape)?;
         let _snapshot = self.reserve_elements::<ReferenceScalar>(destination.element_count())?;
         let values = match source {
@@ -1341,19 +1502,24 @@ impl Interpreter<'_> {
     }
 }
 
+/// Binds `region`'s parameters in `frame`, a scope of the frame that holds
+/// `captures`, to the captured values.
 fn bind_region_parameters(
     function: &SemanticFunction,
     region: crate::ids::RegionId,
     captures: &[SemanticValueId],
-    child: &mut Frame,
-    parent: &Frame,
+    frame: &mut Frame,
 ) {
     let parameters = function.region(region).parameters();
     if parameters.len() != captures.len() {
         unreachable!("checked region capture arity mismatch")
     }
-    for (parameter, capture) in parameters.iter().zip(captures) {
-        child.bind(*parameter, parent.value(*capture).clone());
+    let values = captures
+        .iter()
+        .map(|capture| frame.value(*capture).clone())
+        .collect::<Vec<_>>();
+    for (parameter, value) in parameters.iter().zip(values) {
+        frame.bind(*parameter, value);
     }
 }
 
@@ -1381,23 +1547,56 @@ fn convert_owned_encoded(
 /// The canonical destination bytes of registered conversion `conversion`
 /// applied to the canonical source bytes of a tensor of `shape`: every source
 /// packet through the recipe into the destination representation's packet
-/// form, then placed by the destination layout.
+/// form ([`packet_forms`]), then placed by the destination layout.
 pub(crate) fn repack_bytes(
     conversion: RepresentationConversionId,
     shape: &[usize],
     source_bytes: &[u8],
 ) -> Vec<u8> {
     let conversion = registry::representation_conversion_info(conversion);
-    let source_layout = match &registry::representation_info(conversion.source).kind {
-        RepresentationKind::External(layout) => layout,
-        _ => unreachable!("registered conversion source is not external"),
-    };
-    let destination_kind = &registry::representation_info(conversion.destination).kind;
-    let destination_layout = match destination_kind {
-        RepresentationKind::Packed(layout) => layout,
-        RepresentationKind::PackedRows(layout) => &layout.packet,
-        _ => unreachable!("registered conversion destination is not packed"),
-    };
+    let extents = shape
+        .iter()
+        .map(|extent| *extent as u64)
+        .collect::<Vec<_>>();
+    let forms = packet_forms(conversion, &extents, source_bytes);
+    place_forms(conversion, &extents, forms)
+}
+
+/// `forms`, the packet forms of a tensor of `extents` one after another,
+/// placed by `conversion`'s destination layout.
+pub(crate) fn place_forms(
+    conversion: &RepresentationConversion,
+    extents: &[u64],
+    forms: Vec<u8>,
+) -> Vec<u8> {
+    match conversion.destination_layout {
+        ConversionLayout::Rows(layout) => layout.place(extents, &forms),
+        ConversionLayout::Packet(_) => forms,
+    }
+}
+
+/// The packet forms through `conversion`'s recipe of the packets of
+/// `source_bytes`, the bytes of a source tensor of `extents`, one after
+/// another: each packet's bytes where the source lays them
+/// (`SourceMatrices::packets`).
+pub(crate) fn packet_forms(
+    conversion: &RepresentationConversion,
+    extents: &[u64],
+    source_bytes: &[u8],
+) -> Vec<u8> {
+    let packets = conversion
+        .source_layout
+        .matrices(extents)
+        .expect("a source tensor's extents")
+        .packets(source_bytes);
+    forms_of_packets(conversion, &packets)
+}
+
+/// The packet forms through `conversion`'s recipe of `source_bytes`, whole
+/// source packets one after another, each its bytes in order.
+pub(crate) fn forms_of_packets(conversion: &RepresentationConversion, source_bytes: &[u8]) -> Vec<u8> {
+    let source_layout = conversion.source_layout;
+    let destination_layout = conversion.destination_layout.packet();
     let packet_count = source_bytes.len() / source_layout.packet_size as usize;
     let mut destination = vec![0u8; packet_count * destination_layout.packet_size as usize];
     for packet in 0..packet_count {
@@ -1415,7 +1614,9 @@ pub(crate) fn repack_bytes(
             match recipe {
                 PlaneRepackRecipe::BitRoutes(routes) => {
                     for (destination_bit, source_bit) in routes.iter().enumerate() {
-                        let bit = read_bits(source_packet, *source_bit as usize, 1);
+                        let bit = source_bit.map_or(0, |source_bit| {
+                            read_bits(source_packet, source_bit as usize, 1)
+                        });
                         write_bits(plane_bytes, destination_bit, 1, bit);
                     }
                 }
@@ -1431,24 +1632,15 @@ pub(crate) fn repack_bytes(
                 PlaneRepackRecipe::PackedEntries(expressions) => {
                     let bits = plane.entry_bits;
                     for (entry, expression) in expressions.iter().enumerate() {
-                        let value = scalar::cast(DType::I32, eval_repack(expression, source_packet));
-                        write_bits(plane_bytes, entry * bits as usize, bits, value.bits());
+                        let value =
+                            scalar::cast(DType::I32, eval_repack(expression, source_packet));
+                        write_bits(plane_bytes, entry * bits as usize, bits, value.bits() as u32);
                     }
                 }
             }
         }
     }
-    // `destination` is the packet form; a row layout places it.
-    match destination_kind {
-        RepresentationKind::PackedRows(layout) => layout.place(
-            &shape
-                .iter()
-                .map(|extent| *extent as u64)
-                .collect::<Vec<_>>(),
-            &destination,
-        ),
-        _ => destination,
-    }
+    destination
 }
 
 fn eval_repack(expression: &RepackExpr, source: &[u8]) -> ReferenceScalar {
@@ -1457,45 +1649,20 @@ fn eval_repack(expression: &RepackExpr, source: &[u8]) -> ReferenceScalar {
         RepackExpr::SourceBits { bit, width } => {
             ReferenceScalar::U32(read_bits(source, *bit as usize, u32::from(*width)))
         }
-        RepackExpr::ShiftLeft { value, bits } => scalar::binary(
-            BinaryOp::Shl,
-            eval_repack(value, source),
-            ReferenceScalar::U32(u32::from(*bits)),
-            None,
-        )
-        .unwrap(),
-        RepackExpr::BitOr(left, right) => scalar::binary(
-            BinaryOp::BitOr,
-            eval_repack(left, source),
-            eval_repack(right, source),
-            None,
-        )
-        .unwrap(),
-        RepackExpr::OffsetI32 { value, offset } => scalar::binary(
-            BinaryOp::Add,
-            scalar::cast(DType::I32, eval_repack(value, source)),
-            ReferenceScalar::I32(*offset),
-            None,
-        )
-        .unwrap(),
         RepackExpr::F16ToF32(value) => scalar::cast(
             DType::F32,
             ReferenceScalar::F16(eval_repack(value, source).bits() as u16),
         ),
-        RepackExpr::I32ToF32(value) => scalar::cast(
-            DType::F32,
-            scalar::cast(DType::I32, eval_repack(value, source)),
-        ),
-        RepackExpr::MultiplyF32(left, right) => scalar::binary(
+        RepackExpr::ScaleF32 { value, exponent } => scalar::binary(
             BinaryOp::Mul,
-            eval_repack(left, source),
-            eval_repack(right, source),
+            eval_repack(value, source),
+            ReferenceScalar::F32(2f32.powi(i32::from(*exponent)).to_bits()),
             Some(DType::F32),
         )
         .unwrap(),
         RepackExpr::Lookup { index, table } => {
             let index = scalar::cast(DType::I32, eval_repack(index, source)).bits();
-            ReferenceScalar::I32(table[index as usize])
+            ReferenceScalar::I32(table.values()[index as usize])
         }
     }
 }
@@ -1523,7 +1690,63 @@ fn scalar_symbol(value: ReferenceScalar) -> SymbolValue {
         ReferenceScalar::BF16(bits) => SymbolValue::BF16(bits),
         ReferenceScalar::I32(value) => SymbolValue::I32(value),
         ReferenceScalar::U32(value) => SymbolValue::U32(value),
+        ReferenceScalar::U64(value) => SymbolValue::U64(value),
         ReferenceScalar::Bool(value) => SymbolValue::Bool(value),
+    }
+}
+
+#[cfg(test)]
+mod runtime_symbol_tests {
+    use super::*;
+    use crate::ids::{FunctionId, ProgramId};
+
+    #[test]
+    fn runtime_publications_preserve_scalar_payloads_and_quantity_versions() {
+        let mut arena = ExprArena::new();
+        let function = FunctionId::new(ProgramId::fresh(), 0);
+        let scalars = [
+            ReferenceScalar::F32(0x8000_0000),
+            ReferenceScalar::F32(0x7fc0_1234),
+            ReferenceScalar::F16(0xfe12),
+            ReferenceScalar::BF16(0xffc1),
+            ReferenceScalar::Bool(true),
+            ReferenceScalar::I32(i32::MIN),
+            ReferenceScalar::U32(u32::MAX),
+            ReferenceScalar::U64(u64::MAX - 1),
+        ];
+        let publications: Vec<_> = scalars
+            .iter()
+            .enumerate()
+            .map(|(index, scalar)| {
+                let id = SemanticValueId::new(function, u32::try_from(index).unwrap());
+                let (symbol, _) = arena.runtime_scalar_value(id, scalar.dtype());
+                (id, symbol, *scalar)
+            })
+            .collect();
+        let quantity_id = SemanticValueId::new(function, u32::try_from(scalars.len()).unwrap());
+        let (quantity_symbol, quantity) = arena.runtime_value(quantity_id);
+        let mut frame = Frame::new(runtime_symbols(&arena), Assignment::new());
+        for (id, symbol, scalar) in publications {
+            frame.bind(id, Value::Scalar(scalar));
+            assert_eq!(
+                frame.assignment.get(symbol).unwrap().try_word64().unwrap(),
+                scalar_symbol(scalar).try_word64().unwrap()
+            );
+            assert!(matches!(frame.value(id), Value::Scalar(actual) if *actual == scalar));
+        }
+        let large = BigInt::from(1u32) << 96usize;
+        frame.bind(quantity_id, Value::Integer(large.clone()));
+        assert_eq!(arena.eval_int(quantity, &frame.assignment).unwrap(), large);
+        // Reached loop values replace the previous publication in this frame.
+        frame.bind(quantity_id, Value::Index(7u32.into()));
+        assert_eq!(
+            frame.assignment.get(quantity_symbol),
+            Some(SymbolValue::Int(7u32.into()))
+        );
+        assert_eq!(
+            arena.eval_int(quantity, &frame.assignment).unwrap(),
+            BigInt::from(7u32)
+        );
     }
 }
 
@@ -1532,8 +1755,9 @@ fn word_literal(dtype: DType, value: &BigInt) -> ReferenceScalar {
         dtype.is_int(),
         "checked quantity conversion targets a non-word dtype"
     );
-    let bits = (value & BigInt::from(u32::MAX))
-        .to_u32()
+    let mask = BigInt::from(u64::MAX >> (64 - 8 * dtype.bytes()));
+    let bits = (value & mask)
+        .to_u64()
         .expect("masked mathematical integer fits one word");
     ReferenceScalar::from_bits(dtype, bits)
 }
@@ -1559,6 +1783,7 @@ fn apply_scalar_primitive(
             scalar::binary(*operation, arguments[0], arguments[1], Some(output)).map_err(Into::into)
         }
         PrimitiveId::Cast(dtype) => Ok(scalar::cast(*dtype, arguments[0])),
+        PrimitiveId::Bitcast(dtype) => Ok(ReferenceScalar::from_bits(*dtype, arguments[0].bits())),
         PrimitiveId::Math(operation) => scalar::math(*operation, arguments).map_err(Into::into),
         PrimitiveId::Select => Ok(if arguments[0].bits() != 0 {
             arguments[1]
@@ -1578,8 +1803,10 @@ fn apply_scalar_primitive(
         | PrimitiveId::Transpose
         | PrimitiveId::Reshape
         | PrimitiveId::SliceView { .. }
+        | PrimitiveId::QuantizedComponentRead { .. }
         | PrimitiveId::ElementRead { .. }
         | PrimitiveId::Extent { .. }
+        | PrimitiveId::Operands
         | PrimitiveId::Atomic { .. }
         | PrimitiveId::Reduce { .. } => {
             unreachable!("non-scalar primitive occurs in a checked elementwise node")

@@ -21,6 +21,7 @@ mod ownership;
 mod ownership_tests;
 pub(crate) mod prove;
 pub(crate) mod resolve;
+mod scalar_quantity;
 #[cfg(test)]
 mod stable_identity_tests;
 mod stmt;
@@ -89,12 +90,13 @@ pub(crate) struct Checker<'a> {
     pub kinds: Vec<LocalKind>,
     pub scopes: Vec<HashMap<String, LocalId>>,
     pub facts: Facts,
-    pub symbols: HashMap<LocalId, SymbolId>,
-    pub scalar_symbols: HashMap<LocalId, IntExpr>,
+
     /// Symbols that stand for runtime data values (element reads, words,
     /// runtime slice lengths, binders over data bounds). A bound over one of
     /// them that is not proved is checked at run time instead of rejected.
     pub data_symbols: HashSet<SymbolId>,
+    /// Reached source versions; Local.value remains the declaration identity.
+    pub source_values: HashMap<LocalId, ir::SourceValue>,
     /// Runtime-bounded range views: (start, end, parent extent, realized-length atom).
     pub dyn_views: Vec<(Option<CheckedExpr>, Option<CheckedExpr>, IntExpr, SymbolId)>,
     /// Active independent (`parallel for`) loops: (captured floor, binder).
@@ -109,6 +111,9 @@ pub(crate) struct Checker<'a> {
     pub diagnostics: Vec<Diagnostic>,
     /// Names whose binding was rejected; uses of them are not reported again.
     pub poisoned: HashSet<String>,
+    /// The host ports (`&host tensor`): parameters the body never names,
+    /// so none is in scope.
+    pub host_ports: HashSet<String>,
     pub arena: ExprArena,
     pub elements: elements::ElementUseSet,
     pub placement: Placement,
@@ -130,9 +135,9 @@ impl<'a> Checker<'a> {
             kinds: Vec::new(),
             scopes: vec![HashMap::new()],
             facts: Facts::new(),
-            symbols: HashMap::new(),
-            scalar_symbols: HashMap::new(),
+
             data_symbols: HashSet::new(),
+            source_values: HashMap::new(),
             dyn_views: Vec::new(),
             logical_parallel: Vec::new(),
             divergence: vec![0],
@@ -140,6 +145,7 @@ impl<'a> Checker<'a> {
             block_depth: 0,
             diagnostics: Vec::new(),
             poisoned: HashSet::new(),
+            host_ports: HashSet::new(),
             arena,
             elements: elements::ElementUseSet::default(),
             placement: Placement::default(),
@@ -154,6 +160,7 @@ impl<'a> Checker<'a> {
                 Predicate::NonNegative(e) => c.assume_nonneg(e),
                 Predicate::Zero(e) => c.assume_zero(e),
                 Predicate::NonZero(e) => c.facts.assume_nonzero(&c.arena, e),
+                Predicate::Boolean(e) => c.facts.assume_boolean(e),
             }
         }
         for (i, p) in c.sig.params.clone().into_iter().enumerate() {
@@ -164,24 +171,20 @@ impl<'a> Checker<'a> {
                 LocalKind::Param(i),
                 p.ownership == ParamOwnership::Exclusive,
             );
-            match &p.ty {
-                ValueType::Index { .. } => {
-                    let symbol = c.arena.proof_variable(SymbolSort::Int);
-                    c.facts.assume_type(&mut c.arena, symbol, &p.ty);
-                    c.symbols.insert(id, symbol);
-                    c.locals[id.index()].symbol = Some(symbol);
+            let value = c.source_value(&p.ty, None, true);
+            c.locals[id.index()].value = value.clone();
+            c.source_values.insert(id, value);
+            // A host port keeps its local, so parameters and locals stay
+            // aligned, but leaves the scope: naming it is an error.
+            if matches!(p.ownership, ParamOwnership::Host { .. }) {
+                if let Some(scope) = c.scopes.last_mut() {
+                    scope.remove(&p.name);
                 }
-                ValueType::Scalar(DType::I32 | DType::U32) => {
-                    let symbol = c.fresh_data_symbol();
-                    c.facts.assume_type(&mut c.arena, symbol, &p.ty);
-                    c.symbols.insert(id, symbol);
-                    c.locals[id.index()].symbol = Some(symbol);
-                }
-                _ => {}
+                c.host_ports.insert(p.name.clone());
             }
             if p.ownership == ParamOwnership::Exclusive {
                 for element in tensor_elements(&p.ty) {
-                    c.elements.stored(element);
+                    c.elements.record_stored(element);
                 }
             }
         }
@@ -215,19 +218,8 @@ impl<'a> Checker<'a> {
         if let Some(ordinal) = self.sig.dimension_of(symbol) {
             return self.sig.dimensions[ordinal].name.clone();
         }
-        self.symbols
-            .iter()
-            .find(|(_, candidate)| **candidate == symbol)
-            .or_else(|| {
-                self.locals
-                    .iter()
-                    .enumerate()
-                    .find(|(_, local)| local.symbol == Some(symbol))
-                    .map(|(ordinal, local)| (&local.name, ordinal))
-                    .and(None)
-            })
-            .map(|(local, _)| self.locals[local.index()].name.clone())
-            .unwrap_or_else(|| "?".to_owned())
+        self.locals.iter().find(|local| local.value.leaf_bindings().iter().any(|(_, candidate)| *candidate == symbol))
+            .map(|local| local.name.clone()).unwrap_or_else(|| "?".to_owned())
     }
 
     /// An integer expression in source spelling.
@@ -266,6 +258,16 @@ impl<'a> Checker<'a> {
         self.scopes.iter().rev().find_map(|s| s.get(name).copied())
     }
 
+    /// Why `name`, which [`Self::lookup`] does not find, names nothing the
+    /// body may use, when it is a host port; `None` when it is undeclared.
+    pub fn host_port(&self, name: &str) -> Option<String> {
+        self.host_ports.contains(name).then(|| {
+            format!(
+                "`{name}` is a host port: the host reads or rewrites it once it sees the launch, and the kernel never accesses it"
+            )
+        })
+    }
+
     /// Whether a local is visible at this point: declared in a live scope.
     pub fn in_scope(&self, id: LocalId) -> bool {
         self.scopes
@@ -291,7 +293,7 @@ impl<'a> Checker<'a> {
             ty,
             mutable,
             span,
-            symbol: None,
+            value: ir::SourceValue::Untracked,
         });
         self.kinds.push(kind);
         if let Some(scope) = self.scopes.last_mut() {
@@ -302,7 +304,7 @@ impl<'a> Checker<'a> {
 
     /// A fresh proof variable.
     pub fn fresh_symbol(&mut self) -> SymbolId {
-        self.arena.proof_variable(SymbolSort::Int)
+        self.arena.checker_variable(SymbolSort::Int)
     }
 
     /// A fresh proof variable standing for a runtime data value.
@@ -341,7 +343,7 @@ impl<'a> Checker<'a> {
         span: Span,
         what: &str,
     ) -> bool {
-        if prove::nonneg(&self.arena, &self.facts, e) {
+        if prove::derive_nonnegative(&mut self.arena, &self.facts, e).is_established() {
             return true;
         }
         let rendered = self.render(e);
@@ -380,13 +382,15 @@ impl<'a> Checker<'a> {
                         );
                     }
                 }
-                if !prove::nonneg(&self.arena, &self.facts, extent) {
+                if !prove::derive_nonnegative(&mut self.arena, &self.facts, extent).is_established() {
                     let rendered = self.render(extent);
                     let shown = self.shown(&ty);
                     self.error(
                         DiagnosticRule::Dimension,
                         span,
-                        format!("type `{shown}` requires `{rendered} >= 0`; add `where {rendered} >= 0`"),
+                        format!(
+                            "type `{shown}` requires `{rendered} >= 0`; add `where {rendered} >= 0`"
+                        ),
                     );
                 }
             }
@@ -493,7 +497,16 @@ impl<'a> Checker<'a> {
 
     /// Check that the selected storage can be written. The source-order
     /// region walk decides independent-loop access legality for the body.
-    pub fn write(&mut self, root: LocalId, binding: LocalId, span: Span) -> Option<LocalId> {
+    ///
+    /// `record` is a store of whole trailing matrices, the one write packed
+    /// storage takes (`registry::store_rule`).
+    pub fn write(
+        &mut self,
+        root: LocalId,
+        binding: LocalId,
+        record: bool,
+        span: Span,
+    ) -> Option<LocalId> {
         let binding_name = self.locals[binding.index()].name.clone();
         match &self.kinds[binding.index()] {
             LocalKind::Param(i) if self.sig.params[*i].ownership == ParamOwnership::Owned => {
@@ -528,22 +541,17 @@ impl<'a> Checker<'a> {
         }
         if let ValueType::Tensor(tensor) = &self.locals[root.index()].ty {
             if let Elem::Repr(representation) = &tensor.elem {
-                if crate::registry::representation_info(*representation).access
-                    != crate::registry::RepresentationAccess::ReadWrite
-                {
-                    self.error(
-                        DiagnosticRule::Type,
-                        span,
-                        format!(
-                            "representation `{}` is decode-only and has no canonical write contract",
-                            crate::registry::representation_info(*representation).name
-                        ),
-                    );
+                if let Err(refusal) = crate::registry::store_rule(*representation).admits(record) {
+                    self.error(DiagnosticRule::Type, span, refusal);
                     return None;
                 }
             }
             let element = tensor.elem.clone();
-            self.elements.stored(&element);
+            if record {
+                self.elements.record_stored(&element);
+            } else {
+                self.elements.stored(&element);
+            }
         }
         if self
             .live_borrows()
@@ -560,7 +568,7 @@ impl<'a> Checker<'a> {
             );
             return None;
         }
-        self.scalar_symbols.remove(&root);
+        self.source_values.remove(&root);
         let tensor_effect = matches!(self.locals[root.index()].ty, ValueType::Tensor(_));
         self.dyn_views.retain(|(start, end, _, _)| {
             let mentions =
@@ -588,7 +596,9 @@ impl<'a> Checker<'a> {
                 );
             }
         }
-        let element_domain = self.elements.domain(&self.sig.elem_params);
+        let element_domain = self
+            .elements
+            .domain(&self.sig.elem_params, &self.sig.element_predicates);
         CheckedParts {
             body: CheckedBody {
                 locals: self.locals,
@@ -660,14 +670,16 @@ fn divisors(arena: &ExprArena, e: IntExpr) -> Vec<IntExpr> {
 }
 
 /// Whether publishing/assigning elements of `value` into storage of `target`
-/// is a defined rounding.
+/// is a defined rounding. An element parameter binds a float-decoded
+/// representation, so a pairing with one that some binding admits is decided
+/// where lowering binds it (`install_value`).
 pub(crate) fn elem_rounds(value: &Elem, target: &Elem) -> bool {
     match (value, target) {
         (Elem::Repr(a), Elem::Repr(b)) => a == b,
-        (Elem::Repr(_), _) | (_, Elem::Repr(_)) => false,
+        (Elem::Repr(_), Elem::Dtype(_)) | (Elem::Dtype(_), Elem::Repr(_)) => false,
         (Elem::Dtype(a), Elem::Dtype(b)) => a == b || (a.is_float() && b.is_float()),
         (Elem::Dtype(a), Elem::Param(_)) | (Elem::Param(_), Elem::Dtype(a)) => a.is_float(),
-        (Elem::Param(_), Elem::Param(_)) => true,
+        (Elem::Repr(_) | Elem::Param(_), Elem::Param(_)) | (Elem::Param(_), Elem::Repr(_)) => true,
     }
 }
 
@@ -679,9 +691,6 @@ struct CheckedOutcome {
     initialization: initialization::Contract,
     element_domain: crate::checked::ElementDomain,
     placement: Placement,
-    /// The family dimension plan, for a family contract whose dimensions
-    /// input tensor axes determine.
-    plan: Option<dimensions::DimensionPlan>,
 }
 
 fn check_definition(env: &Env, def: usize) -> CheckedOutcome {
@@ -691,34 +700,6 @@ fn check_definition(env: &Env, def: usize) -> CheckedOutcome {
     let (mut root, mut result) = c.function_body(declared.body, declared.name_span);
     let initialization =
         initialization::check(&mut c, &mut root, &mut result, initialization_facts);
-    let contract = env.resolved.families[declared.family.index()]
-        .contract
-        .index()
-        == def;
-    let plan = if contract {
-        match dimensions::plan_dimensions(&c.arena, &c.sig.dimensions, &c.sig.params) {
-            Ok(plan) => Some(plan),
-            Err(error) => {
-                c.error(
-                    DiagnosticRule::Dimension,
-                    declared.name_span,
-                    format!(
-                        "dimensions {} are not determined by the input tensor axes; every dimension of `{}` must be derivable from its tensor parameters' extents",
-                        error
-                            .underdetermined
-                            .iter()
-                            .map(|name| format!("`{name}`"))
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                        c.sig.name
-                    ),
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
     let parts = c.finish(root, result);
     CheckedOutcome {
         body: parts.body,
@@ -728,7 +709,6 @@ fn check_definition(env: &Env, def: usize) -> CheckedOutcome {
         initialization,
         element_domain: parts.element_domain,
         placement: parts.placement,
-        plan,
     }
 }
 
@@ -740,7 +720,7 @@ pub(crate) fn check_program(
     program: ProgramId,
     semantic_hash: ModuleHash,
     diagnostics: &mut Vec<Located>,
-) -> Option<(Vec<ir::Definition>, Vec<ir::Family>)> {
+) -> Option<(Vec<ir::Definition>, Vec<ir::Family>, Vec<[u8; 32]>)> {
     let resolved = resolve::resolve(files, program, diagnostics);
     let count = resolved.declared.len();
     // L20: every recursion is one diagnostic, and every definition that
@@ -752,14 +732,55 @@ pub(crate) fn check_program(
             .map(|cycle| cycle.diagnostic(&resolved.declared)),
     );
     let mut outcomes: Vec<Option<CheckedOutcome>> = (0..count).map(|_| None).collect();
-    for def in order {
+    // A definition reads only its callees' outcomes, so the definitions of
+    // one call depth are independent: check each depth's definitions on
+    // separate threads, after every deeper callee is complete.
+    let mut depth = vec![0usize; count];
+    let mut levels: Vec<Vec<usize>> = Vec::new();
+    for &def in &order {
+        depth[def] = resolved
+            .call_graph
+            .callees(def)
+            .iter()
+            .map(|callee| depth[*callee] + 1)
+            .max()
+            .unwrap_or(0);
+        if levels.len() <= depth[def] {
+            levels.resize_with(depth[def] + 1, Vec::new);
+        }
+        levels[depth[def]].push(def);
+    }
+    let workers = std::thread::available_parallelism().map_or(1, usize::from);
+    for level in levels {
         let env = Env {
             resolved: &resolved,
             texts,
             checked: &outcomes,
         };
-        let checked = check_definition(&env, def);
-        outcomes[def] = Some(checked);
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let checked = std::thread::scope(|scope| {
+            let threads = (0..workers.min(level.len()))
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut checked = Vec::new();
+                        loop {
+                            let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some(&def) = level.get(index) else {
+                                return checked;
+                            };
+                            checked.push((def, check_definition(&env, def)));
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            threads
+                .into_iter()
+                .flat_map(|thread| thread.join().expect("definition check thread panicked"))
+                .collect::<Vec<_>>()
+        });
+        for (def, outcome) in checked {
+            outcomes[def] = Some(outcome);
+        }
     }
     let mut clean = diagnostics.is_empty();
     for (outcome, declared) in outcomes.iter_mut().zip(&resolved.declared) {
@@ -775,12 +796,13 @@ pub(crate) fn check_program(
         return None;
     }
     // Without a recursion, the order holds every definition.
-    let mut outcomes = outcomes.into_iter().flatten().collect::<Vec<_>>();
+    let outcomes = outcomes.into_iter().flatten().collect::<Vec<_>>();
     assert_eq!(
         outcomes.len(),
         count,
         "definition checking order omitted a body"
     );
+    let contents = family_contents(&resolved, &order);
     let families = resolved
         .families
         .iter()
@@ -789,10 +811,6 @@ pub(crate) fn check_program(
             contract: family.contract,
             bodies: family.bodies.clone(),
             lowerings: family.lowerings.clone(),
-            dimension_plan: outcomes[family.contract.index()]
-                .plan
-                .take()
-                .expect("a checked family contract has its dimension plan"),
         })
         .collect();
     let mut definitions = Vec::with_capacity(count);
@@ -805,6 +823,7 @@ pub(crate) fn check_program(
             .map(|(i, p)| ir::Param {
                 name: p.name.clone(),
                 ownership: p.ownership.clone(),
+                binding: p.binding,
                 ty: p.ty.clone(),
                 local: LocalId::new(
                     u32::try_from(i).expect("definition has more than u32::MAX parameters"),
@@ -841,27 +860,148 @@ pub(crate) fn check_program(
             span: declared.span,
         });
     }
-    Some((definitions, families))
+    Some((definitions, families, contents))
 }
 
-pub(crate) fn check_closed(
+/// The content of each family, by family index: everything a call to it,
+/// or the entry it is, depends on. A definition's content is its
+/// declaration's structure (module constants are integers in it; source
+/// positions are not) with the content of every family it may call (the
+/// name call graph, the single owner of what a body may reach); a family's
+/// is its contract's content, then its other bodies' and its lowerings',
+/// each set in content order. So a change anywhere in a family's closure
+/// changes its content, and nothing outside the closure (another
+/// definition, a source path, where text sits) is in it. `order` is
+/// bottom-up and holds every definition: a module that checked has no
+/// recursion.
+fn family_contents(resolved: &Resolved<'_>, order: &[usize]) -> Vec<[u8; 32]> {
+    use sha2::Digest as _;
+    fn family(family: &resolve::DeclaredFamily, definitions: &[Option<[u8; 32]>]) -> [u8; 32] {
+        let content = |member: &crate::ids::FunctionId| {
+            definitions[member.index()].expect("a family's members precede its callers bottom-up")
+        };
+        let sorted = |members: &mut dyn Iterator<Item = &crate::ids::FunctionId>| {
+            let mut contents = members.map(content).collect::<Vec<_>>();
+            contents.sort_unstable();
+            contents
+        };
+        let bodies = sorted(&mut family.bodies.iter().filter(|body| **body != family.contract));
+        let lowerings = sorted(&mut family.lowerings.iter());
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"seismic-family-content-v1");
+        hasher.update(content(&family.contract));
+        for set in [bodies, lowerings] {
+            hasher.update((set.len() as u64).to_le_bytes());
+            set.iter().for_each(|member| hasher.update(member));
+        }
+        hasher.finalize().into()
+    }
+    let mut definitions = vec![None; resolved.declared.len()];
+    for &definition in order {
+        let declared = &resolved.declared[definition];
+        let called = resolved
+            .call_graph
+            .callees(definition)
+            .iter()
+            .map(|callee| resolved.declared[*callee].family.index())
+            .collect::<BTreeSet<_>>();
+        let mut callees = called
+            .into_iter()
+            .map(|called| family(&resolved.families[called], &definitions))
+            .collect::<Vec<_>>();
+        callees.sort_unstable();
+        let structure = ast::structure(declared.declaration);
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"seismic-definition-content-v1");
+        hasher.update((structure.len() as u64).to_le_bytes());
+        hasher.update(structure.as_bytes());
+        hasher.update((callees.len() as u64).to_le_bytes());
+        callees.iter().for_each(|callee| hasher.update(callee));
+        definitions[definition] = Some(hasher.finalize().into());
+    }
+    resolved
+        .families
+        .iter()
+        .map(|declared| family(declared, &definitions))
+        .collect()
+}
+
+/// Check `sources`, reading each native implementation's source with
+/// `read` (its entry's name and its declaration): the module, and the
+/// sources read, by entry and backend. Which of an implementation's
+/// parameters change generated code is derived here, from the source read
+/// ([`crate::native_source::derive_codes`]), so no checked implementation
+/// holds a code parameter its source does not state.
+pub(crate) fn check_closed<E>(
     sources: crate::checked::SourceSet,
     module_id: ModuleId,
     program: ProgramId,
-) -> Result<crate::checked::internals::Module, crate::checked::SourceError> {
-    use crate::checked::{Diagnostics, SourceDiagnostic, SourceError};
-    let mut parsed = Vec::new();
+    read: &mut crate::checked::NativeReader<'_, E>,
+) -> Result<
+    (crate::checked::internals::Module, crate::checked::NativeSources),
+    crate::checked::CheckFailure<E>,
+> {
+    use crate::checked::{CheckFailure, Diagnostics, SourceDiagnostic, SourceError};
+    // Two passes: the first finds every file's module constants, which the
+    // second reads as the integers they name.
+    let mut constants = std::collections::BTreeMap::new();
+    let mut declared = Vec::new();
     let mut parse_diagnostics = Vec::new();
-    for (file, source) in sources.files().iter().enumerate() {
-        match crate::syntax::parse(&source.text) {
-            Ok(ast) => parsed.push((file, ast)),
+    let empty = std::collections::BTreeMap::new();
+    for source in sources.files() {
+        match crate::syntax::parse(&source.text, &empty) {
+            Ok(ast) => {
+                for constant in &ast.constants {
+                    if constants.contains_key(&constant.name.name) {
+                        parse_diagnostics.push(SourceDiagnostic::located(
+                            source,
+                            crate::span::Diagnostic::with_rule(
+                                crate::checked::DiagnosticRule::Resolution,
+                                constant.name.span,
+                                format!("`{}` is declared twice", constant.name.name),
+                            ),
+                        ));
+                    }
+                    constants.insert(constant.name.name.clone(), constant.value);
+                    declared.push((constant.name.name.clone(), constant.value));
+                }
+            }
             Err(diagnostic) => {
                 parse_diagnostics.push(SourceDiagnostic::located(source, diagnostic))
             }
         }
     }
+    if let Some(diagnostics) = Diagnostics::new(std::mem::take(&mut parse_diagnostics)) {
+        return Err(CheckFailure::Source(SourceError::new(diagnostics)));
+    }
+    let mut parsed = Vec::new();
+    for (file, source) in sources.files().iter().enumerate() {
+        match crate::syntax::parse(&source.text, &constants) {
+            Ok(ast) => {
+                for decl in &ast.decls {
+                    if constants.contains_key(&decl.name().name) {
+                        parse_diagnostics.push(SourceDiagnostic::located(
+                            source,
+                            crate::span::Diagnostic::with_rule(
+                                crate::checked::DiagnosticRule::Resolution,
+                                decl.name().span,
+                                format!("`{}` is a module constant's name", decl.name().name),
+                            ),
+                        ));
+                    }
+                }
+                parsed.push((file, ast));
+            }
+            Err(diagnostic) => {
+                parse_diagnostics.push(SourceDiagnostic::located(source, diagnostic))
+            }
+        }
+    }
+    for (file, diagnostic) in crate::projection::expand(&mut parsed) {
+        parse_diagnostics.push(SourceDiagnostic::located(&sources.files()[file], diagnostic));
+    }
     if let Some(diagnostics) = Diagnostics::new(parse_diagnostics) {
-        return Err(SourceError::new(diagnostics));
+        return Err(CheckFailure::Source(SourceError::new(diagnostics)));
     }
 
     use sha2::Digest as _;
@@ -888,9 +1028,10 @@ pub(crate) fn check_closed(
         .map(|item| SourceDiagnostic::located(&sources.files()[item.file], item.diagnostic))
         .collect();
     if let Some(diagnostics) = Diagnostics::new(diagnostics) {
-        return Err(SourceError::new(diagnostics));
+        return Err(CheckFailure::Source(SourceError::new(diagnostics)));
     }
-    let (definitions, families) = checked.expect("a program without diagnostics is checked");
+    let (definitions, families, contents) =
+        checked.expect("a program without diagnostics is checked");
 
     let mut entries = Vec::new();
     let mut entry_families = Vec::new();
@@ -904,10 +1045,17 @@ pub(crate) fn check_closed(
         stable_hasher.update(semantic_hash.digest());
         stable_hasher.update((family_ordinal as u64).to_le_bytes());
         let stable = crate::ids::StableEntryId::new(stable_hasher.finalize().into());
-        entries.push(entry_info(id, stable, contract));
+        let mut content_hasher = sha2::Sha256::new();
+        content_hasher.update(b"seismic-entry-content-v1");
+        content_hasher.update(crate::bundle::COMPILER_SEMANTIC_VERSION.as_bytes());
+        content_hasher.update(crate::registry::REGISTRY_REVISION.as_bytes());
+        content_hasher.update(contents[family_ordinal]);
+        let content = crate::ids::EntryContent::new(content_hasher.finalize().into());
+        entries.push(entry_info(id, stable, content, contract));
         entry_families.push(family_ordinal);
     }
     let mut native_implementations = Vec::new();
+    let mut native_sources = crate::checked::NativeSources::new();
     let mut native_diagnostics = Vec::new();
     for (file, parsed_file) in &parsed {
         for declaration in &parsed_file.decls {
@@ -971,8 +1119,48 @@ pub(crate) fn check_closed(
                 ));
                 continue;
             }
-            match check_native(native, entry, backend, &sources.files()[*file].path) {
-                Ok(implementation) => native_implementations.push(implementation),
+            let ordinal = entries
+                .iter()
+                .position(|candidate| candidate.id == entry.id)
+                .expect("a matched entry is one of the module's");
+            let contract = &definitions[families[entry_families[ordinal]].contract.index()];
+            match check_native(
+                native,
+                entry,
+                contract,
+                backend,
+                &sources.files()[*file].path,
+            ) {
+                Ok(mut implementation) => {
+                    let source = read(&entry.name, &implementation).map_err(CheckFailure::Read)?;
+                    if let (Some(kind), Some(text), crate::registry::BackendName::Cuda) =
+                        (native.projected_rows, source.as_deref(), backend)
+                    {
+                        if let Err(message) = crate::native_source::check_rows_kind(kind, text) {
+                            native_diagnostics.push(SourceDiagnostic::new(
+                                &sources.files()[*file],
+                                native.span,
+                                DiagnosticRule::NativeDeclaration,
+                                format!("native source `{}`: {message}", implementation.source_path),
+                            ));
+                            continue;
+                        }
+                    }
+                    match crate::native_source::derive_codes(&mut implementation, source.as_deref()) {
+                        Ok(()) => {
+                            if let Some(source) = source {
+                                native_sources.insert((entry.id, backend), source);
+                            }
+                            native_implementations.push(implementation);
+                        }
+                        Err(error) => native_diagnostics.push(SourceDiagnostic::new(
+                            &sources.files()[*file],
+                            native.span,
+                            DiagnosticRule::NativeDeclaration,
+                            format!("native source `{}`: {error}", implementation.source_path),
+                        )),
+                    }
+                }
                 Err(errors) => {
                     for (span, message) in errors {
                         native_diagnostics.push(SourceDiagnostic::new(
@@ -987,30 +1175,270 @@ pub(crate) fn check_closed(
         }
     }
     if let Some(diagnostics) = Diagnostics::new(native_diagnostics) {
-        return Err(SourceError::new(diagnostics));
+        return Err(CheckFailure::Source(SourceError::new(diagnostics)));
     }
-    Ok(crate::checked::internals::Module {
-        id: module_id,
-        program,
-        semantic_hash,
-        sources,
-        entries,
-        native_implementations,
-        entry_families,
-        definitions,
-        families,
-    })
+    Ok((
+        crate::checked::internals::Module {
+            id: module_id,
+            program,
+            semantic_hash,
+            sources: std::sync::Arc::new(sources),
+            entries,
+            native_implementations,
+            entry_families,
+            definitions,
+            families,
+            constants: declared,
+        },
+        native_sources,
+    ))
+}
+
+/// The record ports `declared` lists (`records`), each a device tensor
+/// parameter or tensor result with a leading record axis, listed once; what
+/// is wrong with any is in `errors`.
+fn native_records(
+    declared: &[crate::syntax::ast::NativeRecordDecl],
+    contract: &ir::Definition,
+    errors: &mut Vec<(Span, String)>,
+) -> Vec<crate::checked::RecordPort> {
+    let mut records = Vec::new();
+    let results = result_leaves(&contract.result);
+    for record in declared {
+        let recorded = |ty: &ValueType| matches!(ty, ValueType::Tensor(tensor) if !tensor.axes.is_empty());
+        let (span, port) = match record {
+            ast::NativeRecordDecl::Parameter(name) => (
+                name.span,
+                match contract.params.iter().find(|parameter| parameter.name == name.name) {
+                    Some(ir::Param {
+                        ownership:
+                            ir::Ownership::Owned | ir::Ownership::Shared | ir::Ownership::Exclusive,
+                        ty,
+                        ..
+                    }) if recorded(ty) => Ok(crate::checked::RecordPort::Parameter(name.name.clone())),
+                    Some(_) => Err(format!(
+                        "record port `{}` must be a device tensor with a leading record axis",
+                        name.name
+                    )),
+                    None => Err(format!("record port `{}` is not an entry parameter", name.name)),
+                },
+            ),
+            ast::NativeRecordDecl::Result { ordinal, span } => (
+                *span,
+                match usize::try_from(*ordinal).ok().and_then(|ordinal| results.get(ordinal)) {
+                    Some((_, ty)) if recorded(ty) => {
+                        Ok(crate::checked::RecordPort::Result(*ordinal as u32))
+                    }
+                    Some(_) => Err(format!(
+                        "record port `result {ordinal}` must be a tensor with a leading record axis"
+                    )),
+                    None => Err(format!("record port `result {ordinal}` is not an entry result")),
+                },
+            ),
+        };
+        match port {
+            Ok(port) if records.contains(&port) => errors.push((
+                span,
+                match record {
+                    ast::NativeRecordDecl::Parameter(name) => {
+                        format!("record port `{}` is listed twice", name.name)
+                    }
+                    ast::NativeRecordDecl::Result { ordinal, .. } => {
+                        format!("record port `result {ordinal}` is listed twice")
+                    }
+                },
+            )),
+            Ok(port) => records.push(port),
+            Err(message) => errors.push((span, message)),
+        }
+    }
+    records
+}
+
+/// The operand an expanded buffer holds (`ast::ScratchOperandDecl`), and the
+/// result whose emitted operand it serves (`emission`): `Some((None, None))`
+/// for a buffer that serves none, `None` where it fails to check (its errors
+/// recorded). A consumer's operand is of one of the entry's tensor
+/// parameters, formed by one of the declaration's launches; a producer's, of
+/// one of its tensor results; a declared operand is a projection's text,
+/// which only its expansion places. `condition` checks a clause.
+#[allow(clippy::type_complexity)]
+fn native_operand(
+    backend: crate::registry::BackendName,
+    native: &crate::syntax::ast::NativeDecl,
+    entry: &crate::checked::EntryInfo,
+    buffer: &ast::NativeScratchDecl,
+    errors: &mut Vec<(Span, String)>,
+    condition: &mut dyn FnMut(&str, &ast::Expr, &mut Vec<(Span, String)>) -> Option<crate::checked::NativeCondition>,
+) -> Option<(Option<crate::checked::NativeOperand>, Option<u32>)> {
+    use crate::checked::{NativeOperand, ParameterSummaryKind, ResultSummaryKind};
+    fn refuse<T>(errors: &mut Vec<(Span, String)>, span: Span, message: String) -> Option<T> {
+        errors.push((span, message));
+        None
+    }
+    let emission = match buffer.emission {
+        None => None,
+        Some(result) => match entry.results.get(result as usize).map(|summary| &summary.kind) {
+            Some(ResultSummaryKind::Tensor { .. }) => Some(result as u32),
+            _ => {
+                return refuse(
+                    errors,
+                    buffer.span,
+                    format!("`{}` has no tensor result {result} to emit the operand of", entry.name),
+                );
+            }
+        },
+    };
+    let operand = match &buffer.operand {
+        None => None,
+        Some(ast::ScratchOperandDecl::Declared { .. }) => {
+            return refuse(
+                errors,
+                buffer.span,
+                "only a projection's buffer is declared an operand; an entry takes it with `project .. operand (..)`".to_owned(),
+            );
+        }
+        Some(ast::ScratchOperandDecl::Formed { parameter, formation, pairs, rows, norm, formed, nvfp4 }) => {
+            let ordinal = entry.parameters.iter().position(|candidate| {
+                candidate.name == parameter.name
+                    && matches!(candidate.kind, ParameterSummaryKind::Tensor { .. })
+            });
+            let Some(ordinal) = ordinal else {
+                return refuse(
+                    errors,
+                    parameter.span,
+                    format!("`{}` is not a tensor parameter of `{}`", parameter.name, entry.name),
+                );
+            };
+            if backend == crate::registry::BackendName::Cpu {
+                if let ParameterSummaryKind::Tensor {
+                    element: crate::checked::ElementSummary::Parameter(element),
+                    ..
+                } = &entry.parameters[ordinal].kind
+                {
+                    let uses = entry
+                        .element_domain
+                        .parameters()
+                        .iter()
+                        .find(|candidate| candidate.name == *element)
+                        .map(|candidate| candidate.uses);
+                    if matches!(
+                        entry.element_domain.cpu_binding(element),
+                        Some(crate::checked::CpuBinding::Packed | crate::checked::CpuBinding::External)
+                    ) || uses.is_some_and(|uses| uses.component_read || uses.integer_code_read)
+                    {
+                        return refuse(
+                            errors,
+                            parameter.span,
+                            format!("`{}` is not dense rows in `{}`", parameter.name, entry.name),
+                        );
+                    }
+                }
+            }
+            let Some(launch) = native.launches.iter().position(|launch| launch.kernel.name == formation.name) else {
+                return refuse(errors, formation.span, format!("`{}` is not a launch of the declaration", formation.name));
+            };
+            let norm = operand_norm(backend, entry, norm.as_ref(), errors);
+            let pairs = condition("operand when", pairs, errors);
+            let formed = condition("formed", formed, errors);
+            let nvfp4 = condition("nvfp4", nvfp4, errors);
+            Some(NativeOperand::Formed {
+                parameter: ordinal as u32,
+                formation: launch as u32,
+                pairs: pairs?,
+                rows: *rows,
+                norm: norm?,
+                formed: formed?,
+                nvfp4: nvfp4?,
+            })
+        }
+        Some(ast::ScratchOperandDecl::Emitted { rows, norm }) => {
+            let norm = operand_norm(backend, entry, norm.as_ref(), errors)?;
+            let Some(result) = emission else {
+                return refuse(
+                    errors,
+                    buffer.span,
+                    "an emitted operand is one of a producer's `for emits` buffers, which serve its result".to_owned(),
+                );
+            };
+            Some(NativeOperand::Emitted { result, rows: *rows, norm })
+        }
+    };
+    Some((operand, emission))
+}
+
+/// The norm an operand is formed under (`normed (WEIGHT, EPSILON)`): a
+/// tensor parameter and an `f32` scalar of the entry. `Some(None)` for an
+/// operand without one, `None` where it fails to check.
+fn operand_norm(
+    backend: crate::registry::BackendName,
+    entry: &crate::checked::EntryInfo,
+    norm: Option<&ast::OperandNormDecl>,
+    errors: &mut Vec<(Span, String)>,
+) -> Option<Option<crate::checked::NativeOperandNorm>> {
+    use crate::checked::{CpuBinding, ElementSummary, ParameterSummaryKind};
+    let Some(norm) = norm else { return Some(None) };
+    let find = |name: &ast::Ident, scalar: bool| {
+        entry.parameters.iter().position(|candidate| {
+            candidate.name == name.name
+                && match &candidate.kind {
+                    ParameterSummaryKind::Tensor { .. } => !scalar,
+                    ParameterSummaryKind::Scalar(dtype) => scalar && *dtype == crate::types::DType::F32,
+                    _ => false,
+                }
+        })
+    };
+    let mut weight = find(&norm.weight, false);
+    let epsilon = find(&norm.epsilon, true);
+    match weight {
+        None => errors.push((norm.weight.span, format!("`{}` is not a tensor parameter of `{}`", norm.weight.name, entry.name))),
+        Some(ordinal) if backend == crate::registry::BackendName::Cpu => {
+            if let ParameterSummaryKind::Tensor {
+                element: ElementSummary::Parameter(element),
+                ..
+            } = &entry.parameters[ordinal].kind
+            {
+                if !matches!(entry.element_domain.cpu_binding(element), None | Some(CpuBinding::Weights)) {
+                    errors.push((
+                        norm.weight.span,
+                        format!("`{}` is not read as a weight in `{}`", norm.weight.name, entry.name),
+                    ));
+                    weight = None;
+                }
+            }
+        }
+        Some(_) => {}
+    }
+    if epsilon.is_none() {
+        errors.push((norm.epsilon.span, format!("`{}` is not an `f32` parameter of `{}`", norm.epsilon.name, entry.name)));
+    }
+    Some(Some(crate::checked::NativeOperandNorm { weight: weight? as u32, epsilon: epsilon? as u32 }))
 }
 
 /// Check one native declaration against its entry. Every problem is reported.
 fn check_native(
     native: &crate::syntax::ast::NativeDecl,
     entry: &crate::checked::EntryInfo,
+    contract: &ir::Definition,
     backend: crate::registry::BackendName,
     declared_in: &str,
 ) -> Result<crate::checked::NativeImplementation, Vec<(Span, String)>> {
     use crate::checked::{NativeLaunch, NativeNatExpr, NativeParameter, NativeScratch};
     let mut errors = Vec::new();
+    let destinations: Vec<String> = entry
+        .element_domain
+        .conversions()
+        .iter()
+        .filter_map(|conversion| match &conversion.target {
+            crate::checked::ElementTarget::Parameter(parameter) => Some(parameter.clone()),
+            crate::checked::ElementTarget::Concrete(_) => None,
+        })
+        .collect();
+    let element_reads = NativeElements {
+        parameters: &entry.element_parameters,
+        destinations: &destinations,
+        backend,
+    };
 
     let mut statics: Vec<String> = Vec::new();
     for name in &native.statics {
@@ -1032,16 +1460,11 @@ fn check_native(
         }
     }
 
-    let mut params: Vec<NativeParameter> = Vec::new();
+    // Each parameter with its values; its default is lowered once the terms
+    // are known.
+    let mut declared: Vec<(String, Vec<u64>)> = Vec::new();
     for param in &native.params {
         let name = &param.name.name;
-        if backend == crate::registry::BackendName::Cpu && param.code {
-            errors.push((
-                param.span,
-                "CPU native parameters are runtime values; `code` is for compiled GPU kernels"
-                    .to_owned(),
-            ));
-        }
         if entry.dimensions.contains(name) {
             errors.push((
                 param.name.span,
@@ -1052,7 +1475,7 @@ fn check_native(
             ));
             continue;
         }
-        if params.iter().any(|existing| &existing.name == name) {
+        if declared.iter().any(|(existing, _)| existing == name) {
             errors.push((
                 param.name.span,
                 format!("native parameter `{name}` is declared twice"),
@@ -1070,18 +1493,11 @@ fn check_native(
                 values.push(*value);
             }
         }
-        params.push(NativeParameter {
-            name: name.clone(),
-            code: param.code,
-            arithmetic: param.arithmetic,
-            form: param.form,
-            values,
-            role: crate::checked::NativeParameterRole::Declared,
-        });
+        declared.push((name.clone(), values));
     }
-    let parameter_names = params
+    let parameter_names = declared
         .iter()
-        .map(|parameter| parameter.name.clone())
+        .map(|(name, _)| name.clone())
         .collect::<Vec<_>>();
 
     // Named terms are substitution: every later expression of the
@@ -1105,7 +1521,7 @@ fn check_native(
             continue;
         }
         let value = native_term_expansion(&term.value, &terms);
-        match native_nat_expr(&value, &entry.dimensions, &parameter_names) {
+        match native_nat_expr(&value, &entry.dimensions, &parameter_names, element_reads) {
             Ok(_) => terms.push((name.clone(), value)),
             Err(message) => errors.push((term.value.span, message)),
         }
@@ -1119,8 +1535,16 @@ fn check_native(
         };
         let mut declaration = native.clone();
         declaration.constraint.iter_mut().for_each(expand);
-        for class in &mut declaration.error_classes {
-            expand(&mut class.when);
+        for param in declaration
+            .params
+            .iter_mut()
+            .chain(declaration.launches.iter_mut().flat_map(|launch| &mut launch.params))
+        {
+            match &mut param.default {
+                ast::NativeDefaultDecl::Value(expr)
+                | ast::NativeDefaultDecl::Least(expr)
+                | ast::NativeDefaultDecl::Greatest(expr) => expand(expr),
+            }
         }
         for scratch in &mut declaration.scratch {
             expand(&mut scratch.bytes);
@@ -1128,6 +1552,7 @@ fn check_native(
         }
         for launch in &mut declaration.launches {
             launch.when.iter_mut().for_each(expand);
+            launch.constraint.iter_mut().for_each(expand);
             launch
                 .threadgroups
                 .iter_mut()
@@ -1141,6 +1566,117 @@ fn check_native(
         expanded = declaration;
         &expanded
     };
+
+    // A launch's `where` restricts the configurations of the parameters it
+    // reads, as one more conjunct of the declaration's: the checks below
+    // hold it to what they hold every conjunct to.
+    let folded;
+    let native = if native.launches.iter().all(|launch| launch.constraint.is_none()) {
+        native
+    } else {
+        let mut declaration = native.clone();
+        for launch in &native.launches {
+            if let Some(condition) = &launch.constraint {
+                declaration.constraint = Some(match declaration.constraint.take() {
+                    None => condition.clone(),
+                    Some(constraint) => crate::syntax::ast::Expr {
+                        span: constraint.span.to(condition.span),
+                        kind: crate::syntax::ast::ExprKind::Binary {
+                            op: crate::syntax::ast::BinaryOp::And,
+                            lhs: Box::new(constraint),
+                            rhs: Box::new(condition.clone()),
+                        },
+                    },
+                });
+            }
+        }
+        folded = declaration;
+        &folded
+    };
+
+    // Every default reads only the device, the static dimensions and the
+    // bound elements, and `least`/`greatest` the parameter itself; a default
+    // that reads no dimension and no element is checked here on every
+    // device of the backend.
+    let lowered_default = |param: &ast::NativeParamDecl,
+                           values: &[u64],
+                           errors: &mut Vec<(Span, String)>|
+     -> Option<crate::checked::NativeDefault> {
+        let name = &param.name.name;
+        let (expr, lowered) = match &param.default {
+            ast::NativeDefaultDecl::Value(expr) => (
+                expr,
+                native_nat_expr(expr, &entry.dimensions, &[], element_reads)
+                    .map(crate::checked::NativeDefault::Value)
+                    .map_err(|message| (expr.span, message)),
+            ),
+            ast::NativeDefaultDecl::Least(expr) | ast::NativeDefaultDecl::Greatest(expr) => {
+                let least = matches!(param.default, ast::NativeDefaultDecl::Least(_));
+                (
+                    expr,
+                    native_condition(
+                        "default",
+                        expr,
+                        &entry.dimensions,
+                        std::slice::from_ref(name),
+                        element_reads,
+                    )
+                    .map(|condition| match least {
+                        true => crate::checked::NativeDefault::Least(condition),
+                        false => crate::checked::NativeDefault::Greatest(condition),
+                    }),
+                )
+            }
+        };
+        let default = lowered.map_err(|error| errors.push(error)).ok()?;
+        let mut dimensions = Vec::new();
+        let element = match &default {
+            crate::checked::NativeDefault::Value(value) => {
+                value.dimensions(&mut dimensions);
+                value.element_read().is_some()
+            }
+            crate::checked::NativeDefault::Least(condition)
+            | crate::checked::NativeDefault::Greatest(condition) => {
+                condition.dimensions(&mut dimensions);
+                condition.element_read().is_some()
+            }
+        };
+        if let Some(dynamic) = dimensions.iter().find(|dimension| !statics.contains(dimension)) {
+            errors.push((expr.span, format!("the default of `{name}` reads dimension `{dynamic}`, which is not static; a default reads only the device, the static dimensions and the bound elements")));
+            return None;
+        }
+        if dimensions.is_empty() && !element {
+            if let Err(error) = default.on_every_device(name, values, backend) {
+                errors.push((expr.span, error.to_string()));
+                return None;
+            }
+        }
+        Some(default)
+    };
+    let params = declared
+        .into_iter()
+        .filter_map(|(name, values)| {
+            let param = native
+                .params
+                .iter()
+                .find(|param| param.name.name == name)
+                .expect("every checked parameter is declared");
+            let default = lowered_default(param, &values, &mut errors)?;
+            Some(NativeParameter {
+                name,
+                // Derived from the source in `check_closed`, before the
+                // implementation is kept.
+                code: false,
+                arithmetic: param.arithmetic,
+                form: param.form,
+                values,
+                default,
+                role: crate::checked::NativeParameterRole::Declared,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let records = native_records(&native.records, contract, &mut errors);
 
     let mut elements: Vec<crate::checked::NativeElementCoverage> = Vec::new();
     for coverage in &native.elements {
@@ -1215,7 +1751,7 @@ fn check_native(
     }
 
     let expression = |expr: &crate::syntax::ast::Expr, errors: &mut Vec<(Span, String)>| {
-        native_nat_expr(expr, &entry.dimensions, &parameter_names)
+        native_nat_expr(expr, &entry.dimensions, &parameter_names, element_reads)
             .map_err(|message| errors.push((expr.span, message)))
             .ok()
     };
@@ -1226,10 +1762,12 @@ fn check_native(
                      expr: &Option<crate::syntax::ast::Expr>,
                      errors: &mut Vec<(Span, String)>| match expr {
         None => Some(None),
-        Some(expr) => native_condition(clause, expr, &entry.dimensions, &parameter_names)
-            .map_err(|error| errors.push(error))
-            .ok()
-            .map(Some),
+        Some(expr) => {
+            native_condition(clause, expr, &entry.dimensions, &parameter_names, element_reads)
+                .map_err(|error| errors.push(error))
+                .ok()
+                .map(Some)
+        }
     };
 
     let launch_names = native
@@ -1242,8 +1780,10 @@ fn check_native(
         .cloned()
         .chain(launch_names.iter().cloned())
         .collect::<Vec<_>>();
+    // `where` may read the elements: admissible configurations are those of
+    // the implementation at its bindings (`NativeImplementation::at_elements`).
     let constraint = native.constraint.as_ref().and_then(|expr| {
-        native_condition("where", expr, &entry.dimensions, &where_names)
+        native_condition("where", expr, &entry.dimensions, &where_names, element_reads)
             .map_err(|error| errors.push(error))
             .ok()
     });
@@ -1308,47 +1848,8 @@ fn check_native(
         }
     }
 
-    // An error class is a property of the entry's configuration: its
-    // condition reads static dimensions and entry parameters only.
-    let mut error_classes: Vec<crate::checked::NativeErrorClass> = Vec::new();
-    for class in &native.error_classes {
-        if error_classes
-            .iter()
-            .any(|existing| existing.name == class.name.name)
-        {
-            errors.push((
-                class.name.span,
-                format!("error class `{}` is declared twice", class.name.name),
-            ));
-            continue;
-        }
-        match native_condition(
-            "error_class",
-            &class.when,
-            &entry.dimensions,
-            &parameter_names,
-        ) {
-            Ok(when) => {
-                let mut read = Vec::new();
-                when.dimensions(&mut read);
-                if let Some(dynamic) = read.iter().find(|name| !statics.contains(name)) {
-                    errors.push((
-                        class.when.span,
-                        format!(
-                            "native `error_class` reads dimension `{dynamic}`, which is not static; its value is unknown at preparation"
-                        ),
-                    ));
-                }
-                error_classes.push(crate::checked::NativeErrorClass {
-                    name: class.name.name.clone(),
-                    when,
-                });
-            }
-            Err(error) => errors.push(error),
-        }
-    }
-
     let mut scratch: Vec<NativeScratch> = Vec::new();
+    let mut operands_checked = true;
     for buffer in &native.scratch {
         if scratch
             .iter()
@@ -1358,32 +1859,72 @@ fn check_native(
                 buffer.name.span,
                 format!("scratch buffer `{}` is declared twice", buffer.name.name),
             ));
+            operands_checked = false;
             continue;
         }
         let bytes = expression(&buffer.bytes, &mut errors);
         let when = condition("when", &buffer.when, &mut errors);
-        if let (Some(bytes), Some(when)) = (bytes, when) {
-            scratch.push(NativeScratch {
-                name: buffer.name.name.clone(),
-                bytes,
-                sync: buffer.sync,
-                when,
-            });
+        let operand = native_operand(backend, native, entry, buffer, &mut errors, &mut |clause, expr, errors| {
+            condition(clause, &Some(expr.clone()), errors).flatten()
+        });
+        if let (Some(bytes), Some(when), Some((operand, emission))) = (bytes, when, operand) {
+            let mut device_reads = Vec::new();
+            bytes.device_reads(&mut device_reads);
+            if let Some(condition) = &when {
+                condition.device_reads(&mut device_reads);
+            }
+            if let Some(read) = device_reads.first() {
+                errors.push((
+                    buffer.name.span,
+                    format!(
+                        "scratch buffer `{}` reads `device.{read}`, which has no value before a device is opened",
+                        buffer.name.name
+                    ),
+                ));
+                operands_checked = false;
+            } else {
+                scratch.push(NativeScratch {
+                    name: buffer.name.name.clone(),
+                    bytes,
+                    sync: buffer.sync,
+                    when,
+                    operand,
+                    emission,
+                });
+            }
+        } else {
+            operands_checked = false;
+        }
+    }
+
+    // A CPU form binds every element parameter by how the entry and its
+    // operand clauses use it.
+    if backend == crate::registry::BackendName::Cpu && operands_checked {
+        for parameter in entry.element_domain.parameters() {
+            if crate::checked::NativeImplementation::cpu_binding_with_scratch(
+                entry,
+                &scratch,
+                &parameter.name,
+            )
+            .is_none()
+            {
+                errors.push((
+                    native.function.span,
+                    format!(
+                        "`{}` has no CPU binding in `{}`: neither the entry nor its CPU declaration reads, stores or converts it",
+                        parameter.name, entry.name
+                    ),
+                ));
+            }
         }
     }
 
     let mut launches = Vec::new();
+    let mut launch_records: Vec<(usize, Vec<crate::checked::RecordPort>)> = Vec::new();
     for launch in &native.launches {
         let mut launch_params: Vec<NativeParameter> = Vec::new();
         for param in &launch.params {
             let name = &param.name.name;
-            if backend == crate::registry::BackendName::Cpu && param.code {
-                errors.push((
-                    param.span,
-                    "CPU native parameters are runtime values; `code` is for compiled GPU kernels"
-                        .to_owned(),
-                ));
-            }
             if entry.dimensions.contains(name) || parameter_names.contains(name) {
                 errors.push((
                     param.name.span,
@@ -1409,12 +1950,18 @@ fn check_native(
                     values.push(*value);
                 }
             }
+            let Some(default) = lowered_default(param, &values, &mut errors) else {
+                continue;
+            };
             launch_params.push(NativeParameter {
                 name: name.clone(),
-                code: param.code,
+                // Derived from the source in `check_closed`, before the
+                // implementation is kept.
+                code: false,
                 arithmetic: param.arithmetic,
                 form: param.form,
                 values,
+                default,
                 role: crate::checked::NativeParameterRole::Declared,
             });
         }
@@ -1434,6 +1981,138 @@ fn check_native(
                 reads.push(read.name.clone());
             }
         }
+        // A grid is three `i32` group counts an earlier launch wrote: a
+        // shared rank-1 tensor of the entry, or a 12-byte scratch buffer
+        // of the implementation, read when the launch runs. Every backend
+        // dispatches one: Metal and Vulkan indirectly, the CPU reading the
+        // words when the launch runs, CUDA as a grid-stride loop over them
+        // (the runtime's `abi::written_grid_loop`).
+        let grid = launch.grid.as_ref().and_then(|grid| {
+            let declared = contract.params.iter().find(|parameter| parameter.name == grid.name);
+            let held = scratch.iter().find(|buffer| buffer.name == grid.name);
+            let refusal = match (declared, held) {
+                (Some(_), Some(_)) => Some(format!(
+                    "launch grid `{}` names both an entry parameter and a scratch buffer",
+                    grid.name
+                )),
+                (None, None) => Some(format!(
+                    "launch grid `{}` is not an entry parameter or scratch buffer",
+                    grid.name
+                )),
+                (
+                    Some(ir::Param {
+                        ownership: ir::Ownership::Shared,
+                        ty: ValueType::Tensor(tensor),
+                        ..
+                    }),
+                    None,
+                ) if tensor.elem == crate::types::Elem::Dtype(DType::I32)
+                    && matches!(tensor.axes.as_slice(), [extent] if prove::constant(&contract.arena, *extent) == Some(3)) =>
+                {
+                    None
+                }
+                (Some(_), None) => Some(format!(
+                    "launch grid `{}` must be a `&tensor[3] i32` the launch reads",
+                    grid.name
+                )),
+                (None, Some(NativeScratch { bytes: NativeNatExpr::Constant(12), sync: false, when: None, .. })) => None,
+                (None, Some(_)) => Some(format!(
+                    "launch grid `{}` must be a scratch buffer of `bytes (12)`, neither `sync` nor `when`",
+                    grid.name
+                )),
+            };
+            match (refusal, held) {
+                (Some(message), _) => {
+                    errors.push((grid.span, message));
+                    None
+                }
+                (None, None) => Some(crate::checked::LaunchGrid::Parameter(grid.name.clone())),
+                (None, Some(_)) => Some(crate::checked::LaunchGrid::Scratch(grid.name.clone())),
+            }
+        });
+        // A launch condition's word is one `i32` the host writes between
+        // submissions: word `index` (0 unless written) of a shared rank-1
+        // `i32` tensor of the entry, of a constant extent past it, read when
+        // the run is encoded (`BackendName::encodes_runs`). A written grid's
+        // word is the device's, so it gates no launch
+        // (`checked::NativeLaunch::grid`). The launch's conditions are a
+        // conjunction, each of its own word: a word named twice is
+        // redundant or, under both values, leaves the launch never encoded.
+        let mut named: Vec<(&str, u64)> = Vec::new();
+        let conditions = launch
+            .conditions
+            .iter()
+            .filter_map(|condition| {
+                let word = &condition.word;
+                // The index a constant (module constants read as their
+                // integers), else unrepresentable: refused here.
+                let index = match &condition.index {
+                    None => Some(0),
+                    Some(index) => match index.kind {
+                        crate::syntax::ast::ExprKind::Int(index) => Some(index),
+                        _ => None,
+                    },
+                };
+                let Some(index) = index else {
+                    errors.push((word.span, format!("launch condition `{}`'s index must be a constant", word.name)));
+                    return None;
+                };
+                let written = match condition.index {
+                    Some(_) => format!("{}[{index}]", word.name),
+                    None => word.name.clone(),
+                };
+                let repeated = named.contains(&(word.name.as_str(), index));
+                named.push((&word.name, index));
+                let declared = contract.params.iter().find(|parameter| parameter.name == word.name);
+                let written_grid = native
+                    .launches
+                    .iter()
+                    .any(|other| other.grid.as_ref().is_some_and(|grid| grid.name == word.name));
+                let refusal = match declared {
+                    _ if written_grid => Some(format!(
+                        "launch condition `{written}`: a written grid's word gates no launch"
+                    )),
+                    _ if !backend.encodes_runs() => Some(format!(
+                        "launch condition `{written}`: {} does not encode each run's launches",
+                        backend.as_str()
+                    )),
+                    _ if repeated => Some(format!("launch condition `{written}` is named twice")),
+                    None => Some(format!("launch condition `{}` is not an entry parameter", word.name)),
+                    Some(ir::Param {
+                        ownership: ir::Ownership::Shared,
+                        ty: ValueType::Tensor(tensor),
+                        ..
+                    }) if tensor.elem == crate::types::Elem::Dtype(DType::I32) => match tensor.axes.as_slice() {
+                        [extent] => match prove::constant(&contract.arena, *extent) {
+                            Some(extent) if i64::try_from(index).is_ok_and(|index| index < extent) => None,
+                            Some(extent) => Some(format!(
+                                "launch condition `{written}` indexes past its `&tensor[{extent}] i32`"
+                            )),
+                            None => Some(format!(
+                                "launch condition `{written}` must be a word of a `&tensor[N] i32` of a constant N"
+                            )),
+                        },
+                        _ => Some(format!(
+                            "launch condition `{written}` must be a word of a `&tensor[N] i32` the host writes"
+                        )),
+                    },
+                    Some(_) => Some(format!(
+                        "launch condition `{written}` must be a word of a `&tensor[N] i32` the host writes"
+                    )),
+                };
+                match refusal {
+                    Some(message) => {
+                        errors.push((word.span, message));
+                        None
+                    }
+                    None => Some(crate::checked::LaunchCondition {
+                        word: word.name.clone(),
+                        index,
+                        encoded: condition.encoded,
+                    }),
+                }
+            })
+            .collect::<Vec<_>>();
         let launch_names = parameter_names
             .iter()
             .cloned()
@@ -1441,16 +2120,18 @@ fn check_native(
             .collect::<Vec<_>>();
         let launch_expression = |expr: &crate::syntax::ast::Expr,
                                  errors: &mut Vec<(Span, String)>| {
-            native_nat_expr(expr, &entry.dimensions, &launch_names)
+            native_nat_expr(expr, &entry.dimensions, &launch_names, element_reads)
                 .map_err(|message| errors.push((expr.span, message)))
                 .ok()
         };
         let when = match &launch.when {
             None => Some(None),
-            Some(expr) => native_condition("when", expr, &entry.dimensions, &launch_names)
-                .map_err(|error| errors.push(error))
-                .ok()
-                .map(Some),
+            Some(expr) => {
+                native_condition("when", expr, &entry.dimensions, &launch_names, element_reads)
+                    .map_err(|error| errors.push(error))
+                    .ok()
+                    .map(Some)
+            }
         };
         let groups = launch
             .threadgroups
@@ -1501,35 +2182,130 @@ fn check_native(
                 }
             }
         }
+        if let Some(own) = &launch.records {
+            launch_records.push((launches.len(), native_records(own, contract, &mut errors)));
+        }
+        // A resident launch's grid is the backend's: as many threadgroups as
+        // it holds co-resident for the formed pipeline, at most the first
+        // axis of `threadgroups`, so its other axes are 1 and no written
+        // grid sizes it. Its barrier is a `sync` buffer, zero whenever a
+        // launch starts, of at least the barrier's words.
+        let resident = launch.resident.as_ref().and_then(|barrier| {
+            let refusal = if !backend.resident_launches() {
+                Some(format!(
+                    "`resident` needs a backend that runs a launch's threadgroups co-resident; {} does not",
+                    native.target.name
+                ))
+            } else if launch.grid.is_some() {
+                Some("a resident launch's grid is the backend's `RESIDENT`; it reads no written grid".to_owned())
+            } else if !matches!((&y, &z), (NativeNatExpr::Constant(1), NativeNatExpr::Constant(1))) {
+                Some("a resident launch's grid has one axis: `threadgroups (WORK, 1, 1)`".to_owned())
+            } else {
+                match scratch.iter().find(|buffer| buffer.name == barrier.name) {
+                    Some(NativeScratch { bytes: NativeNatExpr::Constant(bytes), sync: true, when: None, .. })
+                        if *bytes >= crate::registry::RESIDENT_BARRIER_BYTES =>
+                    {
+                        None
+                    }
+                    _ => Some(format!(
+                        "resident barrier `{}` must be a `sync` scratch buffer of at least `bytes ({})`, without `when`",
+                        barrier.name,
+                        crate::registry::RESIDENT_BARRIER_BYTES
+                    )),
+                }
+            };
+            match refusal {
+                Some(message) => {
+                    errors.push((barrier.span, message));
+                    None
+                }
+                None => Some(crate::checked::ResidentLaunch { barrier: barrier.name.clone() }),
+            }
+        });
         launches.push(NativeLaunch {
             kernel: launch.kernel.name.clone(),
             params: launch_params,
             reads,
             when,
             groups: [x, y, z],
+            alike: None,
+            staging: launch.staging,
+            grid,
+            conditions,
             group_extent: [ex, ey, ez],
             shared_bytes,
+            resident,
         });
     }
 
-    // Only the Metal encoder dispatches a block more than once.
+    // Launches of one kernel share its formed source, which reads its record
+    // ports as tables and every other port as its view.
+    let records_of = |ordinal: usize| {
+        launch_records.iter().find(|(own, _)| *own == ordinal).map_or(&records, |(_, own)| own)
+    };
+    for (ordinal, launch) in launches.iter().enumerate() {
+        let first = launches.iter().position(|other: &NativeLaunch| other.kernel == launch.kernel);
+        if first.is_some_and(|first| records_of(first) != records_of(ordinal)) {
+            errors.push((
+                native.launches[ordinal].span,
+                format!("launches of kernel `{}` list different record ports", launch.kernel),
+            ));
+        }
+        // A kernel's source forms once for its launches, resident or not
+        // (`SEISMIC_RESIDENT`, under which its grid barriers form).
+        if first.is_some_and(|first| launches[first].resident.is_some() != launch.resident.is_some()) {
+            errors.push((
+                native.launches[ordinal].span,
+                format!("launches of kernel `{}` are not all resident or all dispatched", launch.kernel),
+            ));
+        }
+    }
+
+    for declared in &native.launches {
+        if declared.staging && declared.alike.is_some() {
+            errors.push((declared.span, "a launch is `staging` or `alike`, not both".to_owned()));
+        }
+    }
+
+    // `alike (LAUNCH)` names the native's one-row launch by its kernel.
+    for (ordinal, declared) in native.launches.iter().enumerate() {
+        let Some(alike) = &declared.alike else { continue };
+        match launches.iter().position(|other| other.kernel == alike.name) {
+            None => errors.push((alike.span, format!("`alike` names `{}`, which is not a launch of this native", alike.name))),
+            Some(target) if target == ordinal => {
+                errors.push((alike.span, "a launch is not `alike` itself; the one-row launch declares none".to_owned()));
+            }
+            Some(target) if native.launches[target].alike.is_some() => errors.push((
+                alike.span,
+                format!("`alike` names `{}`, which is itself `alike` another launch; name the one-row launch", alike.name),
+            )),
+            Some(target) => launches[ordinal].alike = Some(target),
+        }
+    }
+
     let repeat = match &native.repeat {
         None => None,
-        Some(repeat) if backend != crate::registry::BackendName::Metal => {
+        Some(repeat) if !backend.repeats_launches() => {
             errors.push((
                 repeat.span,
                 format!("`repeat` is not implemented for {}", native.target.name),
             ));
             None
         }
-        Some(repeat) => expression(&repeat.count, &mut errors).map(|count| {
-            crate::checked::NativeRepeat {
+        Some(repeat) => {
+            expression(&repeat.count, &mut errors).map(|count| crate::checked::NativeRepeat {
                 first: repeat.first,
                 launches: repeat.launches,
                 count,
-            }
-        }),
+            })
+        }
     };
+
+    let formation = native.formation.as_ref().and_then(|formation| {
+        native_formation(native, entry, formation, &scratch, &mut errors, &mut |expr, errors| expression(expr, errors), &mut |clause, expr, errors| {
+            condition(clause, &Some(expr.clone()), errors).flatten()
+        })
+    });
 
     if !errors.is_empty() {
         return Err(errors);
@@ -1542,12 +2318,92 @@ fn check_native(
         statics,
         params,
         elements,
+        records,
+        launch_records,
         constraint,
-        error_classes,
+
         scratch,
         launches,
         repeat,
+        formation,
+        segments: native.projected_segments.clone(),
+        ordered_segments: native.projected_ordered.clone(),
     })
+}
+
+/// The CPU operator's formation of a consumer's operands
+/// (`ast::NativeFormationDecl`, set by the expansion), by ordinal: its
+/// launch, each operand's buffers, row index and weights. `None` where it
+/// fails to check (its errors recorded).
+fn native_formation(
+    native: &crate::syntax::ast::NativeDecl,
+    entry: &crate::checked::EntryInfo,
+    formation: &ast::NativeFormationDecl,
+    scratch: &[crate::checked::NativeScratch],
+    errors: &mut Vec<(Span, String)>,
+    expression: &mut dyn FnMut(&ast::Expr, &mut Vec<(Span, String)>) -> Option<crate::checked::NativeNatExpr>,
+    condition: &mut dyn FnMut(&str, &ast::Expr, &mut Vec<(Span, String)>) -> Option<crate::checked::NativeCondition>,
+) -> Option<crate::checked::NativeFormation> {
+    use crate::checked::{NativeFormedOperand, NativeFormedValues, ParameterSummaryKind};
+    let tensor = |name: &ast::Ident, errors: &mut Vec<(Span, String)>| {
+        let found = entry.parameters.iter().position(|candidate| {
+            candidate.name == name.name && matches!(candidate.kind, ParameterSummaryKind::Tensor { .. })
+        });
+        if found.is_none() {
+            errors.push((name.span, format!("`{}` is not a tensor parameter of `{}`", name.name, entry.name)));
+        }
+        found.map(|ordinal| ordinal as u32)
+    };
+    let buffer = |name: &ast::Ident, errors: &mut Vec<(Span, String)>| {
+        let found = scratch.iter().position(|buffer| buffer.name == name.name);
+        if found.is_none() {
+            errors.push((name.span, format!("`{}` is not a scratch buffer of the declaration", name.name)));
+        }
+        found.map(|ordinal| ordinal as u32)
+    };
+    let launch = native.launches.iter().position(|launch| launch.kernel.name == formation.launch.name);
+    if launch.is_none() {
+        errors.push((formation.launch.span, format!("`{}` is not a launch of the declaration", formation.launch.name)));
+    }
+    let mut operands = Vec::new();
+    for operand in &formation.operands {
+        let values = match &operand.values {
+            ast::FormedValuesDecl::Parameter { at, within, .. } => {
+                // `None` where a named port fails to check.
+                let at = match at.as_ref().map(|at| tensor(at, errors)) {
+                    None => Some(None),
+                    Some(found) => found.map(Some),
+                };
+                let within = match within.as_ref().map(|[first, count]| (tensor(first, errors), tensor(count, errors))) {
+                    None => Some(None),
+                    Some((first, count)) => first.zip(count).map(|(first, count)| Some([first, count])),
+                };
+                at.zip(within).map(|(at, within)| NativeFormedValues::Parameter { at, within })
+            }
+            ast::FormedValuesDecl::Function(function) => Some(NativeFormedValues::Function(function.name.clone())),
+        };
+        let rows = expression(&operand.rows, errors);
+        let width = expression(&operand.width, errors);
+        let groups = expression(&operand.groups, errors);
+        let formed = condition("formed", &operand.formed, errors);
+        let tiles = condition("tiles", &operand.tiles, errors);
+        let staged = buffer(&operand.staged, errors);
+        let quantized = buffer(&operand.quantized, errors);
+        let weights = operand.weights.iter().map(|weight| tensor(weight, errors)).collect::<Vec<_>>();
+        let weights = weights.into_iter().collect::<Option<Vec<_>>>();
+        operands.push(NativeFormedOperand {
+            values: values?,
+            rows: rows?,
+            width: width?,
+            groups: groups?,
+            staged: staged?,
+            quantized: quantized?,
+            formed: formed?,
+            weights: weights?,
+            tiles: tiles?,
+        });
+    }
+    Some(crate::checked::NativeFormation { launch: launch? as u32, operands })
 }
 
 /// `expression` with every name of `terms` replaced by that term's
@@ -1601,6 +2457,7 @@ fn native_condition(
     expression: &crate::syntax::ast::Expr,
     dimensions: &[String],
     parameters: &[String],
+    elements: NativeElements<'_>,
 ) -> Result<crate::checked::NativeCondition, (Span, String)> {
     use crate::checked::{NativeComparison, NativeCondition};
     use crate::syntax::ast::{BinaryOp, ExprKind};
@@ -1608,17 +2465,38 @@ fn native_condition(
         (
             expression.span,
             format!(
-                "a native `{clause}` condition is a comparison (`<`, `<=`, `>`, `>=`, `==`, `!=`) of natural-number expressions, or conditions joined by `and` and `or`"
+                "a native `{clause}` condition is a comparison (`<`, `<=`, `>`, `>=`, `==`, `!=`) of natural-number expressions, `true` or `false`, or conditions joined by `and` and `or`"
             ),
         )
     };
+    // A capability the backend provides stands as a condition: it holds.
+    if let ExprKind::Attr { base, name } = &expression.kind {
+        if matches!(&base.kind, ExprKind::Name(device) if device.name == "device")
+            && crate::device::provided(elements.backend, &name.name)
+                == Some(crate::device::PropertyKind::Support)
+        {
+            return Ok(NativeCondition::Compare {
+                comparison: NativeComparison::Ne,
+                left: crate::checked::NativeNatExpr::Device(name.name.clone()),
+                right: crate::checked::NativeNatExpr::Constant(0),
+            });
+        }
+    }
+    // `true` and `false` stand as the comparisons of zero that hold and fail.
+    if let ExprKind::Bool(holds) = expression.kind {
+        return Ok(NativeCondition::Compare {
+            comparison: if holds { NativeComparison::Eq } else { NativeComparison::Ne },
+            left: crate::checked::NativeNatExpr::Constant(0),
+            right: crate::checked::NativeNatExpr::Constant(0),
+        });
+    }
     let ExprKind::Binary { op, lhs, rhs } = &expression.kind else {
         return Err(not_a_condition());
     };
     let comparison = match op {
         BinaryOp::And | BinaryOp::Or => {
-            let left = Box::new(native_condition(clause, lhs, dimensions, parameters)?);
-            let right = Box::new(native_condition(clause, rhs, dimensions, parameters)?);
+            let left = Box::new(native_condition(clause, lhs, dimensions, parameters, elements)?);
+            let right = Box::new(native_condition(clause, rhs, dimensions, parameters, elements)?);
             return Ok(match op {
                 BinaryOp::And => NativeCondition::And(left, right),
                 _ => NativeCondition::Or(left, right),
@@ -1633,7 +2511,8 @@ fn native_condition(
         _ => return Err(not_a_condition()),
     };
     let operand = |expr: &crate::syntax::ast::Expr| {
-        native_nat_expr(expr, dimensions, parameters).map_err(|message| (expr.span, message))
+        native_nat_expr(expr, dimensions, parameters, elements)
+            .map_err(|message| (expr.span, message))
     };
     Ok(NativeCondition::Compare {
         comparison,
@@ -1642,19 +2521,47 @@ fn native_condition(
     })
 }
 
+/// The element parameters a native expression may read, those the entry
+/// converts into (`repack[U = W]`: bound only to a registered conversion's
+/// packed destination), and the backend whose forms `form(W, NAME)` names.
+#[derive(Clone, Copy)]
+struct NativeElements<'a> {
+    parameters: &'a [String],
+    destinations: &'a [String],
+    backend: crate::registry::BackendName,
+}
+
+impl NativeElements<'_> {
+    /// Element parameter `argument` of a read, as `call` names it.
+    fn parameter(self, call: &str, argument: &crate::syntax::ast::Arg) -> Result<String, String> {
+        match &argument.value.kind {
+            crate::syntax::ast::ExprKind::Name(element)
+                if argument.name.is_none() && self.parameters.contains(&element.name) =>
+            {
+                Ok(element.name.clone())
+            }
+            _ => Err(format!(
+                "`{call}` reads one of the entry's element parameters ({})",
+                self.parameters.join(", ")
+            )),
+        }
+    }
+}
+
 fn native_nat_expr(
     expression: &crate::syntax::ast::Expr,
     dimensions: &[String],
     parameters: &[String],
+    elements: NativeElements<'_>,
 ) -> Result<crate::checked::NativeNatExpr, String> {
-    use crate::checked::NativeNatExpr as N;
+    use crate::checked::{ElementQuery, NativeNatExpr as N};
     use crate::syntax::ast::{BinaryOp, ExprKind};
     let binary = |left: &crate::syntax::ast::Expr,
                   right: &crate::syntax::ast::Expr,
                   make: fn(Box<N>, Box<N>) -> N| {
         Ok(make(
-            Box::new(native_nat_expr(left, dimensions, parameters)?),
-            Box::new(native_nat_expr(right, dimensions, parameters)?),
+            Box::new(native_nat_expr(left, dimensions, parameters, elements)?),
+            Box::new(native_nat_expr(right, dimensions, parameters, elements)?),
         ))
     };
     match &expression.kind {
@@ -1665,10 +2572,17 @@ fn native_nat_expr(
         ExprKind::Name(name) if parameters.contains(&name.name) => {
             Ok(N::Parameter(name.name.clone()))
         }
-        ExprKind::Name(name) => Err(format!(
-            "native expression references `{}`, which is neither a dimension nor a native parameter",
-            name.name
-        )),
+        ExprKind::Name(name) => crate::forms::constants(elements.backend)
+            .iter()
+            .find(|(constant, _)| *constant == name.name)
+            .map(|(_, value)| N::Constant(*value))
+            .ok_or_else(|| {
+                format!(
+                    "native expression references `{}`, which is neither a dimension, a native parameter nor a constant of `{}`",
+                    name.name,
+                    elements.backend.as_str()
+                )
+            }),
         ExprKind::Binary { op, lhs, rhs } => match op {
             BinaryOp::Add => binary(lhs, rhs, N::Add),
             BinaryOp::Sub => binary(lhs, rhs, N::Sub),
@@ -1677,6 +2591,86 @@ fn native_nat_expr(
             BinaryOp::Rem => binary(lhs, rhs, N::Rem),
             _ => Err("native expressions use only `+`, `-`, `*`, `/`, and `%`".to_owned()),
         },
+        ExprKind::Call {
+            callee,
+            bindings,
+            args,
+        } if matches!(&callee.kind, ExprKind::Name(name) if name.name == "operands") => {
+            match (bindings.is_empty(), args.as_slice()) {
+                (true, [arg]) => Ok(N::Element(
+                    elements.parameter("operands", arg)?,
+                    ElementQuery::Operands,
+                )),
+                _ => Err("`operands` takes one element parameter".to_owned()),
+            }
+        }
+        ExprKind::Call {
+            callee,
+            bindings,
+            args,
+        } if matches!(&callee.kind, ExprKind::Name(name) if name.name == "packed") => {
+            match (bindings.is_empty(), args.as_slice()) {
+                (true, [arg]) => Ok(N::Element(elements.parameter("packed", arg)?, ElementQuery::Packed)),
+                _ => Err("`packed` takes one element parameter".to_owned()),
+            }
+        }
+        ExprKind::Call {
+            callee,
+            bindings,
+            args,
+        } if matches!(&callee.kind, ExprKind::Name(name) if name.name == "dense_bytes") => {
+            match (bindings.is_empty(), args.as_slice()) {
+                (true, [arg]) => {
+                    Ok(N::Element(elements.parameter("dense_bytes", arg)?, ElementQuery::DenseBytes))
+                }
+                _ => Err("`dense_bytes` takes one element parameter".to_owned()),
+            }
+        }
+        ExprKind::Call {
+            callee,
+            bindings,
+            args,
+        } if matches!(&callee.kind, ExprKind::Name(name) if name.name == "unit_columns") => {
+            match (bindings.is_empty(), args.as_slice()) {
+                (true, [arg]) => {
+                    let element = elements.parameter("unit_columns", arg)?;
+                    if !elements.destinations.contains(&element) {
+                        return Err(format!(
+                            "`unit_columns` reads a conversion's destination; `{element}` is not one (`repack[U = {element}]`)"
+                        ));
+                    }
+                    Ok(N::Element(element, ElementQuery::UnitColumns))
+                }
+                _ => Err("`unit_columns` takes one element parameter".to_owned()),
+            }
+        }
+        ExprKind::Call {
+            callee,
+            bindings,
+            args,
+        } if matches!(&callee.kind, ExprKind::Name(name) if name.name == "form") => {
+            let names = crate::forms::names(elements.backend);
+            let form = |arg: &crate::syntax::ast::Arg| match &arg.value.kind {
+                ExprKind::Name(name) if arg.name.is_none() => {
+                    crate::forms::Form::named(elements.backend, &name.name).ok_or_else(|| {
+                        format!(
+                            "`{}` is not a form of `{}`; its forms are {}",
+                            name.name,
+                            elements.backend.as_str(),
+                            if names.is_empty() { "none".to_owned() } else { names.join(", ") }
+                        )
+                    })
+                }
+                _ => Err("`form` names a form of the backend".to_owned()),
+            };
+            match (bindings.is_empty(), args.as_slice()) {
+                (true, [element, name]) => Ok(N::Element(
+                    elements.parameter("form", element)?,
+                    ElementQuery::Form(form(name)?),
+                )),
+                _ => Err("`form` takes an element parameter and a form name".to_owned()),
+            }
+        }
         ExprKind::Call {
             callee,
             bindings,
@@ -1691,11 +2685,32 @@ fn native_nat_expr(
                 ExprKind::Name(name) if name.name == "max" => N::Max,
                 _ => {
                     return Err(
-                        "native expressions call only `ceil_div`, `min`, and `max`".to_owned()
+                        "native expressions call only `ceil_div`, `min`, `max`, `operands`, `form`, `packed`, `dense_bytes` and `unit_columns`"
+                            .to_owned()
                     );
                 }
             };
             binary(&args[0].value, &args[1].value, make)
+        }
+        ExprKind::Attr { base, name }
+            if matches!(&base.kind, ExprKind::Name(device) if device.name == "device") =>
+        {
+            match crate::device::provided(elements.backend, &name.name) {
+                Some(crate::device::PropertyKind::Support | crate::device::PropertyKind::Count) => {
+                    Ok(N::Device(name.name.clone()))
+                }
+                // A measured property has no value until its probe has run,
+                // and a declaration states no alternative to read instead.
+                Some(crate::device::PropertyKind::Measured) => Err(format!(
+                    "`device.{}` is measured, and a native declaration cannot read it: it has no value until its probe has run",
+                    name.name
+                )),
+                None => Err(format!(
+                    "`device.{}` is not a property `{}` provides",
+                    name.name,
+                    elements.backend.as_str()
+                )),
+            }
         }
         _ => Err("unsupported native expression".to_owned()),
     }
@@ -1749,6 +2764,7 @@ pub(super) fn result_leaves(ty: &ValueType) -> Vec<(Vec<u32>, &ValueType)> {
 fn entry_info(
     id: crate::ids::EntryId,
     stable: crate::ids::StableEntryId,
+    content: crate::ids::EntryContent,
     definition: &ir::Definition,
 ) -> crate::checked::EntryInfo {
     use crate::checked::{
@@ -1779,6 +2795,7 @@ fn entry_info(
                     ParamOwnership::Owned | ParamOwnership::Value => TensorAccess::Owned,
                     ParamOwnership::Shared => TensorAccess::Shared,
                     ParamOwnership::Exclusive => TensorAccess::Mutable,
+                    ParamOwnership::Host { write } => TensorAccess::Host { write: *write },
                     ParamOwnership::Tuple(_) => {
                         unreachable!("tensor leaf ownership is not a tuple")
                     }
@@ -1840,6 +2857,7 @@ fn entry_info(
                 access: match ownership {
                     ParamOwnership::Shared => TensorAccess::Shared,
                     ParamOwnership::Exclusive => TensorAccess::Mutable,
+                    ParamOwnership::Host { write } => TensorAccess::Host { write: *write },
                     _ => TensorAccess::Owned,
                 },
                 rank: t.rank() as u32,
@@ -1873,6 +2891,7 @@ fn entry_info(
     EntryInfo {
         id,
         stable,
+        content,
         name: definition.name.clone(),
         dimensions: definition
             .dimensions
@@ -1891,3 +2910,4 @@ fn entry_info(
         element_domain: definition.element_domain.clone(),
     }
 }
+

@@ -6,6 +6,17 @@ import { registerStatusCommand } from "./commands/status"
 import { registerServeCommand } from "./commands/serve"
 import { registerInferenceCommands } from "./commands/inference"
 import { registerConnectionsCommand } from "./commands/connections"
+import { registerHuggingFaceCommand } from "./commands/hugging-face-account"
+import { registerServerCommand } from "./commands/server"
+import { admitsPkexecCommand } from "./startup/pkexec-admission"
+import { ignoreClosedOutput } from "./startup/closed-output"
+
+ignoreClosedOutput(process.stdout)
+
+if (!admitsPkexecCommand(process.argv.slice(2), process.getuid?.(), process.env)) {
+  process.stderr.write("Under pkexec, Magnitude runs only its update installer and server removal.\n")
+  process.exit(1)
+}
 
 const program = new Command()
   .name("magnitude")
@@ -17,7 +28,9 @@ registerStatusCommand(program)
 program.command("native-runtime-check", { hidden: true })
   .action(() => import("./commands/native-runtime-check").then(({ runNativeRuntimeCheck }) => runNativeRuntimeCheck()))
 registerServeCommand(program)
+registerServerCommand(program)
 registerInferenceCommands(program)
+registerHuggingFaceCommand(program)
 registerConnectionsCommand(program)
 registerUpdateCommand(program)
 registerDocsCommand(program)
@@ -26,9 +39,10 @@ program.command("_verify-windows-installation", { hidden: true }).argument("<off
     const { verifyInstallationDownload } = await import("./startup/verify-installation")
     await verifyInstallationDownload(offer, artifact, channel)
   })
-program.command("_install-application-update", { hidden: true }).argument("<request>").option("--parent-stdin").action(async (request, options) => {
+// Runs as root through sudo, or Polkit's installer wrapper. It validates the raw arguments itself instead of commander's parsing.
+program.command("_install-application-update", { hidden: true }).argument("[arguments...]").allowUnknownOption().helpOption(false).action(async () => {
   const { runLinuxUpdateInstallation } = await import("./startup/linux-update-installation")
-  await runLinuxUpdateInstallation(request, options.parentStdin === true)
+  await runLinuxUpdateInstallation(process.argv.slice(2))
 })
 program.command("_complete-application-update", { hidden: true }).action(async () => {
   const { runLinuxUpdateHandoff } = await import("./startup/linux-update-installation")

@@ -63,8 +63,9 @@ uint64_t shape_row_scratch(uint64_t row) {
     return SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STATE) + row * uint64_t(SEISMIC_TUNE_PARTS + 8u) * 4ul;
 }
 
+// The element index of row `row`'s logit of `token` in the logits' owner handle.
 uint64_t shape_logits_at(uint64_t row, uint token) {
-    return SEISMIC_PTR(SEISMIC_BUFFER_LOGITS) + (row * SEISMIC_LOGITS_STRIDE_0 + uint64_t(token) * SEISMIC_LOGITS_STRIDE_1) * 4ul;
+    return row * SEISMIC_LOGITS_STRIDE_0 + uint64_t(token) * SEISMIC_LOGITS_STRIDE_1;
 }
 
 // ---------------------------------------------------------------------------
@@ -94,7 +95,7 @@ void shape_rows_prepare() {
         int count = 0;
         for (uint h = 0u; h < recent_count; ++h)
             count += seismic_shared_i32[h] == int(token) ? 1 : 0;
-        float value = element_f32_at(shape_logits_at(row, token));
+        float value = out_at(SEISMIC_OUT_LOGITS, shape_logits_at(row, token));
         // Correctly rounded division, as the portable route and CUDA divide.
         if (count > 0) {
             value = value < 0.0 ? value * repetition : seismic_div_rn(value, repetition);
@@ -105,7 +106,7 @@ void shape_rows_prepare() {
             value = -SHAPE_INF;
         if (temperature != 0.0)
             value = seismic_div_rn(value, temperature);
-        element_f32_put(shape_logits_at(row, token), value);
+        out_put(SEISMIC_OUT_LOGITS, shape_logits_at(row, token), value);
         if (shape_finite(value))
             maximum = max(maximum, shape_ordered_key(value));
         else if (value != -SHAPE_INF)
@@ -176,7 +177,7 @@ struct shape_survivor {
 };
 
 bool shape_survives(shape_survivor survivor, uint token, out float value, out uint key) {
-    value = element_f32_at(shape_logits_at(survivor.row, token));
+    value = out_at(SEISMIC_OUT_LOGITS, shape_logits_at(survivor.row, token));
     key = 0u;
     if (!shape_finite(value))
         return false;
@@ -184,8 +185,22 @@ bool shape_survives(shape_survivor survivor, uint token, out float value, out ui
     return key >= survivor.top_k_key && !(survivor.min_p > 0.0 && exp(value - survivor.maximum) < survivor.min_p);
 }
 
+// The mass of a survivor: its weight exp(v - max) (at most 1) in 2^-32 fixed
+// point, truncated, as CUDA's (u64)(w * 2^32). It is decoded from the
+// weight's bits, weight = significand * 2^(exponent - 150), so the mass is
+// floor(significand * 2^(exponent - 118)): integer shifts only, with no
+// float -> integer conversion and no case for the maximum's 2^32. NVIDIA's
+// Vulkan compiler (580.x, GB10) got both of those wrong: a direct
+// float -> u64 conversion gave 2^33 - 1 for 2^32, and a branch to the
+// constant 2^32 gave 0xffffffff_00000000, which counted every maximum's mass
+// as -2^32 and so cut top-p at the first maximum.
 uint64_t shape_mass(shape_survivor survivor, float value) {
-    return uint64_t(exp(value - survivor.maximum) * 4294967296.0);
+    const uint bits = floatBitsToUint(min(exp(value - survivor.maximum), 1.0));
+    const uint biased = bits >> 23;
+    const uint significand = biased == 0u ? bits & 0x7fffffu : (bits & 0x7fffffu) | 0x800000u;
+    // A subnormal's exponent is 1; any shift past 32 leaves nothing of the
+    // 33-bit product.
+    return (uint64_t(significand) << 9) >> min(127u - max(biased, 1u), 63u);
 }
 
 // Descending digit of a weighted histogram at which the running weight
@@ -200,8 +215,14 @@ uint shape_descend(uint bins, uint64_t target, inout uint64_t above) {
         for (uint i = 0u; i < per; ++i)
             total += shape_histogram(bins - 1u - (lane * per + i));
         shape_shared_u64_put(SHAPE_LANE_TOTALS + 2u * lane, total);
-        subgroupMemoryBarrierShared();
-        subgroupBarrier();
+    }
+    // Publish lane totals in a workgroup phase before the leader consumes
+    // them. Subgroup-only synchronization here produced inconsistent
+    // radix cutoffs on the tested NVIDIA Vulkan path.
+    barrier();
+    if (SEISMIC_SUBGROUP == 0u) {
+        const uint lane = SEISMIC_LANE;
+        const uint per = bins / 32u;
         if (lane == 0u) {
             uint64_t running = above;
             uint digit = SHAPE_BINS;
@@ -349,7 +370,9 @@ void shape_rows_select() {
             // first reaches the target, counted in ascending token order.
             const uint64_t each = shape_mass(survivor, shape_key_value(key));
             // above < target <= above + ties * each, so each > 0 and rank < ties.
-            const uint64_t rank = (target - above + each - 1ul) / each - 1ul;
+            // The quotient is at most ties, below 2^32.
+            uint64_t rest = target - above + each - 1ul;
+            const uint64_t rank = uint64_t(seismic_narrow_divide(rest, each)) - 1ul;
             const uint chunk = (uint(SEISMIC_DIM_V) + gl_WorkGroupSize.x - 1u) / gl_WorkGroupSize.x;
             const uint first = thread * chunk;
             const uint last = min(first + chunk, uint(SEISMIC_DIM_V));
@@ -410,13 +433,13 @@ void shape_rows_apply() {
     for (uint token = shape_slice_begin(part) + gl_LocalInvocationIndex; token < shape_slice_end(part);
          token += gl_WorkGroupSize.x) {
         const uint64_t slot = shape_logits_at(row, token);
-        const float value = element_f32_at(slot);
+        const float value = out_at(SEISMIC_OUT_LOGITS, slot);
         if (!shape_finite(value))
             continue;
         const uint key = shape_ordered_key(value);
         const bool removed = key < top_k_key || (min_p > 0.0 && exp(value - maximum) < min_p) || mode == 2u
             || (mode == 1u && (key < top_p_key || (key == top_p_key && token > top_p_token)));
         if (removed)
-            element_f32_put(slot, -SHAPE_INF);
+            out_put(SEISMIC_OUT_LOGITS, slot, -SHAPE_INF);
     }
 }

@@ -1,14 +1,14 @@
 //! Why a header could not be read. Families convert it into their own error
 //! type; the wording here is the default a family may keep.
 
-use magnitude_artifacts::gguf::Encoding;
-use magnitude_family_contracts::DefinitionError;
+use magnitude_artifacts::{gguf::Encoding, UnsupportedReason};
+use magnitude_family_contracts::{DefinitionError, FamilyError, ScaleCodes};
 use std::{error, fmt};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum HeaderError {
-    /// An architecture key the family does not interpret.
-    UnknownMetadata(String),
+    /// Every architecture key the family does not interpret.
+    UnknownMetadata(Vec<String>),
     MissingMetadata(String),
     /// A key present with a value outside what it admits.
     MetadataType {
@@ -23,27 +23,34 @@ pub enum HeaderError {
     },
     /// A weight read as a matrix is not one.
     NotMatrix { name: String, shape: Vec<u64> },
-    /// A stored second-level scale that is not one F32 value per matrix.
+    /// A stored companion scale `<stem>.scale` (or `<stem>.input_scale`)
+    /// not of the form its weight takes.
     CompanionScale {
         name: String,
-        matrices: u64,
+        expected: CompanionForm,
         encoding: Encoding,
         shape: Vec<u64>,
     },
-    /// A stored tensor no role bound.
-    UnboundWeight(String),
+    /// Every stored tensor no role bound.
+    UnboundWeights(Vec<String>),
     /// A rotary table over an odd, empty or oversized dimension range, or a
     /// base that does not decay.
     Rotary { rotated: u64, width: u64, base: f64 },
     /// YaRN parameters outside their admitted ranges.
     Yarn,
     Definition(DefinitionError),
+    /// A metadata array whose payload doesn't read or decode
+    /// ([`crate::array_elements`]).
+    Payload {
+        key: String,
+        detail: String,
+    },
 }
 
 impl fmt::Display for HeaderError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnknownMetadata(key) => write!(formatter, "unknown metadata {key:?}"),
+            Self::UnknownMetadata(keys) => write!(formatter, "unknown metadata {keys:?}"),
             Self::MissingMetadata(key) => write!(formatter, "missing metadata {key}"),
             Self::MetadataType { key, expected } => write!(formatter, "{key} must be {expected}"),
             Self::MissingWeight(name) => write!(formatter, "missing weight {name:?}"),
@@ -61,15 +68,15 @@ impl fmt::Display for HeaderError {
             ),
             Self::CompanionScale {
                 name,
-                matrices,
+                expected,
                 encoding,
                 shape,
             } => write!(
                 formatter,
-                "scale {name:?}: expected F32 [{matrices}], received {encoding:?} {shape:?}"
+                "scale {name:?}: expected {expected}, received {encoding:?} {shape:?}"
             ),
-            Self::UnboundWeight(name) => {
-                write!(formatter, "artifact contains unbound weight role {name:?}")
+            Self::UnboundWeights(names) => {
+                write!(formatter, "artifact contains unbound weight roles {names:?}")
             }
             Self::Rotary {
                 rotated,
@@ -81,14 +88,151 @@ impl fmt::Display for HeaderError {
             ),
             Self::Yarn => formatter.write_str("invalid YaRN scaling"),
             Self::Definition(error) => error.fmt(formatter),
+            Self::Payload { key, detail } => write!(formatter, "metadata {key}: {detail}"),
         }
     }
 }
 
 impl error::Error for HeaderError {}
 
+impl HeaderError {
+    /// The unsupported features this error names: unknown keys, keys or
+    /// tensors stored in a form the family doesn't read (such as a weight
+    /// with an extra unit dimension), unbound tensors, rope scaling outside
+    /// the admitted ranges, a key the family requires that the header omits,
+    /// and an output head absent because it is tied to the embedding. A
+    /// header missing a weight the family needs, or whose values contradict
+    /// each other, is `Unreadable`.
+    pub fn reasons(&self) -> Vec<UnsupportedReason> {
+        match self {
+            Self::UnknownMetadata(keys) => keys
+                .iter()
+                .map(|key| UnsupportedReason::UnrecognizedMetadata { key: key.clone() })
+                .collect(),
+            Self::MetadataType { key, .. } => {
+                vec![UnsupportedReason::UnrecognizedMetadata { key: key.clone() }]
+            }
+            Self::UnboundWeights(names) => names
+                .iter()
+                .map(|name| UnsupportedReason::UnrecognizedTensor { name: name.clone() })
+                .collect(),
+            Self::WeightShape { name, .. }
+            | Self::NotMatrix { name, .. }
+            | Self::CompanionScale { name, .. } => {
+                vec![UnsupportedReason::UnrecognizedTensor { name: name.clone() }]
+            }
+            Self::Yarn => vec![UnsupportedReason::RopeScaling {
+                kind: "yarn".into(),
+            }],
+            Self::MissingMetadata(key) => {
+                vec![UnsupportedReason::MissingMetadata { key: key.clone() }]
+            }
+            Self::MissingWeight(name) if name == OUTPUT_HEAD => {
+                vec![UnsupportedReason::TiedOutputHead]
+            }
+            Self::MissingWeight(_)
+            | Self::Rotary { .. }
+            | Self::Definition(_)
+            | Self::Payload { .. } => {
+                vec![UnsupportedReason::Unreadable]
+            }
+        }
+    }
+}
+
+/// The output projection a GGUF stores apart from the embedding unless the
+/// two are tied.
+const OUTPUT_HEAD: &str = "output.weight";
+
+/// The companion scale a weight takes (`Tensors::companion_scale`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompanionForm {
+    /// One F32 value per matrix (of `matrices`).
+    PerMatrix { matrices: u64 },
+    /// An F8_E4M3 `[rows, columns]` matrix's (each matrix's of a stack of
+    /// `stack`) grid of block scales: `[rows / r, columns / c]` (after the
+    /// stack's extent) for the power-of-two tiles `[r, c]` it divides the
+    /// matrix into (`ImportTransform::grid_tile`), stored as the type of
+    /// any grid codes (`ScaleCodes::stored`).
+    Grid {
+        stack: Option<u64>,
+        rows: u64,
+        columns: u64,
+    },
+}
+
+impl fmt::Display for CompanionForm {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PerMatrix { matrices } => write!(formatter, "F32 [{matrices}]"),
+            Self::Grid { stack, rows, columns } => {
+                let matrix = match stack {
+                    Some(stack) => format!("each of {stack} matrices [{rows}, {columns}]"),
+                    None => format!("[{rows}, {columns}]"),
+                };
+                let types = ScaleCodes::ALL.map(|codes| codes.stored().ggml_name()).join(" or ");
+                write!(formatter, "an {types} grid dividing {matrix} into power-of-two tiles")
+            }
+        }
+    }
+}
+
+impl From<HeaderError> for FamilyError {
+    fn from(error: HeaderError) -> Self {
+        FamilyError::unsupported(error.reasons(), error.to_string())
+    }
+}
+
 impl From<DefinitionError> for HeaderError {
     fn from(error: DefinitionError) -> Self {
         Self::Definition(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_weight_in_a_form_the_family_does_not_read_names_that_tensor() {
+        let error = HeaderError::WeightShape {
+            name: "blk.0.ffn_gate_inp_shexp.weight".into(),
+            expected: vec![2048],
+            received: vec![1, 2048],
+        };
+        assert_eq!(
+            error.reasons(),
+            [UnsupportedReason::UnrecognizedTensor {
+                name: "blk.0.ffn_gate_inp_shexp.weight".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_header_missing_a_key_names_it() {
+        assert_eq!(
+            HeaderError::MissingMetadata("lfm2.block_count".into()).reasons(),
+            [UnsupportedReason::MissingMetadata {
+                key: "lfm2.block_count".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_header_missing_a_weight_is_unreadable_unless_its_head_is_tied() {
+        assert_eq!(
+            HeaderError::MissingWeight("output.weight".into()).reasons(),
+            [UnsupportedReason::TiedOutputHead]
+        );
+        for error in [
+            HeaderError::MissingWeight("blk.0.attn_q.weight".into()),
+            HeaderError::Rotary {
+                rotated: 3,
+                width: 64,
+                base: 10_000.0,
+            },
+        ] {
+            assert_eq!(error.reasons(), [UnsupportedReason::Unreadable], "{error}");
+        }
     }
 }

@@ -4,7 +4,9 @@
 #define ATTENTION_U 0
 #define ATTENTION_FRESH (SEISMIC_DIM_F != 0)
 #define ATTENTION_NORM (SEISMIC_DIM_N != 0)
+#define ATTENTION_QUERY_NORM 0
 #define ATTENTION_VALUE_NORM (SEISMIC_DIM_NV != 0)
+#define ATTENTION_STORED_KEY (SEISMIC_DIM_VK != 0)
 #include "lib/attention/attention.h"
 
 
@@ -19,8 +21,8 @@ kernel void attention_append_dense(
     device const float *rotary_amplitudes [[buffer(SEISMIC_BUFFER_ROTARY_AMPLITUDES)]],
     device const int *coordinates [[buffer(SEISMIC_BUFFER_COORDINATES)]],
     device const int *destinations [[buffer(SEISMIC_BUFFER_DESTINATIONS)]],
-    device const ulong *history_key [[buffer(SEISMIC_BUFFER_HISTORY_KEY)]],
-    device const ulong *history_value [[buffer(SEISMIC_BUFFER_HISTORY_VALUE)]],
+    SEISMIC_OUT_HISTORY_KEY_PARAM(history_key),
+    SEISMIC_OUT_HISTORY_VALUE_PARAM(history_value),
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
@@ -34,16 +36,23 @@ kernel void attention_append_dense(
     const uint kv_head = uint(item % KV);
     if (!ATTENTION_FRESH || row >= SEISMIC_DIM_M || destinations[row] < 0)
         return;
-    const ulong source = (row * KV + kv_head) * W;
     const ulong destination = ulong(destinations[row]);
     const ulong slab_rows = ulong(SEISMIC_PARAM_SLAB_ROWS);
     const float epsilon = as_type<float>(uint(SEISMIC_PARAM_EPSILON));
     float k[E], v[E];
-    attention::head_rotary<ATTENTION_NORM>(key + source, key_norm, coordinates + row * 4,
-        rotary_components, rotary_frequencies, rotary_amplitudes, epsilon, lane, k);
-    attention::head_norm<ATTENTION_VALUE_NORM>(value + source, value_norm, epsilon, lane, v);
-    attention::append(slab::row<attention::Scalar>(history_key, destination, slab_rows, KV * W),
+    // The stored key prepared and rounded as the attention entries do.
+    const rounding::Rounding key_rounding = attention::key_rounding(SEISMIC_DIM_KR != 0,
+        uint(SEISMIC_PARAM_KEY_BLOCK), uint(SEISMIC_PARAM_KEY_ELEMENT), uint(SEISMIC_PARAM_KEY_SCALE),
+        uint(SEISMIC_PARAM_KEY_AMAX_FLOOR));
+    attention::fresh_row<true>(key, value, key_norm, value_norm, coordinates, rotary_components, rotary_frequencies,
+        rotary_amplitudes, row, kv_head, epsilon, key_rounding, lane, k);
+    attention::append(slab::out_row(history_key, destination, slab_rows, KV * W),
         0, kv_head, lane, k);
-    attention::append(slab::row<attention::Scalar>(history_value, destination, slab_rows, KV * W),
+    // Stored-key values are the key plane.
+    if (ATTENTION_STORED_KEY)
+        return;
+    attention::fresh_row<false>(key, value, key_norm, value_norm, coordinates, rotary_components, rotary_frequencies,
+        rotary_amplitudes, row, kv_head, epsilon, key_rounding, lane, v);
+    attention::append(slab::out_row(history_value, destination, slab_rows, KV * W),
         0, kv_head, lane, v);
 }

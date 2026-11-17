@@ -2,11 +2,12 @@ import { acnExecutableRelativePath } from "../../src/macos-app"
 import { buildMacApp } from "../apple/build-app"
 import { buildDesktopApplication, DesktopBuildFailed } from "./desktop"
 import { buildLinuxDesktopInstaller } from "./desktop-linux"
+import { linuxPackageFormats } from "../../src/linux-package"
 import { buildWindowsDesktopInstaller } from "./desktop-windows"
 import { signWindowsCode } from "./windows-signing"
 import { BunContext } from "@effect/platform-bun"
 import { buildDesktopDmg, validateDesktopDistribution } from "../apple/desktop"
-import { appleSigning, signAppleCode, appleCommand } from "../apple/signing"
+import { appleSigning, signAppleCode, appleCommand, verifyNotaryCredentials } from "../apple/signing"
 import { runAppleBuild } from "../apple/compile-bun"
 import { notarizeAppleUnit, regularAppleFiles, writeAppleReceipt } from "../apple/distribution"
 import {
@@ -128,7 +129,7 @@ export const smokeHostArchives = async (
       const signing = await runAppleBuild(appleSigning)
       await run(["/usr/bin/codesign", "--verify", "--deep", "--strict", "-R", `=${appleRequirement("dev.magnitude.service", signing.team)}`, app])
       await run(["/usr/bin/codesign", "--verify", "--strict", "-R", `=${appleRequirement("dev.magnitude.cli", signing.team)}`, resolve(cliRoot, "bin/magnitude-cli")])
-      if (signing.mode === "developer-id") await run(["/usr/bin/xcrun", "stapler", "validate", app])
+      if (signing.mode === "developer-id") await runAppleBuild(appleCommand("/usr/bin/xcrun", "stapler", "validate", app))
     }
   } finally {
     await Effect.runPromise(Effect.tryPromise(() => rm(root, { recursive: true, force: true })).pipe(
@@ -165,6 +166,7 @@ export const buildHostArtifacts = async (
   const host = hostById(hostId)
   // Resolved before compiling so a missing or malformed publisher identity fails immediately.
   const desktopEnvironment = await Effect.runPromise(desktopBuildEnvironment(host.id))
+  if (host.id.startsWith("darwin-")) await runAppleBuild(verifyNotaryCredentials)
   const output = resolve(outputRoot)
   await rm(output, { recursive: true, force: true })
   await mkdir(output, { recursive: true, mode: 0o700 })
@@ -252,7 +254,7 @@ export const buildHostArtifacts = async (
       })
       if (applications.length !== 1) return yield* new DesktopBuildFailed({ message: "Desktop packaging did not produce exactly one Linux application" })
       const artifacts: ReleaseArtifact[] = []
-      for (const format of ["deb", "rpm"] as const) {
+      for (const format of linuxPackageFormats(arch)) {
         const installer = yield* buildLinuxDesktopInstaller({
           app: applications[0]!, output, arch, format, version, revision: ACN_COORDINATION_REVISION,
         })

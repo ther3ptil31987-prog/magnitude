@@ -5,10 +5,11 @@ import { MAGNITUDE_RPC_VERSION } from "@magnitudedev/sdk"
 import { nativeWindowsJobOwnerLayer, nativeWindowsPrivatePipesLayer } from "@magnitudedev/utils/windows-native"
 import { makeUnixOwnedChildSpawner, OwnedChildSpawner, OwnedChildSpawnFailed, type OwnedChildCommand } from "./owned-child"
 import { makeWindowsOwnedChildSpawner } from "./windows-owned-child"
-import { makeOwnedService } from "./owned-service"
+import { makeOwnedService, type OwnerAgent } from "./owned-service"
 import { previousInstallationUpgrade } from "./previous-installation-live"
 import { checkServicePort, requireServicePort } from "./service-port"
 import type { ChildOutputMode } from "./child-output"
+import { SERVER_DATA_DIRECTORY, SERVER_PORT } from "./server-profile"
 
 export const ApplicationRuntime = Schema.Union(
   Schema.TaggedStruct("Installed", { resourcesDirectory: Schema.String }),
@@ -35,8 +36,10 @@ export const resolveInstalledApplicationRuntime = (executable: string, platform:
   if (!matched) return yield* new ApplicationRuntimeUnavailable({ message: "This command is not inside a complete Magnitude installation. Reinstall Magnitude." })
   return { _tag: "Installed", resourcesDirectory } satisfies ApplicationRuntime
 })
+/** `sharedControl`: the server profile opens its control endpoint to every local account; data stays private. */
 export const ApplicationProfile = Schema.Struct({
   dataDirectory: Schema.String, isolated: Schema.Boolean, port: Schema.Number, endpoint: Schema.String,
+  sharedControl: Schema.Boolean,
 })
 export type ApplicationProfile = typeof ApplicationProfile.Type
 
@@ -47,13 +50,18 @@ const paths = (platform: string) => platform === "win32" ? win32 : posix
 export const resolveApplicationProfile = (options: {
   readonly runtime: ApplicationRuntime; readonly home: string; readonly platform: string
   readonly acceptance: boolean; readonly environment: Environment
+  /** Whether the installed Linux server profile is active; see `isServerProfileActive`. */
+  readonly server: boolean
 }): ApplicationProfile => {
   const { runtime, environment, acceptance } = options
+  if (options.server && runtime._tag === "Installed" && !acceptance) {
+    return { dataDirectory: SERVER_DATA_DIRECTORY, isolated: false, port: SERVER_PORT, endpoint: `http://127.0.0.1:${SERVER_PORT}`, sharedControl: true }
+  }
   const isolated = acceptance || runtime._tag === "Development" || environment.MAGNITUDE_DEV_DATA_DIR !== undefined
   const dataDirectory = environment.MAGNITUDE_DEV_DATA_DIR ?? paths(options.platform).join(options.home,
     acceptance ? ".magnitude-update-acceptance" : runtime._tag === "Installed" ? ".magnitude" : ".magnitude-desktop-dev")
   const port = isolated ? Number(environment.MAGNITUDE_DEV_PORT ?? (acceptance ? 11143 : 11101)) : 10100
-  return { dataDirectory, isolated, port, endpoint: `http://127.0.0.1:${port}` }
+  return { dataDirectory, isolated, port, endpoint: `http://127.0.0.1:${port}`, sharedControl: false }
 }
 
 export const applicationNativeHostPath = (runtime: ApplicationRuntime, platform: string, architecture: string) =>
@@ -76,6 +84,8 @@ export const applicationServiceCommand = (options: {
     arguments: [...(runtime._tag === "Installed" ? [] : [path.join(runtime.repository, "packages/acn/src/binary.ts")]),
       "serve", "--data-dir", profile.dataDirectory, "--port", String(profile.port)],
     environment: { ...environment, MAGNITUDE_NATIVE_HOST: applicationNativeHostPath(runtime, platform, architecture),
+      // The server's service account has no harnesses; each person connects theirs from the CLI.
+      ...(profile.sharedControl ? { MAGNITUDE_SERVER_SERVICE: "1" } : {}),
       ...(runtime._tag === "Installed" || environment.MAGNITUDE_ICN_PATH ? {} : {
         MAGNITUDE_ICN_PATH: path.join(runtime.repository, "inference/target/development/installation.json"),
       }) },
@@ -88,6 +98,7 @@ export const makeApplicationService = (options: {
   readonly stateDirectory: string; readonly home: string; readonly environment: Environment
   readonly output: ChildOutputMode
   readonly admission: "Immediate" | "Supervised"
+  readonly owner: OwnerAgent
 }) => Effect.gen(function* () {
   const addon = applicationNativeHostPath(options.runtime, process.platform, process.arch)
   const spawner = process.platform === "win32" ? yield* Effect.gen(function* () {
@@ -108,6 +119,6 @@ export const makeApplicationService = (options: {
     Effect.mapError(error => new OwnedChildSpawnFailed({ executable: command.executable, message: error.message })),
     Effect.zipRight(checked.spawn(command)),
   ) })
-  return yield* makeOwnedService(command, MAGNITUDE_RPC_VERSION)
+  return yield* makeOwnedService(command, MAGNITUDE_RPC_VERSION, options.owner)
     .pipe(Effect.provideService(OwnedChildSpawner, admitted))
 })

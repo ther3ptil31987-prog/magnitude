@@ -2,20 +2,22 @@
 //!
 //! A host either names the device (a backend or an exact selector) or asks
 //! for automatic selection. Automatic selection takes backends in the fixed
-//! order Metal > CUDA > Vulkan > CPU, uses the first backend that has a usable
-//! device, and within it the first device in Seismic's enumeration order. A
-//! device is usable when Seismic reports it available (its driver or loader
-//! is present and it meets its backend's floor; Seismic discovery is the
-//! authority) and its memory backing is established. Automatic Vulkan
-//! candidates are GPUs: a software Vulkan device (lavapipe) is never an
-//! accelerator, so the native CPU backend is automatic when no accelerator
-//! is usable. Selection never ranks devices by fit or speed. Preview,
-//! assessment and load all select through here, so the assessed device is
-//! the device a load uses.
+//! order Metal > CUDA > Vulkan > CPU and uses the first backend that has a
+//! usable device. Within a backend, whether automatic or requested by name,
+//! a usable discrete GPU comes before every other usable device (an
+//! integrated GPU sharing host memory), then Seismic's enumeration order
+//! decides. A device is usable when Seismic reports it available (its
+//! driver or loader is present and it meets its backend's floor; Seismic
+//! discovery is the authority) and its memory backing is established.
+//! Automatic Vulkan candidates are GPUs: a software Vulkan device (lavapipe)
+//! is never an accelerator, so the native CPU backend is automatic when no
+//! accelerator is usable. Selection orders devices by kind only, never by
+//! fit or speed. An exact selector resolves exactly that device or fails.
 
 use crate::ExecutionPath;
 use seismic::{
-    Availability, BackendName, DeviceInfo, DeviceKind, DeviceMemory, DeviceSelector, DeviceTopology,
+    Availability, BackendName, DeviceTopology, DiagnosticSource, Executor, ExecutorKind,
+    ExecutorSelector,
 };
 use std::{fmt, str::FromStr};
 
@@ -28,7 +30,7 @@ pub enum DeviceRequest {
     /// The first usable device of this backend.
     Backend(BackendName),
     /// Exactly this device.
-    Selector(DeviceSelector),
+    Selector(ExecutorSelector),
 }
 
 /// The automatic backend order.
@@ -75,7 +77,7 @@ impl FromStr for DeviceRequest {
         if let Some(backend) = BackendName::parse(text) {
             return Ok(Self::Backend(backend));
         }
-        text.parse::<DeviceSelector>()
+        text.parse::<ExecutorSelector>()
             .map(Self::Selector)
             .map_err(|_| DeviceRequestParseError(text.to_owned()))
     }
@@ -97,16 +99,22 @@ impl<'de> serde::Deserialize<'de> for DeviceRequest {
 /// Why a discovered device cannot be selected, when it cannot. `None` means
 /// the device is usable. This is Seismic's own reason (for example a driver
 /// below the backend floor), surfaced unchanged.
-pub fn unusable_reason(device: &DeviceInfo) -> Option<&str> {
-    match (&device.availability, &device.memory) {
-        (Availability::Unavailable { reason }, _) => Some(reason),
-        (Availability::Available, DeviceMemory::Unsupported { reason }) => Some(reason),
-        (Availability::Available, DeviceMemory::Established(_)) => None,
+pub fn unusable_reason(device: &Executor) -> Option<&str> {
+    match device.availability() {
+        Availability::Unavailable { reason } => Some(reason),
+        Availability::Available => None,
     }
 }
 
-fn automatic_candidate(device: &DeviceInfo) -> bool {
-    device.backend != BackendName::Vulkan || device.kind == DeviceKind::Gpu
+fn automatic_candidate(device: &Executor) -> bool {
+    device.backend() != BackendName::Vulkan || is_gpu(device.kind())
+}
+
+fn is_gpu(kind: ExecutorKind) -> bool {
+    matches!(
+        kind,
+        ExecutorKind::IntegratedGpu | ExecutorKind::DiscreteGpu
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -118,12 +126,6 @@ pub enum SelectionError {
         path: ExecutionPath,
         request: DeviceRequest,
         evidence: Vec<String>,
-    },
-    /// An exact selector matches several devices in this process's catalog:
-    /// the identity no longer names one device.
-    Stale {
-        selector: DeviceSelector,
-        matches: usize,
     },
 }
 
@@ -139,10 +141,6 @@ impl fmt::Display for SelectionError {
                 "no device matching `{request}` can execute {path}: {}",
                 evidence.join("; ")
             ),
-            Self::Stale { selector, matches } => write!(
-                formatter,
-                "device {selector} matches {matches} discovered devices"
-            ),
         }
     }
 }
@@ -153,29 +151,22 @@ pub fn select(
     topology: &DeviceTopology,
     path: ExecutionPath,
     request: DeviceRequest,
-) -> Result<DeviceInfo, SelectionError> {
+) -> Result<Executor, SelectionError> {
     let backends: &[BackendName] = match request {
         DeviceRequest::Automatic => &AUTOMATIC_BACKEND_ORDER,
         DeviceRequest::Backend(backend) => &[backend],
         DeviceRequest::Selector(selector) => {
-            let matching = topology
-                .devices()
-                .iter()
-                .filter(|device| device.selector == selector)
-                .collect::<Vec<_>>();
-            if matching.len() > 1 {
-                return Err(SelectionError::Stale {
-                    selector,
-                    matches: matching.len(),
-                });
-            }
-            return match matching.first().copied() {
+            return match topology.resolve(selector) {
                 Some(device) => match unusable_reason(device) {
                     None => Ok(device.clone()),
                     Some(reason) => Err(SelectionError::NoCandidate {
                         path,
                         request,
-                        evidence: vec![format!("{} ({}): {reason}", device.selector, device.name)],
+                        evidence: vec![format!(
+                            "{} ({}): {reason}",
+                            device.selector(),
+                            device.name()
+                        )],
                     }),
                 },
                 None => Err(SelectionError::NoCandidate {
@@ -188,22 +179,29 @@ pub fn select(
     };
     let mut evidence = Vec::new();
     for &backend in backends {
-        for device in topology.devices().iter().filter(|device| {
-            device.backend == backend
-                && (request != DeviceRequest::Automatic || automatic_candidate(device))
-        }) {
-            match unusable_reason(device) {
-                None => return Ok(device.clone()),
-                Some(reason) => {
-                    evidence.push(format!("{} ({}): {reason}", device.selector, device.name))
-                }
-            }
+        let candidates = || {
+            topology.executors().iter().filter(move |device| {
+                device.backend() == backend
+                    && (request != DeviceRequest::Automatic || automatic_candidate(device))
+            })
+        };
+        // `min_by_key` keeps the first of equal keys: enumeration order
+        // within each kind.
+        if let Some(device) = candidates()
+            .filter(|device| unusable_reason(device).is_none())
+            .min_by_key(|device| device.kind() != ExecutorKind::DiscreteGpu)
+        {
+            return Ok(device.clone());
         }
+        evidence.extend(candidates().filter_map(|device| {
+            unusable_reason(device)
+                .map(|reason| format!("{} ({}): {reason}", device.selector(), device.name()))
+        }));
         evidence.extend(
             topology
                 .diagnostics()
                 .iter()
-                .filter(|diagnostic| diagnostic.backend == backend)
+                .filter(|diagnostic| diagnostic.source == DiagnosticSource::Backend(backend))
                 .map(|diagnostic| format!("{}: {}", backend.as_str(), diagnostic.message)),
         );
     }
@@ -248,56 +246,113 @@ mod tests {
         );
         assert_eq!(
             "host-cpu".parse::<DeviceRequest>(),
-            Ok(DeviceRequest::Selector(DeviceSelector::HostCpu))
+            Ok(DeviceRequest::Selector(ExecutorSelector::HostCpu))
         );
         assert!("gpu".parse::<DeviceRequest>().is_err());
     }
 
-    /// The automatic rule over the live topology: the first usable device of
-    /// the first backend (in the fixed order) that has one. The host CPU is
-    /// always usable, so automatic selection always succeeds.
+    /// The automatic rule over the live topology: a usable device of the
+    /// first backend (in the fixed order) that has one, discrete when that
+    /// backend has a usable discrete GPU. The host CPU is always usable, so
+    /// automatic selection always succeeds.
     #[test]
-    fn automatic_selection_takes_the_first_usable_device_of_the_first_usable_backend() {
-        let catalog = seismic::DeviceCatalog::discover().unwrap();
+    fn automatic_selection_takes_a_usable_device_of_the_first_usable_backend() {
+        let catalog = seismic::Inventory::discover(&[], seismic::ProgramStore::user()).unwrap();
         let topology = catalog.topology();
-        let expected = AUTOMATIC_BACKEND_ORDER
-            .iter()
-            .find_map(|&backend| {
-                topology.devices().iter().find(|device| {
-                    device.backend == backend
-                        && automatic_candidate(device)
-                        && unusable_reason(device).is_none()
-                })
+        let usable = |backend| {
+            topology.executors().iter().filter(move |device| {
+                device.backend() == backend
+                    && automatic_candidate(device)
+                    && unusable_reason(device).is_none()
             })
+        };
+        let backend = AUTOMATIC_BACKEND_ORDER
+            .into_iter()
+            .find(|&backend| usable(backend).next().is_some())
             .expect("the host CPU is usable");
         let selected = select(&topology, ExecutionPath::Native, DeviceRequest::Automatic).unwrap();
-        assert_eq!(selected.selector, expected.selector);
+        assert!(usable(backend).any(|device| device.selector() == selected.selector()));
+        if usable(backend).any(|device| device.kind() == ExecutorKind::DiscreteGpu) {
+            assert_eq!(selected.kind(), ExecutorKind::DiscreteGpu);
+        }
+    }
+
+    /// A Ryzen iGPU enumerated before an RTX 4070, both on Vulkan, and no
+    /// CUDA: automatic and Vulkan requests both take the discrete GPU.
+    #[test]
+    fn a_usable_discrete_gpu_comes_before_an_integrated_gpu_enumerated_first() {
+        let topology = seismic::fixtures::recorded::ryzen_igpu_and_rtx4070();
+        let vulkan = topology
+            .executors()
+            .iter()
+            .filter(|device| device.backend() == BackendName::Vulkan)
+            .map(|device| device.kind())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            vulkan,
+            [ExecutorKind::IntegratedGpu, ExecutorKind::DiscreteGpu],
+            "the iGPU is enumerated first"
+        );
+        assert!(
+            topology
+                .executors()
+                .iter()
+                .all(|device| device.backend() != BackendName::Cuda),
+            "CUDA has no device"
+        );
+        for request in [
+            DeviceRequest::Automatic,
+            DeviceRequest::Backend(BackendName::Vulkan),
+        ] {
+            let selected = select(&topology, ExecutionPath::Native, request).unwrap();
+            assert_eq!(selected.backend(), BackendName::Vulkan, "{request}");
+            assert_eq!(selected.kind(), ExecutorKind::DiscreteGpu, "{request}");
+            assert_eq!(selected.name(), "NVIDIA GeForce RTX 4070", "{request}");
+        }
+    }
+
+    /// The integrated GPU stays selectable: by its exact selector.
+    #[test]
+    fn an_integrated_gpu_is_selected_by_its_exact_selector() {
+        let topology = seismic::fixtures::recorded::ryzen_igpu_and_rtx4070();
+        let igpu = topology
+            .executors()
+            .iter()
+            .find(|device| device.kind() == ExecutorKind::IntegratedGpu)
+            .unwrap();
+        let selected = select(
+            &topology,
+            ExecutionPath::Native,
+            DeviceRequest::Selector(igpu.selector()),
+        )
+        .unwrap();
+        assert_eq!(selected.selector(), igpu.selector());
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn automatic_selection_prefers_metal_on_apple_silicon() {
-        let catalog = seismic::DeviceCatalog::discover().unwrap();
+        let catalog = seismic::Inventory::discover(&[], seismic::ProgramStore::user()).unwrap();
         let selected = select(
             &catalog.topology(),
             ExecutionPath::Native,
             DeviceRequest::Automatic,
         )
         .unwrap();
-        assert_eq!(selected.backend, BackendName::Metal);
+        assert_eq!(selected.backend(), BackendName::Metal);
     }
 
     /// A software Vulkan device is never an automatic candidate.
     #[test]
     fn automatic_selection_leaves_software_vulkan_devices_out() {
-        let catalog = seismic::DeviceCatalog::discover().unwrap();
+        let catalog = seismic::Inventory::discover(&[], seismic::ProgramStore::user()).unwrap();
         let topology = catalog.topology();
         for device in topology
-            .devices()
+            .executors()
             .iter()
-            .filter(|device| device.backend == BackendName::Vulkan)
+            .filter(|device| device.backend() == BackendName::Vulkan)
         {
-            assert_eq!(automatic_candidate(device), device.kind == DeviceKind::Gpu);
+            assert_eq!(automatic_candidate(device), is_gpu(device.kind()));
         }
     }
 
@@ -305,7 +360,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_vulkan_request_is_refused_with_the_missing_runtime() {
-        let catalog = seismic::DeviceCatalog::discover().unwrap();
+        let catalog = seismic::Inventory::discover(&[], seismic::ProgramStore::user()).unwrap();
         let request: DeviceRequest = "vulkan".parse().unwrap();
         assert_eq!(
             select(&catalog.topology(), ExecutionPath::Native, request),
@@ -319,29 +374,29 @@ mod tests {
 
     #[test]
     fn explicit_backend_and_selector_requests_select_exactly_that_device() {
-        let catalog = seismic::DeviceCatalog::discover().unwrap();
+        let catalog = seismic::Inventory::discover(&[], seismic::ProgramStore::user()).unwrap();
         let topology = catalog.topology();
         for device in topology
-            .devices()
+            .executors()
             .iter()
             .filter(|device| unusable_reason(device).is_none())
         {
             let selected = select(
                 &topology,
                 ExecutionPath::Native,
-                DeviceRequest::Selector(device.selector),
+                DeviceRequest::Selector(device.selector()),
             )
             .unwrap();
-            assert_eq!(selected.selector, device.selector);
+            assert_eq!(selected.selector(), device.selector());
             let by_backend = select(
                 &topology,
                 ExecutionPath::Native,
-                DeviceRequest::Backend(device.backend),
+                DeviceRequest::Backend(device.backend()),
             )
             .unwrap();
-            assert_eq!(by_backend.backend, device.backend);
+            assert_eq!(by_backend.backend(), device.backend());
         }
-        let missing = DeviceSelector::Metal { registry_id: 0 };
+        let missing = ExecutorSelector::Metal { registry_id: 0 };
         assert!(matches!(
             select(
                 &topology,

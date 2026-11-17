@@ -1,31 +1,142 @@
-// Decode expansion of gated experts (M <= 8); the CUDA form of
-// `metal/routed_gate_up.metal`. Block row y = choice (m, k): the K1 paired
-// GEMV over expert routes[m, k]'s gate/up rows for one activation row, with
-// the activation-generic GLU epilogue.
+// Decode expansion of gated experts (M <= VERIFY_ROWS); the CUDA form of
+// `metal/routed_gate_up.metal`, with the activation-generic GLU epilogue on
+// the accumulators scaled by the expert's gate/up second-level scales where
+// those ports are present (static GS, US). Each choice's weights are read
+// where its source names (`routed::decode_source`): a bank record, or a
+// host tier record read in place over the link.
+// Two forms of one entry (GATHERED, a tuning form both valid at every M,
+// which the tuning admits between):
+// - `routed_gate_up` (GATHERED 0): block row y = choice (m, k), the K1 paired
+//   GEMV over the choice's gate/up rows for its activation row.
+// - `routed_gate_up_gathered` (GATHERED 1): a choice computes only when it
+//   is its expert's first choice, the K1 paired GEMV over that expert's
+//   gate/up rows for the activation row of every choice of the expert
+//   (`routed::gather`), so each chosen expert's records are read
+//   once a step: a host record read once per row that named it would cost
+//   its link bytes again for each (measured on an RTX 3090: 4.2x / 8.0x at 4
+//   / 8 rows naming one host expert). A GEMV row's result does not depend on
+//   the other rows, so every choice gets its one-row bits.
 #define KERNEL_W0 SEISMIC_EXPERT_GATE
 #define KERNEL_W1 SEISMIC_EXPERT_UP
+// The expansion's limit as its F32 bits LB (0: none), which the Glu epilogue
+// clamps at.
+#if SEISMIC_STATIC_LB != 0
+#define PROJECTION_GLU_LIMIT SEISMIC_STATIC_LB
+#endif
 #include "lib/routed/routed.cuh"
 
-using Pro = projection::Plain<ELEMENT_OF(SEISMIC_ELEMENT_A), projection::AllRows>;
+// A block's one row, read in place unless the experts take it as NVFP4
+// operands, which the block forms in its shared memory.
+using Raw = projection::Plain<ELEMENT_OF(SEISMIC_ELEMENT_A), projection::AllRows>;
+using Pro = projection::Operands<
+    projection::OperandRecipe<packets::W0_OPERANDS_NVFP4, packets::W1_OPERANDS_NVFP4>::NVFP4, Raw>;
+using Source = projection::GemvSource<Pro>;
 using Epi = projection::Glu<ELEMENT_OF(SEISMIC_ELEMENT_A)>;
 
-#ifdef SEISMIC_FORMING_ROUTED_GATE_UP
+// Where choice (m, k) of `expert` reads its gate and up weights: a bank
+// record, or its tier records in place. In the kernel's own scope, where
+// its ports are.
+struct Weights {
+    slab::Matrix gate, up;
+    __device__ __forceinline__ bool none() const { return gate.stack == nullptr; }
+};
+#define CHOICE_WEIGHTS(m, k, expert)                                                                       \
+    [&] {                                                                                                  \
+        const slab::Source source = routed::decode_source(SEISMIC_PTR(SEISMIC_BUFFER_SOURCES), SEISMIC_DIM_XS,      \
+                                                 SEISMIC_SOURCES_STRIDE_1, SEISMIC_SOURCES_STRIDE_2, (m),  \
+                                                 (k), (expert));                                           \
+        return Weights{slab::Experts{SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_GATE),                          \
+                                     SEISMIC_PTR(SEISMIC_BUFFER_TIER_GATE)}.matrix(source),            \
+                       slab::Experts{SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP),                            \
+                                     SEISMIC_PTR(SEISMIC_BUFFER_TIER_UP)}.matrix(source)};             \
+    }()
+
+#ifdef SEISMIC_FORMING_ROUTED_GATE_UP_CHOICE
 template <int TPW, int KSPLIT>
-__global__ void routed_gate_up(SEISMIC_KERNEL_PARAMS) {
-    using Shape = projection::GemvShape<4, TPW, KSPLIT, 1>;
-    __shared__ projection::GemvShared<Shape, Pro> shared;
+__global__ void routed_gate_up_choice(SEISMIC_KERNEL_PARAMS) {
+    using Shape = routed::DecodeShape<TPW, KSPLIT>;
+    __shared__ projection::GemvShared<Shape, Source::type> shared;
+    extern __shared__ uint4 dynamic_shared[];
     const projection::u8 *normalized = SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED);
     const int *routes = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));
-    const projection::u64 group = Shape::tile_group();
-    if (group >= projection::gemv_groups<Shape>(SEISMIC_DIM_F))
-        return;
     const projection::u64 m = blockIdx.y / SEISMIC_DIM_K, k = blockIdx.y % SEISMIC_DIM_K;
+    // Block-collective: before any warp leaves.
+    const Source::type pro = Source::make(
+        Pro{Raw{normalized + m * SEISMIC_NORMALIZED_STRIDE_0 * 2, SEISMIC_NORMALIZED_STRIDE_0, projection::AllRows{}}},
+        reinterpret_cast<projection::u8 *>(dynamic_shared), 1u, SEISMIC_DIM_H, nullptr);
     const projection::u64 expert = (projection::u64)routes[m * SEISMIC_ROUTES_STRIDE_0 + k * SEISMIC_ROUTES_STRIDE_1];
-    const Pro pro{normalized + m * SEISMIC_NORMALIZED_STRIDE_0 * 2, SEISMIC_NORMALIZED_STRIDE_0, projection::AllRows{}};
-    const Epi epi{SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + (m * SEISMIC_RESULT_0_STRIDE_0 + k * SEISMIC_RESULT_0_STRIDE_1) * 2,
-                  0, (int)SEISMIC_PARAM_ACTIVATION};
+    const Weights weights = CHOICE_WEIGHTS(m, k, (int)expert);
+    const element::Out<ELEMENT_OF(SEISMIC_ELEMENT_A)> product =
+        SEISMIC_RESULT_0_OUT.offset(m * SEISMIC_RESULT_0_STRIDE_0 + k * SEISMIC_RESULT_0_STRIDE_1);
+    // A choice with no record has a zero product.
+    if (weights.none()) {
+        routed::zero_block_rows<Shape>(SEISMIC_DIM_F, [&](projection::u64 n) {
+            product.put(n, 0.0f);
+        });
+        return;
+    }
+    const projection::u64 group = Shape::tile_group();
+    const auto epi = projection::scaling<(SEISMIC_DIM_GS + SEISMIC_DIM_US != 0)>::wrap(
+        Epi{product, 0, (int)SEISMIC_PARAM_ACTIVATION},
+        projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_GATE_SCALE), SEISMIC_DIM_GS,
+                                 SEISMIC_GATE_SCALE_STRIDE_0, expert),
+        projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_US,
+                                 SEISMIC_UP_SCALE_STRIDE_0, expert));
     projection::gemv_segment<Shape>(shared, pro, 1u, SEISMIC_DIM_H / 64, group, SEISMIC_DIM_F,
-                                    KERNEL_W0_MATRIX(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_GATE), expert),
-                                    KERNEL_W1_MATRIX(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP), expert), epi);
+                                    ROUTED_MATRIX(KERNEL_W0, weights.gate),
+                                    ROUTED_MATRIX(KERNEL_W1, weights.up), epi);
+}
+#endif
+
+// The rows the gathered GEMV reads: the normalized rows, or where the experts
+// take NVFP4 operands the rows `routed_gate_up_stage` formed.
+constexpr bool NVFP4 = projection::OperandRecipe<packets::W0_OPERANDS_NVFP4, packets::W1_OPERANDS_NVFP4>::NVFP4;
+#define GATHERED_ROWS (NVFP4 ? SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_OPERANDS) : SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED))
+#define GATHERED_STRIDE (NVFP4 ? SEISMIC_DIM_H : SEISMIC_NORMALIZED_STRIDE_0)
+
+#ifdef SEISMIC_FORMING_ROUTED_GATE_UP_STAGE
+// Each normalized row as NVFP4 operands, once for every expert.
+__global__ void routed_gate_up_stage(SEISMIC_KERNEL_PARAMS) {
+    projection::form_row(projection::Nvfp4Rows<Raw>{Raw{SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED),
+                                                        SEISMIC_NORMALIZED_STRIDE_0, projection::AllRows{}}},
+                         blockIdx.x, SEISMIC_DIM_H, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_OPERANDS));
+}
+#endif
+
+#ifdef SEISMIC_FORMING_ROUTED_GATE_UP_GATHERED
+template <int TPW, int KSPLIT>
+__global__ void routed_gate_up_gathered(SEISMIC_KERNEL_PARAMS) {
+    using Shape = routed::DecodeShape<TPW, KSPLIT>;
+    __shared__ projection::GemvShared<Shape, Raw> shared;
+    __shared__ routed::Gathered table;
+    const int *routes = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));
+    const unsigned at = blockIdx.y, slots = (unsigned)SEISMIC_DIM_K;
+    if (!routed::gather(table, routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1,
+                        (unsigned)SEISMIC_DIM_M, slots, at, GATHERED_STRIDE, SEISMIC_RESULT_0_STRIDE_0,
+                        SEISMIC_RESULT_0_STRIDE_1))
+        return;
+    const projection::u64 expert = (projection::u64)table.expert;
+    const Weights weights = CHOICE_WEIGHTS(at / slots, at % slots, (int)expert);
+    // An expert with no record (every choice of an expert has its one
+    // source) has a zero product for each of its choices.
+    if (weights.none()) {
+        for (unsigned r = 0; r < table.count; ++r)
+            routed::zero_block_rows<Shape>(SEISMIC_DIM_F, [&](projection::u64 n) {
+                SEISMIC_RESULT_0_OUT.put(table.products[r] + n, 0.0f);
+            });
+        return;
+    }
+    const projection::u64 group = Shape::tile_group();
+    const auto epi = projection::scaling<(SEISMIC_DIM_GS + SEISMIC_DIM_US != 0)>::wrap(
+        routed::ChoiceRows<Epi>{Epi{SEISMIC_RESULT_0_OUT, 0, (int)SEISMIC_PARAM_ACTIVATION},
+                                table.products},
+        projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_GATE_SCALE), SEISMIC_DIM_GS,
+                                 SEISMIC_GATE_SCALE_STRIDE_0, expert),
+        projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_US, SEISMIC_UP_SCALE_STRIDE_0,
+                                 expert));
+    projection::gemv_segment<Shape>(shared, routed::GatheredRows{GATHERED_ROWS, table.rows}, table.count,
+                                    SEISMIC_DIM_H / 64, group, SEISMIC_DIM_F,
+                                    ROUTED_MATRIX(KERNEL_W0, weights.gate),
+                                    ROUTED_MATRIX(KERNEL_W1, weights.up), epi);
 }
 #endif

@@ -4,18 +4,18 @@ namespace attention {
 // partitions in partition order, then the output gate.
 template <int PARTS>
 __device__ __forceinline__ void decode_gate(const Inputs &in, const float *partials,
-                                            const float *statistics, u8 *result, int query_head,
+                                            const float *statistics, element::Out<Act> result, int query_head,
                                             u64 row, int column) {
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
     const u64 first = (row * KV * G + query_head) * PARTS;
     float denominator, accumulator;
-    merge(statistics + first * 2, 2, partials + first * W + column, W, PARTS, denominator,
-          accumulator);
-    const float attended = gated(in, row, query_head, column, accumulator / fmaxf(denominator, 1e-30f));
-    element::put<Act>(result,
-                      row * SEISMIC_RESULT_0_STRIDE_0 + query_head * SEISMIC_RESULT_0_STRIDE_1 +
-                          column * SEISMIC_RESULT_0_STRIDE_2,
-                      attended);
+    const float maximum = merge(statistics + first * 2, 2, partials + first * W + column, W, PARTS,
+                                denominator, accumulator);
+    const float attended =
+        gated(in, row, query_head, column, accumulator / normalizer(in, query_head, maximum, denominator));
+    result.put(row * SEISMIC_RESULT_0_STRIDE_0 + query_head * SEISMIC_RESULT_0_STRIDE_1 +
+                   column * SEISMIC_RESULT_0_STRIDE_2,
+               attended);
 }
 
 } // namespace attention

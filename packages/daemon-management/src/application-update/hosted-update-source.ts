@@ -1,10 +1,11 @@
 import { FetchHttpClient, FileSystem, Path } from "@effect/platform"
-import { checkHostedUpdate, resolveHostedDownload, downloadUpdateArtifact, updateInstallerFilename, ReleaseTarget, type HostedUpdateConnection } from "@magnitudedev/release/hosted-update"
-import { Effect, Option, Schema } from "effect"
+import { checkHostedUpdate, resolveHostedDownload, downloadUpdateArtifact, updateInstallerFilename, releaseTargetOf, type HostedUpdateConnection } from "@magnitudedev/release/hosted-update"
+import { Effect, Option } from "effect"
 import type { KeyObject } from "node:crypto"
 import { join } from "node:path"
 import { PreparedUpdateStore } from "../desktop-native/prepared-update"
 import { ApplicationUpdateFailed, ApplicationUpdateSource } from "./application-update"
+import { UpdateHardwareSource } from "./update-hardware"
 
 export type HostedUpdateSourceOptions = HostedUpdateConnection & {
   readonly trustedPublishers: ReadonlyMap<string, KeyObject>
@@ -16,10 +17,12 @@ export const hostedUpdateSource = (options: HostedUpdateSourceOptions, stage: Ap
   const fs = yield* FileSystem.FileSystem
   const path = yield* Path.Path
   const store = yield* PreparedUpdateStore
+  const hardwareSource = yield* UpdateHardwareSource
   return ApplicationUpdateSource.of({
     check: reason => Effect.gen(function* () {
       const outcome = yield* store.outcome.pipe(Effect.orElseSucceed(() => Option.none()))
-      const candidate = yield* checkHostedUpdate(options, { reason, outcome })
+      const hardware = yield* hardwareSource.current
+      const candidate = yield* checkHostedUpdate(options, { reason, outcome, hardware })
       if (Option.isSome(outcome)) yield* store.markOutcomeReported.pipe(Effect.ignore)
       return candidate
     }).pipe(
@@ -31,7 +34,7 @@ export const hostedUpdateSource = (options: HostedUpdateSourceOptions, stage: Ap
       yield* fs.makeDirectory(transfers, { recursive: true, mode: 0o700 })
       const directory = yield* fs.makeTempDirectoryScoped({ directory: transfers, prefix: "desktop-update-" })
       const downloaded = yield* downloadUpdateArtifact({
-        url, destination: join(directory, updateInstallerFilename(yield* Schema.decodeUnknown(ReleaseTarget)({ os: options.metadata.os, arch: options.metadata.arch, package: options.metadata.package }))),
+        url, destination: join(directory, updateInstallerFilename(yield* releaseTargetOf(options.metadata))),
         release: candidate,
         onProgress: Option.some(value => progress(value.acceptedBytes)),
       })

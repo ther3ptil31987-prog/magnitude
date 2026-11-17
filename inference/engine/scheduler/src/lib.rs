@@ -11,6 +11,8 @@ pub mod prefix_cache;
 pub mod protocol;
 pub mod publication;
 pub mod round_driver;
+pub mod serving;
 pub mod worker;
+pub use magnitude_executor::workload;
 
 pub use policy::ServiceLimits;

@@ -1,9 +1,12 @@
 //! The separate-draft entries (`tap_rows`, `feature_rows`,
-//! `draft_confidence`) against host models of their contracts. The CPU test
+//! `draft_confidence`, `token_confidence`) against host models of their
+//! contracts. The CPU test
 //! runs everywhere; the accelerator test covers every other device the host
 //! has.
 
-use magnitude_kernels::{draft_confidence, feature_rows, tap_rows};
+mod declared;
+
+use magnitude_kernels::{draft_confidence, feature_rows, tap_rows, token_confidence};
 use seismic::{BackendName, Device, Element, NativeSpecialization, Tensor};
 
 fn bf16_round(value: f32) -> f32 {
@@ -60,25 +63,27 @@ fn specialization(
 }
 
 fn taps_write_their_column_blocks(device: &Device) {
-    let implementation = tap_rows::native_implementation(device)
-        .unwrap()
-        .expect("tap_rows has a native implementation on every device");
     for (rows, width, taps) in [(1usize, 64usize, 2usize), (5, 96, 3), (17, 128, 5)] {
         let extents = [
             ("M", rows as u64),
             ("D", width as u64),
             ("T", taps as u64),
         ];
-        let kernel = tap_rows::native_for_device_with(
-            device,
-            tap_rows::Elements { A: Element::bf16() },
-            &specialization(
-                &implementation.statics,
-                |fixed| implementation.default_specialization(fixed).unwrap(),
-                &extents,
-            ),
-        )
-        .unwrap();
+        let entry = tap_rows::native_entry_with(tap_rows::Elements { A: Element::bf16() });
+        let implementation = entry
+            .offered(device)
+            .unwrap()
+            .expect("tap_rows has a native implementation at its elements");
+        let kernel = entry
+            .prepare(
+                device,
+                &specialization(
+                    &implementation.statics,
+                    |fixed| implementation.default_specialization(fixed).unwrap(),
+                    &extents,
+                ),
+            )
+            .unwrap();
         let sentinel = vec![7.0f32; rows * taps * width];
         let mut buffer = Tensor::from_host(
             device,
@@ -124,9 +129,6 @@ fn taps_write_their_column_blocks(device: &Device) {
 }
 
 fn features_gather_the_published_rows(device: &Device) {
-    let implementation = feature_rows::native_implementation(device)
-        .unwrap()
-        .expect("feature_rows has a native implementation on every device");
     for (rows, width, published) in [(1usize, 64usize, vec![0i32]), (9, 96, vec![8, 0, 3])] {
         let outputs = published.len();
         let extents = [
@@ -134,16 +136,21 @@ fn features_gather_the_published_rows(device: &Device) {
             ("O", outputs as u64),
             ("D", width as u64),
         ];
-        let kernel = feature_rows::native_for_device_with(
-            device,
-            feature_rows::Elements { A: Element::bf16() },
-            &specialization(
-                &implementation.statics,
-                |fixed| implementation.default_specialization(fixed).unwrap(),
-                &extents,
-            ),
-        )
-        .unwrap();
+        let entry = feature_rows::native_entry_with(feature_rows::Elements { A: Element::bf16() });
+        let implementation = entry
+            .offered(device)
+            .unwrap()
+            .expect("feature_rows has a native implementation at its elements");
+        let kernel = entry
+            .prepare(
+                device,
+                &specialization(
+                    &implementation.statics,
+                    |fixed| implementation.default_specialization(fixed).unwrap(),
+                    &extents,
+                ),
+            )
+            .unwrap();
         let fused_values = values(rows * width, 11);
         let fused = Tensor::from_host(
             device,
@@ -184,25 +191,27 @@ fn features_gather_the_published_rows(device: &Device) {
 }
 
 fn confidence_declines_below_the_threshold(device: &Device) {
-    let implementation = draft_confidence::native_implementation(device)
-        .unwrap()
-        .expect("draft_confidence has a native implementation on every device");
     let (slots, width, rank) = (6usize, 128usize, 32usize);
     let extents = [
         ("S", slots as u64),
         ("D", width as u64),
         ("R", rank as u64),
     ];
-    let kernel = draft_confidence::native_for_device_with(
-        device,
-        draft_confidence::Elements { A: Element::bf16() },
-        &specialization(
-            &implementation.statics,
-            |fixed| implementation.default_specialization(fixed).unwrap(),
-            &extents,
-        ),
-    )
-    .unwrap();
+    let entry = draft_confidence::native_entry_with(draft_confidence::Elements { A: Element::bf16() });
+    let implementation = entry
+        .offered(device)
+        .unwrap()
+        .expect("draft_confidence has a native implementation at its elements");
+    let kernel = entry
+        .prepare(
+            device,
+            &specialization(
+                &implementation.statics,
+                |fixed| implementation.default_specialization(fixed).unwrap(),
+                &extents,
+            ),
+        )
+        .unwrap();
     let feature_values = values(slots * width, 3)
         .into_iter()
         .map(bf16_round)
@@ -298,21 +307,106 @@ fn confidence_declines_below_the_threshold(device: &Device) {
     assert_eq!(actual, expected, "{:?} draft_confidence", device.backend());
 }
 
+/// Each selection's token probability under the softmax of the logits row
+/// it names, and 0 for a selection that failed.
+fn token_confidence_is_the_selected_probability(device: &Device) {
+    let implementation = token_confidence::native_implementation(device)
+        .unwrap()
+        .expect("token_confidence has a native implementation on every device");
+    let (rows, vocabulary) = (5usize, 3001usize);
+    // Selection r reads logits row (2 r) mod 5: rows out of order.
+    let row_map = (0..rows).map(|row| (2 * row % rows) as i32).collect::<Vec<_>>();
+    let kernel = declared::prepared(
+        device,
+        &token_confidence::native_entry(),
+        &specialization(
+            &implementation.statics,
+            |fixed| implementation.default_specialization(fixed).unwrap(),
+            &[("M", rows as u64), ("N", rows as u64), ("V", vocabulary as u64)],
+        ),
+    )
+    .unwrap();
+    let logit_values = values(rows * vocabulary, 11)
+        .into_iter()
+        .map(|value| value / 64.0)
+        .collect::<Vec<_>>();
+    // Row r selects token 97 r; row 3's selection failed.
+    let selection_values = (0..rows)
+        .flat_map(|row| [97 * row as i32, i32::from(row == 3)])
+        .collect::<Vec<_>>();
+    let expected = (0..rows)
+        .map(|row| {
+            if row == 3 {
+                return 0.0;
+            }
+            let line = &logit_values[row_map[row] as usize * vocabulary..][..vocabulary];
+            let maximum = line.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let total = line.iter().map(|logit| (logit - maximum).exp()).sum::<f32>();
+            (line[97 * row] - maximum).exp() / total
+        })
+        .collect::<Vec<_>>();
+    let logits = Tensor::from_host(
+        device,
+        Element::f32(),
+        &[rows as u64, vocabulary as u64],
+        &f32_bytes(&logit_values),
+    )
+    .unwrap();
+    let selection = Tensor::from_host(
+        device,
+        Element::i32(),
+        &[rows as u64, 2],
+        &i32_bytes(&selection_values),
+    )
+    .unwrap();
+    let mut confidence = Tensor::from_host(
+        device,
+        Element::f32(),
+        &[rows as u64],
+        &f32_bytes(&vec![f32::NAN; rows]),
+    )
+    .unwrap();
+    kernel
+        .call(token_confidence::Args {
+            logits: &logits,
+            rows: &Tensor::from_host(device, Element::i32(), &[rows as u64], &i32_bytes(&row_map))
+                .unwrap(),
+            selection: &selection,
+            confidence: &mut confidence,
+        })
+        .unwrap();
+    let actual = confidence
+        .read_to_host()
+        .unwrap()
+        .chunks_exact(4)
+        .map(|word| f32::from_le_bytes(word.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(actual.len(), rows);
+    for (row, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+        assert!(
+            (actual - expected).abs() <= 1.0e-6 + 1.0e-4 * expected,
+            "{:?} token_confidence row {row}: {actual} against {expected}",
+            device.backend()
+        );
+    }
+}
+
 fn entries_match_on(device: &Device) {
     taps_write_their_column_blocks(device);
     features_gather_the_published_rows(device);
     confidence_declines_below_the_threshold(device);
+    token_confidence_is_the_selected_probability(device);
 }
 
 #[test]
 fn dflash_entries_match_the_host_model_on_cpu() {
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     entries_match_on(&catalog.open_backend(BackendName::Cpu).unwrap());
 }
 
 #[test]
 fn dflash_entries_match_the_host_model_on_accelerators() {
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     for backend in [BackendName::Metal, BackendName::Cuda, BackendName::Vulkan] {
         let Ok(device) = catalog.open_backend(backend) else {
             continue;

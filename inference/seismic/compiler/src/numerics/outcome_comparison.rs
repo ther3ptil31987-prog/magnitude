@@ -141,10 +141,11 @@ pub fn compare_outcome(
         }
     }
     // Shared input identity is a storage contract, independently of floating
-    // tolerance and of any allowed numerical associations in the invocation.
+    // tolerance and of any allowed numerical associations in the invocation;
+    // a host port, which the kernel never accesses, keeps it too.
     for (expected, observed) in reference.inputs().zip(&actual.inputs) {
         let tensor = expected.tensor();
-        if expected.access() == TensorAccess::Shared {
+        if matches!(expected.access(), TensorAccess::Shared | TensorAccess::Host { .. }) {
             allowance(tensor.element_count() as u64)?;
             let bytes = tensor
                 .canonical_bytes()
@@ -277,7 +278,7 @@ pub fn compare_outcome(
     }
     for (expected, observed) in reference.inputs().zip(&actual.inputs) {
         let tensor = expected.tensor();
-        if expected.access() == TensorAccess::Shared
+        if matches!(expected.access(), TensorAccess::Shared | TensorAccess::Host { .. })
             || !matches!(
                 registry::representation_info(tensor.representation()).kind,
                 registry::RepresentationKind::Dense(_)
@@ -397,6 +398,7 @@ fn scalar(value: SymbolValue) -> Option<(DType, f64)> {
         SymbolValue::BF16(v) => (DType::BF16, f32::from_bits((v as u32) << 16) as f64),
         SymbolValue::I32(v) => (DType::I32, v as f64),
         SymbolValue::U32(v) => (DType::U32, v as f64),
+        SymbolValue::U64(v) => (DType::U64, v as f64),
         SymbolValue::Bool(v) => (DType::Bool, f64::from(v)),
         _ => return None,
     })
@@ -410,6 +412,7 @@ fn decode(dtype: DType, bytes: &[u8]) -> f64 {
         }
         DType::I32 => i32::from_le_bytes(bytes.try_into().unwrap()) as f64,
         DType::U32 => u32::from_le_bytes(bytes.try_into().unwrap()) as f64,
+        DType::U64 => u64::from_le_bytes(bytes.try_into().unwrap()) as f64,
         DType::Bool => f64::from(bytes[0] != 0),
     }
 }
@@ -451,6 +454,7 @@ pub(super) mod tests {
                 DType::BF16 => "bf16",
                 DType::I32 => "i32",
                 DType::U32 => "u32",
+                DType::U64 => "u64",
                 DType::Bool => "bool",
             },
             match dtype {
@@ -459,6 +463,7 @@ pub(super) mod tests {
                 DType::BF16 => "bf16",
                 DType::I32 => "i32",
                 DType::U32 => "u32",
+                DType::U64 => "u64",
                 DType::Bool => "bool",
             }
         );
@@ -469,6 +474,7 @@ pub(super) mod tests {
             match dtype {
                 DType::I32 => R::I32(value as i32),
                 DType::U32 => R::U32(value as u32),
+                DType::U64 => R::U64(value as u64),
                 DType::Bool => R::Bool(value != 0.),
                 _ => unreachable!(),
             }
@@ -846,12 +852,7 @@ pub(super) mod tests {
                 &ElementBindings::new().bind("Q", representation),
             )
             .unwrap();
-        let registry::RepresentationKind::Packed(layout) =
-            &registry::representation_info(representation).kind
-        else {
-            panic!()
-        };
-        let bytes = vec![0; layout.bytes(1, 64).unwrap() as usize];
+        let bytes = vec![0; registry::canonical_bytes(representation, &[1, 64]).unwrap() as usize];
         let mut interpreter = Interpreter::new(&entry);
         interpreter
             .add_tensor(TensorData::encoded(representation, vec![64], bytes.clone()).unwrap());
@@ -954,12 +955,7 @@ pub(super) mod tests {
                 &ElementBindings::new().bind("Q", representation),
             )
             .unwrap();
-        let registry::RepresentationKind::Packed(layout) =
-            &registry::representation_info(representation).kind
-        else {
-            panic!()
-        };
-        let bytes = vec![0; layout.bytes(1, 64).unwrap() as usize];
+        let bytes = vec![0; registry::canonical_bytes(representation, &[1, 64]).unwrap() as usize];
         let mut interpreter = Interpreter::new(&entry);
         interpreter
             .add_tensor(TensorData::encoded(representation, vec![64], bytes.clone()).unwrap());
@@ -997,12 +993,7 @@ pub(super) mod tests {
                 &ElementBindings::new().bind("Q", representation),
             )
             .unwrap();
-        let registry::RepresentationKind::Packed(layout) =
-            &registry::representation_info(representation).kind
-        else {
-            panic!()
-        };
-        let bytes = vec![0; layout.bytes(1, 64).unwrap() as usize];
+        let bytes = vec![0; registry::canonical_bytes(representation, &[1, 64]).unwrap() as usize];
         let mut interpreter = Interpreter::new(&entry);
         interpreter
             .add_tensor(TensorData::encoded(representation, vec![64], bytes.clone()).unwrap());

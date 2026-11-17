@@ -15,6 +15,7 @@
 
 #include "../core/activation.h"
 #include "../projection/projection.h"
+#include "../core/norm.h"
 #include "../core/reduce.h"
 
 namespace vision {
@@ -63,21 +64,35 @@ inline float gelu_quick(float value) {
     return value / (1.0f + metal::precise::exp(-1.702f * value));
 }
 
-// The activation of `vision_linear`: 1 tanh GELU, 2 erf GELU, 3 quick GELU.
+inline float relu_squared(float value) {
+    const float positive = metal::max(value, 0.0f);
+    return positive * positive;
+}
+
+inline float silu(float value) {
+    return value / (1.0f + metal::precise::exp(-value));
+}
+
+// The activation of `vision_linear`: 1 tanh GELU, 2 erf GELU, 3 quick GELU,
+// 4 squared ReLU, 5 SiLU.
 inline float activate(int code, float value) {
-    return code == 1 ? gelu_tanh(value) : code == 2 ? gelu_erf(value) : gelu_quick(value);
+    return code == 1 ? gelu_tanh(value)
+         : code == 2 ? gelu_erf(value)
+         : code == 3 ? gelu_quick(value)
+         : code == 4 ? relu_squared(value)
+                     : silu(value);
 }
 
 // ---------------------------------------------------------------------------
 // The `vision_linear` epilogue. `store(m, n, acc)` receives the F32 product
 // of output (m, n); the projection is acc, plus bias[n] when BIAS, clamped to
 // [minimum, maximum] when CLAMP. With `activation` nonzero
-// y = Y(act(round_A(projection))); with GATE y = Y(round_A(projection) ·
-// gate[m, n]); otherwise y = Y(projection), plus the F32 residual row when
+// y = Y(act(projection)), rounded once, as published; with GATE
+// y = Y(projection · gate[m, n]), rounded once; otherwise y = Y(projection), plus the F32 residual row when
 // RESIDUAL.
 template <typename A, typename B, typename Y, bool BIAS, bool RESIDUAL, bool GATE, bool CLAMP>
 struct output_linear {
-    device uchar *y;
+    element::Out<Y> y;
     ulong stride;
     device const uchar *bias;
     device const float *residual;
@@ -95,12 +110,12 @@ struct output_linear {
             projected = metal::min(metal::max(projected, minimum), maximum);
         float published = projected;
         if (activation != 0)
-            published = activate(activation, A::round(projected));
+            published = activate(activation, projected);
         else if (GATE)
-            published = A::round(projected) * element::at<A>(gate, ulong(m) * gate_stride + n);
+            published = projected * element::at<A>(gate, ulong(m) * gate_stride + n);
         else if (RESIDUAL)
             published = residual[ulong(m) * residual_stride + n] + projected;
-        element::put<Y>(y, ulong(m) * stride + n, published);
+        y.put(ulong(m) * stride + n, published);
     }
     void store2(uint m, uint n, float first, float second) const {
         store(m, n, first);
@@ -109,41 +124,31 @@ struct output_linear {
 };
 
 // ---------------------------------------------------------------------------
-// Norm of one F32 row of `width` values (THREADS threads): two-pass F32
-// statistics, centered (a layer norm) or not (the mean taken as 0, a
-// root-mean-square norm), out = Y(centered * inverse [* weight] [+ bias]).
+// Norm of one F32 row of `width` values (THREADS threads): `norm`'s
+// two-pass statistics, centered (a layer norm) or not (the mean taken as 0, a
+// root-mean-square norm), out = Y(act(centered * inverse [* weight] [+ bias])), `act` the
+// activation of `vision_linear`'s codes when `activation` is nonzero.
 // `partials` holds THREADS / 32 floats.
 template <uint THREADS, typename Y, typename WN, typename BN, bool WEIGHT, bool BIAS>
-inline void norm(device const float *row, device uchar *out, ulong stride, device const uchar *weight,
-    device const uchar *bias, uint width, bool centered, float epsilon, threadgroup float *partials,
-    uint thread_index, uint sg, uint lane) {
+inline void norm(device const float *row, element::Out<Y> out, ulong stride, device const uchar *weight,
+    device const uchar *bias, uint width, bool centered, float epsilon, int activation,
+    threadgroup float *partials, uint thread_index, uint sg, uint lane) {
     float mean = 0.0f;
     if (centered) {
         float sum = 0.0f;
         for (uint i = thread_index; i < width; i += THREADS)
             sum += row[i];
-        mean = reduce::group_sum<THREADS / 32>(sum, partials, sg, lane) / float(width);
+        mean = row_norm::mean(reduce::group_sum<THREADS / 32>(sum, partials, sg, lane), width);
     }
     float squares = 0.0f;
+    for (uint i = thread_index; i < width; i += THREADS)
+        squares = row_norm::square(row[i] - mean, squares);
+    const float inverse = row_norm::inverse(reduce::group_sum<THREADS / 32>(squares, partials, sg, lane), width, epsilon);
     for (uint i = thread_index; i < width; i += THREADS) {
-        const float value = row[i] - mean;
-        squares = metal::fma(value, value, squares);
-    }
-    const float inverse =
-        metal::rsqrt(reduce::group_sum<THREADS / 32>(squares, partials, sg, lane) / float(width) + epsilon);
-    // One expression per form: the compiler contracts a product and a sum
-    // only within an expression.
-    for (uint i = thread_index; i < width; i += THREADS) {
-        float value;
-        if (WEIGHT && BIAS)
-            value = (row[i] - mean) * inverse * element::at<WN>(weight, i) + element::at<BN>(bias, i);
-        else if (WEIGHT)
-            value = (row[i] - mean) * inverse * element::at<WN>(weight, i);
-        else if (BIAS)
-            value = (row[i] - mean) * inverse + element::at<BN>(bias, i);
-        else
-            value = (row[i] - mean) * inverse;
-        element::put<Y>(out, ulong(i) * stride, value);
+        const float w = WEIGHT ? element::at<WN>(weight, i) : 0.0f;
+        const float b = BIAS ? element::at<BN>(bias, i) : 0.0f;
+        const float normalized = row_norm::apply<WEIGHT, BIAS>(row[i] - mean, inverse, w, b);
+        out.put(ulong(i) * stride, activation != 0 ? activate(activation, normalized) : normalized);
     }
 }
 
@@ -198,8 +203,9 @@ inline void prepare_head(device const typename A::storage *source, device typena
 // spans in tiles of ATTEND_KEYS: K and V staged in threadgroup memory, scores =
 // Q K^T on the matrix units (Q's fragments held in registers), scaled into the
 // exp2 domain in F32, the online softmax, and the F32 output accumulated from
-// probabilities rounded to half. `qkv` is the [rows, 3, H, WP] operand rows
-// (queries and keys prepared, zero past the head width W); rows past `rows` of
+// probabilities rounded to half. `qkv` is the [rows, H + 2KV, WP] operand rows
+// (the query, then key, then value heads; queries and keys prepared, zero past
+// the head width W); rows past `rows` of
 // the last query tile are read (the buffer holds whole tiles) but never
 // stored. Without `spans` every row attends to every row; with them row r
 // attends to rows [spans[2r], spans[2r + 1]), the tile walking the union of
@@ -227,16 +233,22 @@ inline void attend_stage(threadgroup S *staged, device const S *qkv, ulong row_s
     }
 }
 
-template <typename S, uint W, uint WP>
-inline void attend(device const S *qkv, device S *out, uint rows, uint heads, float scale,
-    device const int *spans, threadgroup S *keys, threadgroup S *values, threadgroup uint *bounds, uint tile,
-    uint head, uint thread_index, uint simd, uint lane) {
+template <typename A, uint W, uint WP>
+inline void attend(device const typename A::native *qkv, element::Out<A> out, uint rows, uint heads, uint group,
+    float scale, device const int *spans, threadgroup typename A::native *keys,
+    threadgroup typename A::native *values, threadgroup uint *bounds, uint tile, uint head, uint thread_index,
+    uint simd, uint lane) {
+    typedef typename A::native S;
     constexpr uint THREADS = ATTEND_ROWS * 4;
     constexpr uint PITCH = attend_pitch<WP>();
     constexpr uint DB = WP / 8;
     constexpr uint KB = ATTEND_KEYS / 8;
-    const ulong width = ulong(heads) * WP;
-    const ulong row_stride = 3 * width;
+    // Operand rows hold the query heads, then the key heads, then the value
+    // heads; query head h reads key and value head h / group.
+    const ulong kv_heads = heads / group;
+    const ulong row_stride = (ulong(heads) + 2 * kv_heads) * WP;
+    const ulong key_column = (ulong(heads) + head / group) * WP;
+    const ulong value_column = key_column + kv_heads * WP;
     const float scale2 = scale * 1.4426950408889634f;
 
     // This lane's fragment coordinates: row fm, columns fn and fn + 1.
@@ -276,9 +288,8 @@ inline void attend(device const S *qkv, device S *out, uint rows, uint heads, fl
 
     for (uint first = walk_first; first < walk_end; first += ATTEND_KEYS) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        attend_stage<S, WP, THREADS>(keys, qkv, row_stride, width + ulong(head) * WP, first, rows, thread_index);
-        attend_stage<S, WP, THREADS>(values, qkv, row_stride, 2 * width + ulong(head) * WP, first, rows,
-            thread_index);
+        attend_stage<S, WP, THREADS>(keys, qkv, row_stride, key_column, first, rows, thread_index);
+        attend_stage<S, WP, THREADS>(values, qkv, row_stride, value_column, first, rows, thread_index);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         simdgroup_matrix<float, 8, 8> scores[KB];
@@ -342,8 +353,8 @@ inline void attend(device const S *qkv, device S *out, uint rows, uint heads, fl
     for (uint d = 0; d < DB; ++d)
         for (uint e = 0; e < 2; ++e)
             if (d * 8 + fn + e < W)
-                out[ulong(row) * heads * W + ulong(head) * W + d * 8 + fn + e] =
-                    S(output[d].thread_elements()[e] * inverse);
+                out.put(ulong(row) * heads * W + ulong(head) * W + d * 8 + fn + e,
+                    output[d].thread_elements()[e] * inverse);
 }
 
 #if SEISMIC_HAS_TENSOR_OPS
@@ -373,10 +384,12 @@ inline void attend_load_rows(threadgroup float *published, uint lane, float valu
     simdgroup_barrier(mem_flags::mem_threadgroup);
 }
 
-template <typename S, uint W, uint WP>
-inline void attend_tensor(device const S *qkv, device S *out, uint rows, uint heads, float scale,
-    device const int *spans, threadgroup S *keys, threadgroup S *values, threadgroup uint *bounds,
-    threadgroup float *slots, uint tile, uint head, uint thread_index, uint simd, uint lane) {
+template <typename A, uint W, uint WP>
+inline void attend_tensor(device const typename A::native *qkv, element::Out<A> out, uint rows, uint heads,
+    uint group, float scale, device const int *spans, threadgroup typename A::native *keys,
+    threadgroup typename A::native *values, threadgroup uint *bounds, threadgroup float *slots, uint tile,
+    uint head, uint thread_index, uint simd, uint lane) {
+    typedef typename A::native S;
     constexpr uint THREADS = ATTEND_ROWS * 4;
     constexpr uint ROWS = ATTEND_TENSOR_ROWS;
     constexpr uint KEYS = ATTEND_KEYS;
@@ -398,8 +411,12 @@ inline void attend_tensor(device const S *qkv, device S *out, uint rows, uint he
         mpp::tensor_ops::matmul2d_descriptor(ROWS, WP, KEYS, false, false, false,
             mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
         metal::execution_simdgroup> output_op;
-    const ulong width = ulong(heads) * WP;
-    const ulong row_stride = 3 * width;
+    // Operand rows hold the query heads, then the key heads, then the value
+    // heads; query head h reads key and value head h / group.
+    const ulong kv_heads = heads / group;
+    const ulong row_stride = (ulong(heads) + 2 * kv_heads) * WP;
+    const ulong key_column = (ulong(heads) + head / group) * WP;
+    const ulong value_column = key_column + kv_heads * WP;
     const float scale2 = scale * 1.4426950408889634f;
     const bool computes = simd < ATTEND_ROWS / ROWS;
     const uint owner = computes ? simd : 0;
@@ -449,9 +466,8 @@ inline void attend_tensor(device const S *qkv, device S *out, uint rows, uint he
 
     for (uint first = walk_first; first < walk_end; first += KEYS) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        attend_stage<S, WP, THREADS>(keys, qkv, row_stride, width + ulong(head) * WP, first, rows, thread_index);
-        attend_stage<S, WP, THREADS>(values, qkv, row_stride, 2 * width + ulong(head) * WP, first, rows,
-            thread_index);
+        attend_stage<S, WP, THREADS>(keys, qkv, row_stride, key_column, first, rows, thread_index);
+        attend_stage<S, WP, THREADS>(values, qkv, row_stride, value_column, first, rows, thread_index);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (!computes)
             continue;
@@ -506,8 +522,8 @@ inline void attend_tensor(device const S *qkv, device S *out, uint rows, uint he
         const uint out_row = first_row + index[1];
         const uint column = index[0];
         if (out_row < rows && column < W)
-            out[ulong(out_row) * heads * W + ulong(head) * W + column] =
-                S(output[i] * *output_rows.map_iterator(output.get_iterator(i)));
+            out.put(ulong(out_row) * heads * W + ulong(head) * W + column,
+                output[i] * *output_rows.map_iterator(output.get_iterator(i)));
     }
 }
 #endif

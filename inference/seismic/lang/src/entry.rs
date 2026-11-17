@@ -132,6 +132,11 @@ impl CallSchema {
     pub fn parameters(&self) -> &[Parameter] {
         &self.parameters
     }
+    /// Whether a call parks: it has an awaited port (`&await`), whose
+    /// words its host writes while the call waits for them.
+    pub fn parks(&self) -> bool {
+        self.parameters.iter().any(|parameter| parameter.binding == PortBinding::Awaited)
+    }
     pub fn parameter(&self, id: ParameterId) -> &Parameter {
         assert_eq!(
             id.schema(),
@@ -518,6 +523,22 @@ pub struct Parameter {
     pub kind: ParameterKind,
     /// The semantic value this parameter binds in the root function.
     pub value: SemanticValueId,
+    /// How the parameter's binding reaches its elements.
+    pub binding: PortBinding,
+}
+
+/// How a parameter's binding reaches its elements.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum PortBinding {
+    /// Its binding is its elements.
+    Ordinary,
+    /// An awaited port (`&await`): its elements, which the host writes while
+    /// the entry's launches wait for them ([`CallSchema::parks`]).
+    Awaited,
+    /// A slab port (`&slab`): a slab view, whose binding is the address
+    /// table of the slabs holding its rows. A tensor of no elements has no
+    /// row to address, and binds as any tensor does.
+    Slab,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -546,6 +567,11 @@ pub enum TensorAccess {
     Owned,
     Shared,
     Mutable,
+    /// A host port: bound for what the host does once it sees the launch,
+    /// reading the tensor or (`write`) rewriting it. The kernel never
+    /// accesses it, so the device neither reads nor writes it; launches are
+    /// ordered around it as the host's access.
+    Host { write: bool },
 }
 
 /// One result leaf, by ordinal tuple path (§3.1: names never define
@@ -556,6 +582,31 @@ pub struct ResultLeaf {
     pub kind: ResultKind,
     /// The semantic value the root function returns at this leaf.
     pub value: SemanticValueId,
+}
+
+/// A result's class as a native entry's scalar-result slots see it: a
+/// tensor is published in a buffer and occupies no slot word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResultClass {
+    Tensor,
+    Scalar,
+    Index,
+    Range,
+}
+
+impl ResultClass {
+    /// The bytes of one scalar-result slot word.
+    pub const WORD_BYTES: u64 = 8;
+
+    /// The slot words a result of this class occupies: one for a scalar or
+    /// an index, two for a range (its start, then its end).
+    pub const fn scalar_words(self) -> usize {
+        match self {
+            Self::Tensor => 0,
+            Self::Scalar | Self::Index => 1,
+            Self::Range => 2,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -571,6 +622,17 @@ pub enum ResultKind {
     Range {
         bound: NatExpr,
     },
+}
+
+impl ResultKind {
+    pub fn class(&self) -> ResultClass {
+        match self {
+            Self::Tensor { .. } => ResultClass::Tensor,
+            Self::Scalar(_) => ResultClass::Scalar,
+            Self::Index { .. } => ResultClass::Index,
+            Self::Range { .. } => ResultClass::Range,
+        }
+    }
 }
 
 /// Alias contract between parameters, proved from the source (§8.2).
@@ -617,6 +679,91 @@ pub struct LogicalEntry {
     domain: EntryDomain,
     arena: ExprArena,
     program: SemanticProgram,
+}
+
+/// An entry's call schema with its tensor parameters' compiled shapes: what
+/// a formed implementation keeps of its logical entry
+/// ([`LogicalEntry::parameter_shapes`]).
+#[derive(Clone, Debug)]
+pub struct ParameterShapes {
+    schema: Arc<CallSchema>,
+    /// Per schema parameter: its compiled axes (none for a non-tensor).
+    axes: Vec<Vec<CompiledNat>>,
+}
+
+impl ParameterShapes {
+    pub fn schema(&self) -> &CallSchema {
+        &self.schema
+    }
+
+    /// [`LogicalEntry::tensor_parameter_shape`].
+    pub fn tensor_parameter_shape(
+        &self,
+        name: &str,
+        dimensions: &[(&str, u64)],
+    ) -> Result<CheckedTensorShape, CheckedTensorShapeError> {
+        tensor_parameter_shape(&self.schema, name, dimensions, |ordinal, index, _| {
+            &self.axes[ordinal][index]
+        })
+    }
+}
+
+/// Tensor parameter `name` of `schema` evaluated at `dimensions`, where
+/// `axis(ordinal, index, expression)` is the compiled axis `index` of
+/// parameter `ordinal`: the one evaluation [`LogicalEntry`] and
+/// [`ParameterShapes`] share.
+fn tensor_parameter_shape<A: std::borrow::Borrow<CompiledNat>>(
+    schema: &CallSchema,
+    name: &str,
+    dimensions: &[(&str, u64)],
+    axis: impl Fn(usize, usize, NatExpr) -> A,
+) -> Result<CheckedTensorShape, CheckedTensorShapeError> {
+    let (ordinal, parameter) = schema
+        .parameters()
+        .iter()
+        .enumerate()
+        .find(|(_, parameter)| parameter.name == name)
+        .ok_or_else(|| CheckedTensorShapeError::UnknownParameter(name.to_owned()))?;
+    let ParameterKind::Tensor {
+        representation,
+        axes,
+        ..
+    } = &parameter.kind
+    else {
+        return Err(CheckedTensorShapeError::NotTensor(name.to_owned()));
+    };
+    let values = dimension_values(schema, dimensions)?;
+    let extents = axes
+        .iter()
+        .enumerate()
+        .map(|(index, expression)| {
+            axis(ordinal, index, *expression)
+                .borrow()
+                .evaluate_u64(&values)
+                .map_err(CheckedTensorShapeError::Evaluation)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(CheckedTensorShape {
+        representation: *representation,
+        extents,
+    })
+}
+
+/// The schema's dimensions bound to `dimensions` by name.
+fn dimension_values(
+    schema: &CallSchema,
+    dimensions: &[(&str, u64)],
+) -> Result<InvocationValues, CheckedTensorShapeError> {
+    let mut values = InvocationValues::new();
+    for dimension in schema.dimensions() {
+        let value = dimensions
+            .iter()
+            .find(|(candidate, _)| *candidate == dimension.name)
+            .map(|(_, value)| *value)
+            .ok_or_else(|| CheckedTensorShapeError::MissingDimension(dimension.name.clone()))?;
+        values.bind(dimension.symbol, SymbolValue::Nat(value.into()));
+    }
+    Ok(values)
 }
 
 /// A tensor parameter's checked semantic shape, before any target layout or
@@ -719,6 +866,58 @@ impl CompiledEntryShapes {
         let evaluated = Self::shape(shape, &self.values(dimensions)?)?;
         self.lock().insert(key, evaluated.clone());
         Ok(evaluated)
+    }
+
+    /// A tensor's shape with every entry dimension but `varying` fixed at
+    /// `dimensions`: compiled once, then evaluated at each point of the
+    /// varying dimensions alone ([`BoundTensorShape::at`]), with no lookup
+    /// by name. A graph regime binds one per buffer and evaluates it per
+    /// class.
+    pub fn bound(
+        self: &std::sync::Arc<Self>,
+        tensor: TensorSlot<'_>,
+        dimensions: &[(&str, u64)],
+        varying: &[&str],
+    ) -> Result<BoundTensorShape, CheckedTensorShapeError> {
+        let slot = match tensor {
+            TensorSlot::Parameter(name) => self.parameter_slot(name)?.0,
+            TensorSlot::Result(ordinal) => {
+                self.result_tensor(ordinal)?;
+                ShapeSlot::Result(ordinal)
+            }
+        };
+        let varying = varying
+            .iter()
+            .map(|name| {
+                self.dimensions
+                    .iter()
+                    .find(|(candidate, _)| candidate == name)
+                    .map(|(_, symbol)| *symbol)
+                    .ok_or_else(|| CheckedTensorShapeError::MissingDimension((*name).to_owned()))
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(BoundTensorShape {
+            shapes: std::sync::Arc::clone(self),
+            slot,
+            fixed: self.values(dimensions)?,
+            varying,
+        })
+    }
+
+    fn slot_shape(&self, slot: ShapeSlot) -> &CompiledTensorShape {
+        match slot {
+            ShapeSlot::Parameter(index) => self.parameters[index].1.as_ref(),
+            ShapeSlot::Result(ordinal) => self.results[ordinal].as_ref(),
+        }
+        .expect("a bound slot is a tensor")
+    }
+
+    /// Forget every shape evaluated so far and return how many there were.
+    /// The memo only saves evaluating a shape again, so forgetting changes
+    /// no result: what built many graph classes holds them until it is
+    /// done, and releases them here.
+    pub fn forget_evaluated(&self) -> usize {
+        std::mem::take(&mut *self.lock()).len()
     }
 
     fn lock(
@@ -825,6 +1024,33 @@ impl CompiledEntryShapes {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok((parameters, results))
+    }
+}
+
+/// A tensor of an entry's signature, by parameter name or result ordinal.
+#[derive(Clone, Copy, Debug)]
+pub enum TensorSlot<'n> {
+    Parameter(&'n str),
+    Result(usize),
+}
+
+/// A tensor's shape over a few varying dimensions, the rest fixed
+/// ([`CompiledEntryShapes::bound`]).
+pub struct BoundTensorShape {
+    shapes: std::sync::Arc<CompiledEntryShapes>,
+    slot: ShapeSlot,
+    fixed: InvocationValues,
+    varying: Vec<SymbolId>,
+}
+
+impl BoundTensorShape {
+    /// The shape at `values` of the varying dimensions, in their order.
+    pub fn at(&self, values: &[u64]) -> Result<CheckedTensorShape, CheckedTensorShapeError> {
+        let mut bound = self.fixed.clone();
+        for (&symbol, &value) in self.varying.iter().zip(values) {
+            bound.bind(symbol, SymbolValue::Nat(value.into()));
+        }
+        CompiledEntryShapes::shape(self.shapes.slot_shape(self.slot), &bound)
     }
 }
 
@@ -954,20 +1180,24 @@ impl LogicalEntry {
         }
     }
 
-    fn tensor_dimension_values(
-        &self,
-        dimensions: &[(&str, u64)],
-    ) -> Result<InvocationValues, CheckedTensorShapeError> {
-        let mut values = InvocationValues::new();
-        for dimension in self.schema.dimensions() {
-            let value = dimensions
+    /// Each tensor parameter's representation and compiled axes: what
+    /// evaluating a parameter's shape reads, without the entry's arena and
+    /// program (`ParameterShapes`).
+    pub fn parameter_shapes(&self) -> ParameterShapes {
+        ParameterShapes {
+            schema: self.schema.clone(),
+            axes: self
+                .schema
+                .parameters()
                 .iter()
-                .find(|(candidate, _)| *candidate == dimension.name)
-                .map(|(_, value)| *value)
-                .ok_or_else(|| CheckedTensorShapeError::MissingDimension(dimension.name.clone()))?;
-            values.bind(dimension.symbol, SymbolValue::Nat(value.into()));
+                .map(|parameter| match &parameter.kind {
+                    ParameterKind::Tensor { axes, .. } => {
+                        axes.iter().map(|axis| self.arena.compile_nat(*axis)).collect()
+                    }
+                    _ => Vec::new(),
+                })
+                .collect(),
         }
-        Ok(values)
     }
 
     fn tensor_shape(
@@ -1000,22 +1230,9 @@ impl LogicalEntry {
         name: &str,
         dimensions: &[(&str, u64)],
     ) -> Result<CheckedTensorShape, CheckedTensorShapeError> {
-        let parameter = self
-            .schema
-            .parameters()
-            .iter()
-            .find(|parameter| parameter.name == name)
-            .ok_or_else(|| CheckedTensorShapeError::UnknownParameter(name.to_owned()))?;
-        let ParameterKind::Tensor {
-            representation,
-            axes,
-            ..
-        } = &parameter.kind
-        else {
-            return Err(CheckedTensorShapeError::NotTensor(name.to_owned()));
-        };
-        let values = self.tensor_dimension_values(dimensions)?;
-        self.tensor_shape(*representation, axes, &values)
+        tensor_parameter_shape(&self.schema, name, dimensions, |_, _, axis| {
+            self.arena.compile_nat(axis)
+        })
     }
 
     /// Evaluate every tensor result leaf in schema order. Scalar leaves stay
@@ -1024,7 +1241,7 @@ impl LogicalEntry {
         &self,
         dimensions: &[(&str, u64)],
     ) -> Result<Vec<Option<CheckedTensorShape>>, CheckedTensorShapeError> {
-        let values = self.tensor_dimension_values(dimensions)?;
+        let values = dimension_values(&self.schema, dimensions)?;
         self.schema
             .results()
             .iter()
@@ -1719,7 +1936,7 @@ impl CheckedProgramSubject {
         for (name, representation) in &self.elements {
             hash.update((name.len() as u64).to_le_bytes());
             hash.update(name.as_bytes());
-            hash.update((representation.index() as u64).to_le_bytes());
+            hash.update(representation.key().to_le_bytes());
         }
         hash.finalize().into()
     }
@@ -2005,6 +2222,8 @@ pub struct FunctionParameter {
     pub name: String,
     pub value: SemanticValueId,
     pub access: ParameterAccess,
+    /// How the parameter's binding reaches its elements.
+    pub binding: PortBinding,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2018,6 +2237,8 @@ pub enum ParameterAccess {
     Owned,
     Shared,
     Mutable,
+    /// A host port ([`TensorAccess::Host`]).
+    Host { write: bool },
     Scalar,
 }
 

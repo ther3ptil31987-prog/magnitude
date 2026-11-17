@@ -5,23 +5,36 @@
 //! The host side is [`EngineClient`]. The same code runs in-process (CLI,
 //! tests: a thread over a channel transport) and in a worker process (the
 //! service: framed messages over stdio).
+//!
+//! A load never searches kernels. A worker process given `Prepare` instead
+//! of `Load` runs the engine's only search and exits. Every host loads
+//! through [`load_prepared`], which has the Prepare run, to its end, only
+//! when a load finds tuning units without a stored record. Given `Measure`,
+//! it runs the measurement job ([`measure`]) and exits.
 
 mod binding;
 mod client;
 mod execution;
+pub mod measure;
+mod preparation;
 pub mod protocol;
 mod session;
 pub mod transport;
 
 pub use binding::GenerationBinding;
 pub use client::{
-    connect_worker, prepare_worker, EngineClient, EngineRequest, RequestEvent, RequestOptions,
-    WorkerConnection,
+    connect_worker, EngineClient, EngineRequest, RequestEvent, RequestOptions, WorkerConnection,
+};
+pub use preparation::{
+    load_prepared, observe_worker_process, prepare, start_worker_process, ChildTransport, Preparation, WorkerProcess,
+    WorkerEnd, WorkerReport,
 };
 
-use crate::census::{AllocationCensus, MemoryDomain};
+use crate::census::AllocationCensus;
+use crate::execution::LoadAttempt;
+use magnitude_executor::UnpreparedUnits;
 use crate::error::{ArtifactError, LoadError, UnloadCause};
-use crate::options::{ExecutionManifest, InputModalities, ReadyInfo, ResourcePlanSummary};
+use crate::options::{ExecutionManifest, InputModalities, ReadyInfo, ResolvedModelPolicy, ResourcePlanSummary};
 use execution::ExecutionOwner;
 use magnitude_artifacts::Package;
 use magnitude_chat::{
@@ -34,7 +47,6 @@ use magnitude_scheduler::{
     worker::{Driven, SpawnError, Wakes, Worker, WorkerWakeHandle},
 };
 use protocol::{EngineBuild, HostMessage, WorkerMessage};
-use seismic::DeviceCatalog;
 use session::{Loaded, Outbound, Session, Signal};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -53,6 +65,11 @@ pub enum WorkerExit {
     Shutdown,
     /// A `Prepare` finished; the host received `Prepared`.
     Prepared,
+    /// A `Measure` finished; the host received `MeasureFinished`.
+    Measured,
+    /// A `Load` asked to report tuning units without a stored record met
+    /// one and placed nothing; the host received `Unprepared`.
+    Unprepared,
     /// The model stopped serving (memory pressure or an execution failure).
     Unloaded(UnloadCause),
     /// Loading failed; the host received `LoadFailed`.
@@ -74,51 +91,111 @@ fn internal(reason: impl Into<String>) -> LoadError {
 }
 
 /// Load `manifest`'s model and serve the host at the other end of
-/// `transport` until shutdown, host loss or unload.
-pub fn run_worker(manifest: ExecutionManifest, transport: impl WorkerTransport) -> WorkerExit {
+/// `transport` until shutdown, host loss or unload; or, asked to report
+/// tuning units without a stored record, end unprepared at the first.
+pub fn run_worker(
+    manifest: ExecutionManifest,
+    unprepared: UnpreparedUnits,
+    transport: impl WorkerTransport,
+) -> WorkerExit {
     let (receiver, sender) = transport.split();
-    serve(manifest, receiver, Box::new(sender))
+    serve(manifest, unprepared, receiver, Box::new(sender)).exit
 }
 
 /// A worker process's entry: accept the host's `Hello`, then either run the
-/// worker on a `Load`'s manifest or only prepare a `Prepare`'s.
-pub fn serve_worker(transport: impl WorkerTransport) -> WorkerExit {
+/// worker on a `Load`'s manifest, only prepare a `Prepare`'s, or only
+/// measure the machine for a `Measure`.
+pub fn serve_worker(transport: impl WorkerTransport) -> Served {
     let (mut receiver, mut sender) = transport.split();
     let worker = EngineBuild::current();
     let host = match receiver.receive() {
         Ok(Some(HostMessage::Hello { build })) => build,
-        Ok(Some(_)) => return WorkerExit::ProtocolViolation("expected Hello".into()),
-        Ok(None) => return WorkerExit::HostLost { reason: None },
-        Err(error) => {
-            return WorkerExit::HostLost {
-                reason: Some(error.to_string()),
-            }
-        }
+        Ok(Some(_)) => return WorkerExit::ProtocolViolation("expected Hello".into()).into(),
+        Ok(None) => return WorkerExit::HostLost { reason: None }.into(),
+        Err(error) => return WorkerExit::HostLost { reason: Some(error.to_string()) }.into(),
     };
     if host != worker {
         // The host learns the mismatch from our Hello.
         let _ = sender.send(WorkerMessage::Hello {
             build: worker.clone(),
         });
-        return WorkerExit::BuildMismatch { host, worker };
+        return WorkerExit::BuildMismatch { host, worker }.into();
     }
-    let manifest = match receiver.receive() {
-        Ok(Some(HostMessage::Load { manifest })) => manifest,
-        Ok(Some(HostMessage::Prepare { manifest })) => return prepare_only(manifest, sender),
-        Ok(Some(_)) => return WorkerExit::ProtocolViolation("expected Load or Prepare".into()),
-        Ok(None) => return WorkerExit::HostLost { reason: None },
-        Err(error) => {
-            return WorkerExit::HostLost {
-                reason: Some(error.to_string()),
-            }
+    let (manifest, unprepared) = match receiver.receive() {
+        Ok(Some(HostMessage::Load {
+            manifest,
+            unprepared,
+        })) => (manifest, unprepared),
+        Ok(Some(HostMessage::Prepare { manifest })) => return prepare_only(manifest, sender).into(),
+        Ok(Some(HostMessage::Measure { request })) => {
+            return measure::measure_only(request, sender)
         }
+        Ok(Some(_)) => {
+            return WorkerExit::ProtocolViolation("expected Load, Prepare or Measure".into()).into()
+        }
+        Ok(None) => return WorkerExit::HostLost { reason: None }.into(),
+        Err(error) => return WorkerExit::HostLost { reason: Some(error.to_string()) }.into(),
     };
-    serve(manifest, receiver, Box::new(sender))
+    serve(manifest, unprepared, receiver, Box::new(sender))
 }
 
-/// Prepare `manifest`'s programs on its device (tuning what the kernel cache
-/// lacks) and report the outcome. No graph sealing, resource allocation,
-/// weight import or warm-up.
+/// How a worker's serving ended: its exit, and what its work still holds
+/// on the device, if it held any once its every durable effect was made: a
+/// load it served, stopped (`magnitude_executor::settle`) with a shutdown
+/// answered, or a measurement job's points, reported with every record
+/// stored. Dropping it joins that teardown; a worker process instead ends
+/// with [`Self::end_process`], cutting it short.
+#[must_use]
+pub struct Served {
+    pub exit: WorkerExit,
+    /// Held for its drop, which joins its teardown.
+    _held: Option<Held>,
+}
+
+/// What a worker's work holds on the device after its last durable effect.
+enum Held {
+    Load { _load: Loaded },
+    /// The points' storage and programs, and the thread forming them,
+    /// whose drop waits for the compiles it began before the job's deadline.
+    Measurement { _points: magnitude_executor::assessment::Held },
+}
+
+impl From<WorkerExit> for Served {
+    fn from(exit: WorkerExit) -> Self {
+        Self { exit, _held: None }
+    }
+}
+
+impl Served {
+    /// End this worker process with `code`. A process that served a load
+    /// ends at once ([`end_at_once`]). A measurement job's ends as
+    /// [`measure::end_measured`] ends it. Any other exits normally, its
+    /// devices dropped, each waiting for its own stores.
+    pub fn end_process(self, code: i32) -> ! {
+        match self._held {
+            Some(Held::Load { _load: _loaded }) => end_at_once(code),
+            Some(Held::Measurement { _points: points }) => measure::end_measured(Some(points), code),
+            None => std::process::exit(code),
+        }
+    }
+}
+
+/// End this process with `code` at once, without dropping the device it
+/// held: once the programs the device compiled are stored (in the
+/// process's one store, `seismic::ProgramStore::user`), what it holds is
+/// released by the process's end, as by a kill, with no teardown of its
+/// own, which on CUDA takes longer than the kernel's.
+pub(crate) fn end_at_once(code: i32) -> ! {
+    seismic::ProgramStore::user().settle();
+    magnitude_service_utils::process::end(code)
+}
+
+/// A Prepare: search the tuning units of `manifest`'s model the kernel cache
+/// has no record for, on the device its load selects, and report the
+/// outcome. Each record is published as it stands, so a Prepare that is
+/// stopped leaves what it reached. Nothing is prepared for serving: no
+/// serving kernels are formed and held, no graph is sealed, nothing is
+/// allocated or imported for the model. The process ends after the outcome.
 fn prepare_only(
     manifest: ExecutionManifest,
     sender: impl MessageSender<WorkerMessage>,
@@ -139,9 +216,10 @@ fn prepare_only(
             ))
         })
         .and_then(|package| {
-            let catalog = DeviceCatalog::discover().map_err(|error| internal(error.to_string()))?;
-            crate::execution::prepare(
-                &catalog,
+            let catalog =
+                seismic::Devices::discover(&[]).map_err(|error| internal(error.to_string()))?;
+            crate::execution::search(
+                Rc::new(catalog),
                 &manifest,
                 &package,
                 Rc::new(move |progress| {
@@ -153,7 +231,7 @@ fn prepare_only(
             )
         });
     let (message, exit) = match prepared {
-        Ok(_) => (WorkerMessage::Prepared, WorkerExit::Prepared),
+        Ok(()) => (WorkerMessage::Prepared, WorkerExit::Prepared),
         Err(error) => (
             WorkerMessage::LoadFailed {
                 error: error.clone(),
@@ -170,26 +248,36 @@ fn prepare_only(
 
 fn serve(
     manifest: ExecutionManifest,
+    unprepared: UnpreparedUnits,
     receiver: impl MessageReceiver<HostMessage>,
     sender: Box<dyn MessageSender<WorkerMessage>>,
-) -> WorkerExit {
+) -> Served {
     let outbound: Outbound = Arc::new(Mutex::new(sender));
     let hello = WorkerMessage::Hello {
         build: EngineBuild::current(),
     };
     if let Err(error) = outbound.lock().unwrap().send(hello) {
-        return WorkerExit::TransportFailed(error.to_string());
+        return WorkerExit::TransportFailed(error.to_string()).into();
     }
     let signal = Arc::new(Signal::default());
     // Host messages that arrive during the load wait in the session inbox.
     let _reader = session::spawn_reader(receiver, signal.clone());
-    match load(manifest, &outbound) {
-        Ok((loaded, ready)) => {
+    match load(manifest, unprepared, &outbound) {
+        Ok(LoadAttempt::Loaded((loaded, ready))) => {
             if let Err(error) = outbound.lock().unwrap().send(WorkerMessage::Ready { ready }) {
-                return WorkerExit::TransportFailed(error.to_string());
+                return WorkerExit::TransportFailed(error.to_string()).into();
             }
-            Session::new(outbound, signal, loaded).run()
+            let (exit, loaded) = Session::new(outbound, signal, loaded).run();
+            Served { exit, _held: Some(Held::Load { _load: loaded }) }
         }
+        // Nothing of the model was placed, and everything the attempt
+        // opened was dropped before this answer.
+        Ok(LoadAttempt::Unprepared) => match outbound.lock().unwrap().send(WorkerMessage::Unprepared)
+        {
+            Ok(()) => WorkerExit::Unprepared,
+            Err(transport) => WorkerExit::TransportFailed(transport.to_string()),
+        }
+        .into(),
         Err(error) => {
             let failed = WorkerMessage::LoadFailed {
                 error: error.clone(),
@@ -198,14 +286,17 @@ fn serve(
                 Ok(()) => WorkerExit::LoadFailed(error),
                 Err(transport) => WorkerExit::TransportFailed(transport.to_string()),
             }
+            .into()
         }
     }
 }
 
 /// Readiness facts of the constructed execution domain.
 struct ExecutionReady {
+    /// The model policy the load serves: the manifest's.
+    model: ResolvedModelPolicy,
     resources: ResourcePlanSummary,
-    device: seismic::DeviceSelector,
+    device: seismic::ExecutorSelector,
     backend: seismic::BackendName,
     census: AllocationCensus,
 }
@@ -220,38 +311,52 @@ struct ChatIdentity {
 /// the worker's tokenizer, constraint vocabulary and chat identity.
 fn load(
     manifest: ExecutionManifest,
+    unprepared: UnpreparedUnits,
     outbound: &Outbound,
-) -> Result<(Loaded, ReadyInfo), LoadError> {
+) -> Result<LoadAttempt<(Loaded, ReadyInfo)>, LoadError> {
+    /// Why the worker's two halves stopped constructing.
+    enum Stopped {
+        Unprepared,
+        Failed(LoadError),
+    }
+    impl From<LoadError> for Stopped {
+        fn from(error: LoadError) -> Self {
+            Self::Failed(error)
+        }
+    }
+    impl std::fmt::Display for Stopped {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Unprepared => formatter.write_str("the load stopped unprepared"),
+                Self::Failed(error) => error.fmt(formatter),
+            }
+        }
+    }
     let package = Arc::new(Package::open_manifest(&manifest.package).map_err(|error| {
         LoadError::Artifact(ArtifactError::from_artifacts(
             error,
             manifest.package.target.path(),
         ))
     })?);
-    let method = manifest
-        .model
-        .method
-        .factory(&manifest.package.identity.to_string())
-        .map_err(internal)?;
     let definition = manifest.definition.clone();
     let session_definition = manifest.definition.clone();
     let manifest_identity = manifest.package.identity;
-    let ready_model = manifest.model.clone();
     let ready_service = manifest.service.clone();
     let ready_path = manifest.path;
     let host_package = package.clone();
     let progress_outbound = outbound.clone();
-    // Readiness, the host-table bytes and the allocation domain.
-    type Built = (ExecutionReady, u64, MemoryDomain);
+    let census = Arc::new(execution::CensusWatch::default());
+    let owner_census = census.clone();
     let factory = move |wakes: WorkerWakeHandle<UnloadCause>| -> Result<
-        (Box<dyn Driven<Stopped = UnloadCause>>, Built),
-        LoadError,
+        (Box<dyn Driven<Stopped = UnloadCause>>, ExecutionReady),
+        Stopped,
     > {
-        let catalog = DeviceCatalog::discover().map_err(|error| internal(error.to_string()))?;
-        let built = crate::execution::build(
+        let catalog = seismic::Devices::discover(&[]).map_err(|error| internal(error.to_string()))?;
+        let built = match crate::execution::build(
             catalog,
             &manifest,
             package,
+            unprepared,
             Rc::new(move |progress| {
                 // A host that is gone is noticed by the session reader.
                 let _ = progress_outbound
@@ -259,13 +364,20 @@ fn load(
                     .unwrap()
                     .send(WorkerMessage::LoadProgress { progress });
             }),
-        )?;
+        )? {
+            LoadAttempt::Loaded(built) => built,
+            LoadAttempt::Unprepared => return Err(Stopped::Unprepared),
+        };
+        let model = manifest.model.clone();
+        let method = model
+            .factory(&manifest.package.identity.to_string())
+            .map_err(internal)?;
         if built.domain.execution_path() != manifest.path {
-            return Err(internal("executor domain differs from the planned execution path"));
+            return Err(
+                internal("executor domain differs from the planned execution path").into(),
+            );
         }
         let backend = built.domain.execution_backend();
-        let host_table_bytes = built.domain.host_table_bytes();
-        let domain = MemoryDomain::of(built.device, built.pool);
         let resources = ResourcePlanSummary::from_plan(&built.plan).map_err(internal)?;
         let owner = Owner::with_resource_plan(
             built.domain,
@@ -277,23 +389,22 @@ fn load(
         .map_err(internal)?;
         let census = owner
             .reconcile_memory_charge()
-            .and_then(|charge| AllocationCensus::classify(&charge, host_table_bytes, domain))
+            .and_then(|charge| owner.serving_census().map(|serving| AllocationCensus::classify(&charge, serving)))
             .map_err(internal)?;
         let ready = ExecutionReady {
+            model,
             resources,
             device: built.device,
             backend,
             census,
         };
         Ok((
-            Box::new(ExecutionOwner::new(owner, method)) as Box<dyn Driven<Stopped = UnloadCause>>,
-            (ready, host_table_bytes, domain),
+            Box::new(ExecutionOwner::new(owner, method, built.pricing, owner_census)) as Box<dyn Driven<Stopped = UnloadCause>>,
+            ready,
         ))
     };
-    let host = move || -> Result<(GenerationBinding, ChatIdentity), LoadError> {
-        let unsupported = |reason: String| {
-            LoadError::Unsupported(crate::error::UnsupportedModel::Representation { reason })
-        };
+    let host = move || -> Result<(GenerationBinding, ChatIdentity), Stopped> {
+        use crate::error::UnsupportedModel;
         // The worker's own reading of its package's chat semantics, which the
         // host verifies against its resolution.
         let family = crate::families::recognize(host_package.target().directory())
@@ -301,7 +412,7 @@ fn load(
         let chat = ChatIdentity {
             template_fingerprint: gguf_templates(host_package.templates(), host_package.tokenizer())
                 .and_then(|templates| templates.inspect())
-                .map_err(unsupported)?
+                .map_err(|detail| LoadError::Unsupported(UnsupportedModel::chat_template(detail)))?
                 .fingerprint,
             modalities: InputModalities::of(family, &definition),
         };
@@ -311,30 +422,41 @@ fn load(
                 definition.artifact_identity.target.to_string(),
             )
             .and_then(ByteBpeTokenizer::new)
-            .map_err(|error| unsupported(error.to_string()))?,
+            .map_err(|error| LoadError::Unsupported(error.into()))?,
         );
         let projection = usize::try_from(definition.decoder.vocabulary)
             .map_err(|_| internal("model vocabulary exceeds the host domain"))?;
         let binding =
-            GenerationBinding::new(tokenizer, projection, CONSTRAINT_CACHE).map_err(unsupported)?;
+            GenerationBinding::new(tokenizer, projection, CONSTRAINT_CACHE)
+                .map_err(|detail| {
+                    LoadError::Unsupported(crate::host::tokenizer_refusal(
+                        host_package.tokenizer(),
+                        detail,
+                    ))
+                })?;
         Ok((binding, chat))
     };
     let (
         execution,
-        (execution_ready, host_table_bytes, domain),
+        execution_ready,
         (binding, chat),
-    ) =
-        Worker::spawn_ready_with(factory, usize::MAX, host).map_err(|error| match error {
-            SpawnError::Factory(error) | SpawnError::Host(error) => error,
-            error @ (SpawnError::Capacity | SpawnError::Thread(_) | SpawnError::Panicked) => {
-                internal(error.to_string())
-            }
-        })?;
+    ) = match Worker::spawn_ready_with(factory, usize::MAX, host) {
+        Ok(spawned) => spawned,
+        Err(SpawnError::Factory(Stopped::Unprepared) | SpawnError::Host(Stopped::Unprepared)) => {
+            return Ok(LoadAttempt::Unprepared)
+        }
+        Err(
+            SpawnError::Factory(Stopped::Failed(error)) | SpawnError::Host(Stopped::Failed(error)),
+        ) => return Err(error),
+        Err(error @ (SpawnError::Capacity | SpawnError::Thread(_) | SpawnError::Panicked)) => {
+            return Err(internal(error.to_string()))
+        }
+    };
     let ready = ReadyInfo {
         package: manifest_identity,
         template_fingerprint: chat.template_fingerprint,
         modalities: chat.modalities,
-        model: ready_model,
+        model: execution_ready.model,
         service: ready_service,
         resources: execution_ready.resources,
         path: ready_path,
@@ -342,14 +464,13 @@ fn load(
         backend: execution_ready.backend,
         census: execution_ready.census,
     };
-    Ok((
+    Ok(LoadAttempt::Loaded((
         Loaded {
             execution,
             binding,
             definition: session_definition,
-            host_table_bytes,
-            domain,
+            census,
         },
         ready,
-    ))
+    )))
 }

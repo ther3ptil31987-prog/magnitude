@@ -1,8 +1,6 @@
 use std::collections::BTreeSet;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use magnitude_service_contracts::models::{
     CatalogBaseId, CatalogPackageAffiliation, CatalogPackageRole, CatalogVariantId, ModelPackageId,
@@ -54,39 +52,20 @@ impl CatalogAffiliations {
         self.entries.insert(affiliation)
     }
 
+    /// Forgets every affiliation of `package_id`; whether there was one.
+    pub(crate) fn forget_package(&mut self, package_id: &ModelPackageId) -> bool {
+        let before = self.entries.len();
+        self.entries
+            .retain(|affiliation| &affiliation.package_id != package_id);
+        self.entries.len() != before
+    }
+
     pub(crate) fn persist(&self, root: &Path) -> std::io::Result<()> {
         let bytes = serde_json::to_vec_pretty(&StoredCatalogAffiliations {
             affiliations: self.entries.iter().collect(),
         })
         .map_err(std::io::Error::other)?;
-        let destination = path(root);
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let temporary = root.join(format!("catalog-affiliations.json.tmp-{nonce}"));
-        let mut options = OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW);
-            options.mode(0o600);
-        }
-        let mut file = options.open(&temporary)?;
-        if let Err(error) = (|| {
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            drop(file);
-            fs::rename(&temporary, &destination)?;
-            #[cfg(unix)]
-            std::fs::File::open(root)?.sync_all()?;
-            Ok(())
-        })() {
-            let _ = fs::remove_file(&temporary);
-            return Err(error);
-        }
-        Ok(())
+        crate::store_fs::replace_file_sync(root, "catalog-affiliations.json", &bytes)
     }
 }
 

@@ -1,95 +1,79 @@
-// dense_output: down projection of the A-typed product rows with the
-// F32 residual of their `out_rows` rows added. GEMV for O <= 16 (`gemv` to
-// 8 rows, `gemv16` beyond) reading the product in place, GEMM otherwise:
-// `gemm_small` to 64 rows (the product in place, or the INT8 candidate's q8_1
-// rows staged by `stage_s8`), `gemm` beyond (the product in place); up to
-// SPLIT_ROWS rows split over K into SPLIT shares of partials that `finalize`
-// sums in part order.
+// dense_output: the down projection of the product rows plus the F32
+// residual, the forms of the `dense` projection (`lib/projection/operator.cuh`).
 #define KERNEL_W0 SEISMIC_DOWN_WEIGHT
-#include "lib/projection/projection.cuh"
+#include "lib/projection/operator.cuh"
 
-using Pro = projection::Plain<ELEMENT_OF(SEISMIC_ELEMENT_A), projection::AllRows>;
+SEISMIC_PROGRAMMATIC_DEPENDENCY
+
+// The product rows, read in place unless the down weight takes them as
+// NVFP4 operands, which the GEMV forms at M = 1 and the stage launch above.
+using Raw = projection::Plain<ELEMENT_OF(SEISMIC_ELEMENT_A), projection::AllRows>;
+using Pro = projection::Operands<projection::OperandRecipe<packets::W0_OPERANDS_NVFP4>::NVFP4, Raw>;
 using Scaling = projection::scaling<(SEISMIC_DIM_DS != 0)>;
-using Epi = Scaling::type<projection::Residual<projection::SelectedRows>>;
 
-#define PRODUCT Pro{SEISMIC_PTR(SEISMIC_BUFFER_PRODUCT), SEISMIC_PRODUCT_STRIDE_0, projection::AllRows{}}
-#define STAGING SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED)
-#define GROUPS SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GROUPS)
-#define DOWN KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_DOWN_WEIGHT))
-#define PARTIALS reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS))
-#define EPILOGUE                                                                                          \
+#define PROJECTION_G 1
+#define PROJECTION_M SEISMIC_DIM_O
+#define PROJECTION_K SEISMIC_DIM_F
+#define PROJECTION_N SEISMIC_DIM_H
+#define PROJECTION_WA packets::W0
+#define PROJECTION_WB projection::NoWeight
+#define PROJECTION_WEIGHT_TYPES projection::op::Types<packets::W0>
+#define PROJECTION_INT8 PACKETS_FORM_INT8(KERNEL_W0)
+#define PROJECTION_ROWS(g) Pro{Raw{SEISMIC_PTR(SEISMIC_BUFFER_PRODUCT), SEISMIC_PRODUCT_STRIDE_0, projection::AllRows{}}}
+#define PROJECTION_PLACE(g) SEISMIC_PTR(SEISMIC_BUFFER_PRODUCT)
+#define PROJECTION_PLACE_STRIDE SEISMIC_PRODUCT_STRIDE_0
+#define PROJECTION_STAGING SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED)
+#define PROJECTION_GROUPS SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GROUPS)
+#define PROJECTION_PARTIALS(g, parts) reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS))
+#define PROJECTION_WEIGHTS(g) KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_DOWN_WEIGHT)), projection::NoWeight{}
+#define PROJECTION_EPILOGUE(g)                                                                               \
     Scaling::wrap(                                                                                        \
-        projection::Residual<projection::SelectedRows>{                                                   \
+        projection::Residual<projection::Act, projection::SelectedRows>{                                  \
             reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL)), SEISMIC_RESIDUAL_STRIDE_0, \
             projection::SelectedRows{reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_OUT_ROWS))},    \
-            reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)), SEISMIC_RESULT_0_STRIDE_0},     \
+            SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0},     \
         projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_DOWN_SCALE), SEISMIC_DIM_DS, 0, 0), 1.0f)
 
-// The GEMV over NB column blocks of 8 rows.
-template <int NB, int KSPLIT>
-__device__ __forceinline__ void output_gemv(const Pro &product, unsigned M, unsigned long long H, unsigned long long F,
-                                            const packets::W0 &down, const Epi &epi) {
-    using Shape = projection::GemvShape<8, 1, KSPLIT, NB>;
-    __shared__ projection::GemvShared<Shape, Pro> shared;
-    const unsigned long long group = Shape::tile_group();
-    if (group < projection::gemv_groups<Shape>(H))
-        projection::gemv_segment<Shape>(shared, product, M, F / 64, group, H, down, projection::NoWeight{}, epi);
-}
-
-#ifdef SEISMIC_FORMING_DENSE_OUTPUT_STAGE_S8
-template <unsigned INT8>
-__global__ void dense_output_stage_s8(SEISMIC_KERNEL_PARAMS) {
-    constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0>;
-    projection::stage_row<S8>(PRODUCT, blockIdx.x, SEISMIC_DIM_F, STAGING, GROUPS);
+#ifdef SEISMIC_FORMING_DENSE_OUTPUT_STAGE
+template <unsigned INT8, unsigned OPERAND>
+__global__ void dense_output_stage(SEISMIC_KERNEL_PARAMS) {
+    PROJECTION_STAGE;
 }
 #endif
 
 #ifdef SEISMIC_FORMING_DENSE_OUTPUT_GEMV
-template <unsigned KSPLIT>
-__global__ void dense_output_gemv(SEISMIC_KERNEL_PARAMS) {
-    output_gemv<1, KSPLIT>(PRODUCT, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_H, SEISMIC_DIM_F, DOWN, EPILOGUE);
+template <unsigned STAGING, unsigned KSPLIT, unsigned RESIDENCY>
+__launch_bounds__(256, PROJECTION_GEMV_BLOCKS(KSPLIT, RESIDENCY)) __global__ void dense_output_gemv(SEISMIC_KERNEL_PARAMS) {
+    extern __shared__ uint4 dynamic_shared[];
+    PROJECTION_GEMV(1, KSPLIT, STAGING, PROJECTION_GEMV_GRID(KSPLIT, RESIDENCY), RESIDENCY,
+                    reinterpret_cast<projection::u8 *>(dynamic_shared));
 }
 #endif
 
 #ifdef SEISMIC_FORMING_DENSE_OUTPUT_GEMV16
-template <unsigned KSPLIT>
+template <unsigned STAGING, unsigned KSPLIT>
 __global__ void dense_output_gemv16(SEISMIC_KERNEL_PARAMS) {
-    output_gemv<2, KSPLIT>(PRODUCT, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_H, SEISMIC_DIM_F, DOWN, EPILOGUE);
+    PROJECTION_GEMV(2, KSPLIT, STAGING, 0, 1, nullptr);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_DENSE_OUTPUT_GEMM_SMALL
-template <unsigned INT8>
+template <unsigned INT8, unsigned OPERAND, unsigned SPLIT>
 __global__ void dense_output_gemm_small(SEISMIC_KERNEL_PARAMS) {
-    constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0>;
-    extern __shared__ uint4 dynamic_shared[];
-    const unsigned long long column = projection::gemm_column<projection::SmallGemm>();
-    if (column < projection::gemm_columns(SEISMIC_DIM_H))
-        projection::gemm_run_split<projection::SmallGemm, S8>(
-            reinterpret_cast<projection::u8 *>(dynamic_shared), S8 ? STAGING : SEISMIC_PTR(SEISMIC_BUFFER_PRODUCT),
-            S8 ? SEISMIC_DIM_F : SEISMIC_PRODUCT_STRIDE_0, GROUPS, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_F, column,
-            SEISMIC_DIM_H, DOWN, EPILOGUE, PARTIALS);
+    PROJECTION_GEMM(projection::SmallGemm, PROJECTION_OPERANDS);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_DENSE_OUTPUT_GEMM
-template <unsigned ROTATE>
+template <unsigned INT8, unsigned OPERAND, unsigned SPLIT, unsigned ROTATE>
 __global__ void dense_output_gemm(SEISMIC_KERNEL_PARAMS) {
-    using Shape = projection::LargeGemm<ROTATE>;
-    extern __shared__ uint4 dynamic_shared[];
-    const unsigned long long column = projection::gemm_column<Shape>();
-    if (column < projection::gemm_columns(SEISMIC_DIM_H))
-        projection::gemm_run_split<Shape, false>(
-            reinterpret_cast<projection::u8 *>(dynamic_shared), SEISMIC_PTR(SEISMIC_BUFFER_PRODUCT),
-            SEISMIC_PRODUCT_STRIDE_0, GROUPS, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_F, column, SEISMIC_DIM_H, DOWN,
-            EPILOGUE, PARTIALS);
+    PROJECTION_GEMM(projection::LargeGemm<ROTATE>, PROJECTION_OPERANDS);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_DENSE_OUTPUT_FINALIZE
-extern "C" __global__ void dense_output_finalize(SEISMIC_KERNEL_PARAMS) {
-    const Epi epi = EPILOGUE;
-    projection::split_finalize<1>(PARTIALS, projection::SPLIT, SEISMIC_DIM_O, SEISMIC_DIM_H,
-                                  [&](unsigned m, unsigned long long n, float value, float) { epi(m, n, value, 0.0f); });
+template <unsigned SPLIT>
+__global__ void dense_output_finalize(SEISMIC_KERNEL_PARAMS) {
+    PROJECTION_FINALIZE;
 }
 #endif

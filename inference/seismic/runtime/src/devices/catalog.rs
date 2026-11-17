@@ -1,514 +1,332 @@
-use super::{
-    host, Availability, DeviceId, DeviceInfo, DeviceMemory, DeviceMemoryInfo, DeviceSelector,
-    DeviceTopology, DiscoveryError, HostMemoryStatus, LedgerKey, MemoryPoolId, MemoryPoolInfo,
-    MemoryPoolKind, ObservationError, OpenError, ResolveError,
-};
+use super::{OpenError, ResolveError};
 use crate::api::device::DeviceInner;
 use crate::artifacts::DeviceOptions;
-use crate::backends::{self, DiscoveredMemory};
-use crate::memory::{MemoryDomain, PoolLedger};
-use seismic_lang::registry::BackendName;
+use crate::memory::{DeviceStores, Store, Tally};
+use seismic_discovery::{DiscoveryError, Inventory, RuntimeStatus, Status};
+use seismic_topology::{
+    Availability, BackendName, DeviceMemory, DeviceTopology, DiagnosticSource, ExecutorId,
+    ExecutorSelector, Reported, ReportedBy,
+};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
-/// The process's one ledger per physical pool, shared by every opened device
-/// of every catalog and revision whose allocations consume that pool.
-fn pool_ledger(key: LedgerKey) -> Arc<PoolLedger> {
-    static LEDGERS: OnceLock<Mutex<HashMap<LedgerKey, Weak<PoolLedger>>>> = OnceLock::new();
-    let mut ledgers = LEDGERS
-        .get_or_init(|| Mutex::new(HashMap::new()))
+/// The executors this process has open, shared by every [`Devices`], held
+/// across an open so that an executor opens once. An open that panics has
+/// changed nothing (an executor is entered only once it opened, and the
+/// entries of dropped ones are only ever removed), so the panic is that
+/// open's alone: the lock does not pass it on to every later open of the
+/// process as poison.
+fn opened() -> MutexGuard<'static, HashMap<ExecutorId, Weak<DeviceInner>>> {
+    static OPENED: OnceLock<Mutex<HashMap<ExecutorId, Weak<DeviceInner>>>> = OnceLock::new();
+    OPENED
+        .get_or_init(Mutex::default)
         .lock()
-        .expect("process pool-ledger registry lock poisoned");
-    if let Some(ledger) = ledgers.get(&key).and_then(Weak::upgrade) {
-        return ledger;
-    }
-    let ledger = PoolLedger::new();
-    ledgers.insert(key, Arc::downgrade(&ledger));
-    ledger
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// The process-local device catalog. Discovery enumerates host and enabled
-/// backend facts only; opening creates contexts, queues and profiles.
-pub struct Catalog {
-    state: Mutex<CatalogState>,
+/// Runtime resources over an inventory. Machine discovery and sampling
+/// belong to the inventory.
+pub struct Devices {
+    inventory: Arc<Inventory>,
 }
 
-struct CatalogState {
-    topology: Arc<DeviceTopology>,
-    opened: HashMap<DeviceId, Weak<DeviceInner>>,
-    /// Displacement windows of the host samples taken through this catalog.
-    displacement: host::DisplacementHistory,
-}
-
-impl Catalog {
-    pub fn discover() -> Result<Self, DiscoveryError> {
-        Ok(Self {
-            state: Mutex::new(CatalogState {
-                topology: Arc::new(inventory(0)?),
-                opened: HashMap::new(),
-                displacement: host::DisplacementHistory::default(),
-            }),
-        })
+impl Devices {
+    /// Devices over `inventory`, which discovers and samples the machine.
+    pub fn new(inventory: Arc<Inventory>) -> Self {
+        Self { inventory }
     }
 
-    fn state(&self) -> MutexGuard<'_, CatalogState> {
-        self.state
-            .lock()
-            .expect("device catalog lock poisoned while holding catalog state")
+    /// Devices over a newly discovered inventory serving `paths`, its
+    /// probe answers (Metal's capability probes) read from and kept in the
+    /// process's store ([`crate::artifacts::ProgramStore::user`]).
+    pub fn discover(paths: &[PathBuf]) -> Result<Self, DiscoveryError> {
+        Inventory::discover(paths, crate::artifacts::ProgramStore::user()).map(|inventory| Self::new(Arc::new(inventory)))
     }
 
+    /// The inventory these devices are over.
+    pub fn inventory(&self) -> &Arc<Inventory> {
+        &self.inventory
+    }
+
+    /// The inventory's current topology revision.
     pub fn topology(&self) -> Arc<DeviceTopology> {
-        self.state().topology.clone()
+        self.inventory.topology()
     }
 
-    /// Re-enumerates. An unchanged inventory keeps its revision and
-    /// identifiers; a changed one receives a new revision, which makes
-    /// earlier identifiers stale. Live opened devices and their allocations
-    /// are unaffected.
-    pub fn refresh(&self) -> Result<Arc<DeviceTopology>, DiscoveryError> {
-        let revision = self.state().topology.revision;
-        let unchanged = inventory(revision)?;
-        let mut state = self.state();
-        if state.topology.revision == revision && *state.topology == unchanged {
-            return Ok(state.topology.clone());
-        }
-        let next = state.topology.revision + 1;
-        state.topology = Arc::new(unchanged.with_revision(next));
-        state.opened.retain(|id, _| id.revision == next);
-        Ok(state.topology.clone())
+    /// The executor of `selector` in the current revision. Never
+    /// substitutes another executor.
+    pub fn resolve(&self, selector: ExecutorSelector) -> Result<ExecutorId, ResolveError> {
+        self.topology()
+            .resolve(selector)
+            .map(|executor| executor.id())
+            .ok_or(ResolveError::Missing(selector))
     }
 
-    /// Resolves a selector in the current topology. A selector never falls
-    /// back to an ordinal or another device.
-    pub fn resolve(&self, selector: DeviceSelector) -> Result<DeviceId, ResolveError> {
-        let topology = self.topology();
-        let mut matches = topology
-            .devices()
-            .iter()
-            .filter(|device| device.selector == selector);
-        let found = matches.next().ok_or(ResolveError::Missing(selector))?;
-        let extra = matches.count();
-        if extra != 0 {
-            return Err(ResolveError::Ambiguous {
-                selector,
-                matches: extra + 1,
-            });
-        }
-        Ok(found.id)
-    }
-
-    pub fn open(&self, id: DeviceId) -> Result<Arc<DeviceInner>, OpenError> {
+    /// Open executor `id` of the current revision with default options;
+    /// see [`Devices::open_with`].
+    pub fn open(&self, id: ExecutorId) -> Result<Arc<DeviceInner>, OpenError> {
         self.open_with(id, DeviceOptions::default())
     }
 
-    /// Open with `options`. A device already open is shared as it was
-    /// opened; asking it for a different artifact store is an error.
-    pub fn open_with(
+    /// Open `id` with `options`, outside any embedder's ledger: an executor
+    /// already open is shared, and one not open yet charges a [`Tally`] of
+    /// each store it reaches, its own. Asking an open executor for a
+    /// different artifact store is an error.
+    pub fn open_with(&self, id: ExecutorId, options: DeviceOptions) -> Result<Arc<DeviceInner>, OpenError> {
+        self.open_shared(id, options, None)
+    }
+
+    /// Open `id` with `options`, charging `stores`, the embedder's ledger of
+    /// every store it reaches: the product's open. An executor already open
+    /// is shared where it charges these same stores; asking it for others,
+    /// or for a different artifact store, is an error.
+    pub fn open_in(
         &self,
-        id: DeviceId,
+        id: ExecutorId,
         options: DeviceOptions,
+        stores: Vec<Arc<dyn Store>>,
     ) -> Result<Arc<DeviceInner>, OpenError> {
-        // Holding this lock through acquisition makes opening atomic: two
-        // callers cannot create independent services or profiles for the
-        // same descriptor. A dropped device may be opened and profiled
-        // again; a live one is always shared.
-        let mut state = self.state();
-        let info = state
-            .topology
-            .device(id)
-            .ok_or(OpenError::Stale(id))?
-            .clone();
-        if let Some(device) = state.opened.get(&id).and_then(Weak::upgrade) {
-            let same = match (&device.artifacts, &options.artifacts) {
-                (_, None) => true,
-                (Some(open), Some(requested)) => Arc::ptr_eq(open, requested),
-                (None, Some(_)) => false,
-            };
-            if !same {
-                return Err(OpenError::ArtifactStoreConflict(info.selector));
+        self.open_shared(id, options, Some(stores))
+    }
+
+    fn open_shared(
+        &self,
+        id: ExecutorId,
+        options: DeviceOptions,
+        stores: Option<Vec<Arc<dyn Store>>>,
+    ) -> Result<Arc<DeviceInner>, OpenError> {
+        let topology = self.topology();
+        let info = topology.executor(id).ok_or(OpenError::Stale(id))?.clone();
+        let mut opened = opened();
+        opened.retain(|_, device| device.strong_count() != 0);
+        if let Some(device) = opened.get(&id).and_then(Weak::upgrade) {
+            if options.artifacts.as_ref().is_some_and(|requested| !Arc::ptr_eq(&device.artifacts, requested)) {
+                return Err(OpenError::ArtifactStoreConflict(info.selector()));
+            }
+            if stores.as_ref().is_some_and(|stores| !device.memory.opened_with(stores)) {
+                return Err(OpenError::StoreConflict(info.selector()));
             }
             return Ok(device);
         }
-        if let Availability::Unavailable { reason } = &info.availability {
+        if let Availability::Unavailable { reason } = info.availability() {
             return Err(OpenError::Unavailable {
-                selector: info.selector,
+                selector: info.selector(),
                 reason: reason.clone(),
             });
         }
-        let key = match &info.memory {
-            DeviceMemory::Established(memory) => {
-                state
-                    .topology
-                    .pool(memory.allocation_pool)
-                    .expect("validated topology references its own pools")
-                    .ledger
-            }
-            DeviceMemory::Unsupported { .. } => LedgerKey::Unestablished(info.selector),
-        };
-        let device = backends::open(info, MemoryDomain::new(pool_ledger(key)), options)?;
-        state.opened.insert(id, Arc::downgrade(&device));
+        let embedded = stores.is_some();
+        let stores = stores.unwrap_or_else(|| tallies(&topology, &info));
+        let memory = DeviceStores::new(&topology, &info, stores, embedded);
+        let device = crate::backends::open(info, topology, memory, options)?;
+        opened.insert(id, Arc::downgrade(&device));
         Ok(device)
     }
 
-    /// Low-level control: opens the first discovered device of a backend in
-    /// discovery order. Managed selection chooses by model requirements.
-    pub fn open_backend(&self, backend: BackendName) -> Result<Arc<DeviceInner>, OpenError> {
+    /// Open `id` with `options` as a device of its own, charging `stores`,
+    /// shared with no other open: for a test, whose process other tests
+    /// share, reading and bounding what its own stores count.
+    #[doc(hidden)]
+    pub fn open_own(
+        &self,
+        id: ExecutorId,
+        options: DeviceOptions,
+        stores: Vec<Arc<dyn Store>>,
+    ) -> Result<Arc<DeviceInner>, OpenError> {
         let topology = self.topology();
-        let Some(device) = topology
-            .devices()
+        let info = topology.executor(id).ok_or(OpenError::Stale(id))?.clone();
+        if let Availability::Unavailable { reason } = info.availability() {
+            return Err(OpenError::Unavailable {
+                selector: info.selector(),
+                reason: reason.clone(),
+            });
+        }
+        let memory = DeviceStores::new(&topology, &info, stores, true);
+        crate::backends::open(info, topology, memory, options)
+    }
+
+    /// The measurement job's running of executor `id`'s probes: each its
+    /// backend declares (`seismic_lang::device`) that `store` holds no
+    /// result of for the executor's device and driver, in a probe process
+    /// of the running executable, keeping each result in `store` as it
+    /// comes, before `deadline` ([`crate::probes`]). Opening the executor
+    /// afterwards with `store` reads them; nothing here opens it. A backend
+    /// without probes runs none.
+    pub fn probe(
+        &self,
+        id: ExecutorId,
+        store: &dyn crate::artifacts::ArtifactStore,
+        deadline: std::time::Instant,
+    ) -> Result<crate::probes::ProbeRun, OpenError> {
+        let topology = self.topology();
+        let selector = topology.executor(id).ok_or(OpenError::Stale(id))?.selector();
+        match selector {
+            #[cfg(not(target_os = "macos"))]
+            ExecutorSelector::Vulkan { uuid } => {
+                let identity = topology.executor_identity(id).ok_or(OpenError::Stale(id))?;
+                let unavailable = |reason: String| OpenError::Unavailable { selector, reason };
+                let program = std::env::current_exe()
+                    .map_err(|error| unavailable(format!("locating the running executable for its probes: {error}")))?;
+                let device = seismic_vulkan::probe::argument(&uuid);
+                Ok(crate::probes::run::<seismic_vulkan::Probed>(
+                    store,
+                    &identity,
+                    seismic_vulkan::probe::REVISION,
+                    &program,
+                    &["vulkan", device.as_str()],
+                    deadline,
+                ))
+            }
+            #[cfg(target_os = "macos")]
+            ExecutorSelector::Vulkan { .. } => unreachable!("this build discovers no Vulkan executor"),
+            // Their backends declare no probes.
+            ExecutorSelector::HostCpu | ExecutorSelector::Metal { .. } | ExecutorSelector::Cuda { .. } => {
+                Ok(crate::probes::ProbeRun::default())
+            }
+        }
+    }
+
+    /// Low-level control: opens the first discovered executor of a backend.
+    /// Managed callers select by requirements and open by identity.
+    pub fn open_backend(&self, backend: BackendName) -> Result<Arc<DeviceInner>, OpenError> {
+        self.open_backend_with(backend, DeviceOptions::default())
+    }
+
+    /// [`Devices::open_backend`] with `options`, as [`Devices::open_with`].
+    pub fn open_backend_with(&self, backend: BackendName, options: DeviceOptions) -> Result<Arc<DeviceInner>, OpenError> {
+        self.open_with(self.executor_of(backend)?, options)
+    }
+
+    /// The first discovered executor of `backend`.
+    #[doc(hidden)]
+    pub fn executor_of(&self, backend: BackendName) -> Result<ExecutorId, OpenError> {
+        let topology = self.topology();
+        let executor = topology
+            .executors()
             .iter()
-            .find(|device| device.backend == backend)
-        else {
-            return Err(OpenError::NoDevice {
+            .find(|executor| executor.backend() == backend)
+            .ok_or_else(|| OpenError::NoDevice {
                 backend,
                 diagnostics: topology
                     .diagnostics()
                     .iter()
-                    .filter(|diagnostic| diagnostic.backend == backend)
+                    .filter(|diagnostic| diagnostic.source == DiagnosticSource::Backend(backend))
                     .map(|diagnostic| diagnostic.message.clone())
                     .collect(),
+            })?;
+        Ok(executor.id())
+    }
+
+    /// The status of `executor` of `topology`: a sample of the stores and
+    /// of the executor's grants, with what this process's opened executors
+    /// hold.
+    pub fn status(&self, topology: &DeviceTopology, executor: ExecutorId) -> Status {
+        // Read outside the lock: a driver query must not hold up an open.
+        let devices = opened()
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect::<Vec<_>>();
+        Status {
+            sample: self.inventory.sample(topology, &[executor]),
+            runtime: Self::runtime_status(&devices, topology, executor),
+        }
+    }
+
+    /// The status of opened `device`, as [`Self::status`] reads it.
+    pub fn device_status(&self, device: &Arc<DeviceInner>) -> Status {
+        let (topology, executor) = (device.topology(), device.info().id());
+        Status {
+            sample: self.inventory.sample(topology, &[executor]),
+            runtime: Self::runtime_status(std::slice::from_ref(device), topology, executor),
+        }
+    }
+
+    /// What only opened executors know: what is left of each grant of `of`
+    /// on its own memory when it is one of `devices`, an opened CUDA
+    /// executor (`cuMemGetInfo`'s free). A grant on host memory is the
+    /// host's figure, read by the embedder's ledger beside what it holds.
+    fn runtime_status(devices: &[Arc<DeviceInner>], topology: &DeviceTopology, of: ExecutorId) -> RuntimeStatus {
+        let free = devices
+            .iter()
+            .filter(|device| {
+                topology
+                    .resolve(device.info().selector())
+                    .is_some_and(|executor| executor.id() == of)
+            })
+            .filter_map(|device| device.kind.cuda_free())
+            .reduce(|a, b| match (a, b) {
+                (Ok(a), Ok(b)) => Ok(a.min(b)),
+                (Err(error), _) | (_, Err(error)) => Err(error),
             });
-        };
-        self.open(device.id)
-    }
-
-    /// One host memory sample. Its displacement windows span the samples
-    /// taken through this catalog, so a process observes displacement only
-    /// while it keeps sampling.
-    pub fn host_memory_status(&self) -> Result<HostMemoryStatus, ObservationError> {
-        host::status(&mut self.state().displacement)
-    }
-}
-
-/// Enumerates host and backend facts into one validated topology.
-fn inventory(revision: u64) -> Result<DeviceTopology, DiscoveryError> {
-    let capacity = host::capacity().map_err(DiscoveryError::HostMemory)?;
-    Ok(inventory_from(revision, capacity, backends::discover()))
-}
-
-fn inventory_from(
-    revision: u64,
-    capacity: host::HostCapacity,
-    discovered: backends::BackendDiscovery,
-) -> DeviceTopology {
-    let host_pool = MemoryPoolId { revision, index: 0 };
-    let mut pools = vec![MemoryPoolInfo {
-        id: host_pool,
-        kind: MemoryPoolKind::HostRam,
-        capacity_bytes: capacity.bytes,
-        basis: capacity.basis,
-        ledger: LedgerKey::Host,
-    }];
-    let mut devices = Vec::with_capacity(discovered.devices.len());
-    for device in discovered.devices {
-        let memory = match device.memory {
-            DiscoveredMemory::Host {
-                max_allocation_bytes,
-            } => DeviceMemory::Established(DeviceMemoryInfo {
-                allocation_pool: host_pool,
-                host_pool,
-                max_allocation_bytes,
-            }),
-            DiscoveredMemory::Dedicated {
-                capacity_bytes,
-                basis,
-                ledger,
-                max_allocation_bytes,
-            } => {
-                // Multiple views of one physical pool are merged only by
-                // proven identity; distinct devices are never summed.
-                let allocation_pool = match pools.iter().find(|pool| pool.ledger == ledger) {
-                    Some(pool) => pool.id,
-                    None => {
-                        let id = MemoryPoolId {
-                            revision,
-                            index: u32::try_from(pools.len()).expect("pool count exceeds u32"),
-                        };
-                        pools.push(MemoryPoolInfo {
-                            id,
-                            kind: MemoryPoolKind::DeviceLocal,
-                            capacity_bytes,
-                            basis,
-                            ledger,
-                        });
-                        id
-                    }
-                };
-                DeviceMemory::Established(DeviceMemoryInfo {
-                    allocation_pool,
-                    host_pool,
-                    max_allocation_bytes,
-                })
-            }
-            DiscoveredMemory::Unsupported { reason } => DeviceMemory::Unsupported { reason },
-        };
-        devices.push(DeviceInfo {
-            id: DeviceId {
-                revision,
-                index: u32::try_from(devices.len()).expect("device count exceeds u32"),
-            },
-            selector: device.selector,
-            name: device.name,
-            kind: device.kind,
-            backend: device.backend,
-            availability: device.availability,
-            memory,
-            memory_bandwidth: device.memory_bandwidth,
-            descriptor: Arc::new(device.descriptor),
-        });
-    }
-    DeviceTopology {
-        revision,
-        devices,
-        pools,
-        diagnostics: discovered.diagnostics,
-    }
-}
-
-impl DeviceTopology {
-    fn with_revision(mut self, revision: u64) -> Self {
-        self.revision = revision;
-        for device in &mut self.devices {
-            device.id.revision = revision;
-            if let DeviceMemory::Established(memory) = &mut device.memory {
-                memory.allocation_pool.revision = revision;
-                memory.host_pool.revision = revision;
+        let mut grants = Vec::new();
+        if let Some(free) = free {
+            let executor = topology.executor(of).expect("opened executor belongs to topology");
+            let memory = topology
+                .physical_device(executor.physical())
+                .expect("an executor's device belongs to topology")
+                .memory();
+            if memory == DeviceMemory::Own {
+                for path in topology.access_paths().iter().filter(|path| path.executor() == of && path.grant().is_some()) {
+                    grants.push((path.id(), free.clone().map(|value| Reported::new(value, ReportedBy::CudaFree))));
+                }
             }
         }
-        for pool in &mut self.pools {
-            pool.id.revision = revision;
-        }
-        self
+        RuntimeStatus { grants }
     }
 }
 
-#[cfg(test)]
+/// An unbounded [`Tally`] of every store `executor` of `topology` reaches:
+/// the stores of a device opened outside any embedder's ledger.
+fn tallies(topology: &DeviceTopology, executor: &seismic_topology::Executor) -> Vec<Arc<dyn Store>> {
+    let mut identities = Vec::new();
+    let reached = topology
+        .access_paths()
+        .iter()
+        .filter(|path| path.executor() == executor.id())
+        .map(|path| path.store())
+        .chain([topology.host_ram().id()]);
+    for store in reached {
+        let identity = topology.store_identity(store).expect("a path's store belongs to its topology");
+        if !identities.contains(&identity) {
+            identities.push(identity);
+        }
+    }
+    identities.into_iter().map(|identity| Arc::new(Tally::unbounded(identity)) as Arc<dyn Store>).collect()
+}
+
+/// Vulkan is not built on macOS: there a Vulkan request is refused with the
+/// Vulkan backend's diagnostic and no other source's.
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
-    use crate::backends::{BackendDiscovery, Descriptor, DiscoveredDevice};
-    use crate::devices::{CapacityBasis, DeviceKind};
 
-    #[cfg(not(target_os = "macos"))]
-    fn gpu(backend: BackendName, uuid: [u8; 16]) -> DiscoveredDevice {
-        DiscoveredDevice {
-            selector: match backend {
-                BackendName::Cuda => DeviceSelector::Cuda { uuid },
-                BackendName::Vulkan => DeviceSelector::Vulkan { uuid },
-                _ => unreachable!(),
-            },
-            name: "Discrete GPU".into(),
-            kind: DeviceKind::Gpu,
-            backend,
-            availability: Availability::Available,
-            memory: DiscoveredMemory::Dedicated {
-                capacity_bytes: 24_000_000_000,
-                basis: if backend == BackendName::Cuda {
-                    CapacityBasis::CudaDeviceTotal
-                } else {
-                    CapacityBasis::VulkanDeviceLocalHeap
-                },
-                ledger: LedgerKey::PhysicalGpu(uuid),
-                max_allocation_bytes: 24_000_000_000,
-            },
-            memory_bandwidth: None,
-            descriptor: match backend {
-                BackendName::Cuda => Descriptor::Cuda { ordinal: 0, uuid },
-                BackendName::Vulkan => Descriptor::Vulkan { uuid },
-                _ => unreachable!(),
-            },
-        }
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    fn gpu_topology(devices: Vec<DiscoveredDevice>) -> DeviceTopology {
-        inventory_from(
-            0,
-            host::HostCapacity {
-                bytes: 64_000_000_000,
-                basis: CapacityBasis::OsUsableRam,
-            },
-            BackendDiscovery {
-                devices,
-                diagnostics: vec![],
-            },
-        )
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    fn gpu_pools(topology: &DeviceTopology) -> Vec<MemoryPoolId> {
-        topology
-            .devices
-            .iter()
-            .map(|device| match &device.memory {
-                DeviceMemory::Established(memory) => memory.allocation_pool,
-                _ => panic!("GPU memory must be established"),
-            })
-            .collect()
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    #[test]
-    fn cuda_and_vulkan_views_share_pools_by_uuid_at_any_count() {
-        for count in [1, 2, 4] {
-            let devices = [BackendName::Cuda, BackendName::Vulkan]
-                .into_iter()
-                .flat_map(|backend| (1..=count).map(move |id| gpu(backend, [id; 16])))
-                .collect();
-            let topology = gpu_topology(devices);
-            let pools = gpu_pools(&topology);
-            assert_eq!(topology.pools.len(), usize::from(count) + 1);
-            for index in 0..usize::from(count) {
-                assert_eq!(pools[index], pools[index + usize::from(count)]);
-            }
-            assert_eq!(
-                pools[..usize::from(count)]
-                    .iter()
-                    .collect::<std::collections::HashSet<_>>()
-                    .len(),
-                usize::from(count)
-            );
-        }
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    #[test]
-    fn unmatched_backend_views_keep_separate_pools() {
-        let topology = gpu_topology(vec![
-            gpu(BackendName::Cuda, [1; 16]),
-            gpu(BackendName::Cuda, [2; 16]),
-            gpu(BackendName::Vulkan, [1; 16]),
-            gpu(BackendName::Vulkan, [3; 16]),
-        ]);
-        let pools = gpu_pools(&topology);
-        assert_eq!(pools[0], pools[2]);
-        assert_ne!(pools[1], pools[3]);
-        assert_eq!(topology.pools.len(), 4);
-
-        // Identical marketing names cannot establish physical identity.
-        let cuda_only = gpu_topology(vec![
-            gpu(BackendName::Cuda, [5; 16]),
-            gpu(BackendName::Cuda, [6; 16]),
-        ]);
-        assert_ne!(gpu_pools(&cuda_only)[0], gpu_pools(&cuda_only)[1]);
-
-        // Enumeration order is irrelevant to the physical pool association.
-        let reverse = gpu_topology(vec![
-            gpu(BackendName::Vulkan, [7; 16]),
-            gpu(BackendName::Cuda, [7; 16]),
-        ]);
-        assert_eq!(gpu_pools(&reverse)[0], gpu_pools(&reverse)[1]);
-    }
-
-    #[test]
-    fn host_cpu_is_always_discovered_on_the_host_pool() {
-        let catalog = Catalog::discover().unwrap();
-        let topology = catalog.topology();
-        let cpu = topology
-            .devices()
-            .iter()
-            .find(|device| device.selector == DeviceSelector::HostCpu)
-            .unwrap();
-        let DeviceMemory::Established(memory) = &cpu.memory else {
-            panic!("host CPU backing is established")
-        };
-        assert!(memory.allocates_host_memory());
-        assert_eq!(
-            topology.pool(memory.allocation_pool),
-            Some(topology.host_pool())
-        );
-        assert!(topology.host_pool().capacity_bytes > 0);
-        // The address-size limit is an allocation limit, never capacity.
-        assert!(memory.max_allocation_bytes > topology.host_pool().capacity_bytes);
-    }
-
-    #[test]
-    fn unchanged_refresh_keeps_identifiers_and_selectors_resolve_exactly() {
-        let catalog = Catalog::discover().unwrap();
-        let before = catalog.topology();
-        let after = catalog.refresh().unwrap();
-        assert_eq!(before.revision(), after.revision());
-        let id = catalog.resolve(DeviceSelector::HostCpu).unwrap();
-        assert_eq!(after.device(id).unwrap().selector, DeviceSelector::HostCpu);
-        assert_eq!(
-            catalog.resolve(DeviceSelector::Cuda { uuid: [0xff; 16] }),
-            Err(ResolveError::Missing(DeviceSelector::Cuda {
-                uuid: [0xff; 16]
-            }))
-        );
-    }
-
-    #[test]
-    fn a_changed_revision_makes_earlier_identifiers_stale() {
-        let catalog = Catalog::discover().unwrap();
-        let old = catalog.resolve(DeviceSelector::HostCpu).unwrap();
-        {
-            let mut state = catalog.state();
-            let bumped = (*state.topology).clone().with_revision(old.revision + 1);
-            state.topology = Arc::new(bumped);
-        }
-        assert!(matches!(catalog.open(old), Err(OpenError::Stale(_))));
-        let current = catalog.resolve(DeviceSelector::HostCpu).unwrap();
-        assert_ne!(old, current);
-    }
-
-    /// Vulkan is not built on macOS.
-    #[cfg(target_os = "macos")]
     #[test]
     fn a_vulkan_request_is_refused_with_the_missing_runtime() {
-        let catalog = Catalog::discover().unwrap();
+        let devices = Devices::discover(&[]).unwrap();
         assert_eq!(
-            catalog.open_backend(BackendName::Vulkan).err(),
+            devices.open_backend(BackendName::Vulkan).err(),
             Some(OpenError::NoDevice {
                 backend: BackendName::Vulkan,
                 diagnostics: vec!["this build has no Vulkan runtime".into()],
             })
         );
     }
+}
 
-    #[test]
-    fn devices_on_one_pool_share_one_ledger_across_handles() {
-        let catalog = Catalog::discover().unwrap();
-        let cpu = catalog.open_backend(BackendName::Cpu).unwrap();
-        let again = catalog.open_backend(BackendName::Cpu).unwrap();
-        assert!(Arc::ptr_eq(&cpu, &again));
-        let tensor = crate::api::tensor::TensorInner::zeros(
-            &cpu,
-            seismic_lang::registry::dense(seismic_lang::types::DType::F32),
-            &[1024],
-        )
-        .unwrap();
-        let usage = cpu.memory_usage();
-        assert!(usage.charged >= 4096);
-        assert!(usage.pool_charged >= usage.charged);
-        // A second catalog in this process opens its own device on the same
-        // physical pool: both see one shared ledger.
-        let other = Catalog::discover()
-            .unwrap()
-            .open_backend(BackendName::Cpu)
-            .unwrap();
-        assert!(!Arc::ptr_eq(&cpu, &other));
-        assert_eq!(other.memory_usage().charged, 0);
-        assert!(other.memory_usage().pool_charged >= usage.charged);
-        drop(tensor);
-        assert_eq!(cpu.memory_usage().charged, 0);
-    }
+#[cfg(test)]
+mod opened_tests {
+    use super::*;
 
+    /// An open that panics while it holds the opened executors leaves
+    /// every later open of the process working.
     #[test]
-    fn selectors_round_trip_through_text() {
-        for selector in [
-            DeviceSelector::HostCpu,
-            DeviceSelector::Metal {
-                registry_id: 0x1000_0000_0abc,
-            },
-            DeviceSelector::Cuda {
-                uuid: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
-            },
-            DeviceSelector::Vulkan {
-                uuid: [16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1],
-            },
-        ] {
-            assert_eq!(selector.to_string().parse::<DeviceSelector>(), Ok(selector));
-        }
-        assert!("cuda:00".parse::<DeviceSelector>().is_err());
+    fn a_panicked_open_leaves_later_opens_working() {
+        let panicked = std::thread::spawn(|| {
+            let _held = opened();
+            panic!("the open failed");
+        })
+        .join();
+        assert!(panicked.is_err());
+        Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap();
     }
 }

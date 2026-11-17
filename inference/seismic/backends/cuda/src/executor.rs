@@ -1,12 +1,11 @@
 //! CUDA execution of the core-owned command vocabulary.
 
+use crate::blocks::Blocks;
 use crate::buffer::Buffer;
 use crate::command::{CompiledKernel, LaunchFrame};
-use crate::driver::{
-    Allocation, Context, Driver, DriverError, HostMapped, PinnedUpload, Reservation, Stream,
-};
+use crate::driver::{Context, Driver, DriverError, HostMapped, PinnedUpload, Stream};
 use crate::{Cuda, CudaLaunchMode};
-use seismic_compiler::errors::ExecutionError;
+use seismic_compiler::errors::{ExecutionError, RefusalReading, TargetError};
 use seismic_compiler::executable::{
     CompiledBufferView, CompiledLocalClassTotals, CompiledLocalLayout, DeviceService,
     ExecutableAllocationId, ExecutableCommand, ExecutableKernelId, ExecutionEnvironment,
@@ -16,13 +15,43 @@ use seismic_ir::physical_target::KernelAbiAllocationRole;
 use seismic_ir::schedule::{AnyScalarSlot, FillValue};
 use seismic_lang::expr::compiled::InvocationValues;
 use seismic_lang::expr::SymbolValue;
-use std::ffi::{c_int, c_void};
+use seismic_memory::entry::{Entry, Store};
+use std::ffi::c_void;
 use std::sync::Arc;
+
+/// A native stream of the device: the one its native work runs on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeStream {
+    /// Compute.
+    Compute,
+    /// Fill work beside compute: moves into device memory and their waits,
+    /// whose spins hold only later fills.
+    Fill,
+}
+
+/// The embedder's ledgers of the stores a device's memory lies in, which it
+/// is opened with: its device memory (`device`: blocks, graphs' driver
+/// memory, the stack the driver grows) and host RAM (`host`: pinned host
+/// memory, staging and the words device work signals). Where the device's
+/// memory is the host's, one store twice.
+#[derive(Clone)]
+pub struct CudaStores {
+    pub device: Arc<dyn Store>,
+    pub host: Arc<dyn Store>,
+}
 
 #[derive(Clone)]
 pub struct Device {
     context: Arc<Context>,
+    stores: CudaStores,
     stream: Arc<Stream>,
+    /// The fill stream ([`NativeStream::Fill`]).
+    fill: Arc<Stream>,
+    blocks: Arc<Blocks>,
+    graphs: Arc<crate::graph_cost::GraphPool>,
+    /// The word a graph's word nodes name as it is recorded, before a
+    /// replay binds its run's own ([`Self::placeholder_word`]).
+    placeholder: Arc<crate::direct::HostWord>,
 }
 
 /// One `cuMemGetInfo` sample.
@@ -32,168 +61,192 @@ pub struct MemoryInfo {
     pub total_bytes: u64,
 }
 
+/// `context`'s device memory as a refusal reads it ([`memory_info`]).
+pub(crate) fn device_free(context: &Context) -> RefusalReading {
+    memory_info(context).map_or(RefusalReading::Unread, |info| RefusalReading::DeviceFree {
+        free: info.free_bytes,
+        total: info.total_bytes,
+    })
+}
+
+/// `cuMemGetInfo` on `context`: device-wide free memory and the total
+/// memory of the exposed device ([`Device::memory_info`]).
+pub(crate) fn memory_info(context: &Context) -> Result<MemoryInfo, ExecutionError> {
+    let _current = context.enter().map_err(submission_error)?;
+    let driver = &context.driver;
+    let (mut free, mut total) = (0usize, 0usize);
+    unsafe {
+        driver
+            .check((driver.memory_info)(&mut free, &mut total), "memory info")
+            .map_err(submission_error)?;
+    }
+    Ok(MemoryInfo {
+        free_bytes: free as u64,
+        total_bytes: total as u64,
+    })
+}
+
 impl Device {
-    pub fn open(ordinal: u32) -> Result<Self, ExecutionError> {
-        let driver = Driver::load().map_err(ExecutionError::SubmissionFailed)?;
+    /// Device `ordinal`, what it holds that no caller names charged to its
+    /// stores' own entries.
+    pub fn open(ordinal: u32, stores: CudaStores) -> Result<Self, TargetError> {
+        let unavailable = |error: ExecutionError| TargetError::DeviceUnavailable(error.to_string());
+        let driver = Driver::load().map_err(|error| unavailable(ExecutionError::SubmissionFailed(error)))?;
         let ordinal = i32::try_from(ordinal).map_err(|_| {
-            ExecutionError::SubmissionFailed("CUDA device ordinal exceeds driver ABI".into())
+            unavailable(ExecutionError::SubmissionFailed("CUDA device ordinal exceeds driver ABI".into()))
         })?;
-        let context = Context::retain(driver, ordinal).map_err(submission_error)?;
-        let stream = Stream::new(&context).map_err(submission_error)?;
-        Ok(Self { context, stream })
+        let context = Context::retain(driver, ordinal).map_err(opening_error)?;
+        let stream = Stream::new(&context).map_err(opening_error)?;
+        let fill = Stream::new(&context).map_err(opening_error)?;
+        let blocks = Arc::new(Blocks::new(context.clone(), stores.device.own()).map_err(opening_error)?);
+        if let Some(memory) = counted_driver_memory(context.ordinal() as u32).map_err(unavailable)? {
+            assert!(
+                context.driver_memory.set(memory).is_ok(),
+                "a context's driver memory is counted once, at its opening"
+            );
+        }
+        let placeholder = Arc::new(crate::direct::HostWord::on(&context, &stores.host.own()).map_err(unavailable)?);
+        let graphs = Arc::new(crate::graph_cost::GraphPool::new(stores.device.own(), context.clone()));
+        context.charge_own_to(stores.device.own());
+        Ok(Self {
+            context,
+            stores,
+            stream,
+            fill,
+            blocks,
+            graphs,
+            placeholder,
+        })
+    }
+
+    /// Whether the process's footprint holds this device's allocations
+    /// (`seismic_native_target::process::ProcessMemory`): where the device's
+    /// memory is the host's, its context counts what the driver holds for
+    /// the process.
+    pub fn allocations_in_process_footprint(&self) -> bool {
+        self.context.driver_memory.get().is_some()
     }
     pub fn ordinal(&self) -> u32 {
         self.context.ordinal() as u32
+    }
+
+    /// The device's memory as a refusal reads it ([`device_free`]).
+    pub(crate) fn refusal_reading(&self) -> RefusalReading {
+        device_free(&self.context)
     }
 
     /// `cuMemGetInfo` on this opened context: device-wide free memory (other
     /// processes' and this process's allocations already excluded) and the
     /// total memory of the exposed device.
     pub fn memory_info(&self) -> Result<MemoryInfo, ExecutionError> {
-        let _current = self.context.enter().map_err(submission_error)?;
-        let driver = &self.context.driver;
-        let (mut free, mut total) = (0usize, 0usize);
-        unsafe {
-            driver
-                .check((driver.memory_info)(&mut free, &mut total), "memory info")
-                .map_err(submission_error)?;
+        memory_info(&self.context)
+    }
+
+    /// Device storage of `bytes` as a range of a block, its bytes carved
+    /// for `entry`, an entry of the device store.
+    pub fn allocate_device(&self, bytes: u64, alignment: u64, entry: &Arc<dyn Entry>) -> Result<Buffer, ExecutionError> {
+        if alignment > 256 || !alignment.is_power_of_two() {
+            panic!("prepared CUDA allocation asks for unsupported alignment")
         }
-        Ok(MemoryInfo {
-            free_bytes: free as u64,
-            total_bytes: total as u64,
-        })
+        self.blocks.allocate(bytes, alignment, entry).map(Buffer::device)
+    }
+
+    /// The word every graph's word nodes name as it is recorded, held from
+    /// the device's opening so a recording allocates no memory of the
+    /// device's ledger.
+    pub fn placeholder_word(&self) -> &crate::direct::HostWord {
+        &self.placeholder
+    }
+
+    /// What the device's instantiated graphs hold
+    /// ([`crate::graph_cost::GraphPool`]).
+    pub(crate) fn graphs(&self) -> &Arc<crate::graph_cost::GraphPool> {
+        &self.graphs
     }
 
     pub(crate) fn context(&self) -> &Arc<Context> {
         &self.context
     }
 
+    /// The stores the device was opened with.
+    pub(crate) fn stores(&self) -> &CudaStores {
+        &self.stores
+    }
+
+    /// The compute stream.
     pub(crate) fn stream(&self) -> &Arc<Stream> {
         &self.stream
     }
 
+    /// Native stream `which`.
+    pub(crate) fn native_stream(&self, which: NativeStream) -> &Arc<Stream> {
+        match which {
+            NativeStream::Compute => &self.stream,
+            NativeStream::Fill => &self.fill,
+        }
+    }
+
+    /// Wait until every launch queued so far on the device's native streams
+    /// has completed, sleeping ([`crate::driver::Stream::synchronize`]).
+    pub fn drain(&self) -> Result<(), ExecutionError> {
+        self.stream.synchronize().map_err(submission_error)?;
+        self.fill.synchronize().map_err(submission_error)
+    }
+
+    /// Whether every launch queued on the device's native streams has
+    /// completed, as of now: it waits for nothing.
+    pub fn idle(&self) -> Result<bool, ExecutionError> {
+        Ok(self.stream.query().map_err(submission_error)? && self.fill.query().map_err(submission_error)?)
+    }
+
     /// Pinned host memory mapped into the device address space, for inputs
     /// the host fills before each submission: the host writes it in place,
-    /// without a driver copy that would wait for queued device work.
-    pub fn allocate_mapped(&self, bytes: u64) -> Result<Buffer, ExecutionError> {
+    /// without a driver copy that would wait for queued device work. Its
+    /// whole host pages are charged to `entry`, an entry of host RAM.
+    pub fn allocate_mapped(&self, bytes: u64, entry: &Arc<dyn Entry>) -> Result<Buffer, ExecutionError> {
         let bytes = usize::try_from(bytes).map_err(|_| {
             ExecutionError::AllocationFailed("CUDA allocation exceeds host address space".into())
         })?;
-        HostMapped::new(&self.context, bytes)
-            .map(Buffer::mapped)
-            .map_err(allocation_error)
+        HostMapped::new(&self.context, entry, bytes).map(Buffer::mapped)
     }
 
-    /// Whether this device reserves address ranges and backs them in place
-    /// (CUDA virtual memory management).
-    pub fn supports_reservation(&self) -> bool {
-        // CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED
-        const VIRTUAL_MEMORY_MANAGEMENT: c_int = 102;
-        let driver = &self.context.driver;
-        driver.address_reserve.is_some()
-            && driver
-                .attribute(VIRTUAL_MEMORY_MANAGEMENT, self.context.ordinal())
-                .is_ok_and(|supported| supported != 0)
-    }
-
-    /// Device memory over a reserved address range of `reserved` bytes, with
-    /// the leading `committed` bytes backed and zeroed. [`Device::recommit`]
-    /// changes the backed prefix without moving it.
-    pub fn allocate_reserved(
-        &self,
-        committed: u64,
-        reserved: u64,
-    ) -> Result<Buffer, ExecutionError> {
-        let host = |bytes: u64| {
-            usize::try_from(bytes).map_err(|_| {
-                ExecutionError::AllocationFailed(
-                    "CUDA reservation exceeds host address space".into(),
-                )
-            })
-        };
-        let (committed, reserved) = (host(committed)?, host(reserved)?);
-        let reservation =
-            Arc::new(Reservation::new(&self.context, reserved).map_err(allocation_error)?);
-        reservation.commit(committed).map_err(allocation_error)?;
-        self.zero(reservation.base, committed)?;
-        Ok(Buffer::reserved(reservation, committed))
-    }
-
-    /// `buffer`'s reservation with its leading `committed` bytes backed; the
-    /// bytes past `buffer`'s own are zeroed. Both buffers share the base
-    /// address. Precondition when shrinking: no device work still touches
-    /// the released bytes.
-    pub fn recommit(&self, buffer: &Buffer, committed: u64) -> Result<Buffer, ExecutionError> {
-        let reservation = buffer.reservation().ok_or_else(|| {
-            ExecutionError::ConstructionContradiction(
-                "only a reserved CUDA buffer can be recommitted".into(),
-            )
-        })?;
-        let committed = usize::try_from(committed)
-            .ok()
-            .filter(|bytes| *bytes <= reservation.reserved)
-            .ok_or_else(|| {
-                ExecutionError::AllocationFailed(format!(
-                    "{committed} bytes exceed a {}-byte CUDA reservation",
-                    reservation.reserved
-                ))
-            })?;
-        let kept = buffer.len() as usize;
-        if committed > kept {
-            reservation.commit(committed).map_err(allocation_error)?;
-            if let Err(error) = self.zero(reservation.base + kept as u64, committed - kept) {
-                // The new granules are not published yet. Restore the old
-                // prefix before returning so its backing and charge agree.
-                reservation.commit(kept).unwrap_or_else(|rollback| {
-                    panic!(
-                        "CUDA recommit zero failed ({error}); backing rollback failed ({rollback})"
-                    )
-                });
-                return Err(error);
+    /// One block of a granule pool, of `kind`: a native allocation of its
+    /// own (never a range of a shared block), every byte backed and zero,
+    /// charged exactly to `entry` and returned to the driver and the OS as
+    /// it drops. Device memory is one `cuMemAlloc`; host memory is a range
+    /// of host pages (large pages where the host has them) backed whole and
+    /// registered for the device (`cuMemHostRegister`), which reads it in
+    /// place.
+    pub fn allocate_block(&self, kind: u32, bytes: u64, entry: &Arc<dyn Entry>) -> Result<Buffer, ExecutionError> {
+        match kind {
+            crate::topology::DEVICE_KIND => self.blocks.allocate_block(bytes, entry).map(Buffer::block),
+            crate::topology::PINNED_KIND => {
+                if self.allocations_in_process_footprint()
+                    && crate::driver::can_create_host_node(&self.context).map_err(submission_error)?
+                {
+                    crate::driver::HostNodeBlock::new(&self.context, entry, bytes).map(Buffer::host_node)
+                } else {
+                    crate::registered::RegisteredBlock::new(&self.context, entry, bytes).map(Buffer::registered)
+                }
             }
-        } else {
-            // This backend has no ordinary allocation failure on shrink.
-            // Driver failures after the first unmap cannot be reported while
-            // leaving the old allocation valid, so `commit` treats them as
-            // fatal rather than handing back a mismatched old view.
-            reservation.commit(committed).map_err(allocation_error)?;
+            kind => panic!("invariant violated: CUDA has no memory kind {kind}"),
         }
-        Ok(Buffer::reserved(reservation.clone(), committed))
     }
 
-    /// Zero `bytes` at `pointer` after all queued device work, and wait.
-    fn zero(&self, pointer: u64, bytes: usize) -> Result<(), ExecutionError> {
-        if bytes == 0 {
-            return Ok(());
-        }
-        {
-            let _current = self.context.enter().map_err(submission_error)?;
-            let driver = &self.context.driver;
-            unsafe {
-                driver
-                    .check(
-                        (driver.memset_d8_async)(pointer, 0, bytes, self.stream.raw()),
-                        "reservation zero fill",
-                    )
-                    .map_err(submission_error)?;
-            }
-        }
-        self.stream.synchronize().map_err(submission_error)
-    }
 }
 
 impl DeviceService<Cuda> for Device {
     type Buffer = Buffer;
-    fn allocate(&self, bytes: u64, alignment: u64) -> Result<Buffer, ExecutionError> {
-        if alignment > 256 || !alignment.is_power_of_two() {
-            panic!("prepared CUDA allocation asks for unsupported alignment")
+    /// CUDA maps no read-only host memory: every buffer is one it allocated.
+    type Writable = Buffer;
+    /// Storage of `kind` (`crate::topology`): a range of a device block, or
+    /// pinned host memory.
+    fn allocate(&self, kind: u32, bytes: u64, alignment: u64, entry: &Arc<dyn Entry>) -> Result<Buffer, ExecutionError> {
+        match kind {
+            crate::topology::DEVICE_KIND => self.allocate_device(bytes, alignment, entry),
+            crate::topology::PINNED_KIND => self.allocate_mapped(bytes, entry),
+            kind => panic!("invariant violated: CUDA has no memory kind {kind}"),
         }
-        let bytes = usize::try_from(bytes).map_err(|_| {
-            ExecutionError::AllocationFailed("CUDA allocation exceeds host address space".into())
-        })?;
-        Allocation::new(&self.context, bytes)
-            .map(Buffer::device)
-            .map_err(allocation_error)
     }
     fn write(&self, buffer: &Buffer, offset: u64, bytes: &[u8]) -> Result<(), ExecutionError> {
         let offset = usize::try_from(offset)
@@ -207,6 +260,9 @@ impl DeviceService<Cuda> for Device {
     }
     fn buffer_len(&self, buffer: &Buffer) -> u64 {
         buffer.len()
+    }
+    fn host_address(&self, buffer: &Buffer) -> Option<std::ptr::NonNull<u8>> {
+        buffer.host_address()
     }
 }
 
@@ -332,6 +388,78 @@ impl NativeExecution for Execution {
 }
 
 impl Submission {
+    /// One fill of `bytes` bytes at device address `pointer`
+    /// ([`Submission::fill`]).
+    fn fill_piece(
+        &self,
+        issue: &crate::enqueue::Enqueue,
+        pointer: u64,
+        value: FillValue,
+        bytes: u64,
+    ) -> Result<(), ExecutionError> {
+        let count = usize::try_from(bytes / value.width())
+            .unwrap_or_else(|_| panic!("prepared CUDA fill exceeds usize"));
+        let driver = &self.device.context.driver;
+        unsafe {
+            match value {
+                FillValue::U8(pattern) => driver.check(
+                    issue.memset_d8_async(pointer, pattern[0], count, self.device.stream.raw()),
+                    "device fill",
+                ),
+                FillValue::U16(pattern) => driver.check(
+                    issue.memset_d16_async(
+                        pointer,
+                        u16::from_le_bytes(pattern),
+                        count,
+                        self.device.stream.raw(),
+                    ),
+                    "device fill",
+                ),
+                FillValue::U32(pattern) => driver.check(
+                    issue.memset_d32_async(
+                        pointer,
+                        u32::from_le_bytes(pattern),
+                        count,
+                        self.device.stream.raw(),
+                    ),
+                    "device fill",
+                ),
+                // Each 32-bit half of every element: one strided pass per half,
+                // or a single pass when the halves agree.
+                FillValue::U64(pattern) => {
+                    let low = u32::from_le_bytes([pattern[0], pattern[1], pattern[2], pattern[3]]);
+                    let high = u32::from_le_bytes([pattern[4], pattern[5], pattern[6], pattern[7]]);
+                    if low == high {
+                        driver.check(
+                            issue.memset_d32_async(
+                                pointer,
+                                low,
+                                count * 2,
+                                self.device.stream.raw(),
+                            ),
+                            "device fill",
+                        )
+                    } else {
+                        [(0, low), (4, high)].into_iter().try_for_each(|(offset, half)| {
+                            driver.check(
+                                issue.memset_d2d32_async(
+                                    pointer + offset,
+                                    8,
+                                    half,
+                                    1,
+                                    count,
+                                    self.device.stream.raw(),
+                                ),
+                                "device fill",
+                            )
+                        })
+                    }
+                }
+            }
+            .map_err(submission_error)
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn launch(
         &mut self,
@@ -504,8 +632,7 @@ impl Submission {
         if total == 0 {
             return Ok(());
         }
-        let mut staging =
-            PinnedUpload::new(&self.device.context, total).map_err(allocation_error)?;
+        let mut staging = PinnedUpload::new(&self.device.context, &self.device.stores.host.own(), total)?;
         let mut segments = Vec::with_capacity(uploads.len());
         let mut source_offset = 0usize;
         for (buffer, bytes) in uploads {
@@ -544,15 +671,16 @@ impl Submission {
     ) -> Result<(), ExecutionError> {
         let source = env.resolve_view(source)?;
         let destination = env.resolve_view(destination)?;
+        let _current = self.device.context.enter().map_err(submission_error)?;
+        let issue = self.device.context.enqueue();
         let count =
             usize::try_from(bytes).unwrap_or_else(|_| panic!("prepared CUDA copy exceeds usize"));
-        let _current = self.device.context.enter().map_err(submission_error)?;
         unsafe {
             self.device
                 .context
                 .driver
                 .check(
-                    (self.device.context.driver.memcpy_device_async)(
+                    issue.memcpy_device_async(
                         destination.buffer.pointer() + destination.byte_offset,
                         source.buffer.pointer() + source.byte_offset,
                         count,
@@ -571,41 +699,12 @@ impl Submission {
         env: &ExecutionEnvironment<'_, Cuda, CompiledKernel, Device>,
     ) -> Result<(), ExecutionError> {
         let destination = env.resolve_view(destination)?;
-        let pointer = destination.buffer.pointer() + destination.byte_offset;
-        let count = usize::try_from(bytes / value.width())
-            .unwrap_or_else(|_| panic!("prepared CUDA fill exceeds usize"));
-        if bytes % value.width() != 0 {
+        if bytes % value.width() != 0 || destination.byte_offset % value.width() != 0 {
             panic!("prepared CUDA fill is not element aligned")
         }
         let _current = self.device.context.enter().map_err(submission_error)?;
-        let driver = &self.device.context.driver;
-        unsafe {
-            match value {
-                FillValue::U8(pattern) => driver.check(
-                    (driver.memset_d8_async)(pointer, pattern[0], count, self.device.stream.raw()),
-                    "device fill",
-                ),
-                FillValue::U16(pattern) => driver.check(
-                    (driver.memset_d16_async)(
-                        pointer,
-                        u16::from_le_bytes(pattern),
-                        count,
-                        self.device.stream.raw(),
-                    ),
-                    "device fill",
-                ),
-                FillValue::U32(pattern) => driver.check(
-                    (driver.memset_d32_async)(
-                        pointer,
-                        u32::from_le_bytes(pattern),
-                        count,
-                        self.device.stream.raw(),
-                    ),
-                    "device fill",
-                ),
-            }
-            .map_err(submission_error)
-        }
+        let issue = self.device.context.enqueue();
+        self.fill_piece(issue, destination.buffer.pointer() + destination.byte_offset, value, bytes)
     }
     fn scalar_read(
         &mut self,
@@ -647,8 +746,8 @@ fn launch(
     block: [u64; 3],
     shared: u64,
 ) -> Result<(), ExecutionError> {
-    let _keep_module_alive = &kernel.module;
-    if kernel.module.context.ordinal() != device.context.ordinal() {
+    let module = kernel.module();
+    if module.context().ordinal() != device.context.ordinal() {
         panic!("compiled CUDA kernel and execution device use different primary contexts")
     }
     let grid = grid.map(|v| {
@@ -661,33 +760,21 @@ fn launch(
         .unwrap_or_else(|_| panic!("prepared CUDA workgroup storage exceeds driver ABI"));
     let mut frame = frame;
     let mut params = [(&mut frame as *mut u64).cast::<c_void>()];
-    let context = &kernel.module.context;
+    let context = module.context();
     let _current = context.enter().map_err(submission_error)?;
-    unsafe {
-        let submit = match mode {
-            CudaLaunchMode::Independent => context.driver.launch,
-            CudaLaunchMode::CooperativeGrid => context.driver.launch_cooperative,
-        };
-        context
-            .driver
-            .check(
-                submit(
-                    kernel.function,
-                    grid[0],
-                    grid[1],
-                    grid[2],
-                    block[0],
-                    block[1],
-                    block[2],
-                    shared,
-                    device.stream.raw(),
-                    params.as_mut_ptr(),
-                    std::ptr::null_mut(),
-                ),
-                "kernel launch",
-            )
-            .map_err(submission_error)
-    }
+    let status = unsafe {
+        context.enqueue().launch(
+            mode == CudaLaunchMode::CooperativeGrid,
+            module.function(kernel.function),
+            grid,
+            block,
+            shared,
+            device.stream.raw(),
+            params.as_mut_ptr(),
+            std::ptr::null_mut(),
+        )
+    };
+    context.driver.check(status, "kernel launch").map_err(submission_error)
 }
 
 fn scratch_pointer(
@@ -749,13 +836,68 @@ fn encode_symbol(value: SymbolValue) -> Result<u64, ExecutionError> {
         ))
     })
 }
-fn allocation_error(error: DriverError) -> ExecutionError {
-    if error.is_device_loss() {
-        ExecutionError::DeviceLost(error.to_string())
-    } else {
-        ExecutionError::AllocationFailed(error.to_string())
+/// The error of an allocation of `bytes` the driver failed: a device loss,
+/// a capacity refusal where the driver is out of memory
+/// (`CUDA_ERROR_OUT_OF_MEMORY`), as every backend reports one, else a
+/// failure.
+/// `CUDA_ERROR_OUT_OF_MEMORY`.
+pub(crate) const OUT_OF_MEMORY: i32 = 2;
+
+pub(crate) fn allocation_error(
+    bytes: u64,
+    reading: impl FnOnce() -> RefusalReading,
+) -> impl FnOnce(DriverError) -> ExecutionError {
+    move |error| {
+        if error.is_device_loss() {
+            ExecutionError::DeviceLost(error.to_string())
+        } else if error.code == OUT_OF_MEMORY {
+            ExecutionError::DeviceRefused { required: bytes, reading: reading() }
+        } else {
+            ExecutionError::AllocationFailed(error.to_string())
+        }
     }
 }
+/// Where device `ordinal`'s memory is the host's, its driver's memory of
+/// this process, counted in the process's footprint while held: what its
+/// context holds, read from NVML once, and every allocation made on it.
+/// Windows reports no footprint at all.
+#[cfg(not(target_os = "windows"))]
+fn counted_driver_memory(
+    ordinal: u32,
+) -> Result<Option<Arc<seismic_native_target::process::DriverMemory>>, ExecutionError> {
+    let descriptor = crate::profile::describe(ordinal)
+        .map_err(|error| ExecutionError::SubmissionFailed(error.to_string()))?;
+    if !descriptor.memory_is_host() {
+        return Ok(None);
+    }
+    seismic_native_target::process::count_driver_memory(u128::from_le_bytes(descriptor.uuid), || {
+        crate::nvml::context_bytes(descriptor.uuid)
+    })
+    .map(Some)
+    .map_err(|error| {
+        ExecutionError::SubmissionFailed(format!("the context's driver memory is unread: {error}"))
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn counted_driver_memory(
+    _ordinal: u32,
+) -> Result<Option<Arc<seismic_native_target::process::DriverMemory>>, ExecutionError> {
+    Ok(None)
+}
+
+/// Opening the device failed on `error`: busy where the driver is out of
+/// memory or another process holds the device ([`DriverError::is_busy`]),
+/// stated as the submission's failure.
+fn opening_error(error: DriverError) -> TargetError {
+    let busy = error.is_busy();
+    let reason = submission_error(error).to_string();
+    match busy {
+        true => TargetError::DeviceBusy(reason),
+        false => TargetError::DeviceUnavailable(reason),
+    }
+}
+
 fn submission_error(error: DriverError) -> ExecutionError {
     if error.is_device_loss() {
         ExecutionError::DeviceLost(error.to_string())

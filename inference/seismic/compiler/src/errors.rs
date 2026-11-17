@@ -18,6 +18,9 @@ pub enum TargetError {
     UnsupportedDriver(String),
     UnsupportedToolchain(String),
     DeviceUnavailable(String),
+    /// The device could not be opened now: the driver is out of memory, or
+    /// the device is held by another process. Opening it later may succeed.
+    DeviceBusy(String),
     /// Device/profile evidence was acquired, but could not certify the
     /// analytical contract. The immutable device description remains valid.
     InvalidExecutionProfile(String),
@@ -52,8 +55,8 @@ pub enum PreparationError {
     TargetDomainUnrepresentable(String),
     SolverResourceExhausted(SolverBudgetReport),
     NativeCompilation(NativeCompilationError),
-    /// A direct native entry could not reserve its fixed invocation storage.
-    NativeWorkspaceAllocation(String),
+    /// A direct native entry could not reserve its scalar-result slots.
+    NativeScalarSlotAllocation(String),
     /// A direct native specialization does not match its declaration, or the
     /// entry has no native implementation for the device's backend.
     NativeSpecialization(String),
@@ -69,6 +72,11 @@ pub enum PreparationError {
     PlannedRouteUnavailable {
         backend: seismic_lang::registry::BackendName,
     },
+    /// The device's execution profile, which analytical preparation
+    /// evaluates against, could not be opened (including a probe that did not
+    /// qualify). It is opened once for an open device; the next opening of
+    /// the executor measures it again.
+    ExecutionProfileUnavailable(TargetError),
     /// The selected evaluator could not consume this sealed domain. No
     /// partial evaluated domain exists.
     Evaluation(crate::evaluation::EvaluationError),
@@ -82,6 +90,9 @@ pub enum PreparationError {
     UniversalClosure(String),
     /// Mandatory source construction awaits an implemented semantic/storage requirement.
     UnfinishedConstruction(crate::candidate_domain::ConstructionPending),
+    /// The preparation's deadline passed before it finished. Nothing it
+    /// had constructed was published.
+    Expired,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -132,6 +143,14 @@ pub enum InvocationError {
         required: seismic_lang::expr::BigUint,
         available: u64,
     },
+    /// A call-time dimension that a native implementation's calls are held
+    /// to a range of is outside it in this invocation.
+    OutsideRange {
+        dimension: String,
+        low: u64,
+        high: u64,
+        actual: u64,
+    },
     /// A dimension fixed when a native implementation was prepared has a
     /// different value in this invocation.
     StaticDimension {
@@ -143,6 +162,11 @@ pub enum InvocationError {
     /// canonical strides into its native source, so it must be bound with
     /// exactly those strides.
     NoncanonicalStaticTensor {
+        parameter: String,
+    },
+    /// A slab view bound to a parameter a launch reads its grid from: a grid
+    /// is read whole from its binding, which a slab view's is not.
+    SlabGrid {
         parameter: String,
     },
 }
@@ -157,6 +181,13 @@ pub enum ExecutionError {
         required: seismic_lang::expr::BigUint,
         available: u64,
     },
+    /// The driver itself refused an allocation of `required` bytes that
+    /// every ledger admitted, with its own reading of the memory it refused
+    /// from, taken at the refusal.
+    DeviceRefused {
+        required: u64,
+        reading: RefusalReading,
+    },
     /// A closed executable violated a compiler-owned construction premise.
     ConstructionContradiction(String),
     SubmissionFailed(String),
@@ -169,6 +200,75 @@ pub enum ExecutionError {
         issue: Box<ExecutionError>,
         completion: Box<ExecutionError>,
     },
+}
+
+/// A driver's own reading of the memory it refused an allocation from
+/// ([`ExecutionError::DeviceRefused`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefusalReading {
+    /// Metal's working set: `recommendedMaxWorkingSetSize` and the
+    /// process's `currentAllocatedSize`.
+    WorkingSet { recommended: u64, allocated: u64 },
+    /// CUDA's `cuMemGetInfo` of the device.
+    DeviceFree { free: u64, total: u64 },
+    /// Vulkan's `VK_EXT_memory_budget` over the device's own heaps.
+    HeapBudget { budget: u64, usage: u64 },
+    /// Host memory the driver takes for itself or pins for the device,
+    /// which it reports no figure of.
+    Host,
+    /// Vulkan's `maxMemoryAllocationCount` reached: Seismic holds `held`
+    /// of the device's `limit` memory objects.
+    MemoryObjects { limit: u64, held: u64 },
+    /// The driver's figure could not be read at the refusal.
+    Unread,
+}
+
+impl RefusalReading {
+    /// The bytes the driver's reading leaves free to allocate; none where
+    /// it reports no figure.
+    pub fn room(&self) -> u64 {
+        match *self {
+            Self::WorkingSet { recommended, allocated } => recommended.saturating_sub(allocated),
+            Self::DeviceFree { free, .. } => free,
+            Self::HeapBudget { budget, usage } => budget.saturating_sub(usage),
+            Self::Host | Self::MemoryObjects { .. } | Self::Unread => 0,
+        }
+    }
+}
+
+impl ExecutionError {
+    /// The capacity refusal this error is, as the bytes required and the
+    /// bytes available: a ledger's ([`Self::AllocationCapacity`], a demand
+    /// beyond u64 never free) or the driver's own
+    /// ([`Self::DeviceRefused`], available as its reading's room). Every
+    /// caller that classifies a refusal reads it here alone.
+    pub fn capacity_refusal(&self) -> Option<(u64, u64)> {
+        match self {
+            Self::AllocationCapacity { required, available } => {
+                Some((u64::try_from(required).unwrap_or(u64::MAX), *available))
+            }
+            Self::DeviceRefused { required, reading } => Some((*required, reading.room())),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for RefusalReading {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WorkingSet { recommended, allocated } => {
+                write!(f, "its working set holds {allocated} of the {recommended} bytes Metal recommends")
+            }
+            Self::DeviceFree { free, total } => write!(f, "the device has {free} of its {total} bytes free"),
+            Self::HeapBudget { budget, usage } => write!(f, "its heaps use {usage} of a {budget}-byte budget"),
+            Self::Host => f.write_str("the driver's host memory was exhausted"),
+            Self::MemoryObjects { limit, held } => write!(
+                f,
+                "Seismic holds {held} of the device's {limit} memory objects"
+            ),
+            Self::Unread => f.write_str("its memory could not be read"),
+        }
+    }
 }
 
 /// A checked source operation that stopped execution, with display location.
@@ -193,7 +293,7 @@ impl fmt::Display for TargetError {
             Self::UnsupportedDevice(s) => write!(f, "unsupported device: {s}"),
             Self::UnsupportedDriver(s) => write!(f, "unsupported driver: {s}"),
             Self::UnsupportedToolchain(s) => write!(f, "unsupported toolchain: {s}"),
-            Self::DeviceUnavailable(s) => write!(f, "device unavailable: {s}"),
+            Self::DeviceUnavailable(s) | Self::DeviceBusy(s) => write!(f, "device unavailable: {s}"),
             Self::InvalidExecutionProfile(s) => write!(f, "invalid execution profile: {s}"),
         }
     }
@@ -225,7 +325,7 @@ impl fmt::Display for PreparationError {
                 r.phase, r.work_units
             ),
             Self::NativeCompilation(e) => write!(f, "native compilation failed: {e}"),
-            Self::NativeWorkspaceAllocation(s) => write!(f, "native invocation workspace: {s}"),
+            Self::NativeScalarSlotAllocation(s) => write!(f, "native scalar-result slots: {s}"),
             Self::NativeBufferSlots { entry, slots, limit } => write!(
                 f,
                 "native implementation of `{entry}` binds {slots} buffers; the backend admits {limit}"
@@ -236,12 +336,16 @@ impl fmt::Display for PreparationError {
                 "`{}` is a native-only backend: planned preparation is unavailable",
                 backend.as_str()
             ),
+            Self::ExecutionProfileUnavailable(e) => {
+                write!(f, "execution profile could not be opened: {e}")
+            }
             Self::Evaluation(e) => write!(f, "candidate evaluation failed: {e:?}"),
             Self::Feedback(e) => write!(f, "feedback evaluation failed: {e:?}"),
             Self::InvalidCandidateDomain(s) => write!(f, "invalid candidate domain: {s}"),
             Self::Planning(e) => write!(f, "planning failed: {e}"),
             Self::UnfinishedConstruction(reason) => write!(f, "source reservation construction is unfinished: {reason:?}"),
             Self::UniversalClosure(s) => write!(f, "universal implementation is not total: {s}"),
+            Self::Expired => write!(f, "preparation's deadline passed before it finished"),
         }
     }
 }
@@ -286,6 +390,15 @@ impl fmt::Display for InvocationError {
                     "allocation needs {required} bytes but {available} are available"
                 )
             }
+            Self::OutsideRange {
+                dimension,
+                low,
+                high,
+                actual,
+            } => write!(
+                f,
+                "dimension `{dimension}` is {actual}, outside the range {low}..={high} the native implementation was prepared for"
+            ),
             Self::StaticDimension {
                 dimension,
                 expected,
@@ -297,6 +410,10 @@ impl fmt::Display for InvocationError {
             Self::NoncanonicalStaticTensor { parameter } => write!(
                 f,
                 "`{parameter}` has static extents, so the native implementation requires its canonical strides"
+            ),
+            Self::SlabGrid { parameter } => write!(
+                f,
+                "`{parameter}` is a launch grid, which binds no slab view"
             ),
         }
     }
@@ -317,6 +434,9 @@ impl fmt::Display for ExecutionError {
                 f,
                 "allocation requires {required} bytes; {available} bytes available"
             ),
+            Self::DeviceRefused { required, reading } => {
+                write!(f, "the driver refused an allocation of {required} bytes: {reading}")
+            }
             Self::ConstructionContradiction(detail) => {
                 write!(f, "closed executable construction contradiction: {detail}")
             }
@@ -330,6 +450,16 @@ impl fmt::Display for ExecutionError {
         }
     }
 }
+/// An entry's refusal of an allocation's bytes: nothing was allocated.
+impl From<seismic_memory::entry::Refused> for ExecutionError {
+    fn from(refused: seismic_memory::entry::Refused) -> Self {
+        Self::AllocationCapacity {
+            required: refused.required.into(),
+            available: refused.available,
+        }
+    }
+}
+
 impl std::error::Error for ExecutionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {

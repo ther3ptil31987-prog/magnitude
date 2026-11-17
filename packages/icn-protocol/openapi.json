@@ -170,6 +170,263 @@
         }
       }
     },
+    "/api/v1/candidates/drafters": {
+      "post": {
+        "tags": [
+          "candidates"
+        ],
+        "operationId": "listDrafterCandidates",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DrafterCandidatesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Drafter candidates for the target, in category order",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DrafterCandidatesResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid target",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Target not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The operation conflicts with the model's current state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The repository's metadata or a file's header is invalid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Enumeration failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/candidates/inspect": {
+      "post": {
+        "tags": [
+          "candidates"
+        ],
+        "operationId": "inspectModelCandidate",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CandidateInspectionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Every version of the candidate with the engine's verdict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CandidateInspection"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid candidate",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Repository, revision or file not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The operation conflicts with the model's current state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The repository's metadata or a file's header is invalid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Inspection failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/candidates/inspect/stream": {
+      "post": {
+        "tags": [
+          "candidates"
+        ],
+        "operationId": "streamModelCandidateInspection",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CandidateInspectionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The inspection's progress in order, then the inspection; a failure after the first event is an `error` event",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid candidate",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Repository, revision or file not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The operation conflicts with the model's current state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The repository's metadata or a file's header is invalid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Inspection failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "x-magnitude-stream": {
+          "version": 1,
+          "responseStatus": 200,
+          "framing": "sse",
+          "data": {
+            "encoding": "json",
+            "schema": {
+              "$ref": "#/components/schemas/CandidateInspectionEvent"
+            }
+          },
+          "termination": {
+            "type": "eof"
+          },
+          "reconnect": {
+            "type": "none"
+          }
+        }
+      }
+    },
     "/api/v1/catalog/installations": {
       "get": {
         "tags": [
@@ -391,6 +648,76 @@
         }
       }
     },
+    "/api/v1/catalog/models/{model_id}/components/{component}/install": {
+      "post": {
+        "tags": [
+          "catalog"
+        ],
+        "operationId": "installCatalogComponent",
+        "parameters": [
+          {
+            "name": "model_id",
+            "in": "path",
+            "description": "Canonical catalog model ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "component",
+            "in": "path",
+            "description": "The one component to fetch",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/CatalogComponent"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Catalog installation admission",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CatalogInstallationAdmission"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Catalog model not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Installation cannot be admitted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Installation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/catalog/models/{model_id}/install": {
       "post": {
         "tags": [
@@ -593,19 +920,87 @@
         }
       }
     },
-    "/api/v1/discovery/models": {
+    "/api/v1/downloads": {
       "get": {
         "tags": [
-          "discovery"
+          "downloads"
         ],
-        "operationId": "listDiscoveredModels",
+        "operationId": "listModelDownloads",
         "responses": {
           "200": {
-            "description": "Current non-catalog discoveries",
+            "description": "Model bundle downloads",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/DiscoveredModelsResponse"
+                  "$ref": "#/components/schemas/ModelDownloadsResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Downloads unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "downloads"
+        ],
+        "operationId": "startModelDownload",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StartModelDownloadRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The admitted download, absent when the bundle is already installed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StartModelDownloadResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid bundle",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Download cannot be admitted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Download failed to start",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -613,19 +1008,111 @@
         }
       }
     },
-    "/api/v1/discovery/refresh": {
+    "/api/v1/downloads/{download_id}/acknowledge-failure": {
       "post": {
         "tags": [
-          "discovery"
+          "downloads"
         ],
-        "operationId": "refreshDiscoveredModels",
+        "operationId": "acknowledgeModelDownloadFailure",
+        "parameters": [
+          {
+            "name": "download_id",
+            "in": "path",
+            "description": "Model download ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
-            "description": "Refreshed discovery snapshot",
+            "description": "The download with its failure acknowledged",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/DiscoveredModelsResponse"
+                  "$ref": "#/components/schemas/ModelDownload"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Download not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Download has not failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Acknowledgement failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/downloads/{download_id}/cancel": {
+      "post": {
+        "tags": [
+          "downloads"
+        ],
+        "operationId": "cancelModelDownload",
+        "parameters": [
+          {
+            "name": "download_id",
+            "in": "path",
+            "description": "Model download ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The cancelled download",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelDownload"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Download not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Cancellation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -817,7 +1304,7 @@
             }
           },
           "422": {
-            "description": "Installed model failed integrity validation",
+            "description": "Installed model failed integrity validation, does not fit, or the engine cannot run it (`model_unsupported`)",
             "content": {
               "application/json": {
                 "schema": {
@@ -954,6 +1441,245 @@
         }
       }
     },
+    "/api/v1/local-models": {
+      "get": {
+        "tags": [
+          "local-models"
+        ],
+        "operationId": "listLocalModels",
+        "responses": {
+          "200": {
+            "description": "Custom models on this computer, and the ones the engine cannot run",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LocalModelsResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Local models unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/local-models/configuration": {
+      "get": {
+        "tags": [
+          "local-models"
+        ],
+        "operationId": "getLocalModelsConfiguration",
+        "responses": {
+          "200": {
+            "description": "The active local-models configuration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LocalModelsConfiguration"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Local models unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "local-models"
+        ],
+        "operationId": "configureLocalModels",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LocalModelsConfiguration"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The applied local-models configuration; applying the same snapshot again changes nothing",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LocalModelsConfiguration"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid configuration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Configuration could not be applied",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/local-models/drafters/prune": {
+      "post": {
+        "tags": [
+          "local-models"
+        ],
+        "operationId": "pruneLocalDrafters",
+        "responses": {
+          "200": {
+            "description": "Magnitude-owned drafter packages no model uses were removed; drafters in other locations are never touched",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DrafterPruning"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Removal failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/local-models/refresh": {
+      "post": {
+        "tags": [
+          "local-models"
+        ],
+        "operationId": "refreshLocalModels",
+        "responses": {
+          "200": {
+            "description": "Local models after a rescan of every enabled root",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LocalModelsResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Rescan failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/local-models/{model_id}/files": {
+      "delete": {
+        "tags": [
+          "local-models"
+        ],
+        "operationId": "removeLocalModelFiles",
+        "parameters": [
+          {
+            "name": "model_id",
+            "in": "path",
+            "description": "Canonical custom model ID of an added model",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Magnitude's copy of the added model was removed; files in other locations are never touched",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LocalModelRemoval"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Not a custom model ID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Custom model not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The model is not an added model, so its files are never removed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Removal failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/model-assessments": {
       "get": {
         "tags": [
@@ -967,6 +1693,86 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ModelAssessmentsSnapshot"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/model-assessments/candidates": {
+      "post": {
+        "tags": [
+          "models"
+        ],
+        "operationId": "assessModelCandidate",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ModelCandidate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The engine's header-only verdict for the candidate",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelAssessment"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid candidate",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Candidate file not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The operation conflicts with the model's current state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The repository's metadata or a file's header is invalid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Assessment failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -1136,6 +1942,129 @@
         }
       }
     },
+    "/api/v1/sources/hugging-face/check": {
+      "post": {
+        "tags": [
+          "hugging-face"
+        ],
+        "operationId": "checkHuggingFaceRepository",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HuggingFaceRepositoryCheckRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "What a listed repository holds on this machine",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HuggingFaceRepositoryCheck"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid check request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Repository or revision not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The operation conflicts with the model's current state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The repository's metadata or a file's header is invalid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The check failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sources/hugging-face/credential": {
+      "put": {
+        "tags": [
+          "hugging-face"
+        ],
+        "operationId": "configureHuggingFaceCredential",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HuggingFaceCredential"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Later Hub requests present this token, or none when it is absent. The token is write-only: no response returns it"
+          },
+          "400": {
+            "description": "Empty token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The credential could not be applied",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/sources/hugging-face/resolve": {
       "post": {
         "tags": [
@@ -1165,6 +2094,36 @@
           },
           "400": {
             "description": "Invalid repository request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Repository or revision not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The operation conflicts with the model's current state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The repository's metadata or a file's header is invalid",
             "content": {
               "application/json": {
                 "schema": {
@@ -1215,6 +2174,36 @@
           },
           "400": {
             "description": "Invalid search request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Repository or revision not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The operation conflicts with the model's current state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The repository's metadata or a file's header is invalid",
             "content": {
               "application/json": {
                 "schema": {
@@ -1536,6 +2525,30 @@
   },
   "components": {
     "schemas": {
+      "AddedModel": {
+        "type": "object",
+        "description": "A model added from Hugging Face: its repository and the path of its first shard, which its\n`hf:` ID names (the other shards of a split model follow from that shard's name), the pinned\ncommit, and a projector path in the repository at it.",
+        "required": [
+          "repository",
+          "path",
+          "revision"
+        ],
+        "properties": {
+          "repository": {
+            "$ref": "#/components/schemas/HuggingFaceRepositoryId"
+          },
+          "path": {
+            "$ref": "#/components/schemas/HuggingFaceArtifactSelector"
+          },
+          "revision": {
+            "type": "string"
+          },
+          "projector": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
       "AllowedToolRequest": {
         "type": "object",
         "required": [
@@ -1803,6 +2816,505 @@
       "AssessmentEnvironmentId": {
         "type": "string"
       },
+      "AttachedDrafter": {
+        "type": "object",
+        "required": [
+          "reference",
+          "state",
+          "updateAvailable"
+        ],
+        "properties": {
+          "reference": {
+            "$ref": "#/components/schemas/DrafterReference"
+          },
+          "method": {
+            "$ref": "#/components/schemas/SpeculativeMethod",
+            "description": "How the engine binds it; a drafter it rejects has no method."
+          },
+          "state": {
+            "$ref": "#/components/schemas/AttachedDrafterState"
+          },
+          "updateAvailable": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "AttachedDrafterState": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Ready"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "NotInstalled"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "reasons",
+              "detail",
+              "_tag"
+            ],
+            "properties": {
+              "reasons": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/UnsupportedReason"
+                }
+              },
+              "detail": {
+                "type": "string"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Rejected"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "CandidateDrafter": {
+        "type": "object",
+        "required": [
+          "reference",
+          "method"
+        ],
+        "properties": {
+          "reference": {
+            "$ref": "#/components/schemas/DrafterReference"
+          },
+          "method": {
+            "$ref": "#/components/schemas/SpeculativeMethod"
+          }
+        },
+        "additionalProperties": false
+      },
+      "CandidateFile": {
+        "type": "object",
+        "required": [
+          "path",
+          "sizeBytes"
+        ],
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "sizeBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "CandidateInspection": {
+        "type": "object",
+        "description": "The repository step: every version with the engine's verdict, or why none can run.",
+        "required": [
+          "source",
+          "displayName",
+          "versions"
+        ],
+        "properties": {
+          "source": {
+            "$ref": "#/components/schemas/CandidateSource"
+          },
+          "displayName": {
+            "type": "string"
+          },
+          "license": {
+            "type": "string"
+          },
+          "variantOf": {
+            "$ref": "#/components/schemas/ModelId"
+          },
+          "developer": {
+            "$ref": "#/components/schemas/ModelDeveloper"
+          },
+          "versions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CandidateVersion"
+            }
+          },
+          "projector": {
+            "$ref": "#/components/schemas/CandidateFile"
+          },
+          "unsupportedArchitecture": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UnsupportedReason"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "CandidateInspectionEvent": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "progress",
+              "_tag"
+            ],
+            "properties": {
+              "progress": {
+                "$ref": "#/components/schemas/CandidateInspectionProgress"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Progress"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "inspection",
+              "_tag"
+            ],
+            "properties": {
+              "inspection": {
+                "$ref": "#/components/schemas/CandidateInspection"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Inspected"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "One event of an inspection's stream: progress, in order, then the inspection itself."
+      },
+      "CandidateInspectionPhase": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "completed",
+              "total",
+              "_tag"
+            ],
+            "properties": {
+              "completed": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "total": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "ReadingHeaders"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "completed",
+              "total",
+              "_tag"
+            ],
+            "properties": {
+              "completed": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "total": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "CheckingVersions"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "version",
+              "completed",
+              "total",
+              "_tag"
+            ],
+            "properties": {
+              "version": {
+                "type": "string"
+              },
+              "completed": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "total": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "CheckingDrafters"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "What an inspection is doing, with how much of it is done: reading each file's GGUF header,\nchecking each version against this computer, then checking the drafters of the version it\nrecommends. A drafter total counts the drafter checks known so far, so it can grow."
+      },
+      "CandidateInspectionProgress": {
+        "type": "object",
+        "description": "How far an inspection has got, each version's verdict included as soon as it is known.",
+        "required": [
+          "phase",
+          "versions"
+        ],
+        "properties": {
+          "phase": {
+            "$ref": "#/components/schemas/CandidateInspectionPhase"
+          },
+          "versions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CandidateVersionProgress"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "CandidateInspectionRequest": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "repository",
+              "revision",
+              "_tag"
+            ],
+            "properties": {
+              "repository": {
+                "$ref": "#/components/schemas/HuggingFaceRepositoryId"
+              },
+              "revision": {
+                "type": "string"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "HuggingFace"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "path",
+              "_tag"
+            ],
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Local"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "CandidateSource": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "repository",
+              "commit",
+              "_tag"
+            ],
+            "properties": {
+              "repository": {
+                "$ref": "#/components/schemas/HuggingFaceRepositoryId"
+              },
+              "commit": {
+                "type": "string"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "HuggingFace"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "path",
+              "_tag"
+            ],
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Local"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "Files not yet added: a Hugging Face repository at a commit, or a local directory."
+      },
+      "CandidateVersion": {
+        "type": "object",
+        "description": "One version of a candidate. `download_bytes` is what adding it downloads before any drafter:\nits files and the repository's projector, or nothing when it is already on this computer or\nis a local file used in place. `catalog_model` is the catalog model this version exactly is (the\nsame repository, commit and file), installed or not: adding the version installs that model.",
+        "required": [
+          "label",
+          "modelId",
+          "files",
+          "sizeBytes",
+          "downloadBytes",
+          "recommended"
+        ],
+        "properties": {
+          "label": {
+            "type": "string"
+          },
+          "modelId": {
+            "$ref": "#/components/schemas/ModelId"
+          },
+          "files": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CandidateFile"
+            }
+          },
+          "sizeBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "downloadBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "assessment": {
+            "$ref": "#/components/schemas/ModelAssessment"
+          },
+          "recommended": {
+            "type": "boolean"
+          },
+          "catalogModel": {
+            "$ref": "#/components/schemas/ModelId"
+          },
+          "onThisComputer": {
+            "$ref": "#/components/schemas/ModelId"
+          },
+          "drafter": {
+            "$ref": "#/components/schemas/DrafterCandidate"
+          }
+        },
+        "additionalProperties": false
+      },
+      "CandidateVersionProgress": {
+        "type": "object",
+        "description": "A version as an inspection in progress knows it: its label and size, and its plain verdict\nonce checked. While headers are read, the rows are the repository's GGUFs named by their files;\nfrom the version checks on, they are the versions the inspection returns.",
+        "required": [
+          "label",
+          "sizeBytes"
+        ],
+        "properties": {
+          "label": {
+            "type": "string"
+          },
+          "sizeBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "assessment": {
+            "$ref": "#/components/schemas/ModelAssessment"
+          }
+        },
+        "additionalProperties": false
+      },
+      "CatalogComponent": {
+        "type": "string",
+        "description": "A part of a catalog model's bundle that can be fetched on its own: the projector that gives\nits target image input, or its separate drafter.",
+        "enum": [
+          "Projector",
+          "Drafter"
+        ]
+      },
+      "CatalogDrafter": {
+        "type": "object",
+        "description": "A catalog model's separately packaged drafter: its method, the repository that publishes it\nand the bytes it adds to the download.",
+        "required": [
+          "method",
+          "repository",
+          "sizeBytes"
+        ],
+        "properties": {
+          "method": {
+            "$ref": "#/components/schemas/SpeculativeMethod"
+          },
+          "repository": {
+            "type": "string"
+          },
+          "sizeBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
       "CatalogInstallationAdmission": {
         "oneOf": [
           {
@@ -2013,6 +3525,7 @@
             "type": "object",
             "required": [
               "reclaimedBytes",
+              "keptComponents",
               "_tag"
             ],
             "properties": {
@@ -2020,6 +3533,12 @@
                 "type": "integer",
                 "format": "int64",
                 "minimum": 0
+              },
+              "keptComponents": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/CatalogComponent"
+                }
               },
               "_tag": {
                 "type": "string",
@@ -2047,7 +3566,8 @@
               }
             }
           }
-        ]
+        ],
+        "description": "`kept_components`: the parts Magnitude stores for a model whose weights are found elsewhere\nthat the removal kept, because another model on this computer needs them."
       },
       "CatalogInstallationRetentionReason": {
         "type": "string",
@@ -2070,11 +3590,32 @@
           }
         }
       },
+      "CatalogMissingComponent": {
+        "type": "object",
+        "description": "A catalog component absent from this computer while the model's exact target weights are\nfound elsewhere. It is not an update: the model serves without it until it is fetched.",
+        "required": [
+          "component",
+          "downloadBytes"
+        ],
+        "properties": {
+          "component": {
+            "$ref": "#/components/schemas/CatalogComponent"
+          },
+          "downloadBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
       "CatalogModel": {
         "type": "object",
+        "description": "A catalog variant and its state on this computer. `desired`: the model installing it fetches\nand serves here. `drafter_withheld`: it fits this computer only without its catalog drafter (or\nnot at all), so it is fetched, served and assessed without it, installed or not: it loads when\nit fits without it, and otherwise is refused with its own shortfall. `aliases` are the `hf:` IDs\nits target's files found in an external location (a Hugging Face cache) would have as custom\nmodels, which clients resolve to this model, so references made before the file was attributed\nkeep working.",
         "required": [
           "id",
           "desired",
+          "drafterWithheld",
           "displayName",
           "variantLabel",
           "description",
@@ -2082,9 +3623,9 @@
           "license",
           "sourceUrls",
           "parameterization",
-          "intelligence",
+          "developer",
           "support",
-          "fidelityRank",
+          "quant",
           "quantizationAware",
           "localState"
         ],
@@ -2094,6 +3635,9 @@
           },
           "desired": {
             "$ref": "#/components/schemas/ReadyModel"
+          },
+          "drafterWithheld": {
+            "type": "boolean"
           },
           "displayName": {
             "type": "string"
@@ -2119,24 +3663,29 @@
           "parameterization": {
             "$ref": "#/components/schemas/ModelParameterization"
           },
-          "intelligence": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
+          "developer": {
+            "$ref": "#/components/schemas/ModelDeveloper"
           },
           "support": {
             "$ref": "#/components/schemas/CatalogSupport"
           },
-          "fidelityRank": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
+          "quant": {
+            "$ref": "#/components/schemas/CatalogQuant"
+          },
+          "drafter": {
+            "$ref": "#/components/schemas/CatalogDrafter"
           },
           "quantizationAware": {
             "type": "boolean"
           },
           "localState": {
             "$ref": "#/components/schemas/CatalogModelState"
+          },
+          "aliases": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ModelId"
+            }
           }
         },
         "additionalProperties": false
@@ -2170,6 +3719,8 @@
               "effective",
               "installation",
               "updateState",
+              "missingComponents",
+              "storedComponents",
               "_tag"
             ],
             "properties": {
@@ -2182,6 +3733,18 @@
               "updateState": {
                 "$ref": "#/components/schemas/CatalogModelUpdate"
               },
+              "missingComponents": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/CatalogMissingComponent"
+                }
+              },
+              "storedComponents": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/CatalogComponent"
+                }
+              },
               "_tag": {
                 "type": "string",
                 "enum": [
@@ -2190,7 +3753,8 @@
               }
             }
           }
-        ]
+        ],
+        "description": "A catalog model's state here. `stored_components`: the parts\nMagnitude stores for a model whose weights are only in another app's location (its projector\npackage and drafter), which Remove deletes while the found weights stay and keep serving."
       },
       "CatalogModelUpdate": {
         "oneOf": [
@@ -2212,6 +3776,7 @@
             "type": "object",
             "required": [
               "requiredDownloadBytes",
+              "parts",
               "_tag"
             ],
             "properties": {
@@ -2219,6 +3784,12 @@
                 "type": "integer",
                 "format": "int64",
                 "minimum": 0
+              },
+              "parts": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/CatalogUpdatePart"
+                }
               },
               "_tag": {
                 "type": "string",
@@ -2235,7 +3806,8 @@
         "required": [
           "revision",
           "reconciliationComplete",
-          "models"
+          "models",
+          "families"
         ],
         "properties": {
           "revision": {
@@ -2251,13 +3823,19 @@
             "items": {
               "$ref": "#/components/schemas/CatalogModel"
             }
+          },
+          "families": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ModelFamily"
+            }
           }
         },
         "additionalProperties": false
       },
       "CatalogOptimizationProgress": {
         "type": "object",
-        "description": "Kernel tuning after a verified download, in tuning work units. `Preparing` opens the device\nand counts the units (0 of 0); `device` is the device a load would select, once previewed.",
+        "description": "Kernel tuning after a verified download, in tuning work units. `Waiting` has not finished and\nwaits for the device, which a resident or loading model holds (0 of 0); `Preparing` opens the\ndevice and counts the units (0 of 0); `device` is the device a load would select, once\npreviewed. A load of the model whose own Prepare tunes reports that Prepare's progress.",
         "required": [
           "stage",
           "completed",
@@ -2286,9 +3864,27 @@
       "CatalogOptimizationStage": {
         "type": "string",
         "enum": [
+          "waiting",
           "preparing",
           "tuning"
         ]
+      },
+      "CatalogQuant": {
+        "type": "object",
+        "description": "The quant a catalog model is: the repository that publishes it and its file quant name (for\nexample `UD-Q4_K_XL`), which states its bit width.",
+        "required": [
+          "repository",
+          "name"
+        ],
+        "properties": {
+          "repository": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
       },
       "CatalogSupport": {
         "oneOf": [
@@ -2296,9 +3892,15 @@
             "type": "object",
             "description": "Intended to be available as a supported catalog model.",
             "required": [
+              "intelligence",
               "level"
             ],
             "properties": {
+              "intelligence": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
               "level": {
                 "type": "string",
                 "enum": [
@@ -2318,6 +3920,11 @@
               "reason": {
                 "type": "string"
               },
+              "intelligence": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
               "level": {
                 "type": "string",
                 "enum": [
@@ -2333,6 +3940,7 @@
               "since",
               "replacement",
               "reason",
+              "intelligence",
               "level"
             ],
             "properties": {
@@ -2345,6 +3953,11 @@
               "reason": {
                 "type": "string"
               },
+              "intelligence": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
               "level": {
                 "type": "string",
                 "enum": [
@@ -2354,7 +3967,16 @@
             }
           }
         ],
-        "description": "What the release promises for a catalog model. It is independent of assessment, which says\nwhat one device can do with it."
+        "description": "What the release promises for a catalog model, with its `intelligence`: its Artificial\nAnalysis score as a percentage of the frontier's, which only a disabled model may lack. It is\nindependent of assessment, which says what one device can do with it."
+      },
+      "CatalogUpdatePart": {
+        "type": "string",
+        "description": "What a catalog update brings: new model weights, a new projector (image input), or a new drafter.",
+        "enum": [
+          "Model",
+          "Projector",
+          "Drafter"
+        ]
       },
       "ChatCompletionChoice": {
         "type": "object",
@@ -2463,6 +4085,9 @@
               "fraction": {
                 "type": "number",
                 "format": "float"
+              },
+              "details": {
+                "$ref": "#/components/schemas/ModelLoadDetails"
               },
               "phase": {
                 "type": "string",
@@ -3007,6 +4632,47 @@
         },
         "additionalProperties": false
       },
+      "ColdExperts": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Read from the model file on demand (unified memory).",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Disk"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "In a host-RAM tier as host memory lets it grow, the rest read from the model file (a\ndiscrete device). `cache_bytes` is what the tier holds past its floor: cache the load\ngrows into free host RAM, which no memory domain's required bytes count.",
+            "required": [
+              "cacheBytes",
+              "_tag"
+            ],
+            "properties": {
+              "cacheBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "HostRam"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "Where a streamed fit keeps the experts its bank lacks."
+      },
       "CompletionFunctionCall": {
         "type": "object",
         "required": [
@@ -3326,37 +4992,77 @@
           }
         }
       },
-      "DefaultGenerationSettings": {
+      "CustomModel": {
         "type": "object",
+        "description": "A model on this computer that is not a catalog model. `drafter_pending`: its drafter choice is\nautomatic and its automatic drafter isn't worked out yet, so it has no drafter for now rather\nthan none. `update_commit` is set only for an added model whose repository's `main` has moved to\na commit where its target file has other content.",
         "required": [
-          "n_ctx"
-        ],
-        "properties": {
-          "n_ctx": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
-          }
-        },
-        "additionalProperties": false
-      },
-      "DiscoveredModel": {
-        "type": "object",
-        "required": [
-          "id",
+          "modelId",
+          "origin",
+          "displayName",
+          "files",
+          "sizeBytes",
+          "drafterPending",
+          "profile",
           "state"
         ],
         "properties": {
-          "id": {
+          "modelId": {
             "$ref": "#/components/schemas/ModelId"
           },
+          "origin": {
+            "$ref": "#/components/schemas/CustomModelOrigin"
+          },
+          "displayName": {
+            "type": "string"
+          },
+          "variantLabel": {
+            "type": "string"
+          },
+          "variantOf": {
+            "$ref": "#/components/schemas/ModelId"
+          },
+          "developer": {
+            "$ref": "#/components/schemas/ModelDeveloper"
+          },
+          "files": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CustomModelFile"
+            }
+          },
+          "sizeBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "projector": {
+            "$ref": "#/components/schemas/CustomModelFile"
+          },
+          "drafter": {
+            "$ref": "#/components/schemas/AttachedDrafter"
+          },
+          "drafterPending": {
+            "type": "boolean"
+          },
+          "recommendedDrafter": {
+            "$ref": "#/components/schemas/DrafterCandidate"
+          },
+          "license": {
+            "type": "string"
+          },
+          "profile": {
+            "$ref": "#/components/schemas/ServingProfile"
+          },
           "state": {
-            "$ref": "#/components/schemas/DiscoveredModelState"
+            "$ref": "#/components/schemas/CustomModelState"
+          },
+          "updateCommit": {
+            "type": "string"
           }
         },
         "additionalProperties": false
       },
-      "DiscoveredModelCatalogAttribution": {
+      "CustomModelCatalogAttribution": {
         "oneOf": [
           {
             "type": "object",
@@ -3392,8 +5098,93 @@
           }
         ]
       },
-      "DiscoveredModelState": {
+      "CustomModelFile": {
+        "type": "object",
+        "required": [
+          "path",
+          "sizeBytes"
+        ],
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "sizeBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "CustomModelOrigin": {
         "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "repository",
+              "commit",
+              "_tag"
+            ],
+            "properties": {
+              "repository": {
+                "$ref": "#/components/schemas/HuggingFaceRepositoryId"
+              },
+              "commit": {
+                "type": "string"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Added"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "source",
+              "_tag"
+            ],
+            "properties": {
+              "source": {
+                "$ref": "#/components/schemas/FoundSource"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Found"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "How a custom model came to be on this computer, which decides who owns its files."
+      },
+      "CustomModelPart": {
+        "type": "string",
+        "description": "Which part of a custom model a download fetches: without one, an added model's files at its\npinned commit with the drafter it downloads with; `Drafter`, only the drafter its choice\nresolves to; `Update`, an added model's files at the commit its repository has moved to.",
+        "enum": [
+          "Drafter",
+          "Update"
+        ]
+      },
+      "CustomModelState": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "NotInstalled"
+                ]
+              }
+            }
+          },
           {
             "type": "object",
             "required": [
@@ -3410,7 +5201,7 @@
                 "$ref": "#/components/schemas/ReadyModel"
               },
               "catalogAttribution": {
-                "$ref": "#/components/schemas/DiscoveredModelCatalogAttribution"
+                "$ref": "#/components/schemas/CustomModelCatalogAttribution"
               },
               "_tag": {
                 "type": "string",
@@ -3444,27 +5235,16 @@
           }
         ]
       },
-      "DiscoveredModelsResponse": {
+      "DefaultGenerationSettings": {
         "type": "object",
         "required": [
-          "revision",
-          "reconciliationComplete",
-          "models"
+          "n_ctx"
         ],
         "properties": {
-          "revision": {
+          "n_ctx": {
             "type": "integer",
-            "format": "int64",
+            "format": "int32",
             "minimum": 0
-          },
-          "reconciliationComplete": {
-            "type": "boolean"
-          },
-          "models": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/DiscoveredModel"
-            }
           }
         },
         "additionalProperties": false
@@ -3570,6 +5350,24 @@
           {
             "type": "object",
             "required": [
+              "access",
+              "_tag"
+            ],
+            "properties": {
+              "access": {
+                "$ref": "#/components/schemas/HuggingFaceAccess"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "HuggingFaceAccessRequired"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
               "message",
               "_tag"
             ],
@@ -3597,6 +5395,378 @@
           "verifying",
           "publishing"
         ]
+      },
+      "DrafterAttachment": {
+        "type": "object",
+        "required": [
+          "modelId",
+          "drafter"
+        ],
+        "properties": {
+          "modelId": {
+            "$ref": "#/components/schemas/ModelId"
+          },
+          "drafter": {
+            "$ref": "#/components/schemas/DrafterChoice"
+          }
+        },
+        "additionalProperties": false
+      },
+      "DrafterCandidate": {
+        "type": "object",
+        "description": "One drafter a model may use. `automatic` says whether automatic choice may take it: the engine\nbinds it, the user didn't enter it, and with it the model still fits when it fits without one.\nThe first automatic candidate, in order, is the preselected drafter.",
+        "required": [
+          "category",
+          "reference",
+          "name",
+          "label",
+          "sizeBytes",
+          "lineage",
+          "verdict",
+          "automatic",
+          "onThisComputer"
+        ],
+        "properties": {
+          "category": {
+            "$ref": "#/components/schemas/DrafterCategory"
+          },
+          "reference": {
+            "$ref": "#/components/schemas/DrafterReference"
+          },
+          "name": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "sizeBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "lineage": {
+            "$ref": "#/components/schemas/DrafterLineage"
+          },
+          "verdict": {
+            "$ref": "#/components/schemas/DrafterVerdict"
+          },
+          "automatic": {
+            "type": "boolean"
+          },
+          "onThisComputer": {
+            "type": "boolean"
+          },
+          "method": {
+            "$ref": "#/components/schemas/SpeculativeMethod"
+          }
+        },
+        "additionalProperties": false
+      },
+      "DrafterCandidatesRequest": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "candidate",
+              "_tag"
+            ],
+            "properties": {
+              "candidate": {
+                "$ref": "#/components/schemas/ModelCandidate"
+              },
+              "other": {
+                "type": "string"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Candidate"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "modelId",
+              "_tag"
+            ],
+            "properties": {
+              "modelId": {
+                "$ref": "#/components/schemas/ModelId"
+              },
+              "other": {
+                "type": "string"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Model"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "DrafterCandidatesResponse": {
+        "type": "object",
+        "description": "Drafter candidates for one target, in the product's category order. `entered` is the listed\nreference the request's different drafter resolves to: a listed candidate that is the same file\n(a catalog drafter by its package, otherwise the same repository, commit and path), else the\ndifferent drafter's own Other row; absent without a different drafter.",
+        "required": [
+          "candidates"
+        ],
+        "properties": {
+          "candidates": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DrafterCandidate"
+            }
+          },
+          "entered": {
+            "$ref": "#/components/schemas/DrafterReference"
+          }
+        },
+        "additionalProperties": false
+      },
+      "DrafterCategory": {
+        "type": "string",
+        "description": "Where a drafter candidate comes from, in the order automatic choice prefers: a separate drafter\nin the model's own repository or folder, the matched catalog model's drafter, MTP heads built\ninto the model, then a drafter the user entered, which is never chosen automatically.",
+        "enum": [
+          "NextToModel",
+          "CatalogDrafter",
+          "BuiltIn",
+          "Other"
+        ]
+      },
+      "DrafterChoice": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Auto"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "None"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "reference",
+              "_tag"
+            ],
+            "properties": {
+              "reference": {
+                "$ref": "#/components/schemas/DrafterReference"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Reference"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "The drafter a custom model should use: the recommended one, none, or an exact reference, whose\nmethod the engine works out from the drafter and the model."
+      },
+      "DrafterLineage": {
+        "type": "string",
+        "enum": [
+          "Exact",
+          "Lineage",
+          "Fingerprint",
+          "None"
+        ]
+      },
+      "DrafterPruning": {
+        "type": "object",
+        "description": "Magnitude-owned drafter packages removed because no model uses them any more.",
+        "required": [
+          "removed",
+          "freedBytes"
+        ],
+        "properties": {
+          "removed": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ModelPackageId"
+            }
+          },
+          "freedBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "DrafterReference": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "modelId",
+              "_tag"
+            ],
+            "properties": {
+              "modelId": {
+                "$ref": "#/components/schemas/ModelId"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Catalog"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Embedded"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "repository",
+              "commit",
+              "path",
+              "_tag"
+            ],
+            "properties": {
+              "repository": {
+                "$ref": "#/components/schemas/HuggingFaceRepositoryId"
+              },
+              "commit": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "HuggingFace"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "path",
+              "_tag"
+            ],
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Local"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "A drafter's files, independent of which model uses it."
+      },
+      "DrafterVerdict": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "None"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "method",
+              "memoryBytes",
+              "_tag"
+            ],
+            "properties": {
+              "method": {
+                "$ref": "#/components/schemas/SpeculativeMethod"
+              },
+              "memoryBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Bound"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "reasons",
+              "detail",
+              "_tag"
+            ],
+            "properties": {
+              "reasons": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/UnsupportedReason"
+                }
+              },
+              "detail": {
+                "type": "string"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Rejected"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "Whether the engine binds a model's drafter. `None` means no drafter was configured."
       },
       "EffectiveModel": {
         "oneOf": [
@@ -3705,6 +5875,85 @@
           "cuda",
           "vulkan"
         ]
+      },
+      "FoundSource": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "HuggingFaceCache"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "LmStudio"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "LlamaCpp"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Ollama"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "path",
+              "_tag"
+            ],
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Folder"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "Where a scanned custom model was found."
       },
       "FunctionCallOutput": {
         "oneOf": [
@@ -3897,44 +6146,52 @@
         ],
         "description": "Lazy grammar triggers. The engine's grammars are never lazy, so responses\ncarry none; the shape remains part of the published contract."
       },
-      "HardwareDevice": {
+      "HardwareAccessPath": {
         "type": "object",
+        "description": "An executor reading and writing a store directly, under its grant.",
         "required": [
           "id",
-          "backend",
-          "name",
-          "description",
-          "kind"
+          "executor",
+          "store"
         ],
         "properties": {
           "id": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Index in this snapshot's access paths; placements reference this index.",
+            "minimum": 0
+          },
+          "executor": {
             "$ref": "#/components/schemas/HardwareDeviceId"
           },
-          "backend": {
-            "$ref": "#/components/schemas/ExecutionBackend"
+          "store": {
+            "$ref": "#/components/schemas/MemoryDomainId"
           },
-          "name": {
-            "type": "string"
-          },
-          "description": {
-            "type": "string"
-          },
-          "kind": {
-            "$ref": "#/components/schemas/HardwareDeviceKind"
-          },
-          "memory_limit": {
+          "grant": {
             "oneOf": [
               {
                 "type": "null"
               },
               {
-                "$ref": "#/components/schemas/HardwareDeviceMemoryLimit"
+                "$ref": "#/components/schemas/HardwareGrant"
               }
             ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "HardwareBackendDiagnostic": {
+        "type": "object",
+        "required": [
+          "source",
+          "message"
+        ],
+        "properties": {
+          "source": {
+            "$ref": "#/components/schemas/HardwareDiagnosticSource"
           },
-          "unavailable_reason": {
-            "type": "string",
-            "description": "Why discovery found this device but it is not an execution candidate, for example a driver\nbelow its backend's floor. Absent means the device is usable."
+          "message": {
+            "type": "string"
           }
         },
         "additionalProperties": false
@@ -3953,26 +6210,19 @@
           "unknown"
         ]
       },
-      "HardwareDeviceMemoryLimit": {
+      "HardwareDeviceMemory": {
         "type": "object",
+        "description": "Memory the OS does not manage, owned by one physical device. Its headroom\nis what opened executors leave, which only a resident worker reads.",
         "required": [
-          "kind",
-          "total_bytes",
-          "stable_bytes"
+          "physical_device_id",
+          "store"
         ],
         "properties": {
-          "kind": {
-            "$ref": "#/components/schemas/HardwareDeviceMemoryLimitKind"
+          "physical_device_id": {
+            "$ref": "#/components/schemas/HardwarePhysicalDeviceId"
           },
-          "total_bytes": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "stable_bytes": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
+          "store": {
+            "$ref": "#/components/schemas/HardwareStore"
           },
           "current_free_bytes": {
             "type": [
@@ -3985,65 +6235,244 @@
         },
         "additionalProperties": false
       },
-      "HardwareDeviceMemoryLimitKind": {
-        "type": "string",
-        "enum": [
-          "recommended_working_set"
-        ]
+      "HardwareDiagnosticSource": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "backend",
+              "type"
+            ],
+            "properties": {
+              "backend": {
+                "$ref": "#/components/schemas/ExecutionBackend"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "backend"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "adapters"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "What a discovery diagnostic is about: one backend's enumeration, or the\nOS's adapter interface (DXGI)."
       },
-      "HardwareMemoryDomain": {
+      "HardwareExecutor": {
         "type": "object",
+        "description": "One backend's handle on a physical device.",
         "required": [
           "id",
-          "kind",
-          "total_capacity_bytes",
-          "stable_capacity_bytes",
-          "shares_system_memory",
-          "devices"
+          "backend",
+          "name",
+          "description",
+          "device_placement",
+          "upload_placement",
+          "availability"
         ],
         "properties": {
           "id": {
-            "$ref": "#/components/schemas/MemoryDomainId"
+            "$ref": "#/components/schemas/HardwareDeviceId"
           },
-          "kind": {
-            "$ref": "#/components/schemas/HardwareMemoryDomainKind"
+          "backend": {
+            "$ref": "#/components/schemas/ExecutionBackend"
           },
-          "total_capacity_bytes": {
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "device_placement": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            },
+            "description": "The access paths device storage is allocated from, in order."
+          },
+          "upload_placement": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            },
+            "description": "The access paths upload storage is allocated from, in order."
+          },
+          "availability": {
+            "$ref": "#/components/schemas/HardwareExecutorAvailability"
+          }
+        },
+        "additionalProperties": false
+      },
+      "HardwareExecutorAvailability": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "stable_capacity_bytes",
+              "type"
+            ],
+            "properties": {
+              "stable_capacity_bytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "available"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "reason",
+              "type"
+            ],
+            "properties": {
+              "reason": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "unavailable"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "Whether an executor can run: with its device placement's stable fit, or\nthe reason it cannot."
+      },
+      "HardwareGrant": {
+        "type": "object",
+        "description": "What an executor's driver lets this process place along one path.",
+        "required": [
+          "bytes",
+          "basis"
+        ],
+        "properties": {
+          "bytes": {
             "type": "integer",
             "format": "int64",
             "minimum": 0
           },
-          "stable_capacity_bytes": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
+          "basis": {
+            "$ref": "#/components/schemas/HardwareReportedBy",
+            "description": "The interface that reported the grant."
           },
-          "current_free_bytes": {
+          "remaining_bytes": {
             "type": [
               "integer",
               "null"
             ],
             "format": "int64",
+            "description": "What is left of the grant, where a reading without an opened\nexecutor reports it.",
             "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "HardwareHostRam": {
+        "type": "object",
+        "description": "Host RAM, memory the OS manages, with what the OS reports of it.",
+        "required": [
+          "store",
+          "current_free_bytes"
+        ],
+        "properties": {
+          "store": {
+            "$ref": "#/components/schemas/HardwareStore"
           },
-          "shares_system_memory": {
-            "type": "boolean"
+          "current_free_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "What the OS can give this process within its binding scope (the\nhost, or the limit that binds): free pages above its target, clean\nfile cache and reclaimable cold pages.",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "HardwarePhysicalDevice": {
+        "type": "object",
+        "description": "One piece of hardware, with every executor that views it.",
+        "required": [
+          "id",
+          "kind",
+          "executors"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/HardwarePhysicalDeviceId"
           },
-          "devices": {
+          "kind": {
+            "$ref": "#/components/schemas/HardwareDeviceKind"
+          },
+          "executors": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/HardwareDevice"
+              "$ref": "#/components/schemas/HardwareExecutor"
             }
           }
         },
         "additionalProperties": false
       },
-      "HardwareMemoryDomainKind": {
+      "HardwarePhysicalDeviceId": {
         "type": "string",
+        "description": "Stable cross-process identity of one piece of hardware: the serialized Seismic physical\nidentity (`host`, `registry:<id>` or `uuid:<uuid>`), which every executor viewing it shares."
+      },
+      "HardwareReportedBy": {
+        "type": "string",
+        "description": "The interface, and the figure of it, a reported value comes from.",
         "enum": [
-          "system",
-          "physical_device",
-          "unified_memory"
+          "linux_mem_total",
+          "mac_os_memsize",
+          "windows_total_phys",
+          "linux_mem_available",
+          "mach_movable_pages",
+          "mac_os_free_pages",
+          "windows_physical_and_commit",
+          "cpu_address_space",
+          "metal_max_buffer_length",
+          "metal_recommended_working_set",
+          "metal_working_set_unallocated",
+          "cuda_total_memory",
+          "cuda_usable_memory",
+          "cuda_free",
+          "vulkan_heap",
+          "vulkan_heap_budget",
+          "vulkan_heaps",
+          "vulkan_heaps_beyond_dedicated",
+          "vulkan_max_allocation",
+          "cuda_total_beyond_dedicated",
+          "metal_working_set_beyond_dedicated",
+          "dxgi_dedicated_memory",
+          "linux_sysfs_cache",
+          "mac_os_sysctl_cache",
+          "windows_processor_cache",
+          "cuda_l2_cache",
+          "filesystem_size",
+          "filesystem_available"
         ]
       },
       "HardwareSnapshot": {
@@ -4053,11 +6482,15 @@
           "platform",
           "architecture",
           "logical_cores",
-          "system_memory",
           "native_build",
-          "enabled_backends",
           "topology_fingerprint",
-          "memory_domains"
+          "physical_devices",
+          "selected_executor",
+          "host_ram",
+          "device_memory",
+          "volumes",
+          "access_paths",
+          "transfer_paths"
         ],
         "properties": {
           "captured_at": {
@@ -4095,75 +6528,147 @@
             "type": "integer",
             "minimum": 0
           },
-          "system_memory": {
-            "$ref": "#/components/schemas/HardwareSystemMemory"
-          },
           "native_build": {
             "type": "string",
             "description": "Engine build identity: engine version plus kernel bundle identity."
           },
-          "enabled_backends": {
+          "backend_diagnostics": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/ExecutionBackend"
+              "$ref": "#/components/schemas/HardwareBackendDiagnostic"
             },
-            "description": "Backends compiled into the engine build."
+            "description": "Backends that discovery could not enumerate on this machine, with the engine's own reason,\nfor example an absent driver or a backend this build lacks. Empty when every backend\nenumerated."
           },
           "topology_fingerprint": {
             "type": "string"
           },
-          "memory_domains": {
+          "physical_devices": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/HardwareMemoryDomain"
+              "$ref": "#/components/schemas/HardwarePhysicalDevice"
+            }
+          },
+          "selected_executor": {
+            "$ref": "#/components/schemas/HardwareDeviceId",
+            "description": "The serving device: the executor the service selected once over its topology, which it\nassesses every model on and loads every model on. The service does not run without one."
+          },
+          "host_ram": {
+            "$ref": "#/components/schemas/HardwareHostRam",
+            "description": "Memory the OS manages; every machine has it."
+          },
+          "device_memory": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HardwareDeviceMemory"
+            }
+          },
+          "volumes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HardwareVolume"
+            },
+            "description": "The filesystems of the model store and the kernel cache, each tagged with its roles."
+          },
+          "access_paths": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HardwareAccessPath"
+            }
+          },
+          "transfer_paths": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HardwareTransferPath"
             }
           }
         },
         "additionalProperties": false
       },
-      "HardwareSystemMemory": {
+      "HardwareStore": {
         "type": "object",
+        "description": "A place bytes live, and what the service plans against in it.",
         "required": [
-          "physical_capacity_bytes",
-          "physical_available_bytes",
-          "allocation_capacity_bytes",
-          "allocation_headroom_bytes",
-          "assess_reserve_bytes",
-          "abort_reserve_bytes"
+          "id",
+          "total_capacity_bytes",
+          "capacity_basis",
+          "allocation_capacity_bytes"
         ],
         "properties": {
-          "physical_capacity_bytes": {
+          "id": {
+            "$ref": "#/components/schemas/MemoryDomainId"
+          },
+          "total_capacity_bytes": {
             "type": "integer",
             "format": "int64",
             "minimum": 0
           },
-          "physical_available_bytes": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
+          "capacity_basis": {
+            "$ref": "#/components/schemas/HardwareReportedBy",
+            "description": "The interface that reported the capacity."
           },
           "allocation_capacity_bytes": {
             "type": "integer",
             "format": "int64",
-            "minimum": 0
-          },
-          "allocation_headroom_bytes": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "assess_reserve_bytes": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "abort_reserve_bytes": {
-            "type": "integer",
-            "format": "int64",
+            "description": "The capacity within process limits.",
             "minimum": 0
           }
         },
         "additionalProperties": false
+      },
+      "HardwareTransferPath": {
+        "type": "object",
+        "description": "Bytes moved between two stores by an executor's copy mechanism.",
+        "required": [
+          "from",
+          "to",
+          "executor"
+        ],
+        "properties": {
+          "from": {
+            "$ref": "#/components/schemas/MemoryDomainId"
+          },
+          "to": {
+            "$ref": "#/components/schemas/MemoryDomainId"
+          },
+          "executor": {
+            "$ref": "#/components/schemas/HardwareDeviceId"
+          }
+        },
+        "additionalProperties": false
+      },
+      "HardwareVolume": {
+        "type": "object",
+        "description": "A volume, with the space the OS reports available to this process and what the service\nkeeps on it.",
+        "required": [
+          "store",
+          "current_free_bytes",
+          "roles"
+        ],
+        "properties": {
+          "store": {
+            "$ref": "#/components/schemas/HardwareStore"
+          },
+          "current_free_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "roles": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HardwareVolumeRole"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "HardwareVolumeRole": {
+        "type": "string",
+        "description": "What the service keeps on a volume.",
+        "enum": [
+          "model_store",
+          "kernel_cache"
+        ]
       },
       "HealthResponse": {
         "type": "object",
@@ -4199,6 +6704,56 @@
         },
         "additionalProperties": false
       },
+      "HuggingFaceAccess": {
+        "type": "string",
+        "description": "What Hugging Face needs before it serves a refused repository's files: a signed-in account\n(no token, or one it rejected), or that the signed-in account accept the repository's terms.",
+        "enum": [
+          "SignIn",
+          "AcceptTerms"
+        ]
+      },
+      "HuggingFaceArtifactSelector": {
+        "type": "string",
+        "description": "The repository-relative GGUF weights selector used in a Hugging Face model identity."
+      },
+      "HuggingFaceBaseRelation": {
+        "type": "string",
+        "description": "How a repository derives from its base model, as the Hub's `baseModels` states it; `unknown`\nwhen only its GGUF names the base.",
+        "enum": [
+          "quantized",
+          "finetune",
+          "merge",
+          "adapter",
+          "unknown"
+        ]
+      },
+      "HuggingFaceCredential": {
+        "type": "object",
+        "description": "The Hugging Face token presented on every later Hub request; without one, Hub requests are\nanonymous. It is write-only: no response carries it.",
+        "properties": {
+          "token": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "HuggingFaceModelBase": {
+        "type": "object",
+        "description": "The model a repository derives from.",
+        "required": [
+          "repository",
+          "relation"
+        ],
+        "properties": {
+          "repository": {
+            "type": "string"
+          },
+          "relation": {
+            "$ref": "#/components/schemas/HuggingFaceBaseRelation"
+          }
+        },
+        "additionalProperties": false
+      },
       "HuggingFaceModelSearchRequest": {
         "type": "object",
         "required": [
@@ -4213,12 +6768,16 @@
             "type": "integer",
             "format": "int32",
             "minimum": 0
+          },
+          "cursor": {
+            "type": "string"
           }
         },
         "additionalProperties": false
       },
       "HuggingFaceModelSearchResult": {
         "type": "object",
+        "description": "One repository as the Hub lists it, before any of its files is read. `architecture` is the\nHub's, from the GGUF it describes the repository by. `developer` is told by the repository's\nname. `version_count` is how many GGUFs the repository's file list offers (split shards counted\nonce, projectors excluded), approximate since drafters are not told apart. `base` is the Hub's\n`baseModels`. What the repository holds on this machine is its check\n(`HuggingFaceRepositoryCheck`).",
         "required": [
           "repository",
           "commit",
@@ -4233,25 +6792,16 @@
           "commit": {
             "type": "string"
           },
-          "last_modified": {
-            "type": [
-              "string",
-              "null"
-            ]
+          "lastModified": {
+            "type": "string"
           },
           "downloads": {
-            "type": [
-              "integer",
-              "null"
-            ],
+            "type": "integer",
             "format": "int64",
             "minimum": 0
           },
           "likes": {
-            "type": [
-              "integer",
-              "null"
-            ],
+            "type": "integer",
             "format": "int64",
             "minimum": 0
           },
@@ -4266,21 +6816,151 @@
             "items": {
               "type": "string"
             }
+          },
+          "architecture": {
+            "type": "string"
+          },
+          "developer": {
+            "$ref": "#/components/schemas/ModelDeveloper"
+          },
+          "versionCount": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 1
+          },
+          "base": {
+            "$ref": "#/components/schemas/HuggingFaceModelBase"
           }
         },
         "additionalProperties": false
       },
       "HuggingFaceModelSearchResults": {
         "type": "object",
+        "description": "One page of the Hub's results, most downloaded first; catalog repositories excluded. `next_cursor` requests the page after it, absent on the last.",
         "required": [
-          "models"
+          "results"
         ],
         "properties": {
-          "models": {
+          "results": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/HuggingFaceModelSearchResult"
             }
+          },
+          "nextCursor": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "HuggingFaceRecommendedVersion": {
+        "type": "object",
+        "description": "A repository's recommended version, chosen and assessed as candidate inspection chooses and\nassesses it. `download_bytes` is what adding it downloads, its projector included; zero when it\nis already on this computer.",
+        "required": [
+          "label",
+          "modelId",
+          "sizeBytes",
+          "downloadBytes",
+          "assessment"
+        ],
+        "properties": {
+          "label": {
+            "type": "string"
+          },
+          "modelId": {
+            "$ref": "#/components/schemas/ModelId"
+          },
+          "sizeBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "downloadBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "assessment": {
+            "$ref": "#/components/schemas/ModelAssessment"
+          }
+        },
+        "additionalProperties": false
+      },
+      "HuggingFaceRepositoryCheck": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "NotAModel"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "unsupported",
+              "_tag"
+            ],
+            "properties": {
+              "architecture": {
+                "type": "string"
+              },
+              "variantOf": {
+                "$ref": "#/components/schemas/ModelId"
+              },
+              "developer": {
+                "$ref": "#/components/schemas/ModelDeveloper"
+              },
+              "base": {
+                "$ref": "#/components/schemas/HuggingFaceModelBase"
+              },
+              "unsupported": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/UnsupportedReason"
+                }
+              },
+              "recommended": {
+                "$ref": "#/components/schemas/HuggingFaceRecommendedVersion"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Model"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "What a listed repository holds on this machine, from its model file's header and the version\ncandidate inspection would recommend. `NotAModel` is a repository of drafters or projectors\nalone: nothing in it is offered. For a `Model`, `unsupported` is empty when the engine runs it;\n`architecture` is its header's, absent when the header couldn't be read; `variant_of` is the\ncatalog model whose shape fingerprint it has; `base` is the Hub's `baseModels`, else its model\nfile's `general.base_model.*`; `recommended` is the version inspection recommends, absent when\nthe versions couldn't be assessed in time."
+      },
+      "HuggingFaceRepositoryCheckRequest": {
+        "type": "object",
+        "description": "A listed repository to check: what the search listed it as. `architecture` is the Hub's,\nwhich decides only when the repository's model file can't be read; `restricted` is whether the\nlisting is gated or private, so its reads are kept for the credential that made them.",
+        "required": [
+          "repository",
+          "commit",
+          "restricted"
+        ],
+        "properties": {
+          "repository": {
+            "type": "string"
+          },
+          "commit": {
+            "type": "string"
+          },
+          "architecture": {
+            "type": "string"
+          },
+          "restricted": {
+            "type": "boolean"
           }
         },
         "additionalProperties": false
@@ -4289,14 +6969,14 @@
         "type": "object",
         "required": [
           "path",
-          "size_bytes",
+          "sizeBytes",
           "content"
         ],
         "properties": {
           "path": {
             "type": "string"
           },
-          "size_bytes": {
+          "sizeBytes": {
             "type": "integer",
             "format": "int64",
             "minimum": 0
@@ -4306,6 +6986,10 @@
           }
         },
         "additionalProperties": false
+      },
+      "HuggingFaceRepositoryId": {
+        "type": "string",
+        "description": "A canonical Hugging Face model repository (`owner/repository`)."
       },
       "HuggingFaceRepositoryRequest": {
         "type": "object",
@@ -4330,9 +7014,9 @@
           "commit",
           "gated",
           "private",
-          "base_models",
+          "baseModels",
           "tags",
-          "gguf_files"
+          "ggufFiles"
         ],
         "properties": {
           "repository": {
@@ -4341,25 +7025,16 @@
           "commit": {
             "type": "string"
           },
-          "last_modified": {
-            "type": [
-              "string",
-              "null"
-            ]
+          "lastModified": {
+            "type": "string"
           },
           "downloads": {
-            "type": [
-              "integer",
-              "null"
-            ],
+            "type": "integer",
             "format": "int64",
             "minimum": 0
           },
           "likes": {
-            "type": [
-              "integer",
-              "null"
-            ],
+            "type": "integer",
             "format": "int64",
             "minimum": 0
           },
@@ -4370,18 +7045,12 @@
             "type": "boolean"
           },
           "license": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           },
-          "license_url": {
-            "type": [
-              "string",
-              "null"
-            ]
+          "licenseUrl": {
+            "type": "string"
           },
-          "base_models": {
+          "baseModels": {
             "type": "array",
             "items": {
               "type": "string"
@@ -4393,7 +7062,7 @@
               "type": "string"
             }
           },
-          "gguf_files": {
+          "ggufFiles": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/HuggingFaceRepositoryFile"
@@ -4411,8 +7080,7 @@
           "capabilities",
           "target",
           "profile",
-          "rustc",
-          "backends"
+          "rustc"
         ],
         "properties": {
           "version": {
@@ -4447,14 +7115,6 @@
           "rustc": {
             "type": "string",
             "minLength": 1
-          },
-          "backends": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ExecutionBackend"
-            },
-            "description": "Backends compiled into the engine build.",
-            "minItems": 1
           }
         },
         "additionalProperties": false
@@ -4497,104 +7157,6 @@
         "type": "string",
         "enum": [
           "shutdown"
-        ]
-      },
-      "IcnStartupBackend": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "hardwareLabel",
-              "type"
-            ],
-            "properties": {
-              "hardwareLabel": {
-                "type": "string"
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "cpu"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "hardwareLabel",
-              "type"
-            ],
-            "properties": {
-              "hardwareLabel": {
-                "type": "string"
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "metal"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "hardwareLabel",
-              "type"
-            ],
-            "properties": {
-              "hardwareLabel": {
-                "type": "string"
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "cuda"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "hardwareLabel",
-              "type"
-            ],
-            "properties": {
-              "hardwareLabel": {
-                "type": "string"
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "vulkan"
-                ]
-              }
-            }
-          }
-        ]
-      },
-      "IcnStartupProgressRecord": {
-        "type": "object",
-        "required": [
-          "type",
-          "backend"
-        ],
-        "properties": {
-          "type": {
-            "$ref": "#/components/schemas/IcnStartupProgressRecordType"
-          },
-          "backend": {
-            "$ref": "#/components/schemas/IcnStartupBackend"
-          }
-        },
-        "additionalProperties": false
-      },
-      "IcnStartupProgressRecordType": {
-        "type": "string",
-        "enum": [
-          "preparing_backend"
         ]
       },
       "IcnStartupRecord": {
@@ -4738,9 +7300,10 @@
         "enum": [
           "hardware",
           "catalog",
-          "discovery",
+          "local-models",
           "model-assessments",
           "catalog-installations",
+          "downloads",
           "instances"
         ]
       },
@@ -4763,13 +7326,506 @@
         },
         "additionalProperties": false
       },
+      "KernelStatic": {
+        "type": "object",
+        "required": [
+          "name",
+          "value"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "value": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "KernelTuningOperation": {
+        "type": "string",
+        "description": "Selected optional tuning work, not a fixed sequence of global phases.",
+        "enum": [
+          "discovery",
+          "form",
+          "measure",
+          "promote",
+          "confirm"
+        ]
+      },
+      "KernelTuningWork": {
+        "type": "object",
+        "required": [
+          "entry",
+          "operation"
+        ],
+        "properties": {
+          "entry": {
+            "type": "string"
+          },
+          "operation": {
+            "$ref": "#/components/schemas/KernelTuningOperation"
+          }
+        }
+      },
+      "KnownUnsupportedReason": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "architecture",
+              "_tag"
+            ],
+            "properties": {
+              "architecture": {
+                "type": "string"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Architecture"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "types",
+              "_tag"
+            ],
+            "properties": {
+              "types": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/WeightTypeCount"
+                }
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "WeightTypes"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind",
+              "_tag"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "RopeScaling"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "name",
+              "_tag"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "UnrecognizedTensor"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "key",
+              "_tag"
+            ],
+            "properties": {
+              "key": {
+                "type": "string"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "UnrecognizedMetadata"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "key",
+              "_tag"
+            ],
+            "properties": {
+              "key": {
+                "type": "string"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "MissingMetadata"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "model",
+              "_tag"
+            ],
+            "properties": {
+              "model": {
+                "type": "string"
+              },
+              "pre": {
+                "type": "string"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Tokenizer"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "ChatTemplate"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "backend",
+              "entry",
+              "statics",
+              "_tag"
+            ],
+            "properties": {
+              "backend": {
+                "type": "string"
+              },
+              "entry": {
+                "type": "string"
+              },
+              "statics": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/KernelStatic"
+                }
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "KernelDomain"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "backend",
+              "_tag"
+            ],
+            "properties": {
+              "backend": {
+                "type": "string"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Backend"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "detail",
+              "_tag"
+            ],
+            "properties": {
+              "detail": {
+                "type": "string"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "TargetMismatch"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "TiedOutputHead"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "architecture",
+              "_tag"
+            ],
+            "properties": {
+              "architecture": {
+                "type": "string"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "DraftArchitecture"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Unreadable"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "UnsupportedFormat"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "A reason the engine raises, typed where it raises it. `DraftArchitecture` is a separate drafter\nwhose architecture no drafter family binds, such as a Nemotron-H MTP file. `UnsupportedFormat`\nis the service's own: a found model whose files are not GGUF, such as an Ollama model stored for\nits MLX runner."
+      },
+      "LabId": {
+        "type": "string"
+      },
+      "LocalModelRemoval": {
+        "type": "object",
+        "description": "The result of removing an added model's Magnitude-owned files. Files in external locations\nare never touched, so the model may remain as found.",
+        "required": [
+          "modelId",
+          "removed",
+          "freedBytes"
+        ],
+        "properties": {
+          "modelId": {
+            "$ref": "#/components/schemas/ModelId"
+          },
+          "removed": {
+            "type": "boolean"
+          },
+          "freedBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "LocalModelsConfiguration": {
+        "type": "object",
+        "description": "The whole local-models configuration ACN owns and hands to ICN, at spawn and after every\nchange. Applying it is idempotent.",
+        "required": [
+          "roots",
+          "added",
+          "hidden",
+          "drafters"
+        ],
+        "properties": {
+          "roots": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ModelRoot"
+            }
+          },
+          "added": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AddedModel"
+            }
+          },
+          "hidden": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ModelId"
+            }
+          },
+          "drafters": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DrafterAttachment"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "LocalModelsResponse": {
+        "type": "object",
+        "description": "`models` are the custom models to offer and assess; `hidden` are the ones the configuration\nhides, listed so a client can unhide them, and never assessed. `unsupported` are GGUF groups\nthat cannot be read at all, and directories inside a location that cannot be read (the rest of\nthe location is still listed); a readable model the engine rejects stays in `models` with an\n`Unsupported` assessment.",
+        "required": [
+          "revision",
+          "reconciliationComplete",
+          "models",
+          "hidden",
+          "unsupported"
+        ],
+        "properties": {
+          "revision": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "reconciliationComplete": {
+            "type": "boolean"
+          },
+          "models": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CustomModel"
+            }
+          },
+          "hidden": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CustomModel"
+            }
+          },
+          "unsupported": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UnsupportedLocalModel"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "MeasurementState": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Measurements are missing and no job has run yet: it waits for the device to be free.",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Unmeasured"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A job is measuring this machine.",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Measuring"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Every measurement that estimates read is stored, or recorded as unobtainable on this\nmachine.",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Measured"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The last job did not store every measurement; the next starts at `retry_at`\n(milliseconds since the Unix epoch).",
+            "required": [
+              "retryAt",
+              "_tag"
+            ],
+            "properties": {
+              "retryAt": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Failed"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "The state of the measurement job, which measures this machine's selected executor in a\nworker process of its own, so that speed estimates can be made. It runs while no model is\nloading or being optimized, and while no request holds a loaded model, beside which it runs\nonce that model has made room for it. It moves from `Unmeasured` to `Measuring`, then to\n`Measured`, or to `Failed` and back to `Measuring` at its retry, or back to `Unmeasured` when\na load or a request preempts the job."
+      },
       "MemoryAssessment": {
         "type": "object",
         "required": [
           "memoryDomainId",
           "capacityBytes",
           "requiredBytes",
-          "compatibilityReserveBytes",
           "remainingBytes"
         ],
         "properties": {
@@ -4786,11 +7842,6 @@
             "format": "int64",
             "minimum": 0
           },
-          "compatibilityReserveBytes": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
           "remainingBytes": {
             "type": "integer",
             "format": "int64"
@@ -4798,15 +7849,42 @@
         },
         "additionalProperties": false
       },
+      "MemoryBreakdown": {
+        "type": "object",
+        "description": "What a fitting model's required memory holds across every domain: its weights, the\nconversation's state at the served context, and everything else the load holds.",
+        "required": [
+          "weightsBytes",
+          "contextBytes",
+          "overheadBytes"
+        ],
+        "properties": {
+          "weightsBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "contextBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "overheadBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
       "MemoryDomainId": {
         "type": "string",
-        "description": "Stable identity of one physical memory pool."
+        "description": "Stable identity of one store, a place bytes live: `system` for host RAM, otherwise the\nstore's own identity (a device's memory by its physical device)."
       },
       "MemoryShortage": {
         "oneOf": [
           {
             "type": "object",
-            "description": "Memory that cannot be moved is in the way of the load's claim in its limiting memory\ndomain. `available_bytes` is what a load may claim there: the reserve is already taken out.",
+            "description": "Memory that cannot be moved is in the way of the load's claim in its limiting memory\ndomain. `available_bytes` is what the domain's ledger could give the claim there once\nevery cache yielded.",
             "required": [
               "requiredBytes",
               "availableBytes",
@@ -4827,21 +7905,6 @@
                 "type": "string",
                 "enum": [
                   "Blocked"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "description": "A memory domain the load uses was under pressure: at its reserve, or with other programs'\nmemory being displaced faster than the system absorbs. No byte count describes it.",
-            "required": [
-              "_tag"
-            ],
-            "properties": {
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "UnderPressure"
                 ]
               }
             }
@@ -5023,16 +8086,24 @@
         "oneOf": [
           {
             "type": "object",
-            "description": "A fitting model, with one decode-speed estimate per requested depth.",
+            "description": "A fitting model at `served`, the largest context tier within `profile` at which its\nstandard workload fits this computer, where it is placed by tier, how it holds its weights,\nand its decode-speed estimates held that way up to `served`.",
             "required": [
               "profile",
+              "served",
               "assessmentId",
               "memory",
-              "performance",
+              "memoryBreakdown",
+              "placement",
+              "residency",
+              "projector",
+              "drafter",
               "_tag"
             ],
             "properties": {
               "profile": {
+                "$ref": "#/components/schemas/ServingProfile"
+              },
+              "served": {
                 "$ref": "#/components/schemas/ServingProfile"
               },
               "assessmentId": {
@@ -5044,11 +8115,20 @@
                   "$ref": "#/components/schemas/MemoryAssessment"
                 }
               },
-              "performance": {
-                "type": "array",
-                "items": {
-                  "$ref": "#/components/schemas/PerformanceEvidence"
-                }
+              "memoryBreakdown": {
+                "$ref": "#/components/schemas/MemoryBreakdown"
+              },
+              "placement": {
+                "$ref": "#/components/schemas/ModelPlacement"
+              },
+              "residency": {
+                "$ref": "#/components/schemas/ModelResidency"
+              },
+              "projector": {
+                "$ref": "#/components/schemas/ProjectorVerdict"
+              },
+              "drafter": {
+                "$ref": "#/components/schemas/DrafterVerdict"
               },
               "_tag": {
                 "type": "string",
@@ -5060,16 +8140,23 @@
           },
           {
             "type": "object",
+            "description": "A model that fits at no context tier: `deficit_bytes` is its shortfall at the smallest,\n`shortfall`.",
             "required": [
               "profile",
+              "shortfall",
               "assessmentId",
               "memory",
               "limitingResource",
               "deficitBytes",
+              "projector",
+              "drafter",
               "_tag"
             ],
             "properties": {
               "profile": {
+                "$ref": "#/components/schemas/ServingProfile"
+              },
+              "shortfall": {
                 "$ref": "#/components/schemas/ServingProfile"
               },
               "assessmentId": {
@@ -5089,6 +8176,12 @@
                 "format": "int64",
                 "minimum": 0
               },
+              "projector": {
+                "$ref": "#/components/schemas/ProjectorVerdict"
+              },
+              "drafter": {
+                "$ref": "#/components/schemas/DrafterVerdict"
+              },
               "_tag": {
                 "type": "string",
                 "enum": [
@@ -5099,18 +8192,24 @@
           },
           {
             "type": "object",
-            "description": "The engine cannot execute a discovered model. A catalog model is\nnever unsupported: the pool drops a catalog target the engine cannot\nexecute as a release defect.",
+            "description": "The engine cannot execute a custom model, with every reason it found. A catalog model is\nnever unsupported: the pool drops a catalog target the engine cannot execute as a release\ndefect. An unreadable file has no serving profile.",
             "required": [
-              "profile",
-              "failure",
+              "reasons",
+              "detail",
               "_tag"
             ],
             "properties": {
               "profile": {
                 "$ref": "#/components/schemas/ServingProfile"
               },
-              "failure": {
-                "$ref": "#/components/schemas/ModelFailure"
+              "reasons": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/UnsupportedReason"
+                }
+              },
+              "detail": {
+                "type": "string"
               },
               "_tag": {
                 "type": "string",
@@ -5172,7 +8271,7 @@
             }
           }
         ],
-        "description": "One source's assessments. `Pending` until the source has been read (and, for discovery,\nreconciled)."
+        "description": "One source's assessments. `Pending` until the source has been read (and, for custom models,\nreconciled)."
       },
       "ModelAssessmentEntry": {
         "type": "object",
@@ -5220,6 +8319,9 @@
               },
               "templateFingerprint": {
                 "type": "string"
+              },
+              "fingerprint": {
+                "$ref": "#/components/schemas/ModelFingerprint"
               },
               "profiles": {
                 "type": "array",
@@ -5291,7 +8393,7 @@
               "_tag": {
                 "type": "string",
                 "enum": [
-                  "Discovery"
+                  "Custom"
                 ]
               }
             }
@@ -5300,12 +8402,13 @@
       },
       "ModelAssessmentsSnapshot": {
         "type": "object",
-        "description": "Every model assessment in the service's one environment, established at service start.",
+        "description": "Every model assessment in the service's current environment: its structure is established at\nservice start, and its identity changes when the measurement job stores this machine's\nmeasurements.",
         "required": [
           "revision",
           "environmentId",
           "catalog",
-          "discovered"
+          "custom",
+          "measurement"
         ],
         "properties": {
           "revision": {
@@ -5319,8 +8422,38 @@
           "catalog": {
             "$ref": "#/components/schemas/ModelAssessmentDomainSnapshot"
           },
-          "discovered": {
+          "custom": {
             "$ref": "#/components/schemas/ModelAssessmentDomainSnapshot"
+          },
+          "measurement": {
+            "$ref": "#/components/schemas/MeasurementState",
+            "description": "Whether this machine's measurements, which speed estimates read, exist."
+          }
+        },
+        "additionalProperties": false
+      },
+      "ModelCandidate": {
+        "type": "object",
+        "description": "A target (shards in order), projector and drafter, by paths relative to `source`.",
+        "required": [
+          "source",
+          "target"
+        ],
+        "properties": {
+          "source": {
+            "$ref": "#/components/schemas/CandidateSource"
+          },
+          "target": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "projector": {
+            "$ref": "#/components/schemas/CandidateFile"
+          },
+          "drafter": {
+            "$ref": "#/components/schemas/CandidateDrafter"
           }
         },
         "additionalProperties": false
@@ -5349,6 +8482,210 @@
         },
         "additionalProperties": false
       },
+      "ModelDeveloper": {
+        "type": "object",
+        "description": "The lab that develops a model, from the catalog's lab table. `country` is its ISO 3166-1\nalpha-2 code.",
+        "required": [
+          "lab",
+          "name",
+          "country"
+        ],
+        "properties": {
+          "lab": {
+            "$ref": "#/components/schemas/LabId"
+          },
+          "name": {
+            "type": "string"
+          },
+          "country": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ModelDownload": {
+        "type": "object",
+        "required": [
+          "id",
+          "bundle",
+          "forModel",
+          "state"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/ModelDownloadId"
+          },
+          "bundle": {
+            "$ref": "#/components/schemas/ServableModelBundle"
+          },
+          "forModel": {
+            "$ref": "#/components/schemas/ModelId"
+          },
+          "state": {
+            "$ref": "#/components/schemas/ModelDownloadState"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ModelDownloadId": {
+        "type": "string"
+      },
+      "ModelDownloadState": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "completedBytes",
+              "totalBytes",
+              "_tag"
+            ],
+            "properties": {
+              "completedBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "totalBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Pending"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "stage",
+              "completedBytes",
+              "totalBytes",
+              "_tag"
+            ],
+            "properties": {
+              "stage": {
+                "$ref": "#/components/schemas/DownloadStage"
+              },
+              "completedBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "totalBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "bytesPerSecond": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int64",
+                "minimum": 0
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Downloading"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Completed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "completedBytes",
+              "totalBytes",
+              "failure",
+              "acknowledged",
+              "_tag"
+            ],
+            "properties": {
+              "completedBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "totalBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "failure": {
+                "$ref": "#/components/schemas/DownloadFailure"
+              },
+              "acknowledged": {
+                "type": "boolean"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Failed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "completedBytes",
+              "totalBytes",
+              "_tag"
+            ],
+            "properties": {
+              "completedBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "totalBytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Cancelled"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "ModelDownloadsResponse": {
+        "type": "object",
+        "required": [
+          "downloads"
+        ],
+        "properties": {
+          "downloads": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ModelDownload"
+            }
+          }
+        }
+      },
       "ModelFailure": {
         "type": "object",
         "required": [
@@ -5369,8 +8706,259 @@
         },
         "additionalProperties": false
       },
-      "ModelId": {
+      "ModelFamily": {
+        "type": "object",
+        "description": "A family of models Magnitude runs, by the GGUF architectures its models declare; fine-tunes and\nre-uploads of these architectures run too.",
+        "required": [
+          "name",
+          "developer",
+          "architectures",
+          "status"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "developer": {
+            "$ref": "#/components/schemas/ModelDeveloper"
+          },
+          "architectures": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "status": {
+            "$ref": "#/components/schemas/ModelFamilyStatus"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ModelFamilyStatus": {
+        "type": "string",
+        "description": "Whether Magnitude runs a model family now or will.",
+        "enum": [
+          "Supported",
+          "ComingSoon"
+        ]
+      },
+      "ModelFile": {
+        "type": "object",
+        "required": [
+          "id",
+          "path",
+          "role",
+          "sizeBytes",
+          "sha256"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/ModelFileId"
+          },
+          "path": {
+            "type": "string"
+          },
+          "role": {
+            "$ref": "#/components/schemas/ModelFileRole"
+          },
+          "sizeBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "tensorStorageBytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Exact encoded tensor storage, when bounded GGUF inspection succeeded.",
+            "minimum": 0
+          },
+          "sha256": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ModelFileId": {
         "type": "string"
+      },
+      "ModelFileRelationship": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "fileId",
+              "index",
+              "count",
+              "_tag"
+            ],
+            "properties": {
+              "fileId": {
+                "$ref": "#/components/schemas/ModelFileId"
+              },
+              "index": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "count": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Shard"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "projectorFileId",
+              "weightsFileId",
+              "_tag"
+            ],
+            "properties": {
+              "projectorFileId": {
+                "$ref": "#/components/schemas/ModelFileId"
+              },
+              "weightsFileId": {
+                "$ref": "#/components/schemas/ModelFileId"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "ProjectorFor"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "mtpFileId",
+              "weightsFileId",
+              "_tag"
+            ],
+            "properties": {
+              "mtpFileId": {
+                "$ref": "#/components/schemas/ModelFileId"
+              },
+              "weightsFileId": {
+                "$ref": "#/components/schemas/ModelFileId"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "MtpFor"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "draftFileId",
+              "weightsFileId",
+              "method",
+              "_tag"
+            ],
+            "properties": {
+              "draftFileId": {
+                "$ref": "#/components/schemas/ModelFileId"
+              },
+              "weightsFileId": {
+                "$ref": "#/components/schemas/ModelFileId"
+              },
+              "method": {
+                "$ref": "#/components/schemas/SpeculativeMethod"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "DraftFor"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "ModelFileRole": {
+        "type": "string",
+        "enum": [
+          "weights",
+          "projector",
+          "draft",
+          "mtp",
+          "auxiliary"
+        ]
+      },
+      "ModelFingerprint": {
+        "type": "object",
+        "description": "The shape a drafter binds to. Requantizations, finetunes and abliterations keep it, so it\nmatches a model to its parent catalog model when nothing else does.",
+        "required": [
+          "architecture",
+          "blockCount",
+          "embeddingLength",
+          "headCount",
+          "headCountKv",
+          "keyLength",
+          "vocabSize",
+          "tokenizerDigest"
+        ],
+        "properties": {
+          "architecture": {
+            "type": "string"
+          },
+          "blockCount": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "embeddingLength": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "headCount": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "headCountKv": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "keyLength": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "vocabSize": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "expertCount": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "tokenizerDigest": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ModelId": {
+        "type": "string",
+        "description": "A model's identity. Two `local:` IDs are the same model exactly when their hashes match: the\nlabel is for reading only, so equality, order and hashing ignore it."
       },
       "ModelInstallation": {
         "oneOf": [
@@ -5432,7 +9020,7 @@
         "type": "string",
         "enum": [
           "Magnitude",
-          "ExternalHuggingFace",
+          "External",
           "Mixed"
         ]
       },
@@ -5460,7 +9048,8 @@
         "type": "object",
         "required": [
           "contextWindowTokens",
-          "memoryDomains"
+          "memoryDomains",
+          "promptGroupPlaces"
         ],
         "properties": {
           "contextWindowTokens": {
@@ -5474,6 +9063,14 @@
               "$ref": "#/components/schemas/ModelInstanceMemoryDomain"
             },
             "description": "The engine heap's observed standing per memory domain at the last observation. Memory is\nelastic, so this is not a fixed reservation."
+          },
+          "promptGroupPlaces": {
+            "$ref": "#/components/schemas/PromptGroupPlaces",
+            "description": "The places granted to the load's prompt groups at the last observation."
+          },
+          "streaming": {
+            "$ref": "#/components/schemas/ModelStreamingStatus",
+            "description": "Where an elastic expert bank's experts are; absent for a load without one."
           }
         },
         "additionalProperties": false
@@ -5575,11 +9172,16 @@
             "type": "object",
             "required": [
               "allocation",
+              "device",
               "_tag"
             ],
             "properties": {
               "allocation": {
                 "$ref": "#/components/schemas/ModelInstanceAllocation"
+              },
+              "device": {
+                "$ref": "#/components/schemas/ModelLoadDevice",
+                "description": "The device the worker opened and serves on."
               },
               "_tag": {
                 "type": "string",
@@ -5721,6 +9323,78 @@
         },
         "additionalProperties": false
       },
+      "ModelLoadDetails": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "elapsed_ms",
+              "budget_ms",
+              "measured_configurations",
+              "formed_programs",
+              "kind"
+            ],
+            "properties": {
+              "elapsed_ms": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "budget_ms": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "work": {
+                "$ref": "#/components/schemas/KernelTuningWork"
+              },
+              "measured_configurations": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "formed_programs": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "tuning"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "completed_bytes",
+              "total_bytes",
+              "kind"
+            ],
+            "properties": {
+              "completed_bytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "total_bytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "weights"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "Exact stage observations; budget time is not configuration completion."
+      },
       "ModelLoadDevice": {
         "type": "object",
         "description": "The execution device a model load uses.",
@@ -5810,6 +9484,131 @@
         },
         "additionalProperties": false
       },
+      "ModelPackage": {
+        "type": "object",
+        "required": [
+          "id",
+          "source",
+          "files",
+          "relationships",
+          "properties"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/ModelPackageId"
+          },
+          "source": {
+            "$ref": "#/components/schemas/ModelPackageSource"
+          },
+          "files": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ModelFile"
+            }
+          },
+          "relationships": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ModelFileRelationship"
+            }
+          },
+          "properties": {
+            "$ref": "#/components/schemas/ModelPackageProperties"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ModelPackageId": {
+        "type": "string"
+      },
+      "ModelPackageProperties": {
+        "type": "object",
+        "required": [
+          "format",
+          "quantization",
+          "quantizationName",
+          "architecture"
+        ],
+        "properties": {
+          "format": {
+            "type": "string"
+          },
+          "quantization": {
+            "type": "string"
+          },
+          "quantizationName": {
+            "type": "string"
+          },
+          "architecture": {
+            "type": "string"
+          },
+          "maximumContextLength": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "intrinsicModelId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "intrinsicQualityId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "ModelPackageSource": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "repository",
+              "revision",
+              "_tag"
+            ],
+            "properties": {
+              "repository": {
+                "type": "string"
+              },
+              "revision": {
+                "type": "string"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "HuggingFace"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "path",
+              "_tag"
+            ],
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Local"
+                ]
+              }
+            }
+          }
+        ]
+      },
       "ModelParameterization": {
         "oneOf": [
           {
@@ -5860,6 +9659,100 @@
           }
         ]
       },
+      "ModelPerformance": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "This machine's measurements do not exist yet: the measurement job has not stored them.",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Pending"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A measurement the estimate needs could not be taken on this machine.",
+            "required": [
+              "failure",
+              "_tag"
+            ],
+            "properties": {
+              "failure": {
+                "$ref": "#/components/schemas/ModelFailure"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Unavailable"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "One decode-speed estimate per requested depth, ascending.",
+            "required": [
+              "samples",
+              "_tag"
+            ],
+            "properties": {
+              "samples": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/PerformanceEvidence"
+                }
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Estimated"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "A fitting model's speed estimates from this machine's measurements."
+      },
+      "ModelPlacement": {
+        "type": "object",
+        "description": "Where a fitting model's weights are held as it runs, as its files store them, so the four sum\nto its weights: `device_bytes` in the serving device's memory (GPU memory, or unified memory on\nApple silicon); `host_bytes` in host RAM beside a discrete device; `disk_bytes` the routed\nexperts neither holds, streamed from the model file as steps miss them; `lookup_disk_bytes` the\nrows of tables read by row (an embedding) that host RAM has no room to cache beside the model,\nwhich each token looks up a few rows of on disk. What it holds beside its weights is its memory\nbreakdown's.",
+        "required": [
+          "deviceBytes",
+          "hostBytes",
+          "diskBytes",
+          "lookupDiskBytes"
+        ],
+        "properties": {
+          "deviceBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "hostBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "diskBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "lookupDiskBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
       "ModelReasoningCapabilities": {
         "type": "object",
         "required": [
@@ -5897,6 +9790,88 @@
           "replacement",
           "memory_pressure",
           "failure"
+        ]
+      },
+      "ModelResidency": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Every weight in memory.",
+            "required": [
+              "performance",
+              "_tag"
+            ],
+            "properties": {
+              "performance": {
+                "$ref": "#/components/schemas/ModelPerformance"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Resident"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The routed experts streamed through an expert bank (`bank`). `performance` is at the\nbank's slots; `floor_performance` is at its floor.",
+            "required": [
+              "bank",
+              "performance",
+              "floorPerformance",
+              "_tag"
+            ],
+            "properties": {
+              "bank": {
+                "$ref": "#/components/schemas/StreamedBank"
+              },
+              "performance": {
+                "$ref": "#/components/schemas/ModelPerformance"
+              },
+              "floorPerformance": {
+                "$ref": "#/components/schemas/ModelPerformance"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Streamed"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "How a fitting model holds its weights, and its decode speed held that way."
+      },
+      "ModelRoot": {
+        "type": "object",
+        "description": "One resolved location ICN scans. ACN resolves the paths; ICN never guesses them.",
+        "required": [
+          "kind",
+          "path",
+          "enabled"
+        ],
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/ModelRootKind"
+          },
+          "path": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ModelRootKind": {
+        "type": "string",
+        "enum": [
+          "HuggingFaceCache",
+          "LmStudio",
+          "LlamaCpp",
+          "Ollama",
+          "Folder"
         ]
       },
       "ModelStoppingAllocation": {
@@ -5937,6 +9912,71 @@
             }
           }
         ]
+      },
+      "ModelStreamingStatus": {
+        "type": "object",
+        "description": "Where an elastic expert bank's routed experts are at the last observation: the experts of\neach routed layer it holds (its slots), between the floor it never shrinks below and the\nceiling it never grows past, at most every expert; its bytes in each memory domain; the\nhost-RAM tier holding cold experts beside it; the bytes of the experts in neither, read\nfrom the model file on demand; the stored tables it holds; and its experts' last resize.",
+        "required": [
+          "experts",
+          "slots",
+          "floorSlots",
+          "ceilingSlots",
+          "tiers",
+          "diskBytes",
+          "tables"
+        ],
+        "properties": {
+          "experts": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Each routed layer's experts.",
+            "minimum": 1
+          },
+          "slots": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "floorSlots": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "ceilingSlots": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "tiers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StreamingTierStatus"
+            },
+            "description": "The memory domains holding the bank, device memory first."
+          },
+          "host": {
+            "$ref": "#/components/schemas/StreamingHostStatus",
+            "description": "The host-RAM tier a discrete device's bank keeps its cold experts in,\nexclusive of the bank; absent on unified memory."
+          },
+          "diskBytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The experts in neither the bank nor the host tier, as the model file\nstores them.",
+            "minimum": 0
+          },
+          "tables": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StreamingTableStatus"
+            },
+            "description": "The stored tables (n-gram tables) the bank holds beside its experts."
+          },
+          "lastResize": {
+            "$ref": "#/components/schemas/StreamingResize",
+            "description": "The experts' last resize; absent before their first."
+          }
+        },
+        "additionalProperties": false
       },
       "NamedFunctionCallRequest": {
         "type": "object",
@@ -6112,7 +10152,7 @@
       },
       "PerformanceEvidence": {
         "type": "object",
-        "description": "An estimated decode speed at one context depth: the model's bytes per decode step over the\ndevice's memory bandwidth.",
+        "description": "An estimated decode speed at one context depth, in tokens per second per conversation, from\nthe costs measured of this machine's selected executor: what the engine's own kernels achieve\non it.",
         "required": [
           "contextTokens",
           "estimatedTokensPerSecond"
@@ -6126,6 +10166,85 @@
           "estimatedTokensPerSecond": {
             "type": "number",
             "format": "double"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ProjectorVerdict": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "None"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Bound"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "reasons",
+              "detail",
+              "_tag"
+            ],
+            "properties": {
+              "reasons": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/UnsupportedReason"
+                }
+              },
+              "detail": {
+                "type": "string"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Rejected"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "Whether the engine binds a model's projector. `None` means the model has no projector; a\n`Rejected` projector leaves the model assessed and served without it, taking text input only."
+      },
+      "PromptGroupPlaces": {
+        "type": "object",
+        "description": "The places a prompt group holds now, of the most it may take: each place runs one chunk of\na prompt in the group's pass. It holds at most its capacity.",
+        "required": [
+          "held",
+          "capacity"
+        ],
+        "properties": {
+          "held": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
+          },
+          "capacity": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
           }
         },
         "additionalProperties": false
@@ -7476,6 +11595,54 @@
           "assistant"
         ]
       },
+      "ServableModelBundle": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "package",
+              "_tag"
+            ],
+            "properties": {
+              "package": {
+                "$ref": "#/components/schemas/ModelPackage"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Standalone"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "target",
+              "draftSource",
+              "method",
+              "_tag"
+            ],
+            "properties": {
+              "target": {
+                "$ref": "#/components/schemas/ModelPackage"
+              },
+              "draftSource": {
+                "$ref": "#/components/schemas/SpeculativeDraftSource"
+              },
+              "method": {
+                "$ref": "#/components/schemas/SpeculativeMethod"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "SpeculativeDecoding"
+                ]
+              }
+            }
+          }
+        ]
+      },
       "ServingProfile": {
         "type": "object",
         "required": [
@@ -7489,6 +11656,42 @@
           }
         },
         "additionalProperties": false
+      },
+      "SpeculativeDraftSource": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Embedded"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "draft",
+              "_tag"
+            ],
+            "properties": {
+              "draft": {
+                "$ref": "#/components/schemas/ModelPackage"
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Separate"
+                ]
+              }
+            }
+          }
+        ]
       },
       "SpeculativeMethod": {
         "oneOf": [
@@ -7547,9 +11750,47 @@
                 ]
               }
             }
+          },
+          {
+            "type": "object",
+            "required": [
+              "_tag"
+            ],
+            "properties": {
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "LiLiCorr"
+                ]
+              }
+            }
           }
         ],
         "description": "Native algorithm used by a speculative decoding stage.\n\nMethod and artifact packaging are intentionally independent. The enclosing speculative bundle\ndeclares whether the selected method is embedded in the target or supplied by a separate draft\npackage."
+      },
+      "StartModelDownloadRequest": {
+        "type": "object",
+        "description": "A download of a custom model's `part`, by intent: the service works out its files from the\nlocal-models configuration and keeps the request until it ends, resolving it again after a\nrestart. Every `ModelDownload` it produces is for `model_id`.",
+        "required": [
+          "modelId"
+        ],
+        "properties": {
+          "modelId": {
+            "$ref": "#/components/schemas/ModelId"
+          },
+          "part": {
+            "$ref": "#/components/schemas/CustomModelPart"
+          }
+        },
+        "additionalProperties": false
+      },
+      "StartModelDownloadResponse": {
+        "type": "object",
+        "properties": {
+          "download": {
+            "$ref": "#/components/schemas/ModelDownload"
+          }
+        }
       },
       "StopRequest": {
         "oneOf": [
@@ -7569,6 +11810,197 @@
         "properties": {
           "include_usage": {
             "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "StreamedBank": {
+        "type": "object",
+        "description": "A streamed fit's expert bank: of each routed layer's `experts`, at least `floorSlots` in\nmemory, growing to `slots` where this machine's memory allows, fewer than every expert; and\nwhere the experts it lacks are kept (`coldExperts`).",
+        "required": [
+          "experts",
+          "slots",
+          "floorSlots",
+          "coldExperts"
+        ],
+        "properties": {
+          "experts": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
+          },
+          "slots": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "floorSlots": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "coldExperts": {
+            "$ref": "#/components/schemas/ColdExperts"
+          }
+        },
+        "additionalProperties": false
+      },
+      "StreamingHostStatus": {
+        "type": "object",
+        "description": "A discrete device's host-RAM tier, in its memory domain: its host slots now (each an expert\nof every streamed layer) up to its ceiling, the host memory its records take, and its last\nresize.",
+        "required": [
+          "memoryDomainId",
+          "slots",
+          "ceilingSlots",
+          "bytes"
+        ],
+        "properties": {
+          "memoryDomainId": {
+            "$ref": "#/components/schemas/MemoryDomainId"
+          },
+          "slots": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "ceilingSlots": {
+            "type": "integer",
+            "format": "int64",
+            "description": "At most every expert; none beside the landing reserve where a\nweight cap leaves the tier no slots.",
+            "minimum": 0
+          },
+          "bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "lastResize": {
+            "$ref": "#/components/schemas/StreamingResize",
+            "description": "Absent before the tier's first resize."
+          }
+        },
+        "additionalProperties": false
+      },
+      "StreamingResize": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "to",
+              "by",
+              "atUnixMs",
+              "_tag"
+            ],
+            "properties": {
+              "to": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "by": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 1
+              },
+              "atUnixMs": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Shrank"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "from",
+              "by",
+              "atUnixMs",
+              "_tag"
+            ],
+            "properties": {
+              "from": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "by": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 1
+              },
+              "atUnixMs": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "_tag": {
+                "type": "string",
+                "enum": [
+                  "Grew"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "A holding's finished resize, in its units (slots, records or host slots), at `atUnixMs`\n(milliseconds since the Unix epoch): shrunk by `by` to `to` as memory grew short, or grown\nby `by` from `from` into free memory. Each changes its size by at least one."
+      },
+      "StreamingTableStatus": {
+        "type": "object",
+        "description": "A stored table an expert bank holds: the records its slots use now, between the floor and\nceiling it resizes within; the bytes they hold; and its last resize.",
+        "required": [
+          "records",
+          "floorRecords",
+          "ceilingRecords",
+          "bytes"
+        ],
+        "properties": {
+          "records": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "floorRecords": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "ceilingRecords": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
+          },
+          "bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "lastResize": {
+            "$ref": "#/components/schemas/StreamingResize",
+            "description": "Absent before the table's first resize."
+          }
+        },
+        "additionalProperties": false
+      },
+      "StreamingTierStatus": {
+        "type": "object",
+        "required": [
+          "memoryDomainId",
+          "bytes"
+        ],
+        "properties": {
+          "memoryDomainId": {
+            "$ref": "#/components/schemas/MemoryDomainId"
+          },
+          "bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           }
         },
         "additionalProperties": false
@@ -7892,6 +12324,63 @@
           }
         ]
       },
+      "UnrecognizedUnsupportedReason": {
+        "type": "object",
+        "required": [
+          "_tag"
+        ],
+        "properties": {
+          "_tag": {
+            "type": "string"
+          },
+          "detail": {
+            "type": "string"
+          }
+        }
+      },
+      "UnsupportedLocalModel": {
+        "type": "object",
+        "description": "A GGUF found on this computer that the engine cannot execute, or a directory inside a model\nlocation that Magnitude can't read, which may hold more models.",
+        "required": [
+          "displayName",
+          "origin",
+          "path",
+          "reasons",
+          "detail"
+        ],
+        "properties": {
+          "displayName": {
+            "type": "string"
+          },
+          "origin": {
+            "$ref": "#/components/schemas/CustomModelOrigin"
+          },
+          "path": {
+            "type": "string"
+          },
+          "reasons": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UnsupportedReason"
+            }
+          },
+          "detail": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "UnsupportedReason": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/KnownUnsupportedReason"
+          },
+          {
+            "$ref": "#/components/schemas/UnrecognizedUnsupportedReason"
+          }
+        ],
+        "description": "Why the engine cannot execute a model; a tag this contract does not name yet matches the unrecognized case."
+      },
       "Usage": {
         "type": "object",
         "required": [
@@ -7953,7 +12442,25 @@
           }
         }
       },
-      "Value": {}
+      "Value": {},
+      "WeightTypeCount": {
+        "type": "object",
+        "required": [
+          "ggmlType",
+          "tensorCount"
+        ],
+        "properties": {
+          "ggmlType": {
+            "type": "string"
+          },
+          "tensorCount": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      }
     }
   }
 }

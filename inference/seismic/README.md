@@ -11,6 +11,7 @@ at `inference/Cargo.toml`. Grouping directories are not nested workspaces.
 | `estimator/core/` | Generic prediction contract, traversal and shared service model |
 | `estimator/metal/` | Pure Metal demand rules over shared IR |
 | `backends/{metal,cpu,cuda}/` | Target adapters, native realization and execution |
+| `reservation/` | Reserved ranges backed granule by granule, and the one resize every backend shares |
 | `runtime/` | Invocation binding, workflow admission, memory and submission |
 | `api/`, `build/`, `cli/` | Public API, build integration and command line |
 
@@ -35,6 +36,3 @@ compilation still precedes production planning. Workflow binding closes the
 whole graph before allocation; admission then reserves the graph atomically,
 rolls the full transaction back on failure, and retains every lease and access
 permit through native completion.
-
-See the [durable compilation architecture](../../design/inference/seismic-compilation.md)
-for the subsystem contracts, ownership, and qualification boundaries.

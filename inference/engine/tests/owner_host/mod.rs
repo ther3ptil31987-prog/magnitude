@@ -8,7 +8,7 @@
 //! Each test binary uses a subset of these helpers.
 #![allow(dead_code)]
 
-use magnitude_executor::{CompletionWake, RequestId, TokenId};
+use magnitude_executor::{CompletionWake, NativeFamily, ProgramFamily, RequestId, TokenId};
 use magnitude_family_contracts::PreparedModelInput;
 use magnitude_generation::{DetailedUsage, Generation};
 use magnitude_scheduler::{
@@ -37,6 +37,11 @@ impl Wakes for RecordedWakes {
 
     fn publication(&self, request: RequestId, wake: PublicationWake) {
         self.0.lock().unwrap().push((request, wake));
+    }
+
+    /// A test's host raises no OS pressure events: each run reads memory.
+    fn pressure(&self) -> Box<dyn Fn() + Send + Sync> {
+        Box::new(|| {})
     }
 }
 
@@ -86,28 +91,47 @@ impl Stream {
     }
 }
 
-pub struct Host {
+pub struct Host<F: ProgramFamily = NativeFamily> {
     /// Moved out only while [`Owner::run`] consumes it.
-    owner: Option<Owner>,
+    owner: Option<Owner<F>>,
     wakes: Arc<RecordedWakes>,
     now: u64,
-    due: u64,
+    /// When the last run left a flight on the device: the device runs it in
+    /// real time, so the host's clock follows real time until it completes.
+    in_flight: Option<Instant>,
+    /// The clock the owner's memory readings are taken at, where its heap
+    /// reads a test's machine ([`Self::reading_memory_at`]): set to the
+    /// host's time at each run.
+    memory_clock: Option<magnitude_executor::fixtures::TestClock>,
 }
 
-impl Host {
-    pub fn new(build: impl FnOnce(Arc<dyn Wakes>) -> Result<Owner, String>) -> Self {
+impl<F: ProgramFamily> Host<F> {
+    pub fn new(build: impl FnOnce(Arc<dyn Wakes>) -> Result<Owner<F>, String>) -> Self {
         let wakes = Arc::new(RecordedWakes::default());
         let owner = build(wakes.clone()).unwrap();
         Self {
             owner: Some(owner),
             wakes,
             now: 0,
-            due: 0,
+            in_flight: None,
+            memory_clock: None,
         }
     }
 
-    pub fn owner(&self) -> &Owner {
+    /// This host, its owner's memory read at the host's time on `clock`
+    /// (`fixtures::clock`): the one clock the owner reads memory by and the
+    /// pace measures its takes on, as the live machine's readings carry the
+    /// owner's monotonic time.
+    pub fn reading_memory_at(self, clock: magnitude_executor::fixtures::TestClock) -> Self {
+        Self { memory_clock: Some(clock), ..self }
+    }
+
+    pub fn owner(&self) -> &Owner<F> {
         self.owner.as_ref().expect("the owner is between runs")
+    }
+
+    pub fn owner_mut(&mut self) -> &mut Owner<F> {
+        self.owner.as_mut().expect("the owner is between runs")
     }
 
     pub fn now(&self) -> u64 {
@@ -145,6 +169,9 @@ impl Host {
     pub fn run_at(&mut self, now: u64) -> Ran {
         assert!(now >= self.now, "the host clock moved backwards");
         self.now = now;
+        if let Some(clock) = &self.memory_clock {
+            clock.set(now);
+        }
         let mut owner = self.owner.take().expect("the owner is between runs");
         let wakes = std::mem::take(&mut *self.wakes.0.lock().unwrap());
         for (request, wake) in wakes {
@@ -154,19 +181,24 @@ impl Host {
             .run(now)
             .unwrap_or_else(|error| panic!("execution stopped: {error}"));
         self.owner = Some(owner);
-        self.due = ran.due;
         ran
     }
 
-    /// Run one tick later.
+    /// Run one tick later, or, while a flight is on the device, as much
+    /// later as really passed: a worker's clock is real time, and polling a
+    /// flight is no step of the host's own (a tick per poll ran the clock
+    /// far ahead of the device, past the memory escalation interval within
+    /// a few decode steps).
     pub fn run(&mut self) -> Ran {
-        self.run_at(self.now + TICK_NS)
-    }
-
-    /// Run no earlier than the owner's next memory observation, as the
-    /// worker does when it wakes for one.
-    pub fn observe(&mut self) -> Ran {
-        self.run_at((self.now + TICK_NS).max(self.due))
+        let advance = self
+            .in_flight
+            .take()
+            .map_or(TICK_NS, |polled| polled.elapsed().as_nanos() as u64);
+        let ran = self.run_at(self.now + advance);
+        if ran.in_flight {
+            self.in_flight = Some(Instant::now());
+        }
+        ran
     }
 
     /// Drain `streams`, run once, drain again, and pause briefly while a

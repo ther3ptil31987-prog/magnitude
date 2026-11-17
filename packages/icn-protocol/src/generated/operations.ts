@@ -29,6 +29,39 @@ export const acknowledgeCatalogInstallationFailureOperation = {
   pathParameters: S.Struct({ operation_id: S.String }),
 } as const
 
+export const acknowledgeModelDownloadFailureOperation = {
+  operationId: "acknowledgeModelDownloadFailure",
+  transport: "http",
+  method: "POST",
+  path: "/api/v1/downloads/{download_id}/acknowledge-failure",
+  group: "downloads",
+  successes: [
+    {
+      status: 200,
+      schema: S.suspend((): S.Schema<Schemas.ModelDownload, Schemas.ModelDownloadEncoded> => Schemas.ModelDownload),
+      mediaType: "application/json",
+    },
+  ],
+  errors: [
+    {
+      status: 404,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 409,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 500,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+  ],
+  pathParameters: S.Struct({ download_id: S.String }),
+} as const
+
 export const applyChatTemplateOperation = {
   operationId: "applyChatTemplate",
   transport: "http",
@@ -79,6 +112,53 @@ export const applyChatTemplateOperation = {
   payloadRequired: true,
 } as const
 
+export const assessModelCandidateOperation = {
+  operationId: "assessModelCandidate",
+  transport: "http",
+  method: "POST",
+  path: "/api/v1/model-assessments/candidates",
+  group: "models",
+  successes: [
+    {
+      status: 200,
+      schema: S.suspend(
+        (): S.Schema<Schemas.ModelAssessment, Schemas.ModelAssessmentEncoded> => Schemas.ModelAssessment,
+      ),
+      mediaType: "application/json",
+    },
+  ],
+  errors: [
+    {
+      status: 400,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 404,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 409,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 422,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 500,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+  ],
+  payload: S.suspend((): S.Schema<Schemas.ModelCandidate, Schemas.ModelCandidateEncoded> => Schemas.ModelCandidate),
+  payloadMediaType: "application/json",
+  payloadRequired: true,
+} as const
+
 export const cancelCatalogInstallationOperation = {
   operationId: "cancelCatalogInstallation",
   transport: "http",
@@ -103,6 +183,147 @@ export const cancelCatalogInstallationOperation = {
     },
   ],
   pathParameters: S.Struct({ operation_id: S.String }),
+} as const
+
+export const cancelModelDownloadOperation = {
+  operationId: "cancelModelDownload",
+  transport: "http",
+  method: "POST",
+  path: "/api/v1/downloads/{download_id}/cancel",
+  group: "downloads",
+  successes: [
+    {
+      status: 200,
+      schema: S.suspend((): S.Schema<Schemas.ModelDownload, Schemas.ModelDownloadEncoded> => Schemas.ModelDownload),
+      mediaType: "application/json",
+    },
+  ],
+  errors: [
+    {
+      status: 404,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 500,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+  ],
+  pathParameters: S.Struct({ download_id: S.String }),
+} as const
+
+export const checkHuggingFaceRepositoryOperation = {
+  operationId: "checkHuggingFaceRepository",
+  transport: "http",
+  method: "POST",
+  path: "/api/v1/sources/hugging-face/check",
+  group: "hugging-face",
+  successes: [
+    {
+      status: 200,
+      schema: S.suspend(
+        (): S.Schema<Schemas.HuggingFaceRepositoryCheck, Schemas.HuggingFaceRepositoryCheckEncoded> =>
+          Schemas.HuggingFaceRepositoryCheck,
+      ),
+      mediaType: "application/json",
+    },
+  ],
+  errors: [
+    {
+      status: 400,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 404,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 409,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 422,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 500,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+  ],
+  payload: S.suspend(
+    (): S.Schema<Schemas.HuggingFaceRepositoryCheckRequest, Schemas.HuggingFaceRepositoryCheckRequestEncoded> =>
+      Schemas.HuggingFaceRepositoryCheckRequest,
+  ),
+  payloadMediaType: "application/json",
+  payloadRequired: true,
+} as const
+
+export const configureHuggingFaceCredentialOperation = {
+  operationId: "configureHuggingFaceCredential",
+  transport: "http",
+  method: "PUT",
+  path: "/api/v1/sources/hugging-face/credential",
+  group: "hugging-face",
+  successes: [{ status: 204, schema: S.Void }],
+  errors: [
+    {
+      status: 400,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 500,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+  ],
+  payload: S.suspend(
+    (): S.Schema<Schemas.HuggingFaceCredential, Schemas.HuggingFaceCredentialEncoded> => Schemas.HuggingFaceCredential,
+  ),
+  payloadMediaType: "application/json",
+  payloadRequired: true,
+} as const
+
+export const configureLocalModelsOperation = {
+  operationId: "configureLocalModels",
+  transport: "http",
+  method: "PUT",
+  path: "/api/v1/local-models/configuration",
+  group: "local-models",
+  successes: [
+    {
+      status: 200,
+      schema: S.suspend(
+        (): S.Schema<Schemas.LocalModelsConfiguration, Schemas.LocalModelsConfigurationEncoded> =>
+          Schemas.LocalModelsConfiguration,
+      ),
+      mediaType: "application/json",
+    },
+  ],
+  errors: [
+    {
+      status: 400,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 500,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+  ],
+  payload: S.suspend(
+    (): S.Schema<Schemas.LocalModelsConfiguration, Schemas.LocalModelsConfigurationEncoded> =>
+      Schemas.LocalModelsConfiguration,
+  ),
+  payloadMediaType: "application/json",
+  payloadRequired: true,
 } as const
 
 export const countAnthropicMessageTokensOperation = {
@@ -546,6 +767,31 @@ export const getHardwareOperation = {
   ],
 } as const
 
+export const getLocalModelsConfigurationOperation = {
+  operationId: "getLocalModelsConfiguration",
+  transport: "http",
+  method: "GET",
+  path: "/api/v1/local-models/configuration",
+  group: "local-models",
+  successes: [
+    {
+      status: 200,
+      schema: S.suspend(
+        (): S.Schema<Schemas.LocalModelsConfiguration, Schemas.LocalModelsConfigurationEncoded> =>
+          Schemas.LocalModelsConfiguration,
+      ),
+      mediaType: "application/json",
+    },
+  ],
+  errors: [
+    {
+      status: 500,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+  ],
+} as const
+
 export const getModelAssessmentsOperation = {
   operationId: "getModelAssessments",
   transport: "http",
@@ -677,6 +923,92 @@ export const healthOperation = {
   errors: [],
 } as const
 
+export const inspectModelCandidateOperation = {
+  operationId: "inspectModelCandidate",
+  transport: "http",
+  method: "POST",
+  path: "/api/v1/candidates/inspect",
+  group: "candidates",
+  successes: [
+    {
+      status: 200,
+      schema: S.suspend(
+        (): S.Schema<Schemas.CandidateInspection, Schemas.CandidateInspectionEncoded> => Schemas.CandidateInspection,
+      ),
+      mediaType: "application/json",
+    },
+  ],
+  errors: [
+    {
+      status: 400,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 404,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 409,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 422,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 500,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+  ],
+  payload: S.suspend(
+    (): S.Schema<Schemas.CandidateInspectionRequest, Schemas.CandidateInspectionRequestEncoded> =>
+      Schemas.CandidateInspectionRequest,
+  ),
+  payloadMediaType: "application/json",
+  payloadRequired: true,
+} as const
+
+export const installCatalogComponentOperation = {
+  operationId: "installCatalogComponent",
+  transport: "http",
+  method: "POST",
+  path: "/api/v1/catalog/models/{model_id}/components/{component}/install",
+  group: "catalog",
+  successes: [
+    {
+      status: 200,
+      schema: S.suspend(
+        (): S.Schema<Schemas.CatalogInstallationAdmission, Schemas.CatalogInstallationAdmissionEncoded> =>
+          Schemas.CatalogInstallationAdmission,
+      ),
+      mediaType: "application/json",
+    },
+  ],
+  errors: [
+    {
+      status: 404,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 409,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 500,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+  ],
+  pathParameters: S.Struct({ model_id: S.String, component: S.Literal("Projector", "Drafter") }),
+} as const
+
 export const installCatalogModelOperation = {
   operationId: "installCatalogModel",
   transport: "http",
@@ -757,23 +1089,104 @@ export const listCatalogModelsOperation = {
   ],
 } as const
 
-export const listDiscoveredModelsOperation = {
-  operationId: "listDiscoveredModels",
+export const listDrafterCandidatesOperation = {
+  operationId: "listDrafterCandidates",
   transport: "http",
-  method: "GET",
-  path: "/api/v1/discovery/models",
-  group: "discovery",
+  method: "POST",
+  path: "/api/v1/candidates/drafters",
+  group: "candidates",
   successes: [
     {
       status: 200,
       schema: S.suspend(
-        (): S.Schema<Schemas.DiscoveredModelsResponse, Schemas.DiscoveredModelsResponseEncoded> =>
-          Schemas.DiscoveredModelsResponse,
+        (): S.Schema<Schemas.DrafterCandidatesResponse, Schemas.DrafterCandidatesResponseEncoded> =>
+          Schemas.DrafterCandidatesResponse,
       ),
       mediaType: "application/json",
     },
   ],
-  errors: [],
+  errors: [
+    {
+      status: 400,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 404,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 409,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 422,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 500,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+  ],
+  payload: S.suspend(
+    (): S.Schema<Schemas.DrafterCandidatesRequest, Schemas.DrafterCandidatesRequestEncoded> =>
+      Schemas.DrafterCandidatesRequest,
+  ),
+  payloadMediaType: "application/json",
+  payloadRequired: true,
+} as const
+
+export const listLocalModelsOperation = {
+  operationId: "listLocalModels",
+  transport: "http",
+  method: "GET",
+  path: "/api/v1/local-models",
+  group: "local-models",
+  successes: [
+    {
+      status: 200,
+      schema: S.suspend(
+        (): S.Schema<Schemas.LocalModelsResponse, Schemas.LocalModelsResponseEncoded> => Schemas.LocalModelsResponse,
+      ),
+      mediaType: "application/json",
+    },
+  ],
+  errors: [
+    {
+      status: 500,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+  ],
+} as const
+
+export const listModelDownloadsOperation = {
+  operationId: "listModelDownloads",
+  transport: "http",
+  method: "GET",
+  path: "/api/v1/downloads",
+  group: "downloads",
+  successes: [
+    {
+      status: 200,
+      schema: S.suspend(
+        (): S.Schema<Schemas.ModelDownloadsResponse, Schemas.ModelDownloadsResponseEncoded> =>
+          Schemas.ModelDownloadsResponse,
+      ),
+      mediaType: "application/json",
+    },
+  ],
+  errors: [
+    {
+      status: 500,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+  ],
 } as const
 
 export const listServableModelsOperation = {
@@ -843,23 +1256,50 @@ export const previewModelLoadOperation = {
   pathParameters: S.Struct({ model_id: S.String }),
 } as const
 
-export const refreshDiscoveredModelsOperation = {
-  operationId: "refreshDiscoveredModels",
+export const pruneLocalDraftersOperation = {
+  operationId: "pruneLocalDrafters",
   transport: "http",
   method: "POST",
-  path: "/api/v1/discovery/refresh",
-  group: "discovery",
+  path: "/api/v1/local-models/drafters/prune",
+  group: "local-models",
+  successes: [
+    {
+      status: 200,
+      schema: S.suspend((): S.Schema<Schemas.DrafterPruning, Schemas.DrafterPruningEncoded> => Schemas.DrafterPruning),
+      mediaType: "application/json",
+    },
+  ],
+  errors: [
+    {
+      status: 500,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+  ],
+} as const
+
+export const refreshLocalModelsOperation = {
+  operationId: "refreshLocalModels",
+  transport: "http",
+  method: "POST",
+  path: "/api/v1/local-models/refresh",
+  group: "local-models",
   successes: [
     {
       status: 200,
       schema: S.suspend(
-        (): S.Schema<Schemas.DiscoveredModelsResponse, Schemas.DiscoveredModelsResponseEncoded> =>
-          Schemas.DiscoveredModelsResponse,
+        (): S.Schema<Schemas.LocalModelsResponse, Schemas.LocalModelsResponseEncoded> => Schemas.LocalModelsResponse,
       ),
       mediaType: "application/json",
     },
   ],
-  errors: [],
+  errors: [
+    {
+      status: 500,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+  ],
 } as const
 
 export const removeCatalogModelInstallationOperation = {
@@ -879,6 +1319,46 @@ export const removeCatalogModelInstallationOperation = {
     },
   ],
   errors: [
+    {
+      status: 404,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 409,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 500,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+  ],
+  pathParameters: S.Struct({ model_id: S.String }),
+} as const
+
+export const removeLocalModelFilesOperation = {
+  operationId: "removeLocalModelFiles",
+  transport: "http",
+  method: "DELETE",
+  path: "/api/v1/local-models/{model_id}/files",
+  group: "local-models",
+  successes: [
+    {
+      status: 200,
+      schema: S.suspend(
+        (): S.Schema<Schemas.LocalModelRemoval, Schemas.LocalModelRemovalEncoded> => Schemas.LocalModelRemoval,
+      ),
+      mediaType: "application/json",
+    },
+  ],
+  errors: [
+    {
+      status: 400,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
     {
       status: 404,
       schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
@@ -921,6 +1401,21 @@ export const resolveHuggingFaceRepositoryOperation = {
       mediaType: "application/json",
     },
     {
+      status: 404,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 409,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 422,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
       status: 500,
       schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
       mediaType: "application/json",
@@ -957,6 +1452,21 @@ export const searchHuggingFaceModelsOperation = {
       mediaType: "application/json",
     },
     {
+      status: 404,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 409,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 422,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
       status: 500,
       schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
       mediaType: "application/json",
@@ -965,6 +1475,47 @@ export const searchHuggingFaceModelsOperation = {
   payload: S.suspend(
     (): S.Schema<Schemas.HuggingFaceModelSearchRequest, Schemas.HuggingFaceModelSearchRequestEncoded> =>
       Schemas.HuggingFaceModelSearchRequest,
+  ),
+  payloadMediaType: "application/json",
+  payloadRequired: true,
+} as const
+
+export const startModelDownloadOperation = {
+  operationId: "startModelDownload",
+  transport: "http",
+  method: "POST",
+  path: "/api/v1/downloads",
+  group: "downloads",
+  successes: [
+    {
+      status: 200,
+      schema: S.suspend(
+        (): S.Schema<Schemas.StartModelDownloadResponse, Schemas.StartModelDownloadResponseEncoded> =>
+          Schemas.StartModelDownloadResponse,
+      ),
+      mediaType: "application/json",
+    },
+  ],
+  errors: [
+    {
+      status: 400,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 409,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 500,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+  ],
+  payload: S.suspend(
+    (): S.Schema<Schemas.StartModelDownloadRequest, Schemas.StartModelDownloadRequestEncoded> =>
+      Schemas.StartModelDownloadRequest,
   ),
   payloadMediaType: "application/json",
   payloadRequired: true,
@@ -1000,6 +1551,52 @@ export const stopModelInstanceOperation = {
     },
   ],
   pathParameters: S.Struct({ instance_id: S.String }),
+} as const
+
+export const streamModelCandidateInspectionOperation = {
+  operationId: "streamModelCandidateInspection",
+  transport: "sse",
+  method: "POST",
+  path: "/api/v1/candidates/inspect/stream",
+  group: "candidates",
+  mediaType: "text/event-stream",
+  responseStatus: 200,
+  eventSchema: Schemas.CandidateInspectionEvent,
+  termination: { type: "eof" },
+  reconnect: { type: "none" },
+  payload: S.suspend(
+    (): S.Schema<Schemas.CandidateInspectionRequest, Schemas.CandidateInspectionRequestEncoded> =>
+      Schemas.CandidateInspectionRequest,
+  ),
+  payloadMediaType: "application/json",
+  payloadRequired: true,
+  errors: [
+    {
+      status: 400,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 404,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 409,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 422,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+    {
+      status: 500,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+  ],
 } as const
 
 export const watchInferenceEventsOperation = {

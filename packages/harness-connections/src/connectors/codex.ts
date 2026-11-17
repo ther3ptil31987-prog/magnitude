@@ -9,6 +9,8 @@ import {
   codexLocalModelId,
   defineConnector,
   isCodexLocalModelId,
+  LOCAL_CODEX_MODEL_PREFIX,
+  magnitudeSelection,
   qualifiedModelSelection,
   readOr,
   removeTomlTable,
@@ -18,6 +20,7 @@ import {
   writeIfChanged,
 } from "../shared"
 import { removeConfigurationFile, writeFileAtomic } from "../configuration-file"
+import { harnessCommand } from "../executable"
 
 const CODEX_BASE_INSTRUCTIONS = "You are a coding agent running in Codex CLI. Work with the user in the current workspace until their request is resolved. Inspect relevant files before changing them, follow repository instructions, make focused edits, verify consequential changes, and communicate progress and results concisely. Use the available tools when they are needed and preserve user work unrelated to the request."
 const CODEX_PROVIDER_ID = "magnitude"
@@ -96,13 +99,8 @@ export const codexModelCatalog = (
   models: [...bundled.models, ...magnitudeCodexModels(spec)],
 }, null, 2)}\n`
 
-const readBundledCatalog = (executable: string) => Command.make(
-  executable,
-  "debug",
-  "models",
-  "--bundled",
-).pipe(
-  Command.string,
+const readBundledCatalog = (executable: string) => harnessCommand(executable, ["debug", "models", "--bundled"]).pipe(
+  Effect.flatMap(Command.string),
   Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(CodexBundledCatalogDocumentSchema))),
   Effect.flatMap((document) => Array.isArray(document.models)
     ? Effect.succeed(document as CodexBundledCatalog)
@@ -129,6 +127,8 @@ export const makeCodexConnector = (
   executable: "codex",
   skillInstallationTarget: "shared-agents",
   configurationFiles: [paths.codexUser, paths.codexModels],
+  selectedModel: readOr(paths.codexUser, "").pipe(Effect.map((source) =>
+    magnitudeSelection(tomlTopLevelValue(source, "model"), LOCAL_CODEX_MODEL_PREFIX))),
   connect: (spec) => Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem
     const bundled = yield* bundledCatalog(spec.installation.executable)

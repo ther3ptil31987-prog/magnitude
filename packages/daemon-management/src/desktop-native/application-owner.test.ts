@@ -1,12 +1,13 @@
-import { mkdtemp, rm } from "node:fs/promises"
+import { mkdtemp, rm, stat } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { Deferred, Effect, Exit, Fiber, Option, Ref, Schema, Scope, TestClock, TestContext } from "effect"
 import { describe, expect, it } from "vitest"
-import { ApplicationSnapshot } from "@magnitudedev/sdk/desktop-host"
+import { ApplicationSnapshot, type ApplicationIntent } from "@magnitudedev/sdk/desktop-host"
 import { acquireApplicationMaintenance, acquireApplicationOwner } from "./application-owner"
-import { serveApplicationControl } from "./application-control"
+import { occupiedMessage } from "./service-port"
+import { requestApplication, serveApplicationControl } from "./application-control"
 import { acquireUpdateInstallationLease } from "./update-installation-lease"
 import { nativeHostLayer } from "./index"
 
@@ -22,10 +23,10 @@ describe.skipIf(process.platform === "win32")("native application owner arbitrat
     const root = yield* directory
     const first = yield* acquireApplicationOwner(root, { _tag: "Headless" })
     if (first._tag !== "Owner") return yield* Effect.die("Expected owner")
-    const intents = yield* Ref.make<string[]>([])
+    const intents = yield* Ref.make<ApplicationIntent[]>([])
     yield* serveApplicationControl(first.socketPath, {
       snapshot: Effect.succeed({ ...snapshot, owner: owner === "Desktop"
-        ? { _tag: "Desktop", tray: { _tag: "Registered" } } : { _tag: "Headless" } }),
+        ? { _tag: "Desktop", tray: { _tag: "Registered" } } : { _tag: "Headless", service: false } }),
       login: noLogin, update: noUpdate, dispatch: intent => Ref.update(intents, values => [...values, intent]),
     })
     const startup = yield* acquireApplicationOwner(root, { _tag: "Headless" }).pipe(Effect.flip)
@@ -36,6 +37,19 @@ describe.skipIf(process.platform === "win32")("native application owner arbitrat
     expect(maintenance.message).toBe(startup.message)
     expect(yield* Ref.get(intents)).toEqual(["Observe", "Observe"])
   })).pipe(Effect.provide(nativeHostLayer(addon)))))
+
+  it.each([[false, 0o700, 0o600], [true, 0o711, 0o666]] as const)("with shared control %s, opens only the path to the socket", (shared, directoryMode, socketMode) =>
+    Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const root = yield* directory
+      const owner = yield* acquireApplicationOwner(root, { _tag: "Headless" }, shared)
+      if (owner._tag !== "Owner") return yield* Effect.die("Expected owner")
+      yield* serveApplicationControl(owner.socketPath, { snapshot: Effect.succeed(snapshot), login: noLogin, update: noUpdate, dispatch: () => Effect.void }, shared)
+      const mode = (path: string) => Effect.promise(() => stat(path)).pipe(Effect.map(info => info.mode & 0o777))
+      expect(yield* mode(root)).toBe(directoryMode)
+      expect(yield* mode(owner.socketPath)).toBe(socketMode)
+      expect(yield* mode(join(root, "application.lock"))).toBe(0o600)
+      expect((yield* requestApplication(owner.socketPath, "Observe")).owner._tag).toBe("Headless")
+    })).pipe(Effect.provide(nativeHostLayer(addon)))))
 
   it("excludes owners during finite maintenance and releases afterward", () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
     const root = yield* directory
@@ -97,12 +111,51 @@ describe.skipIf(process.platform === "win32")("native application owner arbitrat
       const root = yield* directory
       const first = yield* acquireApplicationOwner(root, { _tag: "Desktop", intent: "ShowWindow" })
       if (first._tag !== "Owner") return yield* Effect.die("Expected initial owner")
-      const intents = yield* Ref.make<string[]>([])
+      const intents = yield* Ref.make<ApplicationIntent[]>([])
       yield* serveApplicationControl(first.socketPath, { snapshot: Effect.succeed({ ...snapshot, owner: { _tag: "Desktop", tray: { _tag: "Registered" } } }),
         login: noLogin, update: noUpdate, dispatch: intent => Ref.update(intents, values => [...values, intent]) })
       const second = yield* acquireApplicationOwner(root, { _tag: "Desktop", intent: "ShowWindow" })
       expect(second._tag).toBe("Forwarded")
       expect(yield* Ref.get(intents)).toEqual(["Observe", "ShowWindow"])
+    })).pipe(Effect.provide(nativeHostLayer(addon))))
+  })
+
+  it("forwards an opened link from a later launch to the existing desktop", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const root = yield* directory
+      const first = yield* acquireApplicationOwner(root, { _tag: "Desktop", intent: "ShowWindow" })
+      if (first._tag !== "Owner") return yield* Effect.die("Expected initial owner")
+      const intents = yield* Ref.make<ApplicationIntent[]>([])
+      yield* serveApplicationControl(first.socketPath, { snapshot: Effect.succeed({ ...snapshot, owner: { _tag: "Desktop", tray: { _tag: "Registered" } } }),
+        login: noLogin, update: noUpdate, dispatch: intent => Ref.update(intents, values => [...values, intent]) })
+      const url = "magnitude://open_from_hf?model=owner/repo&file=model.gguf"
+      const second = yield* acquireApplicationOwner(root, { _tag: "Desktop", intent: { _tag: "OpenUrl", url } })
+      expect(second._tag).toBe("Forwarded")
+      expect(yield* Ref.get(intents)).toEqual(["Observe", { _tag: "OpenUrl", url }])
+    })).pipe(Effect.provide(nativeHostLayer(addon))))
+  })
+
+  it.each([true, false])("with a service-started server %s, takes over only a terminal serve", async service => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const root = yield* directory
+      const firstScope = yield* Scope.make()
+      yield* Effect.addFinalizer(() => Scope.close(firstScope, Exit.void))
+      const first = yield* acquireApplicationOwner(root, { _tag: "Headless" }).pipe(Effect.provideService(Scope.Scope, firstScope))
+      if (first._tag !== "Owner") return yield* Effect.die("Expected initial owner")
+      const intents = yield* Ref.make<ApplicationIntent[]>([])
+      yield* serveApplicationControl(first.socketPath, { snapshot: Effect.succeed({ ...snapshot, owner: { _tag: "Headless", service } }),
+        login: noLogin, update: noUpdate, dispatch: intent => Ref.update(intents, values => [...values, intent]).pipe(
+          Effect.zipRight(intent === "Yield" ? Effect.forkDaemon(Scope.close(firstScope, Exit.void)) : Effect.void), Effect.asVoid),
+      }).pipe(Effect.provideService(Scope.Scope, firstScope))
+      const desktop = yield* acquireApplicationOwner(root, { _tag: "Desktop", intent: "ShowWindow" }).pipe(Effect.either, Effect.timeout("5 seconds"))
+      if (service) {
+        expect(desktop._tag === "Left" && desktop.left).toMatchObject({ _tag: "ApplicationServiceRunning", message: occupiedMessage(11101, true) })
+        expect(yield* Ref.get(intents)).toEqual(["Observe"])
+        expect(yield* acquireApplicationMaintenance(root).pipe(Effect.isFailure)).toBe(true)
+      } else {
+        expect(desktop._tag === "Right" && desktop.right._tag).toBe("Owner")
+        expect(yield* Ref.get(intents)).toEqual(["Observe", "Yield"])
+      }
     })).pipe(Effect.provide(nativeHostLayer(addon))))
   })
 
@@ -129,7 +182,7 @@ describe.skipIf(process.platform === "win32")("native application owner arbitrat
 })
 
 it("round trips both owner forms and rejects the obsolete snapshot shape", () => {
-  for (const owner of [{ _tag: "Headless" }, { _tag: "Desktop", tray: { _tag: "Registered" } }] as const) {
+  for (const owner of [{ _tag: "Headless", service: false }, { _tag: "Headless", service: true }, { _tag: "Desktop", tray: { _tag: "Registered" } }] as const) {
     const value = { ...snapshot, owner }
     expect(Schema.decodeUnknownSync(ApplicationSnapshot)(Schema.encodeSync(ApplicationSnapshot)(value))).toEqual(value)
   }

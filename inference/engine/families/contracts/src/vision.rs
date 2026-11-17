@@ -12,8 +12,8 @@
 //! biases and head norms) at import.
 
 use crate::{
-    checked_product, expect_shape, ActivationDType, DefinitionError, RmsNorm, UnweightedRms,
-    WeightDescriptor, WeightKind, WeightRole, WeightScope,
+    ActivationDType, DefinitionError, RmsNorm, UnweightedRms, WeightDescriptor, WeightKind,
+    WeightRole, WeightScope, checked_product, expect_shape,
 };
 use magnitude_artifacts::{ImageProcessorConfig, ImageResize, Resampling};
 use serde::{Deserialize, Serialize};
@@ -27,12 +27,18 @@ pub enum VisionActivation {
     GeluErf,
     /// `x σ(1.702 x)`.
     GeluQuick,
+    /// `max(x, 0)²`.
+    ReluSquared,
+    /// `x σ(x)`.
+    Silu,
 }
 
 /// How an image is resized before it is cut into patches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VisionResize {
+    /// One overview and a bounded grid of detail crops, each near the given pixel resolution.
+    Slices { resolution: u64, max_slices: u64 },
     /// Sides rounded half to even to multiples of patch · merge, then scaled
     /// into the pixel bounds (Qwen3-VL).
     PixelBounds { min_pixels: u64, max_pixels: u64 },
@@ -42,6 +48,13 @@ pub enum VisionResize {
     /// The grid of merged cells (patch · merge pixels) closest to the image's
     /// aspect with at most `max_cells` cells (Muse Glimmer).
     CellBudget { max_cells: u64 },
+    /// One tile of between `min_patches` and `max_patches` patches, the
+    /// aspect kept and each side a whole number of cells (Nemotron Omni's
+    /// dynamic resolution).
+    PatchBounds { min_patches: u64, max_patches: u64 },
+    /// The aspect-kept content in a canvas of whole cells within the pixel
+    /// bounds, black elsewhere (GLM-5).
+    PaddedCanvas { min_pixels: u64, max_pixels: u64 },
 }
 
 impl VisionResize {
@@ -55,9 +68,18 @@ impl VisionResize {
             return Err(DefinitionError::new("a vision cell holds no pixels"));
         }
         Ok(match self {
-            Self::PixelBounds { max_pixels, .. } => max_pixels / cell_pixels,
+            Self::Slices { resolution, .. } => {
+                // Four-patch alignment adds at most two patches to each side.
+                // At the processor's aspect limit of 200, this square bound
+                // covers that added area, including very thin overviews.
+                checked_product(&[resolution / patch + 16, resolution / patch + 16])? / cell_rows
+            }
+            Self::PixelBounds { max_pixels, .. } | Self::PaddedCanvas { max_pixels, .. } => {
+                max_pixels / cell_pixels
+            }
             Self::PatchBudget { max_patches } => max_patches / cell_rows,
             Self::CellBudget { max_cells } => max_cells,
+            Self::PatchBounds { max_patches, .. } => max_patches / cell_rows,
         })
     }
 
@@ -68,8 +90,23 @@ impl VisionResize {
         patch: u64,
         merge: u64,
     ) -> Result<Self, DefinitionError> {
+        let cell_rows = checked_product(&[merge, merge])?;
         let patches = checked_product(&[cells, merge, merge])?;
         Ok(match self {
+            Self::Slices {
+                resolution,
+                max_slices,
+            } => {
+                let side = (cells as f64 * cell_rows as f64).sqrt() as u64;
+                let resolution = resolution.min(side.saturating_sub(16) * patch);
+                if resolution < 4 * patch {
+                    return Err(DefinitionError::new("image budget cannot hold a slice"));
+                }
+                Self::Slices {
+                    resolution,
+                    max_slices,
+                }
+            }
             Self::PixelBounds {
                 min_pixels,
                 max_pixels,
@@ -80,12 +117,32 @@ impl VisionResize {
                     max_pixels,
                 }
             }
+            Self::PaddedCanvas {
+                min_pixels,
+                max_pixels,
+            } => {
+                let max_pixels = max_pixels.min(checked_product(&[patches, patch, patch])?);
+                Self::PaddedCanvas {
+                    min_pixels: min_pixels.min(max_pixels),
+                    max_pixels,
+                }
+            }
             Self::PatchBudget { max_patches } => Self::PatchBudget {
                 max_patches: max_patches.min(patches),
             },
             Self::CellBudget { max_cells } => Self::CellBudget {
                 max_cells: max_cells.min(cells),
             },
+            Self::PatchBounds {
+                min_patches,
+                max_patches,
+            } => {
+                let max_patches = max_patches.min(patches);
+                Self::PatchBounds {
+                    min_patches: min_patches.min(max_patches),
+                    max_patches,
+                }
+            }
         })
     }
 }
@@ -116,6 +173,8 @@ pub struct VisionPreprocessing {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PositionSampling {
+    /// Each patch selects its fractional-position bucket in a square learned table (NaViT).
+    Buckets { side: u64 },
     /// A square table of `side`² rows, bilinearly resampled to the patch grid
     /// with aligned corners (Qwen3-VL).
     AlignedCorners { side: u64 },
@@ -126,6 +185,11 @@ pub enum PositionSampling {
     /// Two tables `[2, length, H]`: row `column` of the first plus row `row`
     /// of the second (Gemma 4).
     Axes { length: u64 },
+    /// A square table of `side`² rows, bilinearly resampled (half-pixel
+    /// centres, edges clamped) to a square of the grid's longer side, whose
+    /// top-left rows and columns the grid takes (C-RADIO's cropped position
+    /// embedding).
+    CroppedSquare { side: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -139,16 +203,20 @@ impl VisionPositions {
     /// Rows of the table as the stem addresses them.
     pub fn rows(&self) -> u64 {
         match self.sampling {
-            PositionSampling::AlignedCorners { side } | PositionSampling::PixelCenters { side } => {
-                side * side
-            }
+            PositionSampling::Buckets { side }
+            | PositionSampling::AlignedCorners { side }
+            | PositionSampling::PixelCenters { side }
+            | PositionSampling::CroppedSquare { side } => side * side,
             PositionSampling::Axes { length } => 2 * length,
         }
     }
 
     fn validate(&self, hidden: u64) -> Result<(), DefinitionError> {
         match self.sampling {
-            PositionSampling::AlignedCorners { side } | PositionSampling::PixelCenters { side } => {
+            PositionSampling::Buckets { side }
+            | PositionSampling::AlignedCorners { side }
+            | PositionSampling::PixelCenters { side }
+            | PositionSampling::CroppedSquare { side } => {
                 if side == 0 {
                     return Err(DefinitionError::new("vision position table has no rows"));
                 }
@@ -285,14 +353,19 @@ impl VisionLinear {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum VisionStem {
     /// A convolution of each frame's pixels (Qwen3-VL: two frames of one
-    /// still image), an optional bias, the position table, then an optional
-    /// norm of the result (Muse Glimmer's pre-norm).
+    /// still image), an optional bias, the position table when the tower has
+    /// one (LFM3-VL places patches by rotary alone), then an optional norm of
+    /// the result (Muse Glimmer's pre-norm).
     Patch {
         /// `[H, C, patch, patch]` per frame.
         frames: Vec<WeightDescriptor>,
         bias: Option<WeightDescriptor>,
-        positions: VisionPositions,
+        positions: Option<VisionPositions>,
         norm: Option<VisionNorm>,
+        /// Learned rows `[R, H]` ahead of the image's patch rows (C-RADIO's
+        /// class and register tokens): every block attends over them with
+        /// the patches, and the merger reads only the patch rows.
+        registers: Option<WeightDescriptor>,
     },
     /// A norm of the flattened patch pixels, a linear to the tower width, a
     /// norm, the position table and a norm (Gemma 4 unified).
@@ -314,9 +387,22 @@ impl VisionStem {
         }
     }
 
-    pub fn positions(&self) -> &VisionPositions {
+    /// The learned position table, when the tower has one.
+    pub fn positions(&self) -> Option<&VisionPositions> {
         match self {
-            Self::Patch { positions, .. } | Self::NormalizedPatch { positions, .. } => positions,
+            Self::Patch { positions, .. } => positions.as_ref(),
+            Self::NormalizedPatch { positions, .. } => Some(positions),
+        }
+    }
+
+    /// Learned rows the tower holds ahead of each image's patch rows.
+    pub fn registers(&self) -> u64 {
+        match self {
+            Self::Patch {
+                registers: Some(registers),
+                ..
+            } => registers.shape.first().copied().unwrap_or(0),
+            Self::Patch { .. } | Self::NormalizedPatch { .. } => 0,
         }
     }
 }
@@ -330,7 +416,7 @@ pub enum VisionAttentionScale {
 }
 
 /// The keys a patch row attends to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VisionAttentionSpan {
     /// Every patch row of the image.
@@ -342,6 +428,8 @@ pub enum VisionAttentionSpan {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VisionAttention {
     pub heads: u64,
+    /// Key and value heads; query head `h` reads head `h / (heads / kv_heads)`.
+    pub kv_heads: u64,
     /// Head width W, a multiple of 4.
     pub width: u64,
     pub query: VisionLinear,
@@ -352,7 +440,8 @@ pub struct VisionAttention {
     pub key_norm: Option<RmsNorm>,
     /// Weightless RMS norm of each value head.
     pub value_norm: Option<UnweightedRms>,
-    pub rotary_base: f64,
+    /// Absent for learned-position-only towers such as SigLIP.
+    pub rotary_base: Option<f64>,
     pub scale: VisionAttentionScale,
     pub span: VisionAttentionSpan,
     pub output: VisionLinear,
@@ -361,8 +450,13 @@ pub struct VisionAttention {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum VisionUp {
     Plain(VisionLinear),
-    /// `activation(gate(x)) ⊙ up(x)`.
-    Gated { gate: VisionLinear, up: VisionLinear },
+    /// `activation(gate(x)) ⊙ up(x)`; under a `limit` L the gate is clamped
+    /// to at most L and the up to `[−L, L]` before they combine.
+    Gated {
+        gate: VisionLinear,
+        up: VisionLinear,
+        limit: Option<f64>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -378,16 +472,60 @@ impl VisionFeedForward {
             VisionUp::Plain(up) | VisionUp::Gated { up, .. } => up.outputs(),
         }
     }
+
+    fn weights<'a>(&'a self, scope: WeightScope, out: &mut Roles<'a>) {
+        match &self.up {
+            VisionUp::Plain(up) => up.weights(scope, VisionLinearSite::Up, out),
+            VisionUp::Gated { gate, up, .. } => {
+                gate.weights(scope, VisionLinearSite::Gate, out);
+                up.weights(scope, VisionLinearSite::Up, out);
+            }
+        }
+        self.down.weights(scope, VisionLinearSite::Down, out);
+    }
 }
 
-/// One transformer block: `x += post(attention(norm(x)))`, then
+/// A gated depthwise 2-D convolution over each image's patch grid (LFM3-VL):
+/// `y = output(C ⊙ conv(B ⊙ X))` with `B`, `C`, `X` the three input
+/// projections, `conv` the `k × k` per-channel kernel over the raster grid
+/// with zero padding `k / 2` (a cross-correlation, PyTorch's `conv2d`), no
+/// biases.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VisionGatedConvolution {
+    /// `B`, `[H, H]`.
+    pub input_gate: VisionLinear,
+    /// `C`, `[H, H]`.
+    pub output_gate: VisionLinear,
+    /// `X`, `[H, H]`.
+    pub value: VisionLinear,
+    /// `[H, 1, k, k]`, `k` odd.
+    pub kernel: WeightDescriptor,
+    /// `[H, H]`.
+    pub output: VisionLinear,
+}
+
+impl VisionGatedConvolution {
+    /// The kernel side `k`.
+    pub fn side(&self) -> u64 {
+        self.kernel.shape.last().copied().unwrap_or(0)
+    }
+}
+
+/// The token mixer of a vision block.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum VisionOperator {
+    Attention(VisionAttention),
+    GatedConvolution(VisionGatedConvolution),
+}
+
+/// One tower block: `x += post(operator(norm(x)))`, then
 /// `x += post(feed_forward(norm(x)))`; an absent post-norm adds the
 /// sublayer's output directly.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VisionBlock {
-    pub attention_norm: VisionNorm,
-    pub attention: VisionAttention,
-    pub attention_post_norm: Option<VisionNorm>,
+    pub operator_norm: VisionNorm,
+    pub operator: VisionOperator,
+    pub operator_post_norm: Option<VisionNorm>,
     pub feedforward_norm: VisionNorm,
     pub feedforward: VisionFeedForward,
     pub feedforward_post_norm: Option<VisionNorm>,
@@ -414,17 +552,19 @@ pub struct Standardize {
     pub scale: WeightDescriptor,
 }
 
+/// `activation(norm(linear(x)))`, each step optional after the linear.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MergerStage {
     pub linear: VisionLinear,
+    pub norm: Option<VisionNorm>,
     pub activation: Option<VisionActivation>,
 }
 
 /// Tower rows to image features: an optional norm of each tower row, the
 /// cell reduction, an optional standardization, an optional norm, the linear
-/// stages, then an optional norm of the feature row. Features enter the
-/// decoder as they are: the decoder's entry transform applies to text rows
-/// only.
+/// stages, an optional feed-forward of the last stage's rows, then an
+/// optional norm of the feature row. Features enter the decoder as they are:
+/// the decoder's entry transform applies to text rows only.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VisionMerger {
     pub norm: Option<VisionNorm>,
@@ -432,6 +572,8 @@ pub struct VisionMerger {
     pub standardize: Option<Standardize>,
     pub projection_norm: Option<VisionNorm>,
     pub stages: Vec<MergerStage>,
+    /// Applied to the last stage's rows; its width is the stage's.
+    pub feed_forward: Option<VisionFeedForward>,
     pub output_norm: Option<VisionNorm>,
 }
 
@@ -460,12 +602,14 @@ pub enum VisionNormSite {
     Stem,
     StemProjection,
     StemPosition,
-    AttentionInput,
-    AttentionOutput,
+    OperatorInput,
+    OperatorOutput,
     FeedForwardInput,
     FeedForwardOutput,
     Merger,
     MergerProjection,
+    /// A merger stage's norm (scope `VisionMerger(stage)`).
+    MergerStage,
     Output,
 }
 
@@ -483,6 +627,10 @@ pub enum VisionLinearSite {
     Key,
     Value,
     AttentionOutput,
+    ConvolutionInputGate,
+    ConvolutionOutputGate,
+    ConvolutionValue,
+    ConvolutionOutput,
     Gate,
     Up,
     Down,
@@ -509,6 +657,8 @@ pub enum VisionWeight {
     /// The patch convolution's bias.
     PatchBias,
     Position,
+    /// The learned rows ahead of the patch rows.
+    Registers,
     Norm {
         site: VisionNormSite,
         part: NormPart,
@@ -519,6 +669,8 @@ pub enum VisionWeight {
     },
     QueryNorm,
     KeyNorm,
+    /// A gated convolution's per-channel kernel.
+    ConvolutionKernel,
     StandardizeBias,
     StandardizeScale,
 }
@@ -570,6 +722,13 @@ impl VisionDescription {
                 .map_err(|_| DefinitionError::new(format!("image {what} exceeds host domain")))
         };
         let resize = match p.resize {
+            VisionResize::Slices {
+                resolution,
+                max_slices,
+            } => ImageResize::Slices {
+                resolution: size(resolution, "slice resolution")?,
+                max_slices: size(max_slices, "slice limit")?,
+            },
             VisionResize::PixelBounds {
                 min_pixels,
                 max_pixels,
@@ -582,6 +741,20 @@ impl VisionDescription {
             },
             VisionResize::CellBudget { max_cells } => ImageResize::CellBudget {
                 max_cells: size(max_cells, "cell budget")?,
+            },
+            VisionResize::PatchBounds {
+                min_patches,
+                max_patches,
+            } => ImageResize::PatchBounds {
+                min_patches: size(min_patches, "minimum patches")?,
+                max_patches: size(max_patches, "maximum patches")?,
+            },
+            VisionResize::PaddedCanvas {
+                min_pixels,
+                max_pixels,
+            } => ImageResize::PaddedCanvas {
+                min_pixels: size(min_pixels, "minimum pixels")?,
+                max_pixels: size(max_pixels, "maximum pixels")?,
             },
         };
         let config = ImageProcessorConfig {
@@ -608,14 +781,28 @@ impl VisionDescription {
             || p.patch == 0
             || p.merge == 0
             || p.mean.iter().any(|value| !value.is_finite())
-            || p.std.iter().any(|value| !value.is_finite() || *value <= 0.0)
+            || p.std
+                .iter()
+                .any(|value| !value.is_finite() || *value <= 0.0)
             || match p.resize {
+                VisionResize::Slices {
+                    resolution,
+                    max_slices,
+                } => resolution < 4 * p.patch || max_slices == 0 || max_slices > 9,
                 VisionResize::PixelBounds {
+                    min_pixels,
+                    max_pixels,
+                }
+                | VisionResize::PaddedCanvas {
                     min_pixels,
                     max_pixels,
                 } => min_pixels == 0 || min_pixels > max_pixels,
                 VisionResize::PatchBudget { max_patches } => max_patches == 0,
                 VisionResize::CellBudget { max_cells } => max_cells == 0,
+                VisionResize::PatchBounds {
+                    min_patches,
+                    max_patches,
+                } => min_patches == 0 || min_patches > max_patches,
             }
             || self.window == Some(0)
         {
@@ -629,6 +816,7 @@ impl VisionDescription {
                 bias,
                 positions,
                 norm,
+                registers,
             } => {
                 if frames.is_empty() || frames.len() > 2 {
                     return Err(DefinitionError::new(
@@ -645,9 +833,18 @@ impl VisionDescription {
                 if let Some(bias) = bias {
                     expect_shape(bias, &[hidden], "vision patch bias")?;
                 }
-                positions.validate(hidden)?;
+                if let Some(positions) = positions {
+                    positions.validate(hidden)?;
+                }
                 if let Some(norm) = norm {
                     norm.validate(hidden, "vision stem norm")?;
+                }
+                if let Some(registers) = registers {
+                    let rows = registers.shape.first().copied().unwrap_or(0);
+                    if rows == 0 {
+                        return Err(DefinitionError::new("vision register table has no rows"));
+                    }
+                    expect_shape(registers, &[rows, hidden], "vision register table")?;
                 }
             }
             VisionStem::NormalizedPatch {
@@ -689,19 +886,25 @@ impl VisionDescription {
         if let Some(norm) = &merger.projection_norm {
             norm.validate(width, "vision merger projection norm")?;
         }
-        let Some(last) = merger.stages.last() else {
+        if merger.stages.is_empty() {
             return Err(DefinitionError::new("a vision merger needs a linear stage"));
-        };
-        if last.linear.outputs() != self.output_hidden {
-            return Err(DefinitionError::new(
-                "the last vision merger stage must produce the decoder width",
-            ));
         }
         for stage in &merger.stages {
             stage
                 .linear
                 .validate(stage.linear.outputs(), width, "vision merger stage")?;
             width = stage.linear.outputs();
+            if let Some(norm) = &stage.norm {
+                norm.validate(width, "vision merger stage norm")?;
+            }
+        }
+        if let Some(feed_forward) = &merger.feed_forward {
+            Self::validate_feed_forward(feed_forward, width)?;
+        }
+        if width != self.output_hidden {
+            return Err(DefinitionError::new(
+                "the last vision merger stage must produce the decoder width",
+            ));
         }
         if let Some(norm) = &merger.output_norm {
             norm.validate(width, "vision feature norm")?;
@@ -709,30 +912,26 @@ impl VisionDescription {
         Ok(())
     }
 
-    fn validate_block(&self, block: &VisionBlock) -> Result<(), DefinitionError> {
+    fn validate_attention(&self, attention: &VisionAttention) -> Result<(), DefinitionError> {
         let hidden = self.hidden;
-        let attention = &block.attention;
         let inner = checked_product(&[attention.heads, attention.width])?;
+        let kv_inner = checked_product(&[attention.kv_heads, attention.width])?;
         if attention.heads == 0
+            || attention.kv_heads == 0
+            || attention.heads % attention.kv_heads != 0
             || attention.width == 0
             || attention.width % 4 != 0
-            || !attention.rotary_base.is_finite()
-            || attention.rotary_base <= 1.0
+            || attention
+                .rotary_base
+                .is_some_and(|base| !base.is_finite() || base <= 1.0)
             || attention.query_norm.is_some() != attention.key_norm.is_some()
             || (attention.span == VisionAttentionSpan::Window && self.window.is_none())
         {
             return Err(DefinitionError::new("invalid vision attention"));
         }
-        block
-            .attention_norm
-            .validate(hidden, "vision attention norm")?;
-        for (linear, role) in [
-            (&attention.query, "vision query"),
-            (&attention.key, "vision key"),
-            (&attention.value, "vision value"),
-        ] {
-            linear.validate(inner, hidden, role)?;
-        }
+        attention.query.validate(inner, hidden, "vision query")?;
+        attention.key.validate(kv_inner, hidden, "vision key")?;
+        attention.value.validate(kv_inner, hidden, "vision value")?;
         for norm in [&attention.query_norm, &attention.key_norm]
             .into_iter()
             .flatten()
@@ -747,27 +946,71 @@ impl VisionDescription {
         attention
             .output
             .validate(hidden, inner, "vision attention output")?;
-        if let Some(norm) = &block.attention_post_norm {
-            norm.validate(hidden, "vision attention post-norm")?;
-        }
-        block
-            .feedforward_norm
-            .validate(hidden, "vision feed-forward norm")?;
-        let feedforward = &block.feedforward;
+        Ok(())
+    }
+
+    /// A feed-forward of rows of `width`, back to `width`.
+    fn validate_feed_forward(
+        feedforward: &VisionFeedForward,
+        width: u64,
+    ) -> Result<(), DefinitionError> {
         let intermediate = feedforward.intermediate();
         if intermediate == 0 {
             return Err(DefinitionError::new("invalid vision feed-forward width"));
         }
         match &feedforward.up {
-            VisionUp::Plain(up) => up.validate(intermediate, hidden, "vision up projection")?,
-            VisionUp::Gated { gate, up } => {
-                gate.validate(intermediate, hidden, "vision gate projection")?;
-                up.validate(intermediate, hidden, "vision up projection")?;
+            VisionUp::Plain(up) => up.validate(intermediate, width, "vision up projection")?,
+            VisionUp::Gated { gate, up, limit } => {
+                if limit.is_some_and(|limit| !limit.is_finite() || limit <= 0.0) {
+                    return Err(DefinitionError::new("invalid vision feed-forward limit"));
+                }
+                gate.validate(intermediate, width, "vision gate projection")?;
+                up.validate(intermediate, width, "vision up projection")?;
             }
         }
         feedforward
             .down
-            .validate(hidden, intermediate, "vision down projection")?;
+            .validate(width, intermediate, "vision down projection")
+    }
+
+    fn validate_block(&self, block: &VisionBlock) -> Result<(), DefinitionError> {
+        let hidden = self.hidden;
+        block
+            .operator_norm
+            .validate(hidden, "vision operator norm")?;
+        match &block.operator {
+            VisionOperator::Attention(attention) => self.validate_attention(attention)?,
+            VisionOperator::GatedConvolution(convolution) => {
+                for (linear, role) in [
+                    (&convolution.input_gate, "vision convolution input gate"),
+                    (&convolution.output_gate, "vision convolution output gate"),
+                    (&convolution.value, "vision convolution value"),
+                ] {
+                    linear.validate(hidden, hidden, role)?;
+                }
+                let side = convolution.side();
+                if side % 2 == 0 {
+                    return Err(DefinitionError::new(
+                        "a vision convolution kernel has an odd side",
+                    ));
+                }
+                expect_shape(
+                    &convolution.kernel,
+                    &[hidden, 1, side, side],
+                    "vision convolution kernel",
+                )?;
+                convolution
+                    .output
+                    .validate(hidden, hidden, "vision convolution output")?;
+            }
+        }
+        if let Some(norm) = &block.operator_post_norm {
+            norm.validate(hidden, "vision operator post-norm")?;
+        }
+        block
+            .feedforward_norm
+            .validate(hidden, "vision feed-forward norm")?;
+        Self::validate_feed_forward(&block.feedforward, hidden)?;
         if let Some(norm) = &block.feedforward_post_norm {
             norm.validate(hidden, "vision feed-forward post-norm")?;
         }
@@ -785,6 +1028,7 @@ impl VisionDescription {
                 bias,
                 positions,
                 norm,
+                registers,
             } => {
                 for (index, frame) in frames.iter().enumerate() {
                     out.push((
@@ -798,9 +1042,14 @@ impl VisionDescription {
                 if let Some(bias) = bias {
                     out.push((role(vision, VisionWeight::PatchBias), bias));
                 }
-                out.push((role(vision, VisionWeight::Position), &positions.table));
+                if let Some(positions) = positions {
+                    out.push((role(vision, VisionWeight::Position), &positions.table));
+                }
                 if let Some(norm) = norm {
                     norm.weights(vision, VisionNormSite::Stem, &mut out);
+                }
+                if let Some(registers) = registers {
+                    out.push((role(vision, VisionWeight::Registers), registers));
                 }
             }
             VisionStem::NormalizedPatch {
@@ -819,43 +1068,60 @@ impl VisionDescription {
         }
         for (index, block) in self.blocks.iter().enumerate() {
             let scope = WeightScope::VisionBlock(u32_index(index));
-            let attention = &block.attention;
             block
-                .attention_norm
-                .weights(scope, VisionNormSite::AttentionInput, &mut out);
-            attention
-                .query
-                .weights(scope, VisionLinearSite::Query, &mut out);
-            attention.key.weights(scope, VisionLinearSite::Key, &mut out);
-            attention
-                .value
-                .weights(scope, VisionLinearSite::Value, &mut out);
-            if let Some(norm) = &attention.query_norm {
-                out.push((role(scope, VisionWeight::QueryNorm), &norm.weight));
+                .operator_norm
+                .weights(scope, VisionNormSite::OperatorInput, &mut out);
+            match &block.operator {
+                VisionOperator::Attention(attention) => {
+                    attention
+                        .query
+                        .weights(scope, VisionLinearSite::Query, &mut out);
+                    attention
+                        .key
+                        .weights(scope, VisionLinearSite::Key, &mut out);
+                    attention
+                        .value
+                        .weights(scope, VisionLinearSite::Value, &mut out);
+                    if let Some(norm) = &attention.query_norm {
+                        out.push((role(scope, VisionWeight::QueryNorm), &norm.weight));
+                    }
+                    if let Some(norm) = &attention.key_norm {
+                        out.push((role(scope, VisionWeight::KeyNorm), &norm.weight));
+                    }
+                    attention
+                        .output
+                        .weights(scope, VisionLinearSite::AttentionOutput, &mut out);
+                }
+                VisionOperator::GatedConvolution(convolution) => {
+                    convolution.input_gate.weights(
+                        scope,
+                        VisionLinearSite::ConvolutionInputGate,
+                        &mut out,
+                    );
+                    convolution.output_gate.weights(
+                        scope,
+                        VisionLinearSite::ConvolutionOutputGate,
+                        &mut out,
+                    );
+                    convolution
+                        .value
+                        .weights(scope, VisionLinearSite::ConvolutionValue, &mut out);
+                    out.push((
+                        role(scope, VisionWeight::ConvolutionKernel),
+                        &convolution.kernel,
+                    ));
+                    convolution
+                        .output
+                        .weights(scope, VisionLinearSite::ConvolutionOutput, &mut out);
+                }
             }
-            if let Some(norm) = &attention.key_norm {
-                out.push((role(scope, VisionWeight::KeyNorm), &norm.weight));
-            }
-            attention
-                .output
-                .weights(scope, VisionLinearSite::AttentionOutput, &mut out);
-            if let Some(norm) = &block.attention_post_norm {
-                norm.weights(scope, VisionNormSite::AttentionOutput, &mut out);
+            if let Some(norm) = &block.operator_post_norm {
+                norm.weights(scope, VisionNormSite::OperatorOutput, &mut out);
             }
             block
                 .feedforward_norm
                 .weights(scope, VisionNormSite::FeedForwardInput, &mut out);
-            match &block.feedforward.up {
-                VisionUp::Plain(up) => up.weights(scope, VisionLinearSite::Up, &mut out),
-                VisionUp::Gated { gate, up } => {
-                    gate.weights(scope, VisionLinearSite::Gate, &mut out);
-                    up.weights(scope, VisionLinearSite::Up, &mut out);
-                }
-            }
-            block
-                .feedforward
-                .down
-                .weights(scope, VisionLinearSite::Down, &mut out);
+            block.feedforward.weights(scope, &mut out);
             if let Some(norm) = &block.feedforward_post_norm {
                 norm.weights(scope, VisionNormSite::FeedForwardOutput, &mut out);
             }
@@ -865,18 +1131,30 @@ impl VisionDescription {
             norm.weights(vision, VisionNormSite::Merger, &mut out);
         }
         if let Some(standardize) = &merger.standardize {
-            out.push((role(vision, VisionWeight::StandardizeBias), &standardize.bias));
-            out.push((role(vision, VisionWeight::StandardizeScale), &standardize.scale));
+            out.push((
+                role(vision, VisionWeight::StandardizeBias),
+                &standardize.bias,
+            ));
+            out.push((
+                role(vision, VisionWeight::StandardizeScale),
+                &standardize.scale,
+            ));
         }
         if let Some(norm) = &merger.projection_norm {
             norm.weights(vision, VisionNormSite::MergerProjection, &mut out);
         }
         for (index, stage) in merger.stages.iter().enumerate() {
-            stage.linear.weights(
-                WeightScope::VisionMerger(u32_index(index)),
-                VisionLinearSite::Merger,
-                &mut out,
-            );
+            let scope = WeightScope::VisionMerger(u32_index(index));
+            stage
+                .linear
+                .weights(scope, VisionLinearSite::Merger, &mut out);
+            if let Some(norm) = &stage.norm {
+                norm.weights(scope, VisionNormSite::MergerStage, &mut out);
+            }
+        }
+        if let Some(feed_forward) = &merger.feed_forward {
+            let scope = WeightScope::VisionMerger(u32_index(merger.stages.len()));
+            feed_forward.weights(scope, &mut out);
         }
         if let Some(norm) = &merger.output_norm {
             norm.weights(vision, VisionNormSite::Output, &mut out);
@@ -925,5 +1203,26 @@ mod tests {
             glimmer.bounded_to_cells(512, 14, 2).unwrap(),
             VisionResize::CellBudget { max_cells: 512 }
         );
+
+        let nemotron = VisionResize::PatchBounds {
+            min_patches: 1_024,
+            max_patches: 13_312,
+        };
+        assert_eq!(nemotron.max_cells(16, 2).unwrap(), 3_328);
+        assert_eq!(
+            nemotron.bounded_to_cells(2_048, 16, 2).unwrap(),
+            VisionResize::PatchBounds {
+                min_patches: 1_024,
+                max_patches: 8_192,
+            }
+        );
+        assert_eq!(
+            nemotron.bounded_to_cells(128, 16, 2).unwrap(),
+            VisionResize::PatchBounds {
+                min_patches: 512,
+                max_patches: 512,
+            }
+        );
+        assert_eq!(nemotron.bounded_to_cells(4_096, 16, 2).unwrap(), nemotron);
     }
 }

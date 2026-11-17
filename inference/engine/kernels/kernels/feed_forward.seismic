@@ -1,0 +1,205 @@
+# Packed target feed-forward stages. The portable bodies are the semantic
+# oracles. Both entries operate on the `out_rows` rows of the residual: a
+# block that advances every row binds the identity, the final block binds
+# the rows with feature or logit demand.
+#
+# Native Metal: every entry here takes the `dense` projection
+# (`dense.seismic`), which owns and documents their forms (GEMV row
+# classes, the batched and matrix GEMVs, the GEMM tiles, TALL, INT8 and PACK)
+# and their bodies (`metal/lib/projection/operator.h`). An entry keeps its
+# prologue: `dense_expand` the RMS norm of its `out_rows`,
+# in-threadgroup in the GEMV and a pre-pass into `normalized` from
+# VERIFY_ROWS + 1 rows (in the tall GEMM's fragment order where TALL runs);
+# `dense_output` the NVFP4 operands of its product rows (`staged`), where its
+# weight takes them.
+# Native CUDA: the K1 projection library's row bands (`dense.seismic`) over
+# the O `out_rows` rows. `dense_up` and `dense_output` share one KSPLIT
+# between their two GEMV launches, so every row of the band has its O = 1
+# bits. Their 1..8-row GEMV states its grid and takes RESIDENCY (tuned; no
+# arithmetic): up to how many of its blocks over streaming weights share an
+# SM (`projection::GemvResidency`), one where a block per SM draws the
+# device's memory rate, two where it does not; a records weight's GEMV
+# (`form(W, GEMV_RECORDS)`) takes its blocks per SM from its grid instead,
+# and `where` holds its RESIDENCY at 1. `dense_up` and `dense_output` are
+# programmatic launches: a GEMV warp issues its first weight loads before it
+# waits for the previous launch, so a shared expert's down projection
+# streams under its expansion's last blocks (Nemotron 3.5 Bolt decode on
+# GB10: 33.6 -> 25.0 us).
+# `activation` is the gate's function code (`functions.seismic`: 0 SiLU,
+# 1 GELU-tanh); the product is the `glu` of gate and up, clamped at the
+# limit whose F32 bits are LB (0 for none, which no limit takes): `glu_limit`
+# holds no values, and its extent LB is static on every GPU backend, which
+# compiles the clamp in only where LB > 0; the CPU reads LB at run time.
+
+fn dense_expand[M, O, H, F, GS, US, GB, UB, LB](residual: &tensor[M, H] f32, norm: &tensor[H] NW,
+    gate_weight: &tensor[F, H] GW, up_weight: &tensor[F, H] UW,
+    out_rows: &tensor[O] i32, eps: f32, activation: i32,
+    gate_scale: &tensor[GS] f32, up_scale: &tensor[US] f32, gate_bound: &tensor[GB] f32,
+    up_bound: &tensor[UB] f32, glu_limit: &host tensor[0, LB] i32) -> tensor[O, F] A where LB >= 0 and GS >= 0 and US >= 0 and GS <= 1 and US <= 1 and GB >= 0 and UB >= 0 and (GB == 0 or H % GB == 0) and (UB == 0 or H % UB == 0) and operands(GW) == operands(UW):
+    let mut selected = tensor[O, H] f32
+    parallel for row in 0..O:
+        parallel for col in 0..H:
+            selected[row, col] = residual[out_rows[row], col]
+    let mut normalized = tensor[O, H] A
+    let mut gate_sum = tensor[O, F] f32
+    let mut up_sum = tensor[O, F] f32
+    let mut gate = tensor[O, F] A
+    let mut up = tensor[O, F] A
+    let mut product = tensor[O, F] A
+    rms_norm(selected, norm, normalized, eps)
+    linear(normalized, gate_weight, gate_sum)
+    linear(normalized, up_weight, up_sum)
+    scale_rows(gate_sum, gate_scale, gate)
+    scale_rows(up_sum, up_scale, up)
+    let mut limit = f32(inf)
+    if LB > 0:
+        limit = bitcast_f32(u32(LB))
+    glu(gate, up, product, activation, limit)
+    return product
+
+native dense_expand for metal from "metal/dense_expand.metal":
+    static (H, F, GS, US, GB, UB, LB)
+    where GS <= 1 and US <= 1
+    scratch normalized bytes ((O + TALL * (ceil_div(O, 64) * 64 - O)) * H * 2) when O > VERIFY_ROWS
+    project dense paired (gate_weight, up_weight)
+    launch dense_expand_normalize before gemv when O > VERIFY_ROWS and (O <= 64 or TALL == 0 or INT8 == 1 or PACK == 1):
+        staging
+        threadgroups (O, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch dense_expand_normalize_tall before tall when O > 64 and TALL == 1 and INT8 == 0 and PACK == 0:
+        staging
+        threadgroups (O, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# Vulkan: the `dense` projection (`dense.seismic`), paired, over the
+# normalized rows, which the GEMV forms in-workgroup and the stage launch
+# into scratch past 8 rows.
+native dense_expand for vulkan from "vulkan/dense_expand.comp":
+    static (H, F, GS, US, LB)
+    where GS <= 1 and US <= 1
+    project dense paired (gate_weight, up_weight) rows rms
+
+native dense_expand for cuda from "cuda/dense_expand.cu":
+    static (H, F, GS, US, LB)
+    where GS <= 1 and US <= 1
+    project dense paired (gate_weight, up_weight) rows rms
+
+# CPU: the CPU projection library (`cpu/lib/projection/projection.rs`). The
+# normalized (expand, up) or product (output) rows are the projection's
+# operand, formed as F32 rows and their Q8 blocks by the operator's `form`
+# launch; the row launch gives each work item ROWS weight rows, projected
+# against every operand row through the weight representation's dot
+# component.
+native dense_expand for cpu from "cpu/dense_expand.rs":
+    static (GS, US)
+    where GS <= 1 and US <= 1
+    project quantized tiled (GW, UW) over (O, H) operand (residual at (out_rows) normed (norm, eps))
+    launch dense_expand_rows:
+        threadgroups (ceil_div(F, ROWS), 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+
+fn dense_output[M, O, H, F, DS, DB](residual: &tensor[M, H] f32,
+    product: &tensor[O, F] A, down_weight: &tensor[H, F] DW,
+    out_rows: &tensor[O] i32, down_scale: &tensor[DS] f32,
+    down_bound: &tensor[DB] f32) -> tensor[O, H] f32 where DS >= 0 and DS <= 1 and DB >= 0 and (DB == 0 or F % DB == 0):
+    let mut down_sum = tensor[O, H] f32
+    let mut projected = tensor[O, H] A
+    let mut result = tensor[O, H] f32
+    linear(product, down_weight, down_sum)
+    scale_rows(down_sum, down_scale, projected)
+    parallel for row in 0..O:
+        parallel for col in 0..H:
+            result[row, col] = residual[out_rows[row], col] + f32(projected[row, col])
+    return result
+
+native dense_output for metal from "metal/dense_output.metal":
+    static (H, F, DS, DB)
+    where DS <= 1
+    project dense single (down_weight)
+    scratch staged bytes (O * F * 2) when O > VERIFY_ROWS and operands(DW) == 1
+    launch dense_output_stage before batch when O > VERIFY_ROWS and operands(DW) == 1:
+        staging
+        threadgroups (O, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# Vulkan: the `dense` projection (single) over the product rows read in
+# place, its GEMM splitting K SPLIT ways.
+native dense_output for vulkan from "vulkan/dense_output.comp":
+    static (H, F, DS)
+    where DS <= 1
+    project dense single (down_weight)
+
+native dense_output for cuda from "cuda/dense_output.cu":
+    static (H, F, DS)
+    where DS <= 1
+    project dense single (down_weight)
+    restate arithmetic KSPLIT in [4, 2, 8] default 4
+    restate gemv RESIDENCY in [1, 2, 0] default 1
+
+native dense_output for cpu from "cpu/dense_output.rs":
+    static (DS)
+    where DS <= 1
+    project quantized tiled (DW) over (O, F) operand (product)
+    launch dense_output_rows:
+        threadgroups (ceil_div(H, ROWS), 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+# The up-only feed-forward expansion (Nemotron-H's ReLU² dense layers and
+# shared expert): `dense_expand` with one up projection and the activated
+# product A(act(A(up))) (`activation`: 2 ReLU²).
+fn dense_up[M, O, H, F, US](residual: &tensor[M, H] f32, norm: &tensor[H] NW,
+    up_weight: &tensor[F, H] UW, out_rows: &tensor[O] i32, eps: f32,
+    activation: i32, up_scale: &tensor[US] f32) -> tensor[O, F] A where US >= 0 and US <= 1:
+    let mut selected = tensor[O, H] f32
+    parallel for row in 0..O:
+        parallel for col in 0..H:
+            selected[row, col] = residual[out_rows[row], col]
+    let mut normalized = tensor[O, H] A
+    let mut up_sum = tensor[O, F] f32
+    let mut up = tensor[O, F] A
+    let mut product = tensor[O, F] A
+    rms_norm(selected, norm, normalized, eps)
+    linear(normalized, up_weight, up_sum)
+    scale_rows(up_sum, up_scale, up)
+    activate(up, product, activation)
+    return product
+
+# Metal: the `dense` projection (`dense.seismic`), single, over the selected
+# residual rows under the norm prologue: the GEMV row classes apply it as they
+# stage, and from VERIFY_ROWS rows `normalize` normalizes once into
+# `normalized`, which every other form reads. The entry keeps the tile mapping
+# it ran before moving onto the projection for every GEMV row count
+# (SIMDGROUPS 16, ROWS 1, LANES 16).
+native dense_up for metal from "metal/dense_up.metal":
+    static (H, F, US)
+    where US <= 1
+    project dense single (up_weight)
+    restate single_gemv
+    scratch normalized bytes (O * H * 2) when O > VERIFY_ROWS
+    launch dense_up_normalize before batch when O > VERIFY_ROWS:
+        staging
+        threadgroups (O, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native dense_up for vulkan from "vulkan/dense_up.comp":
+    static (H, F, US)
+    where US <= 1
+    project dense single (up_weight) rows rms
+
+# `dense_expand`'s bands with one weight stream.
+native dense_up for cuda from "cuda/dense_up.cu":
+    static (H, F, US)
+    where US <= 1
+    project dense single (up_weight) rows rms
+    restate arithmetic KSPLIT in [4, 2, 8] default 4
+    restate arithmetic SPLIT in [2, 1] default 1
+    restate gemv RESIDENCY in [1, 2, 0] default 1
+
+native dense_up for cpu from "cpu/dense_up.rs":
+    static (US)
+    where US <= 1
+    project quantized tiled (UW) over (O, H) operand (residual at (out_rows) normed (norm, eps))
+    launch dense_up_rows:
+        threadgroups (ceil_div(F, ROWS), 1, 1)
+        threads_per_threadgroup (1, 1, 1)

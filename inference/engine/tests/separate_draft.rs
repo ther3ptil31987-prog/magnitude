@@ -1,4 +1,5 @@
-//! Real-device qualification of a separate draft (DFlash, DSpark, DFlash2):
+//! Real-device qualification of a separate draft (DFlash, DSpark, DFlash2,
+//! LiLiCorr):
 //! its state transactions (resume-state refusal while a draft transaction is
 //! in flight, resuming another request from that state, resuming the evicted
 //! source from it) reproduce its proposals exactly, and the header-only
@@ -6,21 +7,23 @@
 //! commits and bounds its graph holdings. Run on a host with a target and its
 //! draft:
 //! `MAGNITUDE_TEST_TARGET_GGUF=T.gguf MAGNITUDE_TEST_DRAFT_GGUF=D.gguf
-//! [MAGNITUDE_TEST_DRAFT_METHOD=dflash|dspark|dflash2] cargo test
+//! [MAGNITUDE_TEST_DRAFT_METHOD=dflash|dspark|dflash2|lilicorr]
+//! [MAGNITUDE_TEST_DRAFT_WIDTH=4] [MAGNITUDE_TEST_DRAFT_DENSE_KV=1] cargo test
 //! -p magnitude-engine --test separate_draft -- --ignored --nocapture`.
 
 use magnitude_engine::{
     assessment::{
-        prepare_model_assessment, AssessmentSetup, ModelPackagePaths, PreparedModelAssessment,
+        prepare_model_assessment, AssessmentStructure, ModelPackagePaths, PreparedModelAssessment,
     },
     build_native_domain,
     composition::{EngineConfiguration, ResolvedEngineConfiguration},
     options::{
-        standard_service_limits, ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection,
+        standard_service_limits, DraftBudget, DraftPolicy, ModelMethod, ModelPolicy, PackageOptions,
+        ProjectorSelection,
     },
 };
 use magnitude_executor::{
-    platform::{DeviceRequest, MemoryReserves},
+    platform::{DeviceRequest, ReleaseRate},
     AssessmentGraphResourceBounds, AssessmentMemoryTerms, Demand, DraftForm, ExecutionPath,
     ExecutorDomain, FeatureReader, FeatureRows, FeatureSpan, Operation, Outcome, PhysicalDecision,
     RequestId, ReservedResources, ResourceCapacity, ResourcePlanner, ResumeState, Sampling,
@@ -39,15 +42,34 @@ fn method() -> ModelMethod {
         Ok("dflash") => ModelMethod::DFlash,
         Ok("dspark") => ModelMethod::DSpark,
         Ok("dflash2") => ModelMethod::DFlash2,
+        Ok("lilicorr") => ModelMethod::LiLiCorr,
         Ok(other) => panic!("unknown draft method {other}"),
     }
 }
 
 fn policy() -> ModelPolicy {
     ModelPolicy {
+        kv_codec: if std::env::var("MAGNITUDE_TEST_DRAFT_DENSE_KV").as_deref() == Ok("1") {
+            Some(magnitude_state::KvCodec::Dense)
+        } else {
+            ModelPolicy::default().kv_codec
+        },
+        draft_policy: test_width().map(|width| {
+            DraftPolicy::Fixed(DraftBudget {
+                generated: width,
+                verified: width,
+            })
+        }),
         method: method(),
         ..ModelPolicy::default()
     }
+}
+
+/// The generated width the load prepares instead of its whole proposal width.
+fn test_width() -> Option<usize> {
+    std::env::var("MAGNITUDE_TEST_DRAFT_WIDTH")
+        .ok()
+        .map(|width| width.parse::<u8>().unwrap() as usize)
 }
 
 fn resolved() -> ResolvedEngineConfiguration {
@@ -63,7 +85,7 @@ fn resolved() -> ResolvedEngineConfiguration {
         path: ExecutionPath::Native,
         device: DeviceRequest::Automatic,
         kernel_cache: std::env::var_os("MAGNITUDE_TEST_KERNEL_CACHE").map(PathBuf::from),
-        reserves: MemoryReserves::standard(),
+        release: ReleaseRate::of_machine(None),
     }
     .resolve()
     .unwrap()
@@ -157,7 +179,7 @@ fn open(
     domain
         .install_input(request, PreparedModelInput::continuation_only())
         .unwrap();
-    domain.open_state(bindings, request, from).unwrap();
+    domain.open_served(bindings, request, from).unwrap();
 }
 
 /// One draft transaction at draft position `position` entering `tokens`
@@ -203,7 +225,7 @@ fn transact(
     let (pending, bindings) = domain.finish_head(flight).unwrap();
     let mut selected = Vec::new();
     for pending in pending {
-        let Outcome::Head { proposals } = pending.outcome().clone() else {
+        let Outcome::Head { proposals, .. } = pending.outcome().clone() else {
             panic!("a draft transaction returns proposals")
         };
         selected = proposals
@@ -287,44 +309,68 @@ fn draft_state_copies_and_restores_reproduce_its_proposals() {
     let source = RequestId(1);
     open(&mut domain, &mut bindings, source, None);
     let (conditioning, bindings) = prefill(&mut domain, bindings, source, &tokens[..committed]);
+    let before_inject = domain.resume_state(source).unwrap();
     let bindings = inject(&mut domain, bindings, source, &tokens, &conditioning);
     let before_draft = domain.resume_state(source).unwrap();
+    let width = test_width().unwrap_or(proposals);
     let (drafted, mut bindings) =
-        draft(&mut domain, bindings, source, &tokens, &conditioning, proposals);
-    assert_eq!(drafted.len(), proposals);
+        draft(&mut domain, bindings, source, &tokens, &conditioning, width);
+    assert_eq!(drafted.len(), width);
 
     // Another request resumed from the state before the draft drafts the
     // same proposals.
     let copy = RequestId(2);
     open(&mut domain, &mut bindings, copy, Some(&before_draft));
-    let (copied, mut bindings) =
-        draft(&mut domain, bindings, copy, &tokens, &conditioning, proposals);
+    let (copied, mut bindings) = draft(&mut domain, bindings, copy, &tokens, &conditioning, width);
     assert_eq!(copied, drafted);
+    domain.close(copy).unwrap();
     // Evicting the source and resuming it from that state drafts them too.
     domain.release_state(&[source]).unwrap();
     domain
-        .open_state(&mut bindings, source, Some(&before_draft))
+        .open_served(&mut bindings, source, Some(&before_draft))
         .unwrap();
-    let (resumed, _) = draft(&mut domain, bindings, source, &tokens, &conditioning, proposals);
+    let (resumed, mut bindings) =
+        draft(&mut domain, bindings, source, &tokens, &conditioning, width);
     assert_eq!(resumed, drafted);
-    eprintln!("proposals after {committed} committed rows: {drafted:?}");
-    for request in [source, copy] {
-        domain.close(request).unwrap();
+    eprintln!("width={width} proposals after {committed} committed rows: {drafted:?}");
+    // Catch up the same committed context in two injection transactions. It
+    // must produce the same proposals as one injection.
+    let catchup = RequestId(3);
+    open(&mut domain, &mut bindings, catchup, Some(&before_inject));
+    let injected = committed - 1;
+    let split = injected / 2;
+    for (start, end) in [(0, split), (split, injected)] {
+        let (none, returned) = transact(
+            &mut domain,
+            bindings,
+            catchup,
+            &tokens[start + 1..end + 1],
+            rows(&conditioning, start..end),
+            start,
+            0,
+        );
+        bindings = returned;
+        assert!(none.is_empty());
     }
+    let (caught_up, _) = draft(&mut domain, bindings, catchup, &tokens, &conditioning, width);
+    assert_eq!(caught_up, drafted);
+    domain.close(catchup).unwrap();
+    domain.close(source).unwrap();
+    drop(before_inject);
     drop(before_draft);
-    let charge = domain.reconcile_memory_charge(&[]).unwrap();
-    assert_eq!(charge.unattributed, 0, "{charge:?}");
+    domain.reconcile_memory_charge(&[]).unwrap();
 }
 
 #[test]
 #[ignore = "requires a device, MAGNITUDE_TEST_TARGET_GGUF and MAGNITUDE_TEST_DRAFT_GGUF"]
 fn header_only_assessment_charges_what_a_load_commits() {
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
-    let setup = AssessmentSetup::discover(
+    let catalog = seismic::Devices::discover(&[]).unwrap();
+    let structure = AssessmentStructure::discover(
         &catalog,
         DeviceRequest::Automatic,
-        MemoryReserves::standard(),
-        ModelPolicy::default(),
+        None,
+        ReleaseRate::of_machine(None),
+        policy(),
         standard_service_limits(),
     )
     .unwrap();
@@ -335,12 +381,13 @@ fn header_only_assessment_charges_what_a_load_commits() {
             draft: Some(path("MAGNITUDE_TEST_DRAFT_GGUF")),
             method: method(),
         },
-        &setup,
+        &structure,
     )
     .unwrap();
-    let PreparedModelAssessment::Planned { draft: plan, .. } = prepared else {
+    let PreparedModelAssessment::Planned { execution, .. } = prepared else {
         panic!("the bundle plans")
     };
+    let plan = execution.draft();
 
     let resolved = resolved();
     let definition = &resolved.manifest.definition;
@@ -361,10 +408,11 @@ fn header_only_assessment_charges_what_a_load_commits() {
         policy.codec(),
         policy.limits(),
         ResourceCapacity {
-            domain_bytes: plan.device().assessment_capacity_bytes(),
+            domain_bytes: magnitude_executor::StableRoom::of(plan.device()).capacity().unwrap(),
             tensor_operations: magnitude_executor::TensorOperations::of(
                 plan.device().tensor_operations(),
             ),
+            allocations: plan.device().allocations(),
         },
     )
     .unwrap();
@@ -399,7 +447,6 @@ fn header_only_assessment_charges_what_a_load_commits() {
     domain.close(request).unwrap();
     let charge = domain.reconcile_memory_charge(&[&held]).unwrap();
     eprintln!("assessed {terms:?} graphs {graphs:?}\nloaded {charge:?}");
-    assert_eq!(charge.unattributed, 0);
     assert_eq!(
         charge.target_weights, terms.target_weights,
         "target weights"

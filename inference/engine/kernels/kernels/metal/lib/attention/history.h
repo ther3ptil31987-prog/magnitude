@@ -1,3 +1,4 @@
+#ifdef ATTENTION_AFFINE_HISTORY
 // history shared attention mechanisms; included at the original declaration point.
 // ---------------------------------------------------------------------------
 // Affine K8/V4 history (`attention_*_k8v4`). A (history row, kv head)
@@ -10,11 +11,11 @@
 // GROUP / E neighbouring lanes.
 // ---------------------------------------------------------------------------
 
-#define ATTENTION_KEY_BITS 8
-#define ATTENTION_VALUE_BITS 4
+#define ATTENTION_KEY_BITS (32 * ATTENTION_KEY_CODE_WORDS / ATTENTION_W)
+#define ATTENTION_VALUE_BITS (32 * ATTENTION_VALUE_CODE_WORDS / ATTENTION_W)
 // Columns per (scale, zero) pair: the codec's group (model-state
 // `AFFINE_GROUP`).
-#define ATTENTION_GROUP 32
+#define ATTENTION_GROUP (2 * ATTENTION_W / ATTENTION_KEY_COEFFICIENTS)
 
 template <uint B>
 struct lane_codes {
@@ -82,14 +83,21 @@ struct lane_codes {
     }
 };
 
-// Encodes one vector held by a simdgroup (lane `lane` owns columns [lane * E,
-// lane * E + E)) with B-bit codes at `row` (its code row) and its group
-// coefficient pairs at `coefficients`: per group, zero = f16(min), scale =
-// f16((max - min) / L), code = min(L, u32(fma(x - zero, 1 / scale, 0.5))), 0
-// when scale is 0.
+// This lane's share of one vector's encoding: its codes, laid out as
+// `lane_codes::load` leaves them, and its group's (scale, zero) pair.
 template <uint B>
-inline void encode(thread const float (&x)[ATTENTION_E], device uint *row,
-    device half *coefficients, uint lane) {
+struct lane_encoding {
+    uint codes[lane_codes<B>::words];
+    half2 pair;
+};
+
+// The encoding of one vector held by a simdgroup (lane `lane` owns columns
+// [lane * E, lane * E + E)) with B-bit codes: per group, zero = f16(min),
+// scale = f16((max - min) / L), code = min(L, u32(fma(x - zero, 1 / scale,
+// 0.5))), 0 when scale is 0. The whole simdgroup calls it. It is the codec's
+// one encode: what `store` writes and what a fresh row is read as.
+template <uint B>
+inline lane_encoding<B> quantize(thread const float (&x)[ATTENTION_E]) {
     typedef lane_codes<B> codes;
     float low = x[0];
     float high = x[0];
@@ -104,36 +112,89 @@ inline void encode(thread const float (&x)[ATTENTION_E], device uint *row,
         low = metal::min(low, simd_shuffle_xor(low, ushort(offset)));
         high = metal::max(high, simd_shuffle_xor(high, ushort(offset)));
     }
+    lane_encoding<B> encoding;
     const half zero = half(low);
     const half scale = half((high - low) / float(codes::levels));
+    encoding.pair = half2(scale, zero);
     const float inverse = float(scale) > 0.0f ? 1.0f / float(scale) : 0.0f;
-    uint w[codes::words];
     ATTENTION_UNROLL
     for (uint j = 0; j < codes::words; ++j)
-        w[j] = 0u;
+        encoding.codes[j] = 0u;
     ATTENTION_UNROLL
     for (uint i = 0; i < ATTENTION_E; ++i) {
         const float t = metal::fma(x[i] - float(zero), inverse, 0.5f);
         const uint c = metal::min(uint(metal::max(t, 0.0f)), uint(codes::levels));
-        w[i * B / 32] |= c << ((i * B) % 32);
+        encoding.codes[i * B / 32] |= c << ((i * B) % 32);
     }
+    return encoding;
+}
+
+// The writable rows of a coefficient plane (F16 group pairs): its slab
+// address table, typed by its element.
+typedef slab::Table<element::F16> coefficient_plane;
+
+// Stores a vector's encoding at `row` (its code row) and its group pairs at
+// `coefficients`, through the coefficient plane's owner. The whole simdgroup
+// calls it.
+template <uint B>
+inline void store(lane_encoding<B> encoding, device uint *row, element::Out<element::F16> coefficients,
+    uint lane) {
+    typedef lane_codes<B> codes;
     if (codes::bits >= 32) {
         ATTENTION_UNROLL
         for (uint j = 0; j < codes::words; ++j)
-            row[lane * codes::words + j] = w[j];
+            row[lane * codes::words + j] = encoding.codes[j];
     } else {
         // 32 / bits neighbouring lanes share a word: join their parts.
         constexpr uint sharing = codes::bits >= 32 ? 1 : 32 / codes::bits;
-        uint joined = w[0] << ((lane % sharing) * codes::bits);
+        uint joined = encoding.codes[0] << ((lane % sharing) * codes::bits);
         ATTENTION_UNROLL
         for (uint offset = 1; offset < sharing; offset *= 2)
             joined |= simd_shuffle_xor(joined, ushort(offset));
         if (lane % sharing == 0)
             row[lane / sharing] = joined;
     }
-    if (lane % codes::pair_lanes == 0) {
-        coefficients[lane / codes::pair_lanes * 2] = scale;
-        coefficients[lane / codes::pair_lanes * 2 + 1] = zero;
+    if (lane % codes::pair_lanes == 0)
+        coefficients.put2(lane / codes::pair_lanes * 2, float(encoding.pair.x), float(encoding.pair.y));
+}
+
+// A fresh key (KEY) or value as history holds it: its prepared vector
+// rounded to the activation dtype, then encoded. The one encoding of a fresh
+// row: its append stores it and every read of the row takes it. The whole
+// simdgroup calls it.
+template <bool KEY>
+inline lane_encoding<KEY ? ATTENTION_KEY_BITS : ATTENTION_VALUE_BITS> held_encoding(
+    thread const float (&x)[ATTENTION_E]) {
+    float rounded[ATTENTION_E];
+    ATTENTION_UNROLL
+    for (uint i = 0; i < ATTENTION_E; ++i)
+        rounded[i] = element::Act::round(x[i]);
+    return quantize<KEY ? ATTENTION_KEY_BITS : ATTENTION_VALUE_BITS>(rounded);
+}
+
+// Two codes (in the low bits of each half of `codes`) decoded to F16 with
+// their group's pair: the codes enter the mantissas of 1024 (0x6400, whose
+// F16 ulp is 1), so subtracting 1024 leaves them exact, and one fused F16
+// multiply-add applies (scale, zero) with a single rounding of code * scale
+// + zero. Every F16 read of an affine vector takes this value.
+inline half2 decode_pair(uint codes, half2 pair) {
+    const half2 exact = as_type<half2>(codes | 0x64006400u) - half2(1024.0h);
+    return metal::fma(exact, half2(pair.x), half2(pair.y));
+}
+
+// This lane's columns of a vector's encoding, decoded (`decode_pair`).
+template <uint B>
+inline void decode(lane_encoding<B> encoding, thread float (&x)[ATTENTION_E]) {
+    typedef lane_codes<B> codes;
+    ATTENTION_UNROLL
+    for (uint i = 0; i < ATTENTION_E; i += 2) {
+        const uint low = (encoding.codes[i * B / 32] >> ((i * B) % 32)) & codes::levels;
+        const uint high = i + 1 < ATTENTION_E
+            ? (encoding.codes[(i + 1) * B / 32] >> (((i + 1) * B) % 32)) & codes::levels : 0u;
+        const half2 decoded = decode_pair(low | (high << 16), encoding.pair);
+        x[i] = float(decoded.x);
+        if (i + 1 < ATTENTION_E)
+            x[i + 1] = float(decoded.y);
     }
 }
 
@@ -210,3 +271,5 @@ inline void absorb_affine(thread const float (&q)[G][ATTENTION_E],
     }
 }
 
+
+#endif

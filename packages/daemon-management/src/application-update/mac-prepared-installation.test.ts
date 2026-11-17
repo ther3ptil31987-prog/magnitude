@@ -14,7 +14,7 @@ import { MacBundleVerifier, MacBundleVerificationFailed } from "../desktop-nativ
 import { MacUpdateArchiveStager, MacUpdateStagingFailed } from "../desktop-native/mac-update-staging"
 import { completeMacPreparedInstallation, recoverMacPreparedInstallation } from "./mac-prepared-installation"
 import { installMacApplicationArchive } from "./mac-archive-installation"
-import { GuardedCommand, GuardedCommandFailed } from "../desktop-native/guarded-command"
+import { GuardedCommand, GuardedCommandFailed } from "@magnitudedev/utils/guarded-command"
 const addon = fileURLToPath(new URL(`../../dist/native/darwin-${process.arch}/desktop-host.node`, import.meta.url))
 const keys = generateKeyPairSync("ed25519")
 const release = await Effect.runPromise(signUpdateRelease({ version: "0.1.6", bytes: 1, sha256: "0".repeat(64) },
@@ -29,13 +29,14 @@ const fixture = Effect.gen(function* () {
   yield* fs.writeFileString(join(bundle, "version"), "0.1.5")
   const events: string[] = []
   const step = (name: string) => Effect.sync(() => { events.push(name) })
-  const prepared = yield* Ref.make<Option.Option<PreparedUpdate>>(Option.some({ release, installation: { _tag: "Unattempted" } }))
+  const prepared = yield* Ref.make<Option.Option<PreparedUpdate>>(Option.some({ release, from: Option.none(), installation: { _tag: "Unattempted" } }))
   const store = PreparedUpdateStore.of({
     read: Ref.get(prepared),
     verify: () => step("verify").pipe(Effect.as("archive")),
-    recordAttempt: () => step("attempt").pipe(Effect.zipRight(Ref.set(prepared, Option.some({ release, installation: { _tag: "Attempted" } })))),
-    recordFailure: (_, reason) => step("failure").pipe(Effect.zipRight(Ref.set(prepared, Option.some({ release, installation: { _tag: "Failed", reason } })))),
-    discard: step("discard").pipe(Effect.zipRight(Ref.set(prepared, Option.none()))), removeAbandonedTransfers: Effect.void, outcome: Effect.succeed(Option.none()), recordOutcome: () => Effect.void, markOutcomeReported: Effect.void,
+    recordAttempt: () => step("attempt").pipe(Effect.zipRight(Ref.set(prepared, Option.some({ release, from: Option.none(), installation: { _tag: "Attempted" } })))),
+    recordFailure: (_, kind, reason) => step("failure").pipe(Effect.zipRight(Ref.set(prepared, Option.some({ release, from: Option.none(), installation: { _tag: "Failed", kind, reason } })))),
+    discard: step("discard").pipe(Effect.zipRight(Ref.set(prepared, Option.none()))),
+    complete: () => step("complete").pipe(Effect.zipRight(Ref.set(prepared, Option.none()))), removeAbandonedTransfers: Effect.void, outcome: Effect.succeed(Option.none()), recordOutcome: () => Effect.void, markOutcomeReported: Effect.void, hold: Effect.succeed(Option.none()), recordHold: () => Effect.void, releaseHold: Effect.void,
     prepare: () => Effect.die("Unexpected download"),
   })
   const stager = MacUpdateArchiveStager.of({ stage: (_, staging) => Effect.gen(function* () {
@@ -83,19 +84,19 @@ describe.skipIf(process.platform !== "darwin")("prepared macOS installation", ()
     const f = yield* fixture
     expect(yield* f.install.pipe(Effect.provideService(PreparedUpdateStore, f.store), Effect.provideService(MacUpdateArchiveStager, f.stager)))
       .toEqual({ _tag: "Installed", version: "0.1.6" })
-    expect(f.events).toEqual(["verify", "attempt", "stage", "discard"])
+    expect(f.events).toEqual(["verify", "attempt", "stage", "complete"])
     expect(yield* f.fs.readFileString(join(f.bundle, "version"))).toBe("0.1.6")
     expect(yield* f.fs.exists(join(f.root, ".Magnitude.app.update"))).toBe(false)
   })))
   it("retains a committed transaction if preparation retirement fails and reconciles without staging again", () => run(Effect.gen(function* () {
     const f = yield* fixture
-    const failing = { ...f.store, discard: Effect.fail(new PreparedUpdateFailed({ message: "Retirement failed" })) }
+    const failing = { ...f.store, complete: () => Effect.fail(new PreparedUpdateFailed({ message: "Retirement failed" })) }
     expect(yield* f.install.pipe(Effect.provideService(PreparedUpdateStore, failing), Effect.provideService(MacUpdateArchiveStager, f.stager), Effect.isFailure)).toBe(true)
     expect(yield* f.fs.readFileString(join(f.bundle, "version"))).toBe("0.1.6")
     expect(yield* f.recover.pipe(Effect.provideService(PreparedUpdateStore, f.store)))
       .toEqual({ _tag: "Installed", version: "0.1.6" })
     expect(f.events.filter(event => event === "stage")).toHaveLength(1)
-    expect(f.events).toEqual(["verify", "attempt", "stage", "failure", "discard"])
+    expect(f.events).toEqual(["verify", "attempt", "stage", "failure", "complete"])
     expect(yield* f.store.read).toEqual(Option.none())
   })))
   it("retains the old installation after partial extraction and cleans staging on explicit retry", () => run(Effect.gen(function* () {
@@ -123,12 +124,12 @@ describe.skipIf(process.platform !== "darwin")("prepared macOS installation", ()
     expect(yield* f.fs.exists(join(f.root, ".Magnitude.app.update"))).toBe(false)
     expect(yield* f.fs.readFileString(join(f.bundle, "version"))).toBe("0.1.5")
   })))
-  it("does not record an attempt or stage after archive verification fails", () => run(Effect.gen(function* () {
+  it("records only a verification failure, without an attempt or staging, when the archive is invalid", () => run(Effect.gen(function* () {
     const f = yield* fixture
     expect(yield* f.install.pipe(Effect.provideService(PreparedUpdateStore, { ...f.store,
       verify: () => Effect.fail(new PreparedUpdateFailed({ message: "Invalid archive" })) }),
       Effect.provideService(MacUpdateArchiveStager, f.stager), Effect.isFailure)).toBe(true)
-    expect(f.events).toEqual([])
+    expect(f.events).toEqual(["failure"])
     expect(yield* f.fs.readFileString(join(f.bundle, "version"))).toBe("0.1.5")
   })))
 })

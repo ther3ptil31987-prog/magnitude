@@ -8,7 +8,7 @@ use std::{
     sync::Arc,
 };
 
-pub const DETECTOR: &str = "v4-reasoning-1";
+pub const DETECTOR: &str = "v4-reasoning-2";
 pub const CONTROLS: &[&str] = &[
     "enable_thinking",
     "thinking",
@@ -76,7 +76,7 @@ fn rank(effort: &str) -> Option<usize> {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ReasoningIntent {
-    /// The template's own default behavior.
+    /// The renderer's default: no reasoning arguments, with thinking enabled.
     #[default]
     ModelDefault,
     Disabled,
@@ -90,7 +90,7 @@ pub enum ReasoningIntent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedReasoning {
     /// The normalized effort whose recipe renders the request; `None` keeps the
-    /// template default without inspecting it.
+    /// renderer default without inspecting it.
     pub effort: Option<String>,
     /// Template arguments that realize the effort.
     pub controls: Controls,
@@ -317,6 +317,22 @@ fn comparable(base: &Outcomes, candidate: &Outcomes) -> bool {
             .zip(candidate)
             .all(|(a, b)| a.is_none() || b.is_some())
 }
+/// Whether a rendering leaves the reply inside a reasoning block: the generation
+/// prompt opens the template's reasoning marker and does not close it again.
+/// Such a rendering does not disable reasoning, however much else it changes.
+fn opens_reasoning(outcomes: &Outcomes) -> bool {
+    outcomes.iter().flatten().any(|s| {
+        let start = s.start.trim();
+        !start.is_empty()
+            && s.prefix.rfind(start).is_some_and(|at| {
+                let rest = &s.prefix[at + start.len()..];
+                !s.ends
+                    .iter()
+                    .map(|end| end.trim())
+                    .any(|end| !end.is_empty() && rest.contains(end))
+            })
+    })
+}
 fn names(outcomes: &Outcomes, effort: &str) -> bool {
     let Some((_, spellings)) = EFFORTS.iter().find(|(name, _)| *name == effort) else {
         return false;
@@ -486,7 +502,11 @@ pub fn inspect_reasoning(
         let enabled = control(name, on);
         let off = probe.render(&disabled);
         let on = probe.render(&enabled);
-        if comparable(&baseline, &off) && comparable(&baseline, &on) && off != on {
+        if comparable(&baseline, &off)
+            && comparable(&baseline, &on)
+            && off != on
+            && !opens_reasoning(&off)
+        {
             toggle = Some((disabled, enabled, off, on));
             break;
         }
@@ -531,14 +551,16 @@ pub fn inspect_reasoning(
         && invalid[0] == invalid[1];
     let effort_policy = EffortPolicy { rejected, fallback };
     let disabled_effort = if rejected || fallback {
-        probe.effort(
-            "none",
-            &["none", "off", "no_think", "disabled"],
-            &enabled,
-            &effort_base,
-            &invalid[0],
-            effort_policy,
-        )?
+        probe
+            .effort(
+                "none",
+                &["none", "off", "no_think", "disabled"],
+                &enabled,
+                &effort_base,
+                &invalid[0],
+                effort_policy,
+            )?
+            .filter(|(_, outcomes)| !opens_reasoning(outcomes))
     } else {
         None
     };

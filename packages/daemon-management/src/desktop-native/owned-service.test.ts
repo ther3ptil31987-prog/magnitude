@@ -4,7 +4,9 @@ import { ProcessStartIdentitySchema } from "@magnitudedev/utils/process-groups"
 import { Deferred, Effect, Fiber, Logger, Option, Queue, Ref, Schema, Stream, TestClock, TestContext } from "effect"
 import { describe, expect, it } from "vitest"
 import { OwnedChildSpawner } from "./owned-child"
-import { makeOwnedService } from "./owned-service"
+import { makeOwnedService, type OwnerAgent } from "./owned-service"
+
+const idleOwner: OwnerAgent = { state: Stream.never, handle: () => Effect.succeed({ reply: { _tag: "Unsupported" }, afterReply: Effect.void }) }
 
 const health: MagnitudeHealthResponse = Schema.decodeUnknownSync(MagnitudeHealthResponseSchema)({
   service: "magnitude-acn", version: AcnIdentitySchema.make("0.0.14"), revision: AcnRevisionSchema.make(1),
@@ -25,7 +27,7 @@ const setup = Effect.gen(function* () {
       stop: Ref.update(stops, value => value + 1),
     }
   }) })
-  const service = yield* makeOwnedService({ output: "DiagnosticTail" as const, logFile: Option.none(), executable: "test", arguments: [], environment: {} }, 1).pipe(Effect.provideService(OwnedChildSpawner, spawner))
+  const service = yield* makeOwnedService({ output: "DiagnosticTail" as const, logFile: Option.none(), executable: "test", arguments: [], environment: {} }, 1, idleOwner).pipe(Effect.provideService(OwnedChildSpawner, spawner))
   return { service, events, exit, commands, launches, stops }
 })
 const run = <A, E>(effect: Effect.Effect<A, E, import("effect").Scope.Scope>) => Effect.runPromise(Effect.scoped(effect).pipe(Effect.provide(TestContext.TestContext)))
@@ -41,7 +43,7 @@ describe("desktop-owned service supervision", () => {
         diagnosticTail: Effect.succeed("private child stack trace"),
         send: () => Effect.void, stop: Effect.void,
       }) })
-      const service = yield* makeOwnedService({ output: "DiagnosticTail" as const, logFile: Option.none(), executable: "test", arguments: [], environment: {} }, 1).pipe(
+      const service = yield* makeOwnedService({ output: "DiagnosticTail" as const, logFile: Option.none(), executable: "test", arguments: [], environment: {} }, 1, idleOwner).pipe(
         Effect.provideService(OwnedChildSpawner, spawner),
       )
       yield* TestClock.adjust("8 seconds")
@@ -69,7 +71,7 @@ describe("desktop-owned service supervision", () => {
         ) : Effect.void,
       }
     }) })
-    const service = yield* makeOwnedService({ output: "DiagnosticTail" as const, logFile: Option.none(), executable: "test", arguments: [], environment: {} }, 1).pipe(
+    const service = yield* makeOwnedService({ output: "DiagnosticTail" as const, logFile: Option.none(), executable: "test", arguments: [], environment: {} }, 1, idleOwner).pipe(
       Effect.provideService(OwnedChildSpawner, spawner),
     )
     yield* TestClock.adjust("8 seconds")
@@ -120,6 +122,21 @@ describe("desktop-owned service supervision", () => {
     yield* f.service.shutdown
   })))
 
+  it("keeps a startup that keeps reporting past five minutes and stops one that falls silent", async () => run(Effect.gen(function* () {
+    const f = yield* setup
+    const starting = Schema.decodeUnknownSync(MagnitudeHealthResponseSchema)({ ...health, state: { _tag: "Starting", activity: "Resolving" } })
+    yield* Queue.offer(f.events, { _tag: "Booted", pid: 42 })
+    for (let minute = 0; minute < 12; minute++) {
+      yield* Queue.offer(f.events, { _tag: "Health", health: starting })
+      yield* TestClock.adjust("1 minute")
+    }
+    expect((yield* f.service.state)._tag).toBe("Starting")
+    expect(yield* Ref.get(f.stops)).toBe(0)
+    yield* TestClock.adjust("5 minutes")
+    expect(yield* Ref.get(f.stops)).toBe(1)
+    yield* f.service.shutdown
+  })))
+
   it("never admits mismatched health", async () => run(Effect.gen(function* () {
     const f = yield* setup
     const waiter = yield* f.service.awaitReady.pipe(Effect.either, Effect.forkScoped)
@@ -143,6 +160,20 @@ describe("desktop-owned service supervision", () => {
     const state = yield* f.service.state
     expect(state._tag).toBe("Failed")
     if (state._tag === "Failed") expect(state.message).toBe("Inference engine installation is missing.")
+    yield* f.service.shutdown
+  })))
+
+  it("does not restart a service that stopped for a reason a restart cannot fix", async () => run(Effect.gen(function* () {
+    const f = yield* setup
+    yield* Queue.offer(f.events, { _tag: "Booted", pid: 42 })
+    yield* Queue.offer(f.events, { _tag: "Health", health: Schema.decodeUnknownSync(MagnitudeHealthResponseSchema)({
+      ...health, state: { _tag: "Stopping", reason: "startup-failed", safeDetail: "Magnitude couldn't download its inference engine (HTTP 404).", permanent: true },
+    }) })
+    yield* TestClock.adjust("1 minute")
+    const state = yield* f.service.state
+    expect(state._tag).toBe("Failed")
+    if (state._tag === "Failed") expect(state.message).toBe("Magnitude couldn't download its inference engine (HTTP 404).")
+    expect(yield* Ref.get(f.launches)).toBe(1)
     yield* f.service.shutdown
   })))
 

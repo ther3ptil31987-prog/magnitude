@@ -1,8 +1,11 @@
-//! CUDA storage exposed through the generic device service: device memory,
-//! pinned host memory mapped into the device address space, or the backed
-//! prefix of a reserved device address range.
+//! CUDA storage exposed through the generic device service: a range of a
+//! device block, pinned host memory mapped into the device address space,
+//! or a pool's block of its own, of device memory or of registered host
+//! pages.
 
-use crate::driver::{self, Allocation, DriverError, HostMapped, Reservation};
+use crate::blocks::{DeviceBlock, Range};
+use crate::driver::{DriverError, HostMapped, HostNodeBlock};
+use crate::registered::RegisteredBlock;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -11,111 +14,120 @@ pub struct Buffer {
 }
 
 enum Memory {
-    Device(Allocation),
+    /// A range of one of the device's blocks.
+    Device(Range),
     /// Host-written inputs: filled by the host without a driver call.
     Mapped(HostMapped),
-    /// The leading `bytes` of a reservation, which are backed. Buffers of
-    /// one reservation share its base address.
-    Reserved {
-        reservation: Arc<Reservation>,
-        bytes: usize,
-    },
+    /// A block of device memory of its own (`Device::allocate_block`).
+    Block(DeviceBlock),
+    /// A block of host-NUMA memory created by the driver for a unified-memory
+    /// device (`Device::allocate_block`).
+    HostNode(HostNodeBlock),
+    /// A block of host pages the device reads in place over its link
+    /// (`Device::allocate_block`).
+    Registered(RegisteredBlock),
 }
 
 impl Buffer {
-    pub(crate) fn device(allocation: Allocation) -> Self {
-        Self {
-            memory: Arc::new(Memory::Device(allocation)),
-        }
+    pub(crate) fn device(range: Range) -> Self {
+        Self { memory: Arc::new(Memory::Device(range)) }
     }
     pub(crate) fn mapped(mapped: HostMapped) -> Self {
-        Self {
-            memory: Arc::new(Memory::Mapped(mapped)),
-        }
+        Self { memory: Arc::new(Memory::Mapped(mapped)) }
     }
-    pub(crate) fn reserved(reservation: Arc<Reservation>, bytes: usize) -> Self {
-        Self {
-            memory: Arc::new(Memory::Reserved { reservation, bytes }),
-        }
+    pub(crate) fn block(block: DeviceBlock) -> Self {
+        Self { memory: Arc::new(Memory::Block(block)) }
     }
-    /// Whether this buffer is the backed prefix of a reservation, which
-    /// `Device::recommit` resizes in place.
-    pub fn is_reserved(&self) -> bool {
-        self.reservation().is_some()
+    pub(crate) fn host_node(block: HostNodeBlock) -> Self {
+        Self { memory: Arc::new(Memory::HostNode(block)) }
     }
-    /// The reservation this buffer is a backed prefix of.
-    pub(crate) fn reservation(&self) -> Option<&Arc<Reservation>> {
-        match &*self.memory {
-            Memory::Reserved { reservation, .. } => Some(reservation),
-            Memory::Device(_) | Memory::Mapped(_) => None,
-        }
+    pub(crate) fn registered(block: RegisteredBlock) -> Self {
+        Self { memory: Arc::new(Memory::Registered(block)) }
     }
     pub fn len(&self) -> u64 {
         match &*self.memory {
-            Memory::Device(allocation) => allocation.bytes as u64,
+            Memory::Device(range) => range.bytes(),
             Memory::Mapped(mapped) => mapped.bytes as u64,
-            Memory::Reserved { bytes, .. } => *bytes as u64,
+            Memory::Block(block) => block.bytes(),
+            Memory::HostNode(block) => block.bytes() as u64,
+            Memory::Registered(block) => block.bytes() as u64,
+        }
+    }
+    /// The host address of host memory's first byte (mapped, host-node or
+    /// registered memory); device memory has none (the host reaches it by
+    /// driver copies).
+    pub(crate) fn host_address(&self) -> Option<std::ptr::NonNull<u8>> {
+        match &*self.memory {
+            Memory::Mapped(mapped) => std::ptr::NonNull::new(mapped.host()),
+            Memory::HostNode(block) => Some(block.host()),
+            Memory::Registered(block) => Some(block.host()),
+            Memory::Device(_) | Memory::Block(_) => None,
         }
     }
     /// The address kernels use.
     pub fn pointer(&self) -> u64 {
         match &*self.memory {
-            Memory::Device(allocation) => allocation.pointer,
+            Memory::Device(range) => range.pointer(),
             Memory::Mapped(mapped) => mapped.device,
-            Memory::Reserved { reservation, .. } => reservation.base,
+            Memory::Block(block) => block.pointer(),
+            Memory::HostNode(block) => block.device(),
+            Memory::Registered(block) => block.device(),
         }
     }
     /// Synchronous host write. Device memory is written by a driver copy
     /// on the non-blocking transfer stream, ordered only by the caller's
-    /// access fence; mapped memory is written in place.
+    /// access fence; host memory is written in place.
     pub(crate) fn upload_at(&self, offset: usize, bytes: &[u8]) -> Result<(), DriverError> {
         match &*self.memory {
-            Memory::Device(allocation) => allocation.upload_at(offset, bytes),
+            Memory::Device(range) => range.upload_at(offset, bytes),
+            Memory::Block(block) => block.upload_at(offset, bytes),
             Memory::Mapped(mapped) => {
                 mapped.write_at(offset, bytes);
                 Ok(())
             }
-            Memory::Reserved {
-                reservation,
-                bytes: backed,
-            } => {
-                assert_within(offset, bytes.len(), *backed, "upload_at");
-                driver::upload(
-                    reservation.context(),
-                    reservation.base + offset as u64,
-                    bytes,
-                )
+            Memory::HostNode(block) => {
+                assert_within(offset, bytes.len(), block.bytes(), "upload_at");
+                // SAFETY: within the block, which the host maps.
+                unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), block.host().as_ptr().add(offset), bytes.len()) };
+                Ok(())
+            }
+            Memory::Registered(block) => {
+                assert_within(offset, bytes.len(), block.bytes(), "upload_at");
+                // SAFETY: within the block, which the host maps.
+                unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), block.host().as_ptr().add(offset), bytes.len()) };
+                Ok(())
             }
         }
     }
-    /// Synchronous host read.
     pub(crate) fn download_at(&self, offset: usize, bytes: &mut [u8]) -> Result<(), DriverError> {
         match &*self.memory {
-            Memory::Device(allocation) => allocation.download_at(offset, bytes),
+            Memory::Device(range) => range.download_at(offset, bytes),
+            Memory::Block(block) => block.download_at(offset, bytes),
             Memory::Mapped(mapped) => {
                 mapped.read_at(offset, bytes);
                 Ok(())
             }
-            Memory::Reserved {
-                reservation,
-                bytes: backed,
-            } => {
-                assert_within(offset, bytes.len(), *backed, "download_at");
-                driver::download(
-                    reservation.context(),
-                    reservation.base + offset as u64,
-                    bytes,
-                )
+            Memory::HostNode(block) => {
+                assert_within(offset, bytes.len(), block.bytes(), "download_at");
+                // SAFETY: within the block, which the host maps.
+                unsafe { std::ptr::copy_nonoverlapping(block.host().as_ptr().add(offset), bytes.as_mut_ptr(), bytes.len()) };
+                Ok(())
+            }
+            Memory::Registered(block) => {
+                assert_within(offset, bytes.len(), block.bytes(), "download_at");
+                // SAFETY: within the block, which the host maps.
+                unsafe { std::ptr::copy_nonoverlapping(block.host().as_ptr().add(offset), bytes.as_mut_ptr(), bytes.len()) };
+                Ok(())
             }
         }
     }
 }
 
-/// This crate's own precondition: host access stays within the backed bytes.
-fn assert_within(offset: usize, length: usize, backed: usize, operation: &str) {
+/// This crate's own precondition: host access stays within the block.
+fn assert_within(offset: usize, length: usize, bytes: usize, operation: &str) {
     assert!(
-        offset.checked_add(length).is_some_and(|end| end <= backed),
-        "Buffer::{operation} precondition: [{offset}, {offset}+{length}) exceeds {backed} backed bytes"
+        offset.checked_add(length).is_some_and(|end| end <= bytes),
+        "Buffer::{operation} precondition: [{offset}, {offset}+{length}) exceeds {bytes} bytes"
     );
 }
 

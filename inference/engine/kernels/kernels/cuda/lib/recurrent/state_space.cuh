@@ -48,7 +48,7 @@ constexpr int INPUT_WIDTH = 2 * G * N + 2 * NH;
 
 // Slots of at most this many rows advance row-sequentially in either entry,
 // so a request's state bits never depend on its row class or its peers.
-constexpr int SEQUENTIAL_ROWS = 16;
+constexpr int SEQUENTIAL_ROWS = SEISMIC_CONST_SEQUENTIAL_ROWS;
 // The chunk's pieces: a slot of more than SEQUENTIAL_ROWS rows splits its
 // rows before the stop row into pieces of at most PIECE rows from its first
 // row; other slots have none. Pieces are numbered over the slots in order.
@@ -63,10 +63,10 @@ struct Operands {
     const float *rate;
     const float *time_bias;
     const float *skip;
-    const u32 *window;
-    const u32 *state;
-    const u32 *tape;
-    u8 *mixed;
+    element::SlabOut<Act> window;
+    element::SlabOut<element::F32> state;
+    element::SlabOut<element::F32> tape;
+    element::Out<Act> mixed;
     versions::Slots slots;
 };
 
@@ -78,101 +78,197 @@ struct Operands {
             reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_RATE)),                     \
             reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_TIME_BIAS)),                \
             reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SKIP)),                     \
-            reinterpret_cast<const state_space::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_WINDOW)),       \
-            reinterpret_cast<const state_space::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_STATE)),        \
-            reinterpret_cast<const state_space::u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_TAPE)),         \
-            SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), VERSIONS_SLOTS()                                 \
+            SEISMIC_OUT_WINDOW, SEISMIC_OUT_STATE, SEISMIC_OUT_TAPE, SEISMIC_RESULT_0_OUT,         \
+            VERSIONS_SLOTS()                                                                       \
     }
 
 // The group whose B and C head `head` reads.
 __device__ __forceinline__ int group_of(int head) { return head * G / NH; }
 
-// Whether `head` is its group's first head: the one that publishes and
-// records the group's B and C.
+// Whether `head` is its group's first head: the one that records the group's
+// B in the tape.
 __device__ __forceinline__ bool leads_group(int head) { return head == 0 || group_of(head - 1) != group_of(head); }
 
-// Tape row `entry` of `bank`.
-__device__ __forceinline__ float *tape_row(const Operands &in, int bank, int entry) {
+// A slot with its banks resolved: read-only views of the source version's
+// window, state and tape banks, and writable handles to the successor's. Each
+// arena's slab lookup happens once per thread, so the addressing of a row
+// never waits on a lookup.
+struct Slot : versions::Slot {
+    element::Stored<Act> window;
+    element::Stored<element::F32> state;
+    element::Stored<element::F32> tape;
+    element::Out<Act> next_window;
+    element::Out<element::F32> next_state;
+    element::Out<element::F32> next_tape;
+};
+
+__device__ __forceinline__ Slot bind(const Operands &in, const versions::Slot &rows) {
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
-    return reinterpret_cast<float *>(versions::bank(in.tape, bank, SEISMIC_TAPE_STRIDE_0 * 4, seismic_words_value)) +
-           static_cast<u64>(entry) * SEISMIC_TAPE_STRIDE_1;
+    const u64 window_elements = SEISMIC_WINDOW_STRIDE_0;
+    const u64 state_elements = SEISMIC_STATE_STRIDE_0;
+    // A planned speculative width of zero has no tape rows to address.
+    const bool taped = SEISMIC_DIM_T > 0;
+    const u64 tape_elements = SEISMIC_TAPE_STRIDE_0;
+    const element::Stored<element::F32> untaped_source(nullptr);
+    const element::Out<element::F32> untaped_target(nullptr);
+    return Slot{rows,
+                versions::bank_view(in.window, rows.source, window_elements, seismic_words_value),
+                versions::bank_view(in.state, rows.source, state_elements, seismic_words_value),
+                taped ? versions::bank_view(in.tape, rows.source, tape_elements, seismic_words_value) : untaped_source,
+                versions::bank(in.window, rows.target, window_elements, seismic_words_value),
+                versions::bank(in.state, rows.target, state_elements, seismic_words_value),
+                taped ? versions::bank(in.tape, rows.target, tape_elements, seismic_words_value) : untaped_target};
 }
 
-// Row `row` of head `head`'s state in `bank`: N contiguous floats.
-__device__ __forceinline__ float *state_row(const Operands &in, int bank, int head, int row) {
+// Tape row `entry` of a tape bank.
+template <class Bank>
+__device__ __forceinline__ Bank tape_row(const Operands &in, const Bank &bank, int entry) {
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
-    return reinterpret_cast<float *>(versions::bank(in.state, bank, SEISMIC_STATE_STRIDE_0 * 4, seismic_words_value)) +
-           static_cast<u64>(head) * SEISMIC_STATE_STRIDE_1 + static_cast<u64>(row) * SEISMIC_STATE_STRIDE_2;
+    return bank.offset(static_cast<u64>(entry) * SEISMIC_TAPE_STRIDE_1);
 }
 
-__device__ __forceinline__ u8 *window_row(const Operands &in, int bank, int tap) {
+// Row `row` of head `head`'s state in a state bank: N contiguous floats.
+template <class Bank>
+__device__ __forceinline__ Bank state_row(const Operands &in, const Bank &bank, int head, int row) {
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
-    return versions::bank(in.window, bank, SEISMIC_WINDOW_STRIDE_0 * Act::bytes, seismic_words_value) +
-           static_cast<u64>(tap) * SEISMIC_WINDOW_STRIDE_1 * Act::bytes;
+    return bank.offset(static_cast<u64>(head) * SEISMIC_STATE_STRIDE_1 + static_cast<u64>(row) * SEISMIC_STATE_STRIDE_2);
+}
+
+// Row `tap` of a window bank.
+template <class Bank>
+__device__ __forceinline__ Bank window_row(const Operands &in, const Bank &bank, int tap) {
+    [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
+    return bank.offset(static_cast<u64>(tap) * SEISMIC_WINDOW_STRIDE_1);
 }
 
 // The raw convolution input of `channel` at slot-local `position`: the source
 // version's window rows before the slot, the projection after.
-__device__ __forceinline__ float raw(const Operands &in, const versions::Slot &slot, int position, int channel) {
+__device__ __forceinline__ element::Stored<Act> raw_stored(const Operands &in, const Slot &slot, int position,
+                                                           int channel) {
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
     if (position < 0)
-        return element::at<Act>(window_row(in, slot.source, slot.taped + TAPS - 1 + position), channel);
-    return element::at<Act>(in.projection,
-                            static_cast<u64>(slot.lo + position) * SEISMIC_PROJECTION_STRIDE_0 + X_COLUMN + channel);
+        return window_row(in, slot.window, slot.taped + TAPS - 1 + position).offset(channel);
+    return element::stored<Act>(
+        in.projection, static_cast<u64>(slot.lo + position) * SEISMIC_PROJECTION_STRIDE_0 + X_COLUMN + channel);
 }
 
-// SiLU of the causal depthwise convolution of `channel` at slot-local row
-// `local` plus the channel's bias, in the body's order: the current row's
-// tap, then taps 0..C - 1 fused in turn, then the bias.
-__device__ __forceinline__ float convolve(const Operands &in, const versions::Slot &slot, int local, int channel) {
+__device__ __forceinline__ float raw(const Operands &in, const Slot &slot, int position, int channel) {
+    return raw_stored(in, slot, position, channel).at();
+}
+
+// The inputs of one convolved channel at one row: its raw values at the
+// taps (the oldest first, the row's own last), the tap weights and the bias.
+// Gathering them apart from the arithmetic lets a thread's reads of several
+// channels overlap.
+struct ConvolutionInputs {
+    float raw[TAPS];
+    float weight[TAPS];
+    float bias;
+};
+
+__device__ __forceinline__ ConvolutionInputs convolution_inputs(const Operands &in, const Slot &slot, int local,
+                                                                int channel) {
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
     const float *weights = in.convolution + static_cast<u64>(channel) * SEISMIC_CONVOLUTION_STRIDE_0;
-    float sum = seismic_mul_rn(weights[(TAPS - 1) * SEISMIC_CONVOLUTION_STRIDE_1], raw(in, slot, local, channel));
+    ConvolutionInputs inputs;
 #pragma unroll
-    for (int tap = 0; tap + 1 < TAPS; ++tap)
-        sum = seismic_fma_rn(weights[tap * SEISMIC_CONVOLUTION_STRIDE_1], raw(in, slot, local + tap - (TAPS - 1), channel),
-                             sum);
-    sum = seismic_add_rn(sum, in.convolution_bias[static_cast<u64>(channel) * SEISMIC_CONVOLUTION_BIAS_STRIDE_0]);
+    for (int tap = 0; tap < TAPS; ++tap) {
+        inputs.raw[tap] = raw(in, slot, local + tap - (TAPS - 1), channel);
+        inputs.weight[tap] = weights[tap * SEISMIC_CONVOLUTION_STRIDE_1];
+    }
+    inputs.bias = in.convolution_bias[static_cast<u64>(channel) * SEISMIC_CONVOLUTION_BIAS_STRIDE_0];
+    return inputs;
+}
+
+// SiLU of the causal depthwise convolution plus the channel's bias, in the
+// body's order: the row's own tap, then taps 0..C - 2 fused in turn, then the
+// bias.
+__device__ __forceinline__ float convolved(const ConvolutionInputs &inputs) {
+    float sum = seismic_mul_rn(inputs.weight[TAPS - 1], inputs.raw[TAPS - 1]);
+#pragma unroll
+    for (int tap = 0; tap + 1 < TAPS; ++tap) sum = seismic_fma_rn(inputs.weight[tap], inputs.raw[tap], sum);
+    sum = seismic_add_rn(sum, inputs.bias);
     return sum / (1.0f + expf(-sum));
 }
 
+// The convolved `channel` at slot-local row `local`.
+__device__ __forceinline__ float convolve(const Operands &in, const Slot &slot, int local, int channel) {
+    return convolved(convolution_inputs(in, slot, local, channel));
+}
+
 // The step size delta = softplus(dt + time_bias) and the log decay
-// rate * delta of head `head` at `row`.
+// rate * delta of head `head` at `row`, from the inputs gathered apart.
 struct Step {
     float delta;
     float log_decay;
 };
 
-__device__ __forceinline__ Step step_of(const Operands &in, int row, int head) {
+struct StepInputs {
+    float dt;
+    float time_bias;
+    float rate;
+};
+
+__device__ __forceinline__ StepInputs step_inputs(const Operands &in, int row, int head) {
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
-    const float shifted = element::at<Act>(in.projection, static_cast<u64>(row) * SEISMIC_PROJECTION_STRIDE_0 +
-                                                              DT_COLUMN + head) +
-                          in.time_bias[head * SEISMIC_TIME_BIAS_STRIDE_0];
-    const float delta = fmaxf(shifted, 0.0f) + logf(1.0f + expf(-fabsf(shifted)));
-    return Step{delta, seismic_mul_rn(in.rate[head * SEISMIC_RATE_STRIDE_0], delta)};
+    return StepInputs{
+        element::at<Act>(in.projection, static_cast<u64>(row) * SEISMIC_PROJECTION_STRIDE_0 + DT_COLUMN + head),
+        in.time_bias[head * SEISMIC_TIME_BIAS_STRIDE_0], in.rate[head * SEISMIC_RATE_STRIDE_0]};
 }
+
+__device__ __forceinline__ Step stepped(const StepInputs &inputs) {
+    const float shifted = inputs.dt + inputs.time_bias;
+    const float delta = fmaxf(shifted, 0.0f) + logf(1.0f + expf(-fabsf(shifted)));
+    return Step{delta, seismic_mul_rn(inputs.rate, delta)};
+}
+
+__device__ __forceinline__ Step step_of(const Operands &in, int row, int head) {
+    return stepped(step_inputs(in, row, head));
+}
+
+// The heads of group `group`: [first_head(group), first_head(group + 1)).
+__device__ __forceinline__ int first_head(int group) { return (group * NH + G - 1) / G; }
 
 // Publishes head `head`'s share of the slot's successor window (the C - 1 raw
 // rows before the publication row, then the raw rows of its tape): its x
-// channels, and its group's B and C channels when it leads the group. The
-// `part`-th of `parts` cooperating blocks copies an even share.
-__device__ __forceinline__ void publish_window(const Operands &in, const versions::Slot &slot, int head, u64 part,
-                                               u64 parts) {
+// channels and an even share of its group's B and C channels among the
+// group's heads. The `part`-th of `parts` cooperating blocks copies an even
+// share. A thread reads its next BATCH items before writing any, so the reads
+// overlap.
+__device__ __forceinline__ void publish_window(const Operands &in, const Slot &slot, int head, int part, int parts) {
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
-    const int taps = TAPS - 1;
-    const int rows = taps + versions::tape_rows(slot, seismic_words_value);
+    constexpr int BATCH = 4;
     const int group = group_of(head);
-    const u64 per_tap = P + (leads_group(head) ? 2 * N : 0);
-    const u64 total = static_cast<u64>(rows) * per_tap;
-    const u64 per = (total + parts - 1) / parts;
-    const u64 last = min(total, (part + 1) * per);
-    for (u64 item = part * per + threadIdx.x; item < last; item += blockDim.x) {
-        const int tap = static_cast<int>(item / per_tap);
-        const int offset = static_cast<int>(item % per_tap);
-        const int channel = offset < P       ? head * P + offset
-                            : offset < P + N ? B_CHANNEL + group * N + offset - P
-                                             : C_CHANNEL + group * N + offset - P - N;
-        element::put<Act>(window_row(in, slot.target, tap), channel, raw(in, slot, slot.stop + tap - taps, channel));
+    const int lead = first_head(group);
+    const int heads = first_head(group + 1) - lead;
+    // This head's columns [shared_lo, shared_lo + per_tap - P) of the group's
+    // 2N B | C columns.
+    const int shared_lo = (head - lead) * 2 * N / heads;
+    const int per_tap = P + (head - lead + 1) * 2 * N / heads - shared_lo;
+    const int total = (TAPS - 1 + versions::tape_rows(slot, static_cast<int>(SEISMIC_DIM_T))) * per_tap;
+    const int per = (total + parts - 1) / parts;
+    const int last = min(total, (part + 1) * per);
+    const int stride = static_cast<int>(blockDim.x);
+    for (int first = part * per + static_cast<int>(threadIdx.x); first < last; first += BATCH * stride) {
+        int taps_of[BATCH];
+        int channels[BATCH];
+        element::StoredValue<Act> values[BATCH];
+#pragma unroll
+        for (int k = 0; k < BATCH; ++k) {
+            const int item = first + k * stride;
+            const int offset = item % per_tap;
+            const int column = shared_lo + offset - P;
+            taps_of[k] = item / per_tap;
+            channels[k] = offset < P    ? head * P + offset
+                          : column < N ? B_CHANNEL + group * N + column
+                                       : C_CHANNEL + group * N + column - N;
+            if (item < last)
+                values[k] = raw_stored(in, slot, slot.stop + taps_of[k] - (TAPS - 1), channels[k]).item();
+        }
+#pragma unroll
+        for (int k = 0; k < BATCH; ++k)
+            if (first + k * stride < last)
+                window_row(in, slot.next_window, taps_of[k]).put_stored(channels[k], values[k]);
     }
 }
 
@@ -182,39 +278,36 @@ template <int LANE_ROWS> struct Rows {
     float values[LANE_ROWS][COLUMNS];
 };
 
+// A lane's COLUMNS columns move in the widest equal pieces (`Out::span`,
+// `Out::put_span`): they start at a multiple of COLUMNS floats of a state row,
+// and state rows and banks are 16-byte aligned (N % 32 == 0, 256-byte slabs).
 template <int LANE_ROWS>
-__device__ __forceinline__ void store_rows(const Operands &in, int bank, int head, int row0, int lane,
-                                           const Rows<LANE_ROWS> &rows) {
+__device__ __forceinline__ void store_rows(const Operands &in, const element::Out<element::F32> &bank, int head, int row0,
+                                           int lane, const Rows<LANE_ROWS> &rows) {
 #pragma unroll
-    for (int r = 0; r < LANE_ROWS; ++r) {
-        float *to = state_row(in, bank, head, row0 + r) + lane * COLUMNS;
-#pragma unroll
-        for (int c = 0; c < COLUMNS; ++c) to[c] = rows.values[r][c];
-    }
+    for (int r = 0; r < LANE_ROWS; ++r)
+        state_row(in, bank, head, row0 + r).put_span(lane * COLUMNS, rows.values[r]);
 }
 
 // The rows of the slot's source version: the bank's state advanced by its
 // first `taped` tape rows with the step's update, so the bits equal a run that
 // published after those rows.
 template <int LANE_ROWS>
-__device__ __forceinline__ void load_version(const Operands &in, const versions::Slot &slot, int head, int row0,
+__device__ __forceinline__ void load_version(const Operands &in, const Slot &slot, int head, int row0,
                                              int lane, Rows<LANE_ROWS> &rows) {
 #pragma unroll
-    for (int r = 0; r < LANE_ROWS; ++r) {
-        const float *from = state_row(in, slot.source, head, row0 + r) + lane * COLUMNS;
-#pragma unroll
-        for (int c = 0; c < COLUMNS; ++c) rows.values[r][c] = from[c];
-    }
+    for (int r = 0; r < LANE_ROWS; ++r)
+        state_row(in, slot.state, head, row0 + r).span(lane * COLUMNS, rows.values[r]);
     const int group = group_of(head);
     for (int entry = 0; entry < slot.taped; ++entry) {
-        const float *tape = tape_row(in, slot.source, entry);
-        const float decay = tape[TAPE_D + head];
+        const element::Stored<element::F32> tape = tape_row(in, slot.tape, entry);
+        const float decay = tape.at(TAPE_D + head);
         float b[COLUMNS];
 #pragma unroll
-        for (int c = 0; c < COLUMNS; ++c) b[c] = tape[TAPE_B + group * N + lane * COLUMNS + c];
+        for (int c = 0; c < COLUMNS; ++c) b[c] = tape.at(TAPE_B + group * N + lane * COLUMNS + c);
 #pragma unroll
         for (int r = 0; r < LANE_ROWS; ++r) {
-            const float input = tape[TAPE_U + head * P + row0 + r];
+            const float input = tape.at(TAPE_U + head * P + row0 + r);
 #pragma unroll
             for (int c = 0; c < COLUMNS; ++c)
                 rows.values[r][c] = seismic_fma_rn(input, b[c], seismic_mul_rn(rows.values[r][c], decay));
@@ -244,44 +337,69 @@ template <int BLOCK_ROWS, int SPAN> struct SequentialShared {
 // each row's step size and decay; after one barrier the rows advance in
 // order: S <- decay S + (delta x) B^T, output S C + D x.
 template <int LANE_ROWS, int BLOCK_ROWS, int SPAN>
-__device__ __forceinline__ void advance_rows(const Operands &in, const versions::Slot &slot, int begin, int head,
+__device__ __forceinline__ void advance_rows(const Operands &in, const Slot &slot, int begin, int head,
                                              int block_row0, int row0, Rows<LANE_ROWS> &rows,
                                              SequentialShared<BLOCK_ROWS, SPAN> &shared) {
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
     const int lane = threadIdx.x % 32;
     const int group = group_of(head);
     const int publish = slot.lo + slot.stop;
-    const int recorded = versions::tape_rows(slot, seismic_words_value);
+    const int recorded = versions::tape_rows(slot, static_cast<int>(SEISMIC_DIM_T));
     const float skip = in.skip[head * SEISMIC_SKIP_STRIDE_0];
     // The warp that owns state row 0 records the decay, and B when the head
     // leads its group.
     const bool records = row0 == 0;
     const bool records_b = records && leads_group(head);
     const int local_row = row0 - block_row0;
+    // A row's staged items, and a thread's share of one row's items in a
+    // block of four warps.
+    constexpr int STAGED_WIDTH = 2 * N + BLOCK_ROWS;
+    constexpr int STAGED = (STAGED_WIDTH + 127) / 128;
     if (begin == publish)
-        store_rows<LANE_ROWS>(in, slot.target, head, row0, lane, rows);
+        store_rows<LANE_ROWS>(in, slot.next_state, head, row0, lane, rows);
     for (int first = begin; first < slot.hi; first += SPAN) {
         const int count = min(SPAN, slot.hi - first);
-        for (int item = threadIdx.x; item < count * 2 * N; item += blockDim.x) {
-            const int i = item / (2 * N);
-            const int column = item % (2 * N);
-            const int channel = column < N ? B_CHANNEL + group * N + column : C_CHANNEL + group * N + column - N;
-            const float value = convolve(in, slot, first + i - slot.lo, channel);
-            if (column < N)
-                shared.b[i][column] = value;
-            else
-                shared.c[i][column - N] = value;
-        }
-        // The x channels go to the last threads, off the B/C work.
-        for (int item = blockDim.x - 1 - threadIdx.x; item < count * BLOCK_ROWS; item += blockDim.x) {
-            const int i = item / BLOCK_ROWS;
-            shared.x[i][item % BLOCK_ROWS] =
-                convolve(in, slot, first + i - slot.lo, head * P + block_row0 + item % BLOCK_ROWS);
-        }
-        for (int i = threadIdx.x; i < count; i += blockDim.x) {
-            const Step step = step_of(in, first + i, head);
-            shared.delta[i] = step.delta;
-            shared.decay[i] = expf(step.log_decay);
+        // Items of a row: the group's B and C channels, then the block's x
+        // channels. A thread gathers STAGED items' inputs (and the step inputs
+        // of row first + threadIdx.x) before any arithmetic, so the reads
+        // overlap.
+        const int items = count * STAGED_WIDTH;
+        for (int base = 0; base < items; base += STAGED * static_cast<int>(blockDim.x)) {
+            ConvolutionInputs inputs[STAGED];
+#pragma unroll
+            for (int k = 0; k < STAGED; ++k) {
+                const int item = base + k * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
+                const int column = item % STAGED_WIDTH;
+                const int channel = column < N       ? B_CHANNEL + group * N + column
+                                    : column < 2 * N ? C_CHANNEL + group * N + column - N
+                                                     : head * P + block_row0 + column - 2 * N;
+                if (item < items)
+                    inputs[k] = convolution_inputs(in, slot, first + item / STAGED_WIDTH - slot.lo, channel);
+            }
+            const bool steps = base == 0 && static_cast<int>(threadIdx.x) < count;
+            StepInputs step;
+            if (steps)
+                step = step_inputs(in, first + threadIdx.x, head);
+#pragma unroll
+            for (int k = 0; k < STAGED; ++k) {
+                const int item = base + k * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
+                const int i = item / STAGED_WIDTH;
+                const int column = item % STAGED_WIDTH;
+                if (item >= items)
+                    continue;
+                const float value = convolved(inputs[k]);
+                if (column < N)
+                    shared.b[i][column] = value;
+                else if (column < 2 * N)
+                    shared.c[i][column - N] = value;
+                else
+                    shared.x[i][column - 2 * N] = value;
+            }
+            if (steps) {
+                const Step stepped_row = stepped(step);
+                shared.delta[threadIdx.x] = stepped_row.delta;
+                shared.decay[threadIdx.x] = expf(stepped_row.log_decay);
+            }
         }
         __syncthreads();
         for (int i = 0; i < count; ++i) {
@@ -295,21 +413,22 @@ __device__ __forceinline__ void advance_rows(const Operands &in, const versions:
                 b[j] = shared.b[i][lane * COLUMNS + j];
                 c[j] = shared.c[i][lane * COLUMNS + j];
             }
-            float *entry = row >= publish && row - publish < recorded ? tape_row(in, slot.target, row - publish)
-                                                                      : nullptr;
-            if (entry != nullptr && records_b) {
+            const bool recording = row >= publish && row - publish < recorded;
+            const element::Out<element::F32> entry =
+                recording ? tape_row(in, slot.next_tape, row - publish) : element::Out<element::F32>(nullptr);
+            if (recording && records_b) {
 #pragma unroll
-                for (int j = 0; j < COLUMNS; ++j) entry[TAPE_B + group * N + lane * COLUMNS + j] = b[j];
+                for (int j = 0; j < COLUMNS; ++j) entry.put(TAPE_B + group * N + lane * COLUMNS + j, b[j]);
             }
-            if (entry != nullptr && records && lane == 0)
-                entry[TAPE_D + head] = decay;
+            if (recording && records && lane == 0)
+                entry.put(TAPE_D + head, decay);
             float mine = 0.0f;
 #pragma unroll
             for (int r = 0; r < LANE_ROWS; ++r) {
                 const float value = shared.x[i][local_row + r];
                 const float input = seismic_mul_rn(delta, value);
-                if (entry != nullptr && lane == r)
-                    entry[TAPE_U + head * P + row0 + r] = input;
+                if (recording && lane == r)
+                    entry.put(TAPE_U + head * P + row0 + r, input);
                 float sum = 0.0f;
 #pragma unroll
                 for (int j = 0; j < COLUMNS; ++j) {
@@ -320,12 +439,11 @@ __device__ __forceinline__ void advance_rows(const Operands &in, const versions:
                 mine = lane == r ? output : mine;
             }
             if (lane < LANE_ROWS)
-                element::put<Act>(in.mixed,
-                                  static_cast<u64>(row) * SEISMIC_RESULT_0_STRIDE_0 + head * SEISMIC_RESULT_0_STRIDE_1 +
-                                      (row0 + lane) * SEISMIC_RESULT_0_STRIDE_2,
-                                  mine);
+                in.mixed.put(static_cast<u64>(row) * SEISMIC_RESULT_0_STRIDE_0 + head * SEISMIC_RESULT_0_STRIDE_1 +
+                                 (row0 + lane) * SEISMIC_RESULT_0_STRIDE_2,
+                             mine);
             if (row + 1 == publish)
-                store_rows<LANE_ROWS>(in, slot.target, head, row0, lane, rows);
+                store_rows<LANE_ROWS>(in, slot.next_state, head, row0, lane, rows);
         }
         __syncthreads();
     }
@@ -340,10 +458,9 @@ __device__ __forceinline__ void zero_uncovered(const Operands &in, int head, int
     const int covered = versions::covered_end(in.slots, seismic_words_value);
     for (u64 row = covered; row < SEISMIC_DIM_M; ++row)
         if (lane < LANE_ROWS)
-            element::put<Act>(in.mixed,
-                              row * SEISMIC_RESULT_0_STRIDE_0 + head * SEISMIC_RESULT_0_STRIDE_1 +
-                                  (row0 + lane) * SEISMIC_RESULT_0_STRIDE_2,
-                              0.0f);
+            in.mixed.put(row * SEISMIC_RESULT_0_STRIDE_0 + head * SEISMIC_RESULT_0_STRIDE_1 +
+                             (row0 + lane) * SEISMIC_RESULT_0_STRIDE_2,
+                         0.0f);
 }
 
 // The pieces of a slot (see PIECE).

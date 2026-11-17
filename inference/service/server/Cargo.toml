@@ -13,10 +13,12 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 axum.workspace = true
 clap.workspace = true
 futures-util.workspace = true
 libc.workspace = true
+magnitude-artifacts = { path = "../../engine/artifacts" }
 magnitude-engine = { path = "../../engine" }
 magnitude-executor = { path = "../../engine/executor" }
 magnitude-service-api = { path = "../api" }
@@ -26,8 +28,10 @@ magnitude-service-utils.workspace = true
 magnitude-serving = { path = "../../engine/serving" }
 opentelemetry.workspace = true
 opentelemetry-appender-tracing.workspace = true
+opentelemetry-http.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry_sdk.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
 seismic.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -39,11 +43,16 @@ tracing.workspace = true
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 
+[[test]]
+name = "residency_lifecycle"
+harness = false
+
 [dev-dependencies]
+flate2.workspace = true
+hf-hub.workspace = true
+# The catalog's headers (`headers`), for the header-cache skeleton test.
+magnitude-family-common = { path = "../../engine/families/common", features = ["catalog-headers"] }
 http-body-util.workspace = true
-# Every catalog model's kernel requests form (`assessment/catalog_kernels_tests.rs`).
-magnitude-kernels = { path = "../../engine/kernels" }
-seismic = { workspace = true, features = ["coverage"] }
 tempfile = "3.24.0"
 tower = { workspace = true, features = ["util"] }
 tokio = { workspace = true, features = ["test-util"] }

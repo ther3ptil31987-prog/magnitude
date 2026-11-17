@@ -4,6 +4,7 @@
 
 use lib::vision::vision;
 
+#[inline(always)]
 fn vision_pool<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
     let (g, h) = (cx.dim_g() as usize, cx.dim_h() as usize);
@@ -19,7 +20,7 @@ fn vision_pool<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3],
     });
     let result = cx.result_0();
     // SAFETY: each work item writes its own row.
-    let out = unsafe { result.span_mut([row, 0], h) };
+    let mut out = unsafe { result.span_mut([row, 0], h) };
     for (column, target) in out.iter_mut().enumerate() {
         let mut sum = 0.0f32;
         for member in 0..g {
@@ -29,6 +30,6 @@ fn vision_pool<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3],
         if let Some((bias, standard_scale)) = standardize {
             value = (value - bias[column]) * standard_scale[column];
         }
-        *target = value;
+        target.set(value);
     }
 }

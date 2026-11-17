@@ -5,14 +5,28 @@
 
 use crate::{ArtifactIdentity, Error, FileSource};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
-    io::{BufReader, Read, Seek, SeekFrom},
+    collections::{HashMap, HashSet},
+    fmt,
+    io::{Read, Seek, SeekFrom},
+    ops::Range,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, OnceLock, Weak,
+    },
 };
 
-pub const DEFAULT_HEADER_LIMIT: u64 = 256 * 1024 * 1024;
+mod walk;
+
+pub use walk::{
+    walk, Absence, Entry, EntryHead, Header, HeaderBytes, Preamble, Prefix, SharedHeader, Skeleton,
+    TensorInfo, Walk, HEADER_LIMIT,
+};
+
+/// The `general.architecture` a multimodal projector declares.
+pub const PROJECTOR_ARCHITECTURE: &str = "clip";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ByteOrder {
@@ -20,175 +34,7 @@ pub enum ByteOrder {
     Big,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[repr(u32)]
-pub enum Encoding {
-    // Numeric IDs, block element counts, and serialized block sizes below are
-    // pinned to ggml/llama.cpp commit
-    // 5e6c0e18b6b11f109411401239b3b0ef61058dae:
-    //   ggml/include/ggml.h (`enum ggml_type`)
-    //   ggml/src/ggml-common.h (`QK_*` and `block_*` definitions)
-    // Every type a GGUF file can store is listed, so any valid header
-    // parses. Keep this container description independent from numerical
-    // import support: accepting a directory entry does not imply that an
-    // execution backend can decode it. Retired ids (4, 5, 31-33, 36-38) are
-    // not valid in GGUF files.
-    F32 = 0,
-    F16 = 1,
-    Q4_0 = 2,
-    Q4_1 = 3,
-    Q5_0 = 6,
-    Q5_1 = 7,
-    Q8_0 = 8,
-    Q8_1 = 9,
-    Q2K = 10,
-    Q3K = 11,
-    Q4K = 12,
-    Q5K = 13,
-    Q6K = 14,
-    Q8K = 15,
-    Iq2Xxs = 16,
-    Iq2Xs = 17,
-    Iq3Xxs = 18,
-    Iq1S = 19,
-    Iq4Nl = 20,
-    Iq3S = 21,
-    Iq2S = 22,
-    Iq4Xs = 23,
-    I8 = 24,
-    I16 = 25,
-    I32 = 26,
-    I64 = 27,
-    F64 = 28,
-    Iq1M = 29,
-    BF16 = 30,
-    Tq1_0 = 34,
-    Tq2_0 = 35,
-    Mxfp4 = 39,
-    Nvfp4 = 40,
-    Q1_0 = 41,
-}
-
-impl Encoding {
-    /// Every encoding, in ggml id order.
-    pub const ALL: [Self; 34] = [
-        Self::F32,
-        Self::F16,
-        Self::Q4_0,
-        Self::Q4_1,
-        Self::Q5_0,
-        Self::Q5_1,
-        Self::Q8_0,
-        Self::Q8_1,
-        Self::Q2K,
-        Self::Q3K,
-        Self::Q4K,
-        Self::Q5K,
-        Self::Q6K,
-        Self::Q8K,
-        Self::Iq2Xxs,
-        Self::Iq2Xs,
-        Self::Iq3Xxs,
-        Self::Iq1S,
-        Self::Iq4Nl,
-        Self::Iq3S,
-        Self::Iq2S,
-        Self::Iq4Xs,
-        Self::I8,
-        Self::I16,
-        Self::I32,
-        Self::I64,
-        Self::F64,
-        Self::Iq1M,
-        Self::BF16,
-        Self::Tq1_0,
-        Self::Tq2_0,
-        Self::Mxfp4,
-        Self::Nvfp4,
-        Self::Q1_0,
-    ];
-
-    pub fn block_elements(self) -> u64 {
-        match self {
-            Self::F32
-            | Self::F16
-            | Self::BF16
-            | Self::F64
-            | Self::I8
-            | Self::I16
-            | Self::I32
-            | Self::I64 => 1,
-            Self::Q4_0
-            | Self::Q4_1
-            | Self::Q5_0
-            | Self::Q5_1
-            | Self::Q8_0
-            | Self::Q8_1
-            | Self::Iq4Nl
-            | Self::Mxfp4 => 32,
-            Self::Nvfp4 => 64,
-            Self::Q1_0 => 128,
-            Self::Q2K
-            | Self::Q3K
-            | Self::Q4K
-            | Self::Q5K
-            | Self::Q6K
-            | Self::Q8K
-            | Self::Iq2Xxs
-            | Self::Iq2Xs
-            | Self::Iq2S
-            | Self::Iq3Xxs
-            | Self::Iq3S
-            | Self::Iq1S
-            | Self::Iq1M
-            | Self::Iq4Xs
-            | Self::Tq1_0
-            | Self::Tq2_0 => 256,
-        }
-    }
-
-    pub fn block_bytes(self) -> u64 {
-        match self {
-            Self::I8 => 1,
-            Self::F16 | Self::BF16 | Self::I16 => 2,
-            Self::F32 | Self::I32 => 4,
-            Self::F64 | Self::I64 => 8,
-            Self::Q4_0 | Self::Iq4Nl | Self::Q1_0 => 18,
-            Self::Q4_1 => 20,
-            Self::Q5_0 => 22,
-            Self::Q5_1 => 24,
-            Self::Q8_0 => 34,
-            Self::Q8_1 => 36,
-            Self::Mxfp4 => 17,
-            Self::Nvfp4 => 36,
-            Self::Iq1S => 50,
-            Self::Tq1_0 => 54,
-            Self::Iq1M => 56,
-            Self::Iq2Xxs | Self::Tq2_0 => 66,
-            Self::Iq2Xs => 74,
-            Self::Iq2S => 82,
-            Self::Q2K => 84,
-            Self::Iq3Xxs => 98,
-            Self::Q3K | Self::Iq3S => 110,
-            Self::Iq4Xs => 136,
-            Self::Q4K => 144,
-            Self::Q5K => 176,
-            Self::Q6K => 210,
-            Self::Q8K => 292,
-        }
-    }
-}
-
-impl TryFrom<u32> for Encoding {
-    type Error = Error;
-
-    fn try_from(value: u32) -> Result<Self, Self::Error> {
-        Self::ALL
-            .into_iter()
-            .find(|encoding| *encoding as u32 == value)
-            .ok_or_else(|| invalid(format!("unknown GGUF tensor type {value}")))
-    }
-}
+pub use magnitude_ggml::Encoding;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Scalar {
@@ -199,10 +45,562 @@ pub enum Scalar {
     Float(f64),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
+#[cfg_attr(any(test, feature = "equality"), derive(PartialEq))]
 pub enum Value {
     Scalar(Scalar),
-    Array(Vec<Scalar>),
+    Array(Array),
+}
+
+/// One GGUF metadata array: how many elements it holds, what kind ([`Self::kind`]), and the
+/// elements ([`Self::elements`]).
+///
+/// An array read from a header holds its payload as the bytes it occupies there: a span of the
+/// header's bytes shared by every array read from them, or, for an array read from a header
+/// skeleton ([`read_skeleton`]), the content-addressed file the skeleton names for it, read and
+/// checked against its sha256 when its elements are first needed. It decodes and checks the
+/// payload the first time its elements are read, and its clones share that result. An array
+/// built in code, or detached from its header ([`Directory::detach`]), holds its elements alone,
+/// shared by its clones.
+#[derive(Clone)]
+pub struct Array(Repr);
+
+#[derive(Clone)]
+enum Repr {
+    Decoded(Arc<Elements>),
+    Stored(Arc<Stored>),
+}
+
+/// An array read from a header: `count` elements stored as `stored` in `order`.
+struct Stored {
+    /// The entry's key, which a payload that can't be read is reported by.
+    key: String,
+    stored: ValueType,
+    order: ByteOrder,
+    count: usize,
+    payload: Payload,
+    decoded: OnceLock<Elements>,
+    /// Whether a payload apart from its skeleton failed to read ([`Array::lost_payload`]).
+    lost: AtomicBool,
+}
+
+/// Where a read array's payload is.
+enum Payload {
+    /// A range of the header's bytes, shared with every other array read from them.
+    Held {
+        bytes: Arc<Vec<u8>>,
+        range: Range<usize>,
+    },
+    /// Apart from the skeleton the array was read from ([`Absence`]), read when first needed
+    /// ([`verified`]).
+    Apart {
+        absence: Absence,
+        read: OnceLock<Arc<Vec<u8>>>,
+    },
+}
+
+/// What the elements of an array are, known whether or not its payload has been read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    String,
+    Bool,
+    Unsigned,
+    Signed,
+    Float,
+}
+
+/// The elements of a GGUF metadata array. A GGUF array has a single element type, so its elements
+/// are held unboxed in one buffer of that type rather than as a [`Scalar`] (and, for text, an
+/// allocation) apiece: a tokenizer's hundreds of thousands of pieces, merges, scores and kinds then
+/// take about the bytes they occupy in the file, where boxed scalars took several times that.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Elements {
+    String(Strings),
+    Bool(Vec<bool>),
+    Unsigned(Vec<u64>),
+    Signed(Vec<i64>),
+    Float(Vec<f64>),
+}
+
+/// The elements of a text array, concatenated, with where each one ends.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Strings {
+    text: String,
+    ends: Vec<u32>,
+}
+
+/// One element of an [`Elements`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Element<'a> {
+    String(&'a str),
+    Bool(bool),
+    Unsigned(u64),
+    Signed(i64),
+    Float(f64),
+}
+
+impl Strings {
+    /// Room for `count` strings of `text` bytes in all.
+    fn with_capacity(count: usize, text: usize) -> Self {
+        Self {
+            text: String::with_capacity(text),
+            ends: Vec::with_capacity(count),
+        }
+    }
+
+    fn push(&mut self, value: &str) -> Result<(), Error> {
+        self.text.push_str(value);
+        self.ends.push(
+            u32::try_from(self.text.len())
+                .map_err(|_| invalid("GGUF string array exceeds its addressable length"))?,
+        );
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ends.is_empty()
+    }
+
+    pub fn get(&self, index: usize) -> Option<&str> {
+        let end = *self.ends.get(index)? as usize;
+        let start = index
+            .checked_sub(1)
+            .map_or(0, |previous| self.ends[previous] as usize);
+        Some(&self.text[start..end])
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &str> + '_ {
+        (0..self.len()).map(|index| self.get(index).expect("an index below the length"))
+    }
+}
+
+impl<S: AsRef<str>> FromIterator<S> for Strings {
+    fn from_iter<I: IntoIterator<Item = S>>(values: I) -> Self {
+        let mut strings = Self::default();
+        for value in values {
+            strings
+                .push(value.as_ref())
+                .expect("an in-memory string array within its addressable length");
+        }
+        strings
+    }
+}
+
+impl Elements {
+    pub fn kind(&self) -> Kind {
+        match self {
+            Self::String(_) => Kind::String,
+            Self::Bool(_) => Kind::Bool,
+            Self::Unsigned(_) => Kind::Unsigned,
+            Self::Signed(_) => Kind::Signed,
+            Self::Float(_) => Kind::Float,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Self::String(values) => values.len(),
+            Self::Bool(values) => values.len(),
+            Self::Unsigned(values) => values.len(),
+            Self::Signed(values) => values.len(),
+            Self::Float(values) => values.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn get(&self, index: usize) -> Option<Element<'_>> {
+        Some(match self {
+            Self::String(values) => Element::String(values.get(index)?),
+            Self::Bool(values) => Element::Bool(*values.get(index)?),
+            Self::Unsigned(values) => Element::Unsigned(*values.get(index)?),
+            Self::Signed(values) => Element::Signed(*values.get(index)?),
+            Self::Float(values) => Element::Float(*values.get(index)?),
+        })
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = Element<'_>> + '_ {
+        (0..self.len()).map(|index| self.get(index).expect("an index below the length"))
+    }
+}
+
+impl Stored {
+    /// The payload's bytes: the header's, or the verified bytes a skeleton names for it
+    /// ([`verified`]), fetched once.
+    fn payload(&self) -> Result<&[u8], Error> {
+        match &self.payload {
+            Payload::Held { bytes, range } => Ok(&bytes[range.clone()]),
+            Payload::Apart { absence, read } => {
+                if let Some(bytes) = read.get() {
+                    return Ok(bytes);
+                }
+                let bytes = verified(&self.key, absence)
+                    .inspect_err(|_| self.lost.store(true, Ordering::Relaxed))?;
+                Ok(read.get_or_init(|| bytes))
+            }
+        }
+    }
+}
+
+/// The bytes `absence` names for the array of `key`: its file's (no more of it read than one byte
+/// past its length), checked to be its length and to have its sha256, and so the bytes the header
+/// cache wrote ([`Error::PayloadRead`] when they can't be read, [`Error::DamagedPayload`] when
+/// they aren't those). Verified bytes are
+/// shared by their digest while any array holds them, so another header with the same payload
+/// (a tokenizer many models share) reads and hashes nothing; once no array holds them they are
+/// freed, and the next reader verifies them again. Nothing is remembered as verified apart from
+/// the bytes themselves.
+fn verified(key: &str, absence: &Absence) -> Result<Arc<Vec<u8>>, Error> {
+    static VERIFIED: OnceLock<Mutex<HashMap<[u8; 32], Weak<Vec<u8>>>>> = OnceLock::new();
+    let shared = VERIFIED.get_or_init(Mutex::default);
+    let held = |shared: &HashMap<[u8; 32], Weak<Vec<u8>>>| {
+        shared
+            .get(&absence.digest)
+            .and_then(Weak::upgrade)
+            .filter(|bytes| bytes.len() == absence.length)
+    };
+    let lock = || {
+        shared
+            .lock()
+            .expect("no reader panics holding the verified payloads")
+    };
+    if let Some(bytes) = held(&*lock()) {
+        return Ok(bytes);
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(&absence.file)
+        .and_then(|file| file.take(absence.length as u64 + 1).read_to_end(&mut bytes))
+        .map_err(|error| Error::PayloadRead {
+            key: key.to_owned(),
+            error,
+        })?;
+    if bytes.len() != absence.length || sha256(&bytes) != absence.digest {
+        return Err(Error::DamagedPayload {
+            key: key.to_owned(),
+        });
+    }
+    let bytes = Arc::new(bytes);
+    let mut verified = lock();
+    if let Some(bytes) = held(&*verified) {
+        return Ok(bytes);
+    }
+    verified.retain(|_, bytes| bytes.strong_count() > 0);
+    verified.insert(absence.digest, Arc::downgrade(&bytes));
+    Ok(bytes)
+}
+
+impl Array {
+    /// The array of `key`, `count` elements stored as `stored` in `order`, whose payload is
+    /// `bytes[range]`, which the walk hopped as that many such elements.
+    fn held(
+        key: &str,
+        stored: ValueType,
+        order: ByteOrder,
+        count: usize,
+        bytes: Arc<Vec<u8>>,
+        range: Range<usize>,
+    ) -> Self {
+        Self::stored(key, stored, order, count, Payload::Held { bytes, range })
+    }
+
+    /// The array of `key`, read from a skeleton whose `absence` its payload is, which the walk
+    /// passed as `count` elements stored as `stored` in `order`.
+    fn apart(
+        key: &str,
+        stored: ValueType,
+        order: ByteOrder,
+        count: usize,
+        absence: Absence,
+    ) -> Self {
+        let read = OnceLock::new();
+        Self::stored(key, stored, order, count, Payload::Apart { absence, read })
+    }
+
+    fn stored(
+        key: &str,
+        stored: ValueType,
+        order: ByteOrder,
+        count: usize,
+        payload: Payload,
+    ) -> Self {
+        Self(Repr::Stored(Arc::new(Stored {
+            key: key.to_owned(),
+            stored,
+            order,
+            count,
+            payload,
+            decoded: OnceLock::new(),
+            lost: AtomicBool::new(false),
+        })))
+    }
+
+    /// How many elements the array holds, known whether or not its payload has been read.
+    pub fn len(&self) -> usize {
+        match &self.0 {
+            Repr::Decoded(elements) => elements.len(),
+            Repr::Stored(stored) => stored.count,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// What the array's elements are, known whether or not its payload has been read.
+    pub fn kind(&self) -> Kind {
+        match &self.0 {
+            Repr::Decoded(elements) => elements.kind(),
+            Repr::Stored(stored) => stored.stored.kind(),
+        }
+    }
+
+    /// The array's elements, decoded from its payload (and checked: text must be UTF-8 and
+    /// booleans 0 or 1) the first time any clone of it reads them. A payload apart from its
+    /// skeleton that can't be read is [`Error::PayloadRead`], one that isn't its bytes
+    /// [`Error::DamagedPayload`].
+    pub fn elements(&self) -> Result<&Elements, Error> {
+        match &self.0 {
+            Repr::Decoded(elements) => Ok(elements.as_ref()),
+            Repr::Stored(stored) => {
+                if let Some(elements) = stored.decoded.get() {
+                    return Ok(elements);
+                }
+                let elements =
+                    walk::decode(stored.stored, stored.order, stored.count, stored.payload()?)?;
+                Ok(stored.decoded.get_or_init(|| elements))
+            }
+        }
+    }
+
+    /// The element at `index`, checked as [`Self::elements`] checks it: from the decoded elements
+    /// when they are, else decoded alone from the payload, the elements before it passed by their
+    /// lengths. `None` past the end.
+    pub fn element(&self, index: usize) -> Result<Option<Element<'_>>, Error> {
+        match &self.0 {
+            Repr::Decoded(elements) => Ok(elements.get(index)),
+            Repr::Stored(stored) => match stored.decoded.get() {
+                Some(elements) => Ok(elements.get(index)),
+                None if index < stored.count => {
+                    walk::element(stored.stored, stored.order, stored.payload()?, index).map(Some)
+                }
+                None => Ok(None),
+            },
+        }
+    }
+
+    /// Whether this array was read from a header skeleton and its payload apart from it failed to
+    /// read (it was gone or not the bytes its digest names): whatever was concluded from the
+    /// header since rests on a read that failed.
+    pub fn lost_payload(&self) -> bool {
+        matches!(&self.0, Repr::Stored(stored) if stored.lost.load(Ordering::Relaxed))
+    }
+
+    /// Makes this array hold its elements alone ([`Directory::detach`]): elements already
+    /// decoded are moved out of the payload's holder when no clone shares it, and copied only
+    /// when one does.
+    fn detach(&mut self) -> Result<(), Error> {
+        let Repr::Stored(stored) = &mut self.0 else {
+            return Ok(());
+        };
+        let elements = match Arc::get_mut(stored) {
+            Some(owned) => match owned.decoded.take() {
+                Some(elements) => elements,
+                None => walk::decode(owned.stored, owned.order, owned.count, owned.payload()?)?,
+            },
+            None => Self(Repr::Stored(Arc::clone(stored))).elements()?.clone(),
+        };
+        self.0 = Repr::Decoded(Arc::new(elements));
+        Ok(())
+    }
+
+    /// The sha256 of a text array's payload stored little-endian, so one list of strings has one
+    /// digest however it was read or built: a little-endian header's payload is hashed as it is
+    /// (and a skeleton's absent one is named by the digest it carries, so nothing is read), any
+    /// other is encoded first. A non-text array is [`Error::DigestOfNonText`]: its stored width
+    /// is part of its payload, so equal elements could digest differently.
+    pub fn digest(&self) -> Result<[u8; 32], Error> {
+        if self.kind() != Kind::String {
+            return Err(Error::DigestOfNonText);
+        }
+        if let Repr::Stored(stored) = &self.0 {
+            if stored.order == ByteOrder::Little {
+                return Ok(match &stored.payload {
+                    Payload::Held { bytes, range } => sha256(&bytes[range.clone()]),
+                    Payload::Apart { absence, .. } => absence.digest,
+                });
+            }
+        }
+        let mut payload = Vec::new();
+        self.encode(ValueType::String, &mut payload)?;
+        Ok(sha256(&payload))
+    }
+
+    /// The array's payload stored as `stored` (little-endian): a payload read from a header of
+    /// that type and byte order as it is, else its elements encoded.
+    fn encode(&self, stored: ValueType, out: &mut Vec<u8>) -> Result<(), Error> {
+        if let Repr::Stored(read) = &self.0 {
+            if read.stored == stored && read.order == ByteOrder::Little {
+                out.extend_from_slice(read.payload()?);
+                return Ok(());
+            }
+        }
+        for element in self.elements()?.iter() {
+            stored.encode(element, out)?;
+        }
+        Ok(())
+    }
+
+    /// The array of `values`, which must share one element type.
+    pub fn of(values: impl IntoIterator<Item = Scalar>) -> Result<Self, Error> {
+        let mut values = values.into_iter().peekable();
+        let mismatch = || invalid("GGUF array elements must share one type");
+        Ok(Self::from(match values.peek() {
+            None | Some(Scalar::Unsigned(_)) => Elements::Unsigned(
+                values
+                    .map(|value| match value {
+                        Scalar::Unsigned(value) => Ok(value),
+                        _ => Err(mismatch()),
+                    })
+                    .collect::<Result<_, _>>()?,
+            ),
+            Some(Scalar::Signed(_)) => Elements::Signed(
+                values
+                    .map(|value| match value {
+                        Scalar::Signed(value) => Ok(value),
+                        _ => Err(mismatch()),
+                    })
+                    .collect::<Result<_, _>>()?,
+            ),
+            Some(Scalar::Float(_)) => Elements::Float(
+                values
+                    .map(|value| match value {
+                        Scalar::Float(value) => Ok(value),
+                        _ => Err(mismatch()),
+                    })
+                    .collect::<Result<_, _>>()?,
+            ),
+            Some(Scalar::Bool(_)) => Elements::Bool(
+                values
+                    .map(|value| match value {
+                        Scalar::Bool(value) => Ok(value),
+                        _ => Err(mismatch()),
+                    })
+                    .collect::<Result<_, _>>()?,
+            ),
+            Some(Scalar::String(_)) => {
+                let mut strings = Strings::default();
+                for value in values {
+                    match value {
+                        Scalar::String(value) => strings.push(&value)?,
+                        _ => return Err(mismatch()),
+                    }
+                }
+                Elements::String(strings)
+            }
+        }))
+    }
+}
+
+/// Arrays are equal when their elements are; one whose payload can't be read or decoded equals
+/// none. Comparing decodes both (and may read a skeleton's payload apart from it), so it is for
+/// tests only (feature `equality`).
+#[cfg(any(test, feature = "equality"))]
+impl PartialEq for Array {
+    fn eq(&self, other: &Self) -> bool {
+        matches!(
+            (self.elements(), other.elements()),
+            (Ok(left), Ok(right)) if left == right
+        )
+    }
+}
+
+impl fmt::Debug for Array {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            Repr::Decoded(elements) => fmt::Debug::fmt(elements, f),
+            Repr::Stored(stored) => {
+                let mut debug = f.debug_struct("Array");
+                debug
+                    .field("key", &stored.key)
+                    .field("stored", &stored.stored)
+                    .field("count", &stored.count);
+                match &stored.payload {
+                    Payload::Held { range, .. } => debug.field("payload", range),
+                    Payload::Apart { absence, .. } => debug.field("apart", &absence.file),
+                };
+                debug.finish()
+            }
+        }
+    }
+}
+
+/// The sha256 of `bytes`: what a header, and a payload kept apart from its skeleton, is named by.
+pub fn sha256(bytes: &[u8]) -> [u8; 32] {
+    let mut digest = [0; 32];
+    digest.copy_from_slice(&Sha256::digest(bytes));
+    digest
+}
+
+impl From<Elements> for Array {
+    fn from(elements: Elements) -> Self {
+        Self(Repr::Decoded(Arc::new(elements)))
+    }
+}
+
+impl From<Vec<bool>> for Array {
+    fn from(values: Vec<bool>) -> Self {
+        Self::from(Elements::Bool(values))
+    }
+}
+
+impl From<Vec<u64>> for Array {
+    fn from(values: Vec<u64>) -> Self {
+        Self::from(Elements::Unsigned(values))
+    }
+}
+
+impl From<Vec<i64>> for Array {
+    fn from(values: Vec<i64>) -> Self {
+        Self::from(Elements::Signed(values))
+    }
+}
+
+impl From<Vec<f64>> for Array {
+    fn from(values: Vec<f64>) -> Self {
+        Self::from(Elements::Float(values))
+    }
+}
+
+impl From<Strings> for Array {
+    fn from(values: Strings) -> Self {
+        Self::from(Elements::String(values))
+    }
+}
+
+impl Element<'_> {
+    pub fn unsigned(self) -> Option<u64> {
+        match self {
+            Self::Unsigned(value) => Some(value),
+            Self::Signed(value) => u64::try_from(value).ok(),
+            _ => None,
+        }
+    }
+
+    pub fn to_scalar(self) -> Scalar {
+        match self {
+            Self::String(value) => Scalar::String(value.to_owned()),
+            Self::Bool(value) => Scalar::Bool(value),
+            Self::Unsigned(value) => Scalar::Unsigned(value),
+            Self::Signed(value) => Scalar::Signed(value),
+            Self::Float(value) => Scalar::Float(value),
+        }
+    }
 }
 
 impl Value {
@@ -222,10 +620,327 @@ impl Value {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
+#[cfg_attr(any(test, feature = "equality"), derive(PartialEq))]
 pub struct Metadata {
     pub name: String,
     pub value: Value,
+}
+
+/// A GGUF metadata value type (`gguf_type`): how a scalar, or each element of an array, is
+/// stored. [`Value`] keeps only the kind of number, so a header keeps these to encode its values
+/// back to their bytes ([`StoredHeader`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ValueType {
+    U8,
+    I8,
+    U16,
+    I16,
+    U32,
+    I32,
+    F32,
+    Bool,
+    String,
+    U64,
+    I64,
+    F64,
+}
+
+impl ValueType {
+    fn from_id(id: u32) -> Result<Self, Error> {
+        Ok(match id {
+            0 => Self::U8,
+            1 => Self::I8,
+            2 => Self::U16,
+            3 => Self::I16,
+            4 => Self::U32,
+            5 => Self::I32,
+            6 => Self::F32,
+            7 => Self::Bool,
+            8 => Self::String,
+            10 => Self::U64,
+            11 => Self::I64,
+            12 => Self::F64,
+            _ => return Err(invalid(format!("unsupported GGUF metadata type {id}"))),
+        })
+    }
+
+    /// What elements of this type are.
+    fn kind(self) -> Kind {
+        match self {
+            Self::String => Kind::String,
+            Self::Bool => Kind::Bool,
+            Self::U8 | Self::U16 | Self::U32 | Self::U64 => Kind::Unsigned,
+            Self::I8 | Self::I16 | Self::I32 | Self::I64 => Kind::Signed,
+            Self::F32 | Self::F64 => Kind::Float,
+        }
+    }
+
+    /// The bytes one value of this type takes; for a string, the least (its length).
+    fn width(self) -> usize {
+        match self {
+            Self::U8 | Self::I8 | Self::Bool => 1,
+            Self::U16 | Self::I16 => 2,
+            Self::U32 | Self::I32 | Self::F32 => 4,
+            Self::String | Self::U64 | Self::I64 | Self::F64 => 8,
+        }
+    }
+
+    fn id(self) -> u32 {
+        match self {
+            Self::U8 => 0,
+            Self::I8 => 1,
+            Self::U16 => 2,
+            Self::I16 => 3,
+            Self::U32 => 4,
+            Self::I32 => 5,
+            Self::F32 => 6,
+            Self::Bool => 7,
+            Self::String => 8,
+            Self::U64 => 10,
+            Self::I64 => 11,
+            Self::F64 => 12,
+        }
+    }
+
+    /// The bytes of `element` stored as this type (little-endian), or an error when it is
+    /// another kind of value or out of this type's range.
+    fn encode(self, element: Element<'_>, out: &mut Vec<u8>) -> Result<(), Error> {
+        let range = || invalid(format!("GGUF value {element:?} does not fit {self:?}"));
+        match (self, element) {
+            (Self::U8, Element::Unsigned(value)) => {
+                out.push(u8::try_from(value).map_err(|_| range())?);
+            }
+            (Self::I8, Element::Signed(value)) => {
+                out.extend(i8::try_from(value).map_err(|_| range())?.to_le_bytes());
+            }
+            (Self::U16, Element::Unsigned(value)) => {
+                out.extend(u16::try_from(value).map_err(|_| range())?.to_le_bytes());
+            }
+            (Self::I16, Element::Signed(value)) => {
+                out.extend(i16::try_from(value).map_err(|_| range())?.to_le_bytes());
+            }
+            (Self::U32, Element::Unsigned(value)) => {
+                out.extend(u32::try_from(value).map_err(|_| range())?.to_le_bytes());
+            }
+            (Self::I32, Element::Signed(value)) => {
+                out.extend(i32::try_from(value).map_err(|_| range())?.to_le_bytes());
+            }
+            (Self::F32, Element::Float(value)) => {
+                let stored = value as f32;
+                if f64::from(stored).to_bits() != value.to_bits() && !value.is_nan() {
+                    return Err(range());
+                }
+                out.extend(stored.to_le_bytes());
+            }
+            (Self::Bool, Element::Bool(value)) => out.push(u8::from(value)),
+            (Self::String, Element::String(value)) => encode_string(value, out),
+            (Self::U64, Element::Unsigned(value)) => out.extend(value.to_le_bytes()),
+            (Self::I64, Element::Signed(value)) => out.extend(value.to_le_bytes()),
+            (Self::F64, Element::Float(value)) => out.extend(value.to_le_bytes()),
+            _ => return Err(range()),
+        }
+        Ok(())
+    }
+}
+
+/// How one metadata value is stored: a scalar, or an array of elements of one type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoredType {
+    Scalar(ValueType),
+    Array(ValueType),
+}
+
+/// One metadata entry of a [`StoredHeader`].
+#[derive(Clone, Debug)]
+#[cfg_attr(any(test, feature = "equality"), derive(PartialEq))]
+pub struct StoredMetadata {
+    pub metadata: Metadata,
+    pub stored: StoredType,
+}
+
+/// One little-endian GGUF file's header as it is stored: its version, its metadata with each
+/// value's stored type, and its tensor directory in stored order, so it encodes back to the bytes
+/// it was read from ([`StoredHeader::encode`]) and an edited copy keeps every value's type.
+#[derive(Clone, Debug)]
+#[cfg_attr(any(test, feature = "equality"), derive(PartialEq))]
+pub struct StoredHeader {
+    pub version: u32,
+    pub metadata: Vec<StoredMetadata>,
+    /// Offsets are relative to the data section.
+    pub tensors: Vec<TensorDescriptor>,
+}
+
+impl StoredHeader {
+    /// The header of the GGUF file `source`; tensor payloads need not follow it.
+    pub fn read<R: Read + Seek>(source: &mut R) -> Result<Self, Error> {
+        let (directory, types) = read_stored_directory(source, false)?;
+        if directory.byte_order != ByteOrder::Little {
+            return Err(invalid("a stored GGUF header must be little-endian"));
+        }
+        Ok(Self {
+            version: directory.version,
+            metadata: directory
+                .metadata
+                .into_iter()
+                .zip(types)
+                .map(|(metadata, stored)| StoredMetadata { metadata, stored })
+                .collect(),
+            tensors: directory.tensors,
+        })
+    }
+
+    /// A header whose `tensors` (name, outermost-first shape and encoding) are stored in order,
+    /// each at the alignment boundary after the one before.
+    pub fn new(
+        version: u32,
+        metadata: Vec<StoredMetadata>,
+        tensors: impl IntoIterator<Item = (String, Vec<u64>, Encoding)>,
+    ) -> Result<Self, Error> {
+        let mut header = Self {
+            version,
+            metadata,
+            tensors: Vec::new(),
+        };
+        let alignment = header.alignment()?;
+        let mut offset = 0u64;
+        for (name, shape, encoding) in tensors {
+            if shape.contains(&0)
+                || shape
+                    .last()
+                    .is_none_or(|row| row % encoding.block_elements() != 0)
+            {
+                return Err(invalid(format!(
+                    "invalid block geometry on tensor {name:?}"
+                )));
+            }
+            let nbytes = stored_bytes(&name, &shape, encoding)?;
+            header.tensors.push(TensorDescriptor {
+                name,
+                shape,
+                encoding,
+                offset,
+                nbytes,
+            });
+            offset = aligned(
+                offset
+                    .checked_add(nbytes)
+                    .ok_or_else(|| invalid("GGUF data section overflows"))?,
+                alignment,
+            )?;
+        }
+        Ok(header)
+    }
+
+    pub fn value(&self, name: &str) -> Option<&Value> {
+        self.metadata
+            .iter()
+            .find(|entry| entry.metadata.name == name)
+            .map(|entry| &entry.metadata.value)
+    }
+
+    /// `general.alignment`, or GGUF's default of 32.
+    pub fn alignment(&self) -> Result<u64, Error> {
+        self.value("general.alignment")
+            .map_or(Ok(32), |value| alignment(value.unsigned()))
+    }
+
+    /// Every byte of the header through its aligned tensor-data offset.
+    pub fn encode(&self) -> Result<Vec<u8>, Error> {
+        let count = |count: usize| u64::try_from(count).expect("a count fits u64");
+        let mut out = b"GGUF".to_vec();
+        out.extend(self.version.to_le_bytes());
+        out.extend(count(self.tensors.len()).to_le_bytes());
+        out.extend(count(self.metadata.len()).to_le_bytes());
+        for entry in &self.metadata {
+            encode_string(&entry.metadata.name, &mut out);
+            match (entry.stored, &entry.metadata.value) {
+                (StoredType::Scalar(stored), Value::Scalar(scalar)) => {
+                    out.extend(stored.id().to_le_bytes());
+                    stored.encode(scalar.element(), &mut out)?;
+                }
+                (StoredType::Array(stored), Value::Array(array)) => {
+                    out.extend(9u32.to_le_bytes());
+                    out.extend(stored.id().to_le_bytes());
+                    out.extend(count(array.len()).to_le_bytes());
+                    array.encode(stored, &mut out)?;
+                }
+                _ => {
+                    return Err(invalid(format!(
+                        "metadata {:?} is not stored as {:?}",
+                        entry.metadata.name, entry.stored
+                    )));
+                }
+            }
+        }
+        for tensor in &self.tensors {
+            encode_string(&tensor.name, &mut out);
+            out.extend(
+                u32::try_from(tensor.shape.len())
+                    .expect("a tensor rank fits u32")
+                    .to_le_bytes(),
+            );
+            for dimension in tensor.shape.iter().rev() {
+                out.extend(dimension.to_le_bytes());
+            }
+            out.extend((tensor.encoding as u32).to_le_bytes());
+            out.extend(tensor.offset.to_le_bytes());
+        }
+        let length = aligned(count(out.len()), self.alignment()?)?;
+        out.resize(
+            usize::try_from(length).map_err(|_| invalid("GGUF header exceeds host address range"))?,
+            0,
+        );
+        Ok(out)
+    }
+}
+
+/// The tensor-data alignment a `general.alignment` value declares: a power of two, stored as an
+/// integer of any width.
+fn alignment(value: Option<u64>) -> Result<u64, Error> {
+    value
+        .filter(|alignment| alignment.is_power_of_two())
+        .ok_or_else(|| invalid("alignment must be a positive power of two"))
+}
+
+impl Scalar {
+    /// The scalar as an array element holds it.
+    pub fn element(&self) -> Element<'_> {
+        match self {
+            Self::String(value) => Element::String(value),
+            Self::Bool(value) => Element::Bool(*value),
+            Self::Unsigned(value) => Element::Unsigned(*value),
+            Self::Signed(value) => Element::Signed(*value),
+            Self::Float(value) => Element::Float(*value),
+        }
+    }
+}
+
+fn encode_string(value: &str, out: &mut Vec<u8>) {
+    out.extend(
+        u64::try_from(value.len())
+            .expect("a length fits u64")
+            .to_le_bytes(),
+    );
+    out.extend_from_slice(value.as_bytes());
+}
+
+fn aligned(offset: u64, alignment: u64) -> Result<u64, Error> {
+    offset
+        .checked_add(alignment - 1)
+        .map(|offset| offset & !(alignment - 1))
+        .ok_or_else(|| invalid("GGUF data alignment overflows"))
+}
+
+/// The bytes a tensor of `shape` (in either order) stores in `encoding`.
+fn stored_bytes(name: &str, shape: &[u64], encoding: Encoding) -> Result<u64, Error> {
+    let elements = shape
+        .iter()
+        .try_fold(1u64, |product, dimension| product.checked_mul(*dimension))
+        .ok_or_else(|| invalid(format!("tensor {name:?} element count overflows")))?;
+    (elements / encoding.block_elements())
+        .checked_mul(encoding.block_bytes())
+        .ok_or_else(|| invalid(format!("tensor {name:?} byte size overflows")))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -245,7 +960,8 @@ pub struct TensorDescriptor {
 /// the shards' data sections in shard order (each starting at the next
 /// alignment boundary after the previous shard's last tensor), so
 /// `data_offset` is 0 and tensor offsets address that concatenation.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
+#[cfg_attr(any(test, feature = "equality"), derive(PartialEq))]
 pub struct Directory {
     pub version: u32,
     pub byte_order: ByteOrder,
@@ -256,6 +972,19 @@ pub struct Directory {
 }
 
 impl Directory {
+    /// Decodes every metadata array into one that holds its elements alone, so the directory keeps
+    /// no header bytes alive: for a directory held as long as its model is loaded, whose arrays
+    /// (a tokenizer's above all) would otherwise keep the whole header in memory beside what was
+    /// decoded from it.
+    pub fn detach(&mut self) -> Result<(), Error> {
+        for entry in &mut self.metadata {
+            if let Value::Array(array) = &mut entry.value {
+                array.detach()?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn tensor(&self, name: &str) -> Option<&TensorDescriptor> {
         self.tensors.iter().find(|tensor| tensor.name == name)
     }
@@ -282,124 +1011,59 @@ fn invalid(message: impl Into<String>) -> Error {
     Error::Invalid(message.into())
 }
 
-struct Reader<'a, R> {
-    source: &'a mut R,
-    offset: u64,
-    end: u64,
-    order: ByteOrder,
+pub fn read_directory<R: Read + Seek>(source: &mut R) -> Result<Directory, Error> {
+    read_stored_directory(source, true).map(|(directory, _)| directory)
 }
 
-impl<R: Read> Reader<'_, R> {
-    fn check(&self, size: u64) -> Result<(), Error> {
-        if size > self.end.saturating_sub(self.offset) {
-            Err(invalid(format!(
-                "truncated or oversized GGUF header at byte {}",
-                self.offset
-            )))
-        } else {
-            Ok(())
-        }
-    }
-
-    fn take<const N: usize>(&mut self) -> Result<[u8; N], Error> {
-        self.check(N as u64)?;
-        let mut bytes = [0; N];
-        self.source.read_exact(&mut bytes)?;
-        self.offset += N as u64;
-        Ok(bytes)
-    }
-
-    fn u8(&mut self) -> Result<u8, Error> {
-        Ok(self.take::<1>()?[0])
-    }
-
-    fn u16(&mut self) -> Result<u16, Error> {
-        let bytes = self.take()?;
-        Ok(match self.order {
-            ByteOrder::Little => u16::from_le_bytes(bytes),
-            ByteOrder::Big => u16::from_be_bytes(bytes),
-        })
-    }
-
-    fn u32(&mut self) -> Result<u32, Error> {
-        let bytes = self.take()?;
-        Ok(match self.order {
-            ByteOrder::Little => u32::from_le_bytes(bytes),
-            ByteOrder::Big => u32::from_be_bytes(bytes),
-        })
-    }
-
-    fn u64(&mut self) -> Result<u64, Error> {
-        let bytes = self.take()?;
-        Ok(match self.order {
-            ByteOrder::Little => u64::from_le_bytes(bytes),
-            ByteOrder::Big => u64::from_be_bytes(bytes),
-        })
-    }
-
-    fn string(&mut self) -> Result<String, Error> {
-        let size = self.u64()?;
-        self.check(size)?;
-        let size =
-            usize::try_from(size).map_err(|_| invalid("GGUF string exceeds host address range"))?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(size)
-            .map_err(|_| invalid("cannot allocate bounded GGUF string"))?;
-        bytes.resize(size, 0);
-        self.source.read_exact(&mut bytes)?;
-        self.offset += size as u64;
-        String::from_utf8(bytes).map_err(|_| invalid("invalid UTF-8 in GGUF header"))
-    }
-
-    fn scalar(&mut self, kind: u32) -> Result<Scalar, Error> {
-        Ok(match kind {
-            0 => Scalar::Unsigned(u64::from(self.u8()?)),
-            1 => Scalar::Signed(i64::from(self.u8()? as i8)),
-            2 => Scalar::Unsigned(u64::from(self.u16()?)),
-            3 => Scalar::Signed(i64::from(self.u16()? as i16)),
-            4 => Scalar::Unsigned(u64::from(self.u32()?)),
-            5 => Scalar::Signed(i64::from(self.u32()? as i32)),
-            6 => Scalar::Float(f64::from(f32::from_bits(self.u32()?))),
-            7 => match self.u8()? {
-                0 => Scalar::Bool(false),
-                1 => Scalar::Bool(true),
-                _ => return Err(invalid("invalid GGUF boolean")),
-            },
-            8 => Scalar::String(self.string()?),
-            10 => Scalar::Unsigned(self.u64()?),
-            11 => Scalar::Signed(self.u64()? as i64),
-            12 => Scalar::Float(f64::from_bits(self.u64()?)),
-            _ => return Err(invalid(format!("unsupported GGUF metadata type {kind}"))),
-        })
-    }
-
-    fn value(&mut self) -> Result<Value, Error> {
-        let kind = self.u32()?;
-        if kind != 9 {
-            return Ok(Value::Scalar(self.scalar(kind)?));
-        }
-        let element = self.u32()?;
-        let count = self.u64()?;
-        if element == 9 || count > self.end - self.offset {
-            return Err(invalid("nested or oversized GGUF array"));
-        }
-        let mut values = Vec::new();
-        for _ in 0..count {
-            values
-                .try_reserve(1)
-                .map_err(|_| invalid("cannot allocate bounded GGUF array"))?;
-            values.push(self.scalar(element)?);
-        }
-        Ok(Value::Array(values))
-    }
+/// Read a GGUF header held in memory (every byte through the aligned data
+/// offset); tensor payloads need not follow it. Its metadata arrays hold their
+/// payloads as spans of `bytes`, decoded when read.
+pub fn read_header(bytes: impl Into<Arc<Vec<u8>>>) -> Result<Directory, Error> {
+    SharedHeader::walk(bytes.into(), Vec::new())?.directory()
 }
 
-pub fn read_directory<R: Read + Seek>(
-    source: &mut R,
-    header_limit: u64,
-) -> Result<Directory, Error> {
-    read_directory_with_payload(source, header_limit, true)
+/// The metadata of a GGUF header's prefix `bytes`: its complete entries, as a header of their own
+/// without tensors (its data offset where the last of them ends, aligned), and the head of the
+/// entry the bytes end inside, if any. `None` before the preamble and one entry are in hand. Its
+/// arrays hold their payloads as spans of `bytes`, decoded when read.
+pub fn read_prefix(
+    bytes: &Arc<Vec<u8>>,
+) -> Result<Option<(Directory, Option<EntryHead<'_>>)>, Error> {
+    let (preamble, entries, alignment, open) = match walk(bytes)? {
+        Walk::Complete(header) => (header.preamble, header.entries, header.alignment, None),
+        Walk::Incomplete(prefix) => match prefix.preamble {
+            Some(preamble) => (preamble, prefix.entries, prefix.alignment, prefix.open),
+            None => return Ok(None),
+        },
+    };
+    let Some(last) = entries.last() else {
+        return Ok(None);
+    };
+    Ok(Some((
+        Directory {
+            version: preamble.version,
+            byte_order: preamble.byte_order,
+            alignment,
+            data_offset: (last.end as u64).next_multiple_of(alignment),
+            metadata: entries.iter().map(|entry| entry.metadata(bytes)).collect(),
+            tensors: Vec::new(),
+        },
+        open,
+    )))
+}
+
+/// Read a GGUF header skeleton: the header's directory, each of its arrays
+/// whose payload the skeleton lacks holding where that payload is apart, its
+/// count, length and digest known without reading it.
+pub fn read_skeleton(skeleton: Skeleton) -> Result<Directory, Error> {
+    SharedHeader::walk(Arc::new(skeleton.bytes), skeleton.absent)?.directory()
+}
+
+impl SharedHeader {
+    /// The directory of this header ([`read_header`]).
+    pub fn directory(&self) -> Result<Directory, Error> {
+        stored_directory(self, None).map(|(directory, _)| directory)
+    }
 }
 
 /// Inspect one downloaded GGUF file header before weight payloads exist.
@@ -410,34 +1074,65 @@ pub fn inspect_header(path: impl AsRef<Path>) -> Result<Directory, Error> {
     read_file_directory(&source, false)
 }
 
+/// One GGUF file's validated header directory and logical size.
+#[derive(Clone, Debug)]
+pub struct FileHeader {
+    pub directory: Directory,
+    pub size: u64,
+}
+
+/// Where header-only inspection reads GGUF headers: the files themselves
+/// ([`FileHeaders`]), or a host that already holds them, so assessing one
+/// file several ways never rereads it. A header is the file's bytes through
+/// its aligned tensor-data offset, parsed by [`read_header`].
+pub trait HeaderSource {
+    fn header(&self, path: &Path) -> Result<FileHeader, Error>;
+}
+
+/// Headers read from the files they describe.
+pub struct FileHeaders;
+
+impl HeaderSource for FileHeaders {
+    fn header(&self, path: &Path) -> Result<FileHeader, Error> {
+        let source = FileSource::open(path)?;
+        Ok(FileHeader {
+            directory: read_file_directory(&source, false)?,
+            size: source.size(),
+        })
+    }
+}
+
 /// Inspect the headers of the GGUF component `path` names: the file itself,
 /// or every shard when it is the first shard of a split GGUF (see
 /// [`split_paths`]). Tensor payloads need not exist. Returns the component
-/// directory and its files in shard order.
-pub(crate) fn inspect_component_header(path: &Path) -> Result<(Directory, Vec<FileSource>), Error> {
-    let first = FileSource::open(path)?;
-    let directory = read_file_directory(&first, false)?;
-    match split_paths(path, &directory)? {
-        None => Ok((directory, vec![first])),
+/// directory and its files (absolute, in shard order) with their sizes.
+pub(crate) fn inspect_component_header(
+    path: &Path,
+    headers: &dyn HeaderSource,
+) -> Result<(Directory, Vec<(PathBuf, u64)>), Error> {
+    let read = |path: &Path| -> Result<(FileHeader, PathBuf), Error> {
+        let header = headers.header(path)?;
+        header.directory.require_execution_byte_order()?;
+        Ok((header, std::path::absolute(path)?))
+    };
+    let (first, first_path) = read(path)?;
+    match split_paths(path, &first.directory)? {
+        None => Ok((first.directory, vec![(first_path, first.size)])),
         Some(paths) => {
-            let mut sources = vec![first];
-            let mut shards = vec![directory];
+            let mut files = vec![(first_path, first.size)];
+            let mut shards = vec![first.directory];
             for shard in &paths[1..] {
-                let source = FileSource::open(shard)?;
-                shards.push(read_file_directory(&source, false)?);
-                sources.push(source);
+                let (header, path) = read(shard)?;
+                files.push((path, header.size));
+                shards.push(header.directory);
             }
-            Ok((merge_shards(shards)?.0, sources))
+            Ok((merge_shards(shards)?.0, files))
         }
     }
 }
 
 fn read_file_directory(source: &FileSource, require_payload: bool) -> Result<Directory, Error> {
-    let directory = read_directory_with_payload(
-        &mut BufReader::with_capacity(1 << 20, source.reader()),
-        DEFAULT_HEADER_LIMIT,
-        require_payload,
-    )?;
+    let (directory, _) = read_stored_directory(&mut source.reader(), require_payload)?;
     directory.require_execution_byte_order()?;
     Ok(directory)
 }
@@ -595,106 +1290,69 @@ fn merge_shards(shards: Vec<Directory>) -> Result<(Directory, Vec<u64>), Error> 
     ))
 }
 
-fn read_directory_with_payload<R: Read + Seek>(
+/// The directory of a GGUF file with the stored type of each of its metadata values.
+fn read_stored_directory<R: Read + Seek>(
     source: &mut R,
-    header_limit: u64,
     require_payload: bool,
-) -> Result<Directory, Error> {
+) -> Result<(Directory, Vec<StoredType>), Error> {
     let size = source.seek(SeekFrom::End(0))?;
     source.seek(SeekFrom::Start(0))?;
-    let mut reader = Reader {
-        source,
-        offset: 0,
-        end: size.min(header_limit),
-        order: ByteOrder::Little,
-    };
-    if &reader.take::<4>()? != b"GGUF" {
-        return Err(invalid("not a GGUF container"));
-    }
-    let version_bytes = reader.take::<4>()?;
-    if version_bytes == [0, 0, 0, 3] {
-        reader.order = ByteOrder::Big;
-    }
-    let version = match reader.order {
-        ByteOrder::Little => u32::from_le_bytes(version_bytes),
-        ByteOrder::Big => u32::from_be_bytes(version_bytes),
-    };
-    if !matches!(version, 2 | 3) {
-        return Err(invalid(format!("unsupported GGUF version {version}")));
-    }
-    let tensor_count = reader.u64()?;
-    let metadata_count = reader.u64()?;
-    if tensor_count
-        .checked_add(metadata_count)
-        .is_none_or(|count| count > (reader.end - reader.offset) / 12)
-    {
-        return Err(invalid("GGUF entry counts exceed header bounds"));
-    }
+    let mut bytes = HeaderBytes::new();
+    bytes.read(source)?;
+    let length = bytes.bytes().len();
+    stored_directory(&bytes.into_shared(length)?, require_payload.then_some(size))
+}
 
-    let mut metadata = Vec::new();
-    let mut names = HashSet::new();
-    let mut alignment = 32;
-    for _ in 0..metadata_count {
-        let name = reader.string()?;
-        let value = reader.value()?;
-        if !names.insert(name.clone()) {
-            return Err(invalid(format!("duplicate metadata {name:?}")));
-        }
-        if name == "general.alignment" {
-            alignment = value
-                .unsigned()
-                .filter(|alignment| alignment.is_power_of_two())
-                .ok_or_else(|| invalid("alignment must be a positive power of two"))?;
-        }
-        metadata.push(Metadata { name, value });
-    }
-
+/// The directory of a walked GGUF header, with the stored type of each of its metadata values.
+/// With the `size` of its file, every tensor's bytes must lie within the file.
+fn stored_directory(
+    shared: &SharedHeader,
+    size: Option<u64>,
+) -> Result<(Directory, Vec<StoredType>), Error> {
+    let header = shared.header();
+    let (metadata, types) = header
+        .entries
+        .iter()
+        .map(|entry| (entry.metadata(shared.bytes()), entry.head().stored))
+        .unzip();
+    let alignment = header.alignment;
     let mut tensors = Vec::new();
-    names.clear();
-    for _ in 0..tensor_count {
-        let name = reader.string()?;
-        let rank = reader.u32()?;
-        if name.is_empty() || !names.insert(name.clone()) || !(1..=4).contains(&rank) {
+    let mut unknown = std::collections::BTreeMap::<u32, u32>::new();
+    let mut names = HashSet::new();
+    for tensor in &header.tensors {
+        let name = tensor.name;
+        if name.is_empty() || !names.insert(name) {
             return Err(invalid(format!(
                 "invalid or duplicate tensor directory entry {name:?}"
             )));
         }
-        let mut shape = (0..rank)
-            .map(|_| reader.u64())
-            .collect::<Result<Vec<_>, _>>()?;
-        let encoding = Encoding::try_from(reader.u32()?)?;
-        let offset = reader.u64()?;
+        // A type id this parser doesn't know is a newer quantization, not a damaged header: the
+        // rest of the directory is still read, and the ids are reported together.
+        let Some(encoding) = Encoding::from_id(tensor.type_id) else {
+            *unknown.entry(tensor.type_id).or_default() += 1;
+            continue;
+        };
+        let mut shape = tensor.dimensions().collect::<Vec<_>>();
         if shape.contains(&0) || shape[0] % encoding.block_elements() != 0 {
             return Err(invalid(format!(
                 "invalid block geometry on tensor {name:?}"
             )));
         }
-        if offset % alignment != 0 {
+        if tensor.offset % alignment != 0 {
             return Err(invalid(format!("misaligned tensor {name:?}")));
         }
-        let elements = shape
-            .iter()
-            .try_fold(1u64, |product, dimension| product.checked_mul(*dimension));
-        let elements =
-            elements.ok_or_else(|| invalid(format!("tensor {name:?} element count overflows")))?;
-        let nbytes = (elements / encoding.block_elements())
-            .checked_mul(encoding.block_bytes())
-            .ok_or_else(|| invalid(format!("tensor {name:?} byte size overflows")))?;
+        let nbytes = stored_bytes(name, &shape, encoding)?;
         shape.reverse();
         tensors.push(TensorDescriptor {
-            name,
+            name: name.to_owned(),
             shape,
             encoding,
-            offset,
+            offset: tensor.offset,
             nbytes,
         });
     }
 
-    let data_offset = reader
-        .offset
-        .checked_add(alignment - 1)
-        .map(|offset| offset & !(alignment - 1))
-        .ok_or_else(|| invalid("GGUF data alignment overflows"))?;
+    let data_offset = header.data_offset as u64;
     let mut stored = tensors.iter().collect::<Vec<_>>();
     stored.sort_by_key(|tensor| tensor.offset);
     let mut end = data_offset;
@@ -705,7 +1363,7 @@ fn read_directory_with_payload<R: Read + Seek>(
         let next = start
             .checked_add(tensor.nbytes)
             .ok_or_else(|| invalid("GGUF tensor end overflows"))?;
-        if start < end || (require_payload && next > size) {
+        if start < end || size.is_some_and(|size| next > size) {
             return Err(invalid(format!(
                 "overlapping or truncated tensor {:?}",
                 tensor.name
@@ -714,14 +1372,21 @@ fn read_directory_with_payload<R: Read + Seek>(
         end = next;
     }
 
-    Ok(Directory {
-        version,
-        byte_order: reader.order,
+    let directory = Directory {
+        version: header.preamble.version,
+        byte_order: header.preamble.byte_order,
         alignment,
         data_offset,
         metadata,
         tensors,
-    })
+    };
+    if !unknown.is_empty() {
+        return Err(Error::UnknownTensorTypes {
+            types: unknown.into_iter().collect(),
+            directory: Box::new(directory),
+        });
+    }
+    Ok((directory, types))
 }
 
 #[derive(Clone, Debug)]
@@ -765,12 +1430,14 @@ pub struct GgufArtifact {
 
 impl GgufArtifact {
     /// Open the GGUF component `path` names: the file, or every shard when
-    /// it is the first shard of a split GGUF (see [`split_paths`]).
+    /// it is the first shard of a split GGUF (see [`split_paths`]). The
+    /// artifact lives as long as its model is loaded, so its directory is
+    /// detached from the header bytes ([`Directory::detach`]).
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         let path = path.as_ref();
         let first = Arc::new(FileSource::open(path)?);
         let directory = read_file_directory(&first, true)?;
-        let (directory, shards) = match split_paths(path, &directory)? {
+        let (mut directory, shards) = match split_paths(path, &directory)? {
             None => {
                 let data_offset = directory.data_offset;
                 (
@@ -808,6 +1475,7 @@ impl GgufArtifact {
                 (directory, shards)
             }
         };
+        directory.detach()?;
         Ok(Self {
             directory,
             shards,

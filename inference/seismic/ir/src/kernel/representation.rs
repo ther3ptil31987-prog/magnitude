@@ -12,9 +12,26 @@ pub(super) fn read<B: PhysicalDialect>(
     place: PlaceEntry,
     indices: &[PortableValue],
 ) -> PortableValue {
+    read_component(builder, place, indices, None)
+}
+
+pub(super) fn read_component<B: PhysicalDialect>(
+    builder: &mut PortableBuilder<'_, B>,
+    place: PlaceEntry,
+    indices: &[PortableValue],
+    component: Option<registry::QuantizedComponent>,
+) -> PortableValue {
     let info = registry::representation_info(place.representation);
     let recipe = registry::decode_recipe(place.representation, info.decoded)
         .expect("registered packed representation has a decode sequence");
+    if let Some(registry::DecodeComponent::Constant(value)) =
+        component.and_then(|role| recipe.component(role))
+    {
+        return builder.constant(
+            super::ops::ConstantValue::from_scalar(value),
+            ValueType::Scalar(value.dtype()),
+        );
+    }
     let mut values = Vec::with_capacity(recipe.temporary_count());
     for step in recipe.steps() {
         let get = |temp| values[recipe.ordinal(temp)];
@@ -31,6 +48,27 @@ pub(super) fn read<B: PhysicalDialect>(
                 let scalar = reference_math::code_recipe(interpretation, *bits);
                 super::reference_math::expand_total_recipe(builder, &scalar, &[get(*raw)])
             }
+            DecodeStep::SignedCode { code, raw, bit, .. } => {
+                let scalar = reference_math::signed_code_recipe(*bit);
+                super::reference_math::expand_total_recipe(
+                    builder,
+                    &scalar,
+                    &[get(*code), get(*raw)],
+                )
+            }
+            DecodeStep::ReadPlaneLane { plane, .. } => {
+                builder.read_plane_lane(place, indices, *plane)
+            }
+            DecodeStep::InterpretGridCode {
+                raw, lane, grid, ..
+            } => {
+                let scalar = reference_math::grid_code_recipe(grid);
+                super::reference_math::expand_total_recipe(
+                    builder,
+                    &scalar,
+                    &[get(*raw), get(*lane)],
+                )
+            }
             DecodeStep::DecodeFloatCode { raw, format, .. } => {
                 let scalar = reference_math::float_code_recipe(*format);
                 super::reference_math::expand_total_recipe(builder, &scalar, &[get(*raw)])
@@ -38,6 +76,10 @@ pub(super) fn read<B: PhysicalDialect>(
             DecodeStep::ConvertToF32 { from, .. } => {
                 builder.cast(get(*from), ValueType::Scalar(DType::F32))
             }
+            DecodeStep::Constant { value, .. } => builder.constant(
+                super::ops::ConstantValue::from_scalar(*value),
+                ValueType::Scalar(value.dtype()),
+            ),
             DecodeStep::Multiply { left, right, .. } => {
                 builder.binary(BinaryOp::Mul, get(*left), get(*right))
             }
@@ -58,7 +100,19 @@ pub(super) fn read<B: PhysicalDialect>(
         assert_eq!(value.ty, ValueType::Scalar(recipe.dtype(step.defines())));
         values.push(value);
     }
-    values[recipe.ordinal(recipe.output())]
+    match component {
+        None => values[recipe.ordinal(recipe.output())],
+        Some(role) => match recipe
+            .component(role)
+            .expect("checked representation supports role")
+        {
+            registry::DecodeComponent::Temporary(temp) => values[recipe.ordinal(temp)],
+            registry::DecodeComponent::Constant(value) => builder.constant(
+                super::ops::ConstantValue::from_scalar(value),
+                ValueType::Scalar(value.dtype()),
+            ),
+        },
+    }
 }
 
 #[cfg(test)]

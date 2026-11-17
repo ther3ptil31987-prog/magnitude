@@ -6,7 +6,7 @@ import { isDeepStrictEqual } from "node:util"
 import type { HarnessConnector, HarnessModel } from "./contract"
 import type { HarnessConnectionPaths } from "./paths"
 import { harnessEndpoints, jsonObject, readOr, valueAt } from "./shared"
-import { CLAUDE_GATEWAY_DISCOVERY } from "./connectors/claude-code"
+import { CLAUDE_AUTH_TOKEN_PLACEHOLDER, CLAUDE_GATEWAY_DISCOVERY, claudeCodeHasLogin } from "./connectors/claude-code"
 import { clineModelCatalog, clineProviderSettings } from "./connectors/cline"
 import { hermesProviderConfig } from "./connectors/hermes"
 import { ohMyPiProviderConfig } from "./connectors/oh-my-pi"
@@ -14,8 +14,8 @@ import { openClawProviderConfig } from "./connectors/openclaw"
 import { openCodeProviderConfig, readOpenCodeConfiguration } from "./connectors/opencode"
 import { piProviderConfig } from "./connectors/pi"
 
-import { ConnectionInspection } from "@magnitudedev/client-common"
-export { ConnectionInspection } from "@magnitudedev/client-common"
+import { ConnectionInspection } from "@magnitudedev/sdk"
+export { ConnectionInspection } from "@magnitudedev/sdk"
 
 const disconnected = (reason: string): ConnectionInspection => ({ _tag: "Disconnected", reason })
 const connected: ConnectionInspection = { _tag: "Connected" }
@@ -30,6 +30,9 @@ const includesFields = (actual: unknown, expected: unknown): boolean => {
   if (actual === null || typeof actual !== "object" || Array.isArray(actual)) return false
   return Object.entries(expected).every(([key, value]) => includesFields(valueAt(actual, [key]), value))
 }
+
+/** A skill file's text with LF line endings: a build checked out on Windows bundles the skill with CRLF, and a skill compares by its text, not its line endings. */
+export const skillText = (contents: string) => contents.replace(/\r\n/g, "\n")
 
 /** Read owned configuration fields; never repair files or start a harness while inspecting. */
 export const inspectHarnessConnection = (
@@ -46,8 +49,11 @@ export const inspectHarnessConnection = (
       catch: (): ConnectionInspection => ({ _tag: "Unavailable", reason: `Fix invalid configuration in ${path} before reconnecting or disconnecting` }),
     })),
   )
+  // Whether Magnitude's own entry exists at all: absent means never connected, present but different means changed.
+  let present = false
+  const owned = (value: unknown) => { present ||= value !== undefined; return value }
   const provider = (path: string, segments: ReadonlyArray<string>, expected: unknown, format: "json" | "json5" | "yaml" = "json") =>
-    read(path, format).pipe(Effect.map((document) => includesFields(valueAt(document, segments), expected)))
+    read(path, format).pipe(Effect.map((document) => includesFields(owned(valueAt(document, segments)), expected)))
   let valid = false
   switch (connector.id) {
     case "pi": valid = yield* provider(paths.piModels, ["providers", "magnitude"], piProviderConfig(models, endpoints.openai)); break
@@ -55,22 +61,28 @@ export const inspectHarnessConnection = (
       const document = yield* readOpenCodeConfiguration(paths).pipe(
         Effect.catchTag("UnknownException", () => Effect.fail<ConnectionInspection>({ _tag: "Unavailable", reason: "Fix invalid OpenCode configuration before reconnecting or disconnecting" })),
       )
-      valid = includesFields(valueAt(document, ["provider", "magnitude"]), openCodeProviderConfig(models, endpoints.openai))
+      valid = includesFields(owned(valueAt(document, ["provider", "magnitude"])), openCodeProviderConfig(models, endpoints.openai))
       break
     }
     case "hermes": valid = yield* provider(paths.hermes, ["providers", "magnitude"], hermesProviderConfig(endpoints.openai), "yaml"); break
     case "openclaw": valid = yield* provider(paths.openclaw, ["models", "providers", "magnitude"], openClawProviderConfig(models, endpoints.openai), "json5"); break
     case "oh-my-pi": valid = yield* provider(paths.ompModels, ["providers", "magnitude"], ohMyPiProviderConfig(models, endpoints.openai), "yaml"); break
-    case "claude-code": valid = yield* provider(paths.claude, ["env"], {
-      ANTHROPIC_BASE_URL: endpoints.anthropic, CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: CLAUDE_GATEWAY_DISCOVERY,
-    }); break
+    case "claude-code": {
+      const settings = yield* read(paths.claude)
+      owned(valueAt(settings, ["env", "ANTHROPIC_BASE_URL"]) === endpoints.anthropic ? true : undefined)
+      valid = includesFields(valueAt(settings, ["env"]), {
+        ANTHROPIC_BASE_URL: endpoints.anthropic, CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: CLAUDE_GATEWAY_DISCOVERY,
+      }) && (valueAt(settings, ["env", "ANTHROPIC_AUTH_TOKEN"]) === CLAUDE_AUTH_TOKEN_PLACEHOLDER
+        || (yield* claudeCodeHasLogin(paths, settings)))
+      break
+    }
     case "cline":
       valid = (yield* provider(paths.clineProviders, ["providers", "openai-compatible", "settings"], clineProviderSettings(Option.none(), endpoints.openai)))
         && (yield* provider(paths.clineModels, ["providers", "openai-compatible", "models"], clineModelCatalog(models)))
       break
     case "codex": {
       const document = yield* read(paths.codexUser, "toml")
-      valid = includesFields(valueAt(document, ["model_providers", "magnitude"]), {
+      valid = includesFields(owned(valueAt(document, ["model_providers", "magnitude"])), {
         base_url: endpoints.codex, wire_api: "responses", requires_openai_auth: true, supports_websockets: true,
       }) && valueAt(document, ["model_catalog_json"]) === paths.codexModels
       if (valid) {
@@ -81,10 +93,10 @@ export const inspectHarnessConnection = (
       break
     }
   }
-  if (!valid) return disconnected("Magnitude configuration is missing or has changed")
+  if (!valid) return disconnected(present ? "Magnitude configuration has changed" : "Not connected")
   if (Option.isSome(requiredSkill)) {
     const path = paths.skillInstallations[connector.skillInstallationTarget].skillFile
-    if ((yield* readOr(path, "")) !== requiredSkill.value) return disconnected("Magnitude skill is missing or has changed")
+    if (skillText(yield* readOr(path, "")) !== skillText(requiredSkill.value)) return disconnected("Magnitude skill is missing or has changed")
   }
   if (connector.companion !== undefined && !(yield* connector.companion.inspect)) {
     return disconnected("Magnitude plugin is missing, disabled, or incompatible")

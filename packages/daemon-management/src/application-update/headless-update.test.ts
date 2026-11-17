@@ -1,7 +1,8 @@
-import { Effect, Stream, TestClock, TestContext } from "effect"
+import { Deferred, Effect, Fiber, Stream, SubscriptionRef, TestClock, TestContext } from "effect"
+import type { ApplicationUpdateState } from "@magnitudedev/sdk/desktop-host"
 import { describe, expect, it } from "vitest"
 import type { ApplicationUpdate } from "./application-update"
-import { makeHeadlessUpdateControl } from "./headless-update"
+import { makeHeadlessUpdateControl, reportUpdateOutcome } from "./headless-update"
 
 const fixture = () => {
   const calls: string[] = []
@@ -19,16 +20,38 @@ describe("running headless update control", () => {
     const { calls, updates, state } = fixture()
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const control = yield* makeHeadlessUpdateControl(updates)
+      yield* TestClock.adjust("1 millis")
       expect((yield* control("status")).state).toEqual(state)
       expect(calls).toEqual([])
       const failure = yield* control("install").pipe(Effect.flip)
-      expect(failure.message).toContain("Stop the server")
+      expect(failure.message).toContain("magnitude update install")
       expect(calls).toEqual([])
       for (const action of ["check", "download", "discard"] as const) {
         const reply = yield* control(action)
         yield* reply.afterReply
       }
       expect(calls).toEqual(["check", "download", "discard"])
+    })).pipe(Effect.provide(TestContext.TestContext)))
+  })
+  it("explains how an installation that never installs in place is updated instead", async () => {
+    const { calls, updates } = fixture()
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const control = yield* makeHeadlessUpdateControl(updates, Effect.void, "Pull the new image.")
+      expect((yield* control("install").pipe(Effect.flip)).message).toBe("Pull the new image.")
+      expect(calls).toEqual([])
+    })).pipe(Effect.provide(TestContext.TestContext)))
+  })
+  it("runs no manual check before the service is first ready, so no outcome is reported early", async () => {
+    const { calls, updates, state } = fixture()
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const ready = yield* Deferred.make<void>()
+      const control = yield* makeHeadlessUpdateControl(updates, Deferred.await(ready))
+      expect((yield* control("check")).state).toEqual(state)
+      expect(calls).toEqual([])
+      yield* Deferred.succeed(ready, undefined)
+      yield* TestClock.adjust("1 millis")
+      yield* control("check")
+      expect(calls).toEqual(["check"])
     })).pipe(Effect.provide(TestContext.TestContext)))
   })
   it("owns one timer that ends with its scope", async () => {
@@ -42,5 +65,30 @@ describe("running headless update control", () => {
       yield* TestClock.adjust("2 hours")
       expect(calls).toEqual(["check"])
     }).pipe(Effect.provide(TestContext.TestContext)))
+  })
+})
+
+describe("reporting an outcome now", () => {
+  it("waits for the check the update owner runs, so an owner failing before Ready still sends it", async () => {
+    const sent: string[] = []
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const response = yield* Deferred.make<void>()
+      const scope = yield* Effect.scope
+      const state = yield* SubscriptionRef.make<ApplicationUpdateState>({ transfer: { _tag: "Idle" }, check: { _tag: "Idle" }, preference: { _tag: "Known", autoDownload: true } })
+      const updates: ApplicationUpdate = { state: SubscriptionRef.get(state), changes: state.changes,
+        // Like the real owner: mark the check started, then run the request on a worker and return.
+        check: reason => SubscriptionRef.update(state, (current): ApplicationUpdateState => ({ ...current, check: { _tag: "Checking" } })).pipe(
+          Effect.zipRight(Deferred.await(response).pipe(Effect.zipRight(Effect.sync(() => { sent.push(reason) })),
+            Effect.zipRight(SubscriptionRef.update(state, (current): ApplicationUpdateState => ({ ...current, check: { _tag: "Succeeded", at: 0 } }))), Effect.forkIn(scope))), Effect.asVoid),
+        download: Effect.die("unused"), discard: Effect.die("unused"), close: Effect.void,
+        requireReady: Effect.die("unused"), setAutoDownload: () => Effect.die("unused"),
+      }
+      const reporting = yield* reportUpdateOutcome(updates, "launch").pipe(Effect.fork)
+      yield* TestClock.adjust("1 seconds")
+      expect(reporting.unsafePoll()).toBeNull()
+      yield* Deferred.succeed(response, undefined)
+      yield* Fiber.join(reporting)
+      expect(sent).toEqual(["launch"])
+    })).pipe(Effect.provide(TestContext.TestContext)))
   })
 })

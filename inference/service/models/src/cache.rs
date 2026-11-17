@@ -1,28 +1,43 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
 use getrandom::fill;
-use magnitude_service_contracts::models::{ModelAssessment, ModelCapabilities};
+use magnitude_service_contracts::models::{ModelAssessment, ModelCapabilities, ModelId, ParsedModelId};
 use magnitude_service_utils::file_cache::{
-    read_bytes, read_json, read_object, write_bytes_atomic, write_json_atomic,
+    read_json, read_object, write_json_atomic,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-/// One completed profile assessment. Its evidence key carries the complete assessment identity
-/// (environment, bundle, profile and depths), so a read never revalidates it.
+use crate::header_cache::{HEADER_CAPACITY_BYTES, HEADER_EVICTION_GRACE, HeaderCache};
+
+/// One completed profile assessment. Its evidence key carries the assessment's identity:
+/// environment, bundle, profile and depths.
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CachedModelAssessment {
     pub capabilities: ModelCapabilities,
     pub template_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<magnitude_service_contracts::models::ModelFingerprint>,
     pub profile: ModelAssessment,
 }
 
+/// Presentation already established by candidate inspection, before the weights are installed.
+/// This is derived engine data, never a declaration supplied by the client.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CachedModelPresentation {
+    pub display_name: String,
+    pub variant_label: String,
+    pub variant_of: Option<ModelId>,
+    pub license: Option<String>,
+}
+
 const MAX_INDEX_BYTES: usize = 64 * 1024 * 1024;
-const MAX_BLOB_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug)]
 pub enum ModelIndexKind {
@@ -30,8 +45,15 @@ pub enum ModelIndexKind {
     InventoryMetadata,
     GgufInspection,
     HuggingFaceRepositorySnapshot,
+    HuggingFaceBaseModels,
+    HuggingFaceGgufHeader,
+    HuggingFaceSearchShape,
+    HuggingFaceWeightSample,
     RecommendableModelCatalog,
     ModelAssessment,
+    CandidateClassification,
+    CandidatePresentation,
+    OllamaHubFile,
 }
 
 impl ModelIndexKind {
@@ -41,21 +63,15 @@ impl ModelIndexKind {
             Self::InventoryMetadata => "inventory/model-metadata",
             Self::GgufInspection => "inspections/gguf",
             Self::HuggingFaceRepositorySnapshot => "sources/hugging-face/repositories",
+            Self::HuggingFaceBaseModels => "sources/hugging-face/base-models",
+            Self::HuggingFaceGgufHeader => "sources/hugging-face/gguf-headers",
+            Self::HuggingFaceSearchShape => "sources/hugging-face/search-shapes",
+            Self::HuggingFaceWeightSample => "sources/hugging-face/weight-samples",
             Self::RecommendableModelCatalog => "catalogs/recommendable-models",
             Self::ModelAssessment => "assessments/model-configurations",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum ModelBlobKind {
-    GgufHeader,
-}
-
-impl ModelBlobKind {
-    fn relative(self) -> &'static str {
-        match self {
-            Self::GgufHeader => "gguf-headers",
+            Self::CandidateClassification => "inspections/candidate-classification",
+            Self::CandidatePresentation => "inspections/candidate-presentation",
+            Self::OllamaHubFile => "sources/hugging-face/ollama-files",
         }
     }
 }
@@ -64,6 +80,7 @@ impl ModelBlobKind {
 #[derive(Clone, Debug)]
 pub struct ModelCache {
     root: PathBuf,
+    headers: HeaderCache,
 }
 
 pub struct ModelCacheWorkspace {
@@ -89,8 +106,16 @@ impl Drop for ModelCacheWorkspace {
 impl ModelCache {
     #[must_use]
     pub fn new(cache_root: &Path) -> Self {
+        Self::with_header_capacity(cache_root, HEADER_CAPACITY_BYTES)
+    }
+
+    /// A cache whose GGUF headers are bounded by `capacity` bytes: a build that must hold every header
+    /// it reads until it ends (the release catalog's bundle) bounds them by none.
+    #[must_use]
+    pub fn with_header_capacity(cache_root: &Path, capacity: u64) -> Self {
         Self {
             root: cache_root.to_path_buf(),
+            headers: HeaderCache::new(cache_root, capacity, HEADER_EVICTION_GRACE),
         }
     }
 
@@ -146,29 +171,90 @@ impl ModelCache {
         self.write_index(ModelIndexKind::ModelAssessment, evidence, assessment);
     }
 
+    /// A version's inspected identity at an immutable Hub commit. Changing the release catalog
+    /// invalidates its family mapping; no repository name is used to guess a family on a miss.
+    pub fn read_model_presentation(
+        &self,
+        model_id: &ModelId,
+        commit: &str,
+    ) -> Option<CachedModelPresentation> {
+        self.read_index::<CachedModelPresentation>(
+            ModelIndexKind::CandidatePresentation,
+            &presentation_evidence(model_id, commit),
+        )
+        .filter(|presentation| {
+            !presentation.display_name.trim().is_empty()
+                && !presentation.variant_label.trim().is_empty()
+                && presentation.variant_of.as_ref().is_none_or(|id| {
+                    matches!(id.parsed(), ParsedModelId::Catalog { .. })
+                })
+        })
+    }
+
+    pub fn write_model_presentation(
+        &self,
+        model_id: &ModelId,
+        commit: &str,
+        presentation: &CachedModelPresentation,
+    ) {
+        self.write_index(
+            ModelIndexKind::CandidatePresentation,
+            &presentation_evidence(model_id, commit),
+            presentation,
+        );
+    }
+
     /// The engine's compiled-kernel store, shared by loads and tuning.
     #[must_use]
     pub fn kernel_directory(&self) -> PathBuf {
         self.root.join("kernels")
     }
 
-    pub fn read_blob(&self, kind: ModelBlobKind, digest: &str) -> Option<Vec<u8>> {
-        valid_digest(digest)
-            .then(|| read_bytes(&self.blob_path(kind, digest), MAX_BLOB_BYTES))
-            .flatten()
-            .filter(|bytes| hex_sha256(bytes) == digest)
+    /// The GGUF header with this sha256, or `None` when the header cache doesn't hold it (see
+    /// `header_cache`): its caller fetches it again.
+    #[must_use]
+    pub fn read_header(&self, digest: &str) -> Option<Vec<u8>> {
+        self.headers.read(digest)
     }
 
-    pub fn write_blob(&self, kind: ModelBlobKind, digest: &str, bytes: &[u8]) {
-        if !valid_digest(digest) || hex_sha256(bytes) != digest {
-            return;
-        }
-        write_bytes_atomic(
-            &self.blob_path(kind, digest),
-            &self.lock_path(&format!("blob-{digest}")),
-            bytes,
-            MAX_BLOB_BYTES,
-        );
+    /// The skeleton of the GGUF header with this sha256 (its large arrays' payloads absent), or
+    /// `None` when the header cache doesn't hold it.
+    #[must_use]
+    pub fn read_header_skeleton(
+        &self,
+        digest: &str,
+    ) -> Option<magnitude_artifacts::gguf::Skeleton> {
+        self.headers.read_skeleton(digest)
+    }
+
+    /// Discards the header with this sha256 from the header cache, a payload of its skeleton having
+    /// failed to read: it is stored again when next written.
+    pub fn discard_header(&self, digest: &str) {
+        self.headers.discard_header(digest);
+    }
+
+    /// Whether the header cache holds this header, marking it used for the read that follows;
+    /// `read_header` still verifies it.
+    #[must_use]
+    /// Cached headers holding a large entry whose fixed part is `head` (see `header_cache`).
+    pub(crate) fn sharing_headers(&self, head: &[u8]) -> Vec<Vec<u8>> {
+        self.headers.sharing(head)
+    }
+
+    /// Cached headers holding that entry, after any read fetching it stores its header; or the
+    /// claim to fetch it (see `header_cache`).
+    pub(crate) async fn lend_or_claim(&self, head: &[u8]) -> crate::header_cache::Lending {
+        self.headers.lend_or_claim(head).await
+    }
+
+    pub fn has_header(&self, digest: &str) -> bool {
+        self.headers.contains(digest)
+    }
+
+    /// Stores a GGUF header and returns its sha256. When the header cache has outgrown its
+    /// capacity, `pinned` names the headers it must keep.
+    pub fn write_header(&self, header: &[u8], pinned: impl FnOnce() -> BTreeSet<String>) -> String {
+        self.headers.write(header, pinned)
     }
 
     pub fn workspace(&self) -> io::Result<ModelCacheWorkspace> {
@@ -226,13 +312,20 @@ impl ModelCache {
             .join(format!("{digest}.json"))
     }
 
-    fn blob_path(&self, kind: ModelBlobKind, digest: &str) -> PathBuf {
-        self.root.join("blobs").join(kind.relative()).join(digest)
-    }
-
     fn lock_path(&self, name: &str) -> PathBuf {
         self.root.join(".locks").join(format!("{name}.lock"))
     }
+}
+
+fn presentation_evidence(model_id: &ModelId, commit: &str) -> String {
+    static CATALOG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let catalog = CATALOG.get_or_init(|| {
+        format!("{}:{}", crate::catalog::catalog_source_digest(), crate::catalog::catalog_lock_digest())
+    });
+    format!(
+        "candidate-presentation-v2:{}:{catalog}:{model_id}@{commit}",
+        crate::gguf::RULES
+    )
 }
 
 fn evidence_digest(evidence: &str) -> String {
@@ -243,24 +336,43 @@ fn hex_sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn valid_digest(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use magnitude_service_contracts::MemoryDomainId;
     use magnitude_service_contracts::models::{
-        MemoryAssessment, ModelAssessmentId, ModelCapabilities, ModelReasoningCapabilities,
-        PerformanceEvidence, ServingProfile,
+        MemoryAssessment, MemoryBreakdown, ModelAssessmentId, ModelPlacement, ModelCapabilities, ModelPerformance,
+        ModelReasoningCapabilities, ModelResidency, PerformanceEvidence, ServingProfile,
     };
 
     fn profile(context_length: u32) -> ServingProfile {
         ServingProfile { context_length }
+    }
+
+    #[test]
+    fn inspected_presentation_is_pinned_to_commit_and_selected_file_across_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = ModelCache::new(directory.path());
+        let q4: ModelId = "hf:publisher/Qwen-Finetune-GGUF/model-Q4_K_M.gguf".parse().unwrap();
+        let q8: ModelId = "hf:publisher/Qwen-Finetune-GGUF/model-Q8_0.gguf".parse().unwrap();
+        let presentation = CachedModelPresentation {
+            display_name: "Qwen Finetune".to_owned(),
+            variant_label: "Q4_K_M".to_owned(),
+            variant_of: Some("qwen3.6-35b-a3b:gguf:q4".parse().unwrap()),
+            license: None,
+        };
+        let commit = "c".repeat(40);
+        cache.write_model_presentation(&q4, &commit, &presentation);
+        let reopened = ModelCache::new(directory.path());
+        assert_eq!(reopened.read_model_presentation(&q4, &commit), Some(presentation.clone()));
+        assert_eq!(reopened.read_model_presentation(&q8, &commit), None);
+        assert_eq!(reopened.read_model_presentation(&q4, &"d".repeat(40)), None);
+        cache.write_model_presentation(&q4, &commit, &CachedModelPresentation {
+            variant_of: Some(q8),
+            ..presentation
+        });
+        assert_eq!(reopened.read_model_presentation(&q4, &commit), None, "a family must be a validated catalog identity");
     }
 
     #[test]
@@ -274,20 +386,10 @@ mod tests {
             Some(42)
         );
         let bytes = b"header";
-        let digest = hex_sha256(bytes);
-        cache.write_blob(ModelBlobKind::GgufHeader, &digest, bytes);
-        assert_eq!(
-            cache
-                .read_blob(ModelBlobKind::GgufHeader, &digest)
-                .as_deref(),
-            Some(bytes.as_slice())
-        );
-        cache.write_blob(ModelBlobKind::GgufHeader, &"0".repeat(64), bytes);
-        assert!(
-            cache
-                .read_blob(ModelBlobKind::GgufHeader, &"0".repeat(64))
-                .is_none()
-        );
+        let digest = cache.write_header(bytes, BTreeSet::new);
+        assert_eq!(digest, hex_sha256(bytes));
+        assert_eq!(cache.read_header(&digest).as_deref(), Some(bytes.as_slice()));
+        assert!(cache.read_header(&"0".repeat(64)).is_none());
 
         let index_path = cache.index_path(ModelIndexKind::InventoryMetadata, "model evidence");
         fs::write(&index_path, b"corrupt").unwrap();
@@ -301,13 +403,8 @@ mod tests {
             Some(7)
         );
 
-        let blob_path = cache.blob_path(ModelBlobKind::GgufHeader, &digest);
-        fs::write(&blob_path, b"corrupt").unwrap();
-        assert!(
-            cache
-                .read_blob(ModelBlobKind::GgufHeader, &digest)
-                .is_none()
-        );
+        fs::write(directory.path().join("blobs/gguf-headers").join(&digest), b"corrupt").unwrap();
+        assert!(cache.read_header(&digest).is_none());
     }
 
     #[test]
@@ -328,31 +425,50 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let fits = ModelAssessment::Fits {
             profile: profile(50_000),
+            served: profile(50_000),
             assessment_id: ModelAssessmentId("fits-assessment".to_owned()),
             memory: vec![MemoryAssessment {
                 memory_domain_id: MemoryDomainId::system(),
                 capacity_bytes: 100,
                 required_bytes: 50,
-                compatibility_reserve_bytes: 0,
                 remaining_bytes: 50,
             }],
-            performance: vec![PerformanceEvidence {
-                context_tokens: 50_000,
-                estimated_tokens_per_second: 2.0,
-            }],
+            memory_breakdown: MemoryBreakdown {
+                weights_bytes: 30,
+                context_bytes: 10,
+                overhead_bytes: 10,
+            },
+            placement: ModelPlacement {
+                device_bytes: 50,
+                host_bytes: 0,
+                disk_bytes: 0,
+                lookup_disk_bytes: 0,
+            },
+            residency: ModelResidency::Resident {
+                performance: ModelPerformance::Estimated {
+                    samples: vec![PerformanceEvidence {
+                        context_tokens: 50_000,
+                        estimated_tokens_per_second: 2.0,
+                    }],
+                },
+            },
+            projector: magnitude_service_contracts::models::ProjectorVerdict::None,
+            drafter: magnitude_service_contracts::models::DrafterVerdict::None,
         };
         let does_not_fit = ModelAssessment::DoesNotFit {
             profile: profile(100_000),
+            shortfall: profile(32_768),
             assessment_id: ModelAssessmentId("non-fit-assessment".to_owned()),
             memory: vec![MemoryAssessment {
                 memory_domain_id: MemoryDomainId::system(),
                 capacity_bytes: 100,
                 required_bytes: 101,
-                compatibility_reserve_bytes: 0,
                 remaining_bytes: -1,
             }],
             limiting_resource: "system memory".to_owned(),
             deficit_bytes: 1,
+            projector: magnitude_service_contracts::models::ProjectorVerdict::None,
+            drafter: magnitude_service_contracts::models::DrafterVerdict::None,
         };
 
         let initial = ModelCache::new(directory.path());
@@ -369,11 +485,13 @@ mod tests {
         let fits = CachedModelAssessment {
             capabilities: capabilities.clone(),
             template_fingerprint: "template".to_owned(),
+            fingerprint: None,
             profile: fits,
         };
         let does_not_fit = CachedModelAssessment {
             capabilities,
             template_fingerprint: fits.template_fingerprint.clone(),
+            fingerprint: None,
             profile: does_not_fit,
         };
         initial.write_model_assessment("fits evidence", &fits);

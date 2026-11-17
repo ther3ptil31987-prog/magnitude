@@ -2,6 +2,7 @@ use magnitude_chat::reasoning::{
     inspect_reasoning, normalize_effort, EffortDomain, EffortMapping, ReasoningError,
     ReasoningIntent, ReasoningProfile, DETECTOR,
 };
+use magnitude_chat::{TemplateBundle, TemplateVariant};
 use magnitude_templates::Template;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -171,6 +172,63 @@ fn a_model_without_enabled_reasoning_cannot_enable_it() {
     ));
 }
 
+/// Real LFM2.5 templates are fixed reasoning: 2.6B opens `<think>` in its
+/// generation prompt, while the 1.2B Thinking and Instruct finetunes share one
+/// byte-identical template that leaves the block to the model and strips
+/// `</think>` from history.
+#[test]
+fn lfm2_5_templates_are_fixed_reasoning() {
+    for name in ["LFM2_5_THINKING", "LFM2_5_1_2B_THINKING", "LFM2_5_INSTRUCT"] {
+        let profile = profile_of(name);
+        assert_eq!(
+            profile
+                .mappings
+                .iter()
+                .map(|mapping| mapping.effort.as_str())
+                .collect::<Vec<_>>(),
+            ["high"],
+            "{name}"
+        );
+        assert_eq!(profile.default_effort.as_deref(), Some("high"), "{name}");
+        assert_eq!(profile.supports_reasoning_output, Some(true), "{name}");
+        assert!(
+            matches!(
+                profile.resolve(&effort("none")),
+                Err(ReasoningError::CannotDisable { .. })
+            ),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        fixtures()["LFM2_5_1_2B_THINKING"],
+        fixtures()["LFM2_5_INSTRUCT"]
+    );
+}
+
+/// The real Llama 3.2 1B Instruct template (bartowski/LM Studio GGUF) has no
+/// reasoning control, so it is the single disabled option `none`.
+#[test]
+fn llama_3_2_instruct_normalizes_to_none() {
+    let profile = profile_of("LLAMA_3_2_INSTRUCT");
+    assert_eq!(
+        profile
+            .mappings
+            .iter()
+            .map(|mapping| mapping.effort.as_str())
+            .collect::<Vec<_>>(),
+        ["none"]
+    );
+    assert_eq!(profile.default_effort.as_deref(), Some("none"));
+    assert_eq!(profile.supports_reasoning_output, None);
+    let disabled = profile.resolve(&effort("none")).unwrap();
+    assert_eq!(disabled.effort.as_deref(), Some("none"));
+    assert!(disabled.controls.is_empty());
+    assert!(matches!(
+        profile.resolve(&effort("high")),
+        Err(ReasoningError::UnsupportedEffort { .. })
+    ));
+}
+
 #[test]
 fn disabled_and_extra_high_spellings_normalize() {
     for spelling in ["none", "off", "no_think", "disabled"] {
@@ -181,6 +239,47 @@ fn disabled_and_extra_high_spellings_normalize() {
     }
     assert_eq!(normalize_effort("adaptive"), Some("adaptive"));
     assert_eq!(normalize_effort("ultra"), None);
+}
+
+fn asset_profile(source: &str) -> ReasoningProfile {
+    let template = Template::new(source, &Default::default()).unwrap();
+    inspect_reasoning(&template, &Default::default()).unwrap()
+}
+
+/// Turning reasoning off counts only when the generation prompt no longer
+/// leaves the reply inside a reasoning block. The DavidAU LFM2.5 8B-A1B
+/// TBrilliance template swaps its system prompt for `enable_thinking=false`
+/// and for `reasoning_effort="off"` but always ends by opening `<think>`, so
+/// it keeps its native efforts and cannot be disabled. Qwen 3.5 closes the
+/// block empty when reasoning is off, which does disable it.
+#[test]
+fn an_off_setting_that_still_opens_reasoning_does_not_disable_it() {
+    let tbrilliance = asset_profile(include_str!(
+        "../../templates/tests/assets/LFM2.5-8B-A1B-Q3.8-TBrilliance.jinja"
+    ));
+    assert_eq!(
+        tbrilliance
+            .mappings
+            .iter()
+            .map(|mapping| mapping.effort.as_str())
+            .collect::<Vec<_>>(),
+        ["low", "medium", "high"]
+    );
+    assert_eq!(tbrilliance.default_effort.as_deref(), Some("high"));
+    for intent in [effort("none"), ReasoningIntent::Disabled] {
+        assert!(
+            matches!(
+                tbrilliance.resolve(&intent),
+                Err(ReasoningError::CannotDisable { .. })
+            ),
+            "{intent:?}"
+        );
+    }
+    let qwen = asset_profile(include_str!("../../templates/tests/assets/Qwen3.5-4B.jinja"));
+    assert_eq!(
+        qwen.resolve(&ReasoningIntent::Disabled).unwrap().controls,
+        BTreeMap::from([("enable_thinking".into(), json!(false))])
+    );
 }
 
 #[test]
@@ -204,5 +303,72 @@ fn muse_glimmer_reasoning_can_be_disabled() {
     assert_eq!(
         disabled.controls,
         BTreeMap::from([("enable_thinking".to_string(), json!(false))])
+    );
+}
+
+/// The renderer enables thinking unless the caller turns it off, so a toggle's
+/// enabled side is the default even when a template's own Jinja falls back to
+/// disabled, as the real Gemma 4 template does with `default(false)`.
+#[test]
+fn an_omitted_effort_selects_the_enabled_side_of_a_toggle() {
+    let gemma = asset_profile(include_str!(
+        "../../templates/tests/assets/gemma-4-12B-it.jinja"
+    ));
+    assert_eq!(
+        gemma
+            .mappings
+            .iter()
+            .map(|mapping| mapping.effort.as_str())
+            .collect::<Vec<_>>(),
+        ["none", "high"]
+    );
+    assert_eq!(gemma.default_effort.as_deref(), Some("high"));
+    assert_eq!(
+        gemma.resolve(&ReasoningIntent::Disabled).unwrap().controls,
+        BTreeMap::from([("enable_thinking".into(), json!(false))])
+    );
+    for (name, default) in [
+        ("BASIC", Some("none")),
+        ("TOGGLE", Some("high")),
+        ("FIXED", Some("high")),
+        ("THINKING_BOOL", Some("none")),
+        ("THINKING_MODE", Some("adaptive")),
+        ("EFFORT_TOGGLE", Some("high")),
+        ("EFFORT_NONE_MATCHES_LOW", Some("high")),
+        ("CLOSED_EFFORT", Some("high")),
+        ("QWEN_3_8_EFFORT", Some("xhigh")),
+        ("REVERSE_EFFORT_ALIAS", Some("high")),
+        ("ONE_ENABLED_EFFORT_BEHAVIOR", Some("max")),
+        ("SHARED_FALLBACK_EFFORT", Some("high")),
+        ("NAMED_SHARED_FALLBACK_EFFORT", Some("max")),
+        ("UNNAMED_DEFAULT_EFFORT", None),
+        ("OPEN_EFFORT", Some("high")),
+    ] {
+        assert_eq!(profile_of(name).default_effort.as_deref(), default, "{name}");
+    }
+}
+
+/// A template whose omitted control renders as no single effort cannot be
+/// published with a default, so inspecting it is an assessment failure rather
+/// than a capability without one.
+#[test]
+fn a_template_without_a_unique_default_effort_fails_inspection() {
+    let inspect = |name: &str| {
+        TemplateBundle::new(
+            vec![TemplateVariant {
+                name: "default".into(),
+                source: fixtures()[name].clone(),
+                provenance: "fixture".into(),
+            }],
+            "default".into(),
+            Default::default(),
+        )
+        .unwrap()
+        .inspect()
+    };
+    assert!(inspect("UNNAMED_DEFAULT_EFFORT").is_err());
+    assert_eq!(
+        inspect("TOGGLE").unwrap().reasoning.default_effort.as_deref(),
+        Some("high")
     );
 }

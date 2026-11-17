@@ -1,137 +1,142 @@
-//! Exact GGUF headers of catalog components, as dumped under
-//! `inference/validation/results/catalog-headers/` (metadata plus the full
-//! tensor directory; long metadata arrays keep only their head), for family
-//! tests.
+//! GGUF headers for family and assessment tests: the release catalog's
+//! components at their locked revisions, and the pinned artifacts outside the
+//! catalog the tests read ([`catalog_headers::artifacts`]).
+//!
+//! The catalog's headers are exported from `inference/catalog/models.lock.json`
+//! by `magnitude-service-catalog-tool headers --output DIR --model-store STORE`
+//! (the evaluation flow's `--catalog-headers` runs it on the host), and
+//! `MAGNITUDE_CATALOG_HEADERS` names the export (`DIR/headers`). Each is the
+//! exact header, read as the engine reads a component before its payload
+//! exists ([`PackageHeaders`]): a split target is all its shards. An export
+//! of another lock or other artifacts is refused.
 
-use magnitude_artifacts::gguf::{
-    ByteOrder, Directory, Encoding, Metadata, Scalar, TensorDescriptor, Value,
+use magnitude_artifacts::catalog_headers::{
+    self, lock_digest, CatalogComponent, ComponentRole, HeaderIndex, INDEX,
 };
-use serde_json::Value as Json;
-use std::path::PathBuf;
+use magnitude_artifacts::gguf::{Directory, Encoding, Metadata, TensorDescriptor, Value};
+use magnitude_artifacts::PackageHeaders;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
+/// The environment variable naming the catalog header export.
+pub const ROOT: &str = "MAGNITUDE_CATALOG_HEADERS";
+
+/// The catalog lock, of which the export must be.
+const LOCK: &[u8] = include_bytes!("../../../../catalog/models.lock.json");
+
+/// The catalog header export.
 pub fn root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../validation/results/catalog-headers")
-}
-
-/// Every dumped component: `(model, role, file)`.
-pub fn index() -> Vec<(String, String, String)> {
-    let index: Json =
-        serde_json::from_slice(&std::fs::read(root().join("index.json")).unwrap()).unwrap();
-    index
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|row| {
-            let field = |name: &str| row[name].as_str().unwrap().to_owned();
-            (field("model"), field("role"), field("file"))
+    std::env::var_os(ROOT)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            panic!(
+                "{ROOT} must name the catalog header export: \
+             `cargo run -p magnitude-service-catalog-tool -- headers --output DIR \
+             --model-store STORE` writes DIR/headers"
+            )
         })
-        .collect()
 }
 
-fn scalar(value: &Json) -> Scalar {
-    match value {
-        Json::Bool(value) => Scalar::Bool(*value),
-        Json::String(value) => Scalar::String(value.clone()),
-        Json::Number(number) => {
-            if let Some(value) = number.as_u64() {
-                Scalar::Unsigned(value)
-            } else if let Some(value) = number.as_i64() {
-                Scalar::Signed(value)
-            } else {
-                Scalar::Float(number.as_f64().unwrap())
-            }
-        }
-        other => panic!("metadata scalar expected, received {other}"),
-    }
+/// Every catalog component, from an export of this tree's lock.
+pub fn index() -> &'static [CatalogComponent] {
+    &export().components
 }
 
-fn value(value: &Json) -> Value {
-    match value {
-        Json::Array(values) => Value::Array(values.iter().map(scalar).collect()),
-        Json::Object(truncated) => Value::Array(
-            truncated["head"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(scalar)
-                .collect(),
-        ),
-        other => Value::Scalar(scalar(other)),
-    }
+/// The export's index, of this tree's lock and artifacts.
+fn export() -> &'static HeaderIndex {
+    static EXPORT: OnceLock<HeaderIndex> = OnceLock::new();
+    EXPORT.get_or_init(|| {
+        let path = root().join(INDEX);
+        let index: HeaderIndex = serde_json::from_slice(
+            &std::fs::read(&path).unwrap_or_else(|error| panic!("{path:?}: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("{path:?}: {error}"));
+        let lock = lock_digest(LOCK);
+        assert_eq!(
+            index.lock, lock,
+            "{path:?} is an export of another catalog lock; export this tree's"
+        );
+        assert_eq!(
+            index.artifacts,
+            catalog_headers::artifacts(),
+            "{path:?} is an export of other artifacts; export this tree's"
+        );
+        index
+    })
 }
 
-fn encoding(name: &str) -> Encoding {
-    let id = match name {
-        "F32" => 0,
-        "F16" => 1,
-        "Q4_0" => 2,
-        "Q5_0" => 6,
-        "Q5_1" => 7,
-        "Q8_0" => 8,
-        "Q3_K" => 11,
-        "Q4_K" => 12,
-        "Q5_K" => 13,
-        "Q6_K" => 14,
-        "IQ4_NL" => 20,
-        "IQ3_S" => 21,
-        "IQ4_XS" => 23,
-        "I32" => 26,
-        "BF16" => 30,
-        "MXFP4" => 39,
-        "NVFP4" => 40,
-        "Q1_0" => 41,
-        other => panic!("unmapped GGML type {other}"),
-    };
-    Encoding::try_from(id).unwrap()
+/// The directory of one catalog component.
+pub fn component(component: &CatalogComponent) -> Directory {
+    open(&component.file(&root()))
 }
 
-/// The directory of one dumped component file.
-pub fn directory(file: &str) -> Directory {
-    let path = root().join(file);
-    let header: Json = serde_json::from_slice(
-        &std::fs::read(&path).unwrap_or_else(|error| panic!("{path:?}: {error}")),
+/// The directory of the pinned artifact `name` ([`catalog_headers::artifacts`]).
+pub fn artifact(name: &str) -> Directory {
+    let artifact = export()
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.name == name)
+        .unwrap_or_else(|| panic!("no pinned artifact is named {name}"));
+    open(&artifact.file(&root()))
+}
+
+fn open(file: &Path) -> Directory {
+    PackageHeaders::open(file, None)
+        .unwrap_or_else(|error| panic!("{file:?}: {error}"))
+        .target()
+        .clone()
+}
+
+/// The directory of catalog model `model`'s (`qwen3.5-4b:gguf:q4`) component
+/// in `role`.
+pub fn catalog(model: &str, role: ComponentRole) -> Directory {
+    component(
+        index()
+            .iter()
+            .find(|component| component.model == model && component.role == role)
+            .unwrap_or_else(|| panic!("the catalog has no {model} {role}")),
     )
-    .unwrap();
-    let metadata = header["metadata"]
-        .as_object()
-        .unwrap()
-        .iter()
-        .map(|(name, item)| Metadata {
-            name: name.clone(),
-            value: value(item),
-        })
-        .collect();
-    let tensors = header["tensors"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|tensor| {
-            let encoding = encoding(tensor["type"].as_str().unwrap());
-            // Dumped in GGML storage order; the directory is outermost first.
-            let mut shape = tensor["shape"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|extent| extent.as_u64().unwrap())
-                .collect::<Vec<_>>();
-            let elements = shape.iter().product::<u64>();
-            shape.reverse();
-            TensorDescriptor {
-                name: tensor["name"].as_str().unwrap().to_owned(),
-                shape,
-                encoding,
-                offset: 0,
-                nbytes: elements / encoding.block_elements() * encoding.block_bytes(),
-            }
-        })
-        .collect();
-    Directory {
-        version: 3,
-        byte_order: ByteOrder::Little,
-        alignment: 32,
-        data_offset: 0,
-        metadata,
-        tensors,
+}
+
+/// The directory of catalog model `model`'s target.
+pub fn target(model: &str) -> Directory {
+    catalog(model, ComponentRole::Target)
+}
+
+/// The directory of catalog model `model`'s separately packaged draft.
+pub fn draft(model: &str) -> Directory {
+    catalog(model, ComponentRole::Draft)
+}
+
+/// The directory of catalog model `model`'s projector.
+pub fn projector(model: &str) -> Directory {
+    catalog(model, ComponentRole::Projector)
+}
+
+/// A header a test names: a catalog component, or a pinned artifact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Header {
+    /// Catalog model `.0`'s (`qwen3.5-4b:gguf:q4`) component in role `.1`.
+    Catalog(&'static str, ComponentRole),
+    /// The pinned artifact named `.0` ([`catalog_headers::artifacts`]).
+    Artifact(&'static str),
+}
+
+impl Header {
+    pub fn directory(self) -> Directory {
+        match self {
+            Self::Catalog(model, role) => catalog(model, role),
+            Self::Artifact(name) => artifact(name),
+        }
+    }
+}
+
+impl std::fmt::Display for Header {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Catalog(model, role) => write!(formatter, "{model} {role}"),
+            Self::Artifact(name) => formatter.write_str(name),
+        }
     }
 }
 
@@ -147,7 +152,11 @@ pub fn set(directory: &mut Directory, name: &str, value: Value) {
 pub fn remove_tensor(directory: &mut Directory, name: &str) {
     let before = directory.tensors.len();
     directory.tensors.retain(|tensor| tensor.name != name);
-    assert_eq!(directory.tensors.len() + 1, before, "{name} is recorded once");
+    assert_eq!(
+        directory.tensors.len() + 1,
+        before,
+        "{name} is recorded once"
+    );
 }
 
 pub fn reshape_tensor(directory: &mut Directory, name: &str, shape: &[u64]) {

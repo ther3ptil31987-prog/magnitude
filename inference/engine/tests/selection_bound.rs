@@ -15,7 +15,7 @@ use magnitude_engine::{
 };
 use magnitude_executor::{
     self as executor,
-    platform::{DeviceRequest, MemoryReserves},
+    platform::{DeviceRequest, ReleaseRate},
     ExecutionPath, ExecutorDomain, RequestId, StateBindings, TokenId,
 };
 use magnitude_family_contracts::{PreparedModelInput, TokenPlan};
@@ -48,19 +48,21 @@ fn plain_owner(limits: ServiceLimits) -> (Host, usize, std::sync::Arc<ByteBpeTok
             draft: None,
         },
         model: ModelPolicy {
+            draft_policy: None,
             method: ModelMethod::Plain,
             mtp_proposals: None,
-            kv_codec: KvCodec::AffineK8V4,
+            kv_codec: Some(KvCodec::AffineK8V4),
             lookahead: false,
             exported_logits_rows: 0,
-            error_classes: Vec::new(),
+            numerical_profile: None,
+            weight_bound: None,
         },
         context_tokens: Some(1024),
         service: limits.clone(),
         path: ExecutionPath::Native,
         device: DeviceRequest::Automatic,
         kernel_cache: std::env::var_os("MAGNITUDE_TEST_KERNEL_CACHE").map(PathBuf::from),
-        reserves: MemoryReserves::standard(),
+        release: ReleaseRate::of_machine(None),
     }
     .resolve()
     .unwrap();
@@ -73,7 +75,7 @@ fn plain_owner(limits: ServiceLimits) -> (Host, usize, std::sync::Arc<ByteBpeTok
             domain,
             bindings,
             limits,
-            PrefixCacheCapacity { max_entries: 0 },
+            PrefixCacheCapacity::disabled(),
             wakes,
         )
     });
@@ -145,6 +147,7 @@ fn a_prefill_round_finishes_at_most_the_selection_bound_and_defers_the_rest() {
         decode_tokens: BOUND,
         decode_share: 0.5,
         locality_seconds: 1.0,
+        conversations: std::num::NonZeroUsize::MIN,
     };
     let (mut host, vocabulary, tokenizer) = plain_owner(limits);
     let prompts = (0..5)
@@ -204,12 +207,14 @@ fn plain_domain(bound: usize, exported: usize) -> (ExecutorDomain, StateBindings
             draft: None,
         },
         model: ModelPolicy {
+            draft_policy: None,
             method: ModelMethod::Plain,
             mtp_proposals: None,
-            kv_codec: KvCodec::AffineK8V4,
+            kv_codec: Some(KvCodec::AffineK8V4),
             lookahead: false,
             exported_logits_rows: exported,
-            error_classes: Vec::new(),
+            numerical_profile: None,
+            weight_bound: None,
         },
         context_tokens: Some(1024),
         service: ServiceLimits {
@@ -217,11 +222,12 @@ fn plain_domain(bound: usize, exported: usize) -> (ExecutorDomain, StateBindings
             decode_tokens: bound,
             decode_share: 0.5,
             locality_seconds: 1.0,
+            conversations: std::num::NonZeroUsize::MIN,
         },
         path: ExecutionPath::Native,
         device: DeviceRequest::Automatic,
         kernel_cache: std::env::var_os("MAGNITUDE_TEST_KERNEL_CACHE").map(PathBuf::from),
-        reserves: MemoryReserves::standard(),
+        release: ReleaseRate::of_machine(None),
     }
     .resolve()
     .unwrap();
@@ -250,7 +256,7 @@ fn finishing(
     )
     .unwrap();
     domain.install_input(request, input).unwrap();
-    domain.open_state(bindings, request, None).unwrap();
+    domain.open_served(bindings, request, None).unwrap();
     executor::Operation::Forward {
         request,
         kind: executor::WorkKind::Prefill,

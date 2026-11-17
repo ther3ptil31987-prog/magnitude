@@ -1,8 +1,11 @@
 //! One actual Qwen3.5-4B block-zero recurrent path, independent CPU GGUF fixture.
 //! Run only with MAGNITUDE_REAL_RECURRENT_FIXTURE set to its generated directory.
 
+mod common;
+mod declared;
+
 use magnitude_kernels::{attention_output, gated_delta_project, gated_delta_step, repack_weight};
-use seismic::{BackendName, Device, DeviceCatalog, Element, SlabRegion, SlabTensor, Tensor};
+use seismic::{BackendName, Device, Element, SlabRegion, Tensor};
 use std::{fs, path::Path};
 
 fn bytes(path: &Path, name: &str, extension: &str) -> Vec<u8> {
@@ -55,12 +58,12 @@ fn repacked(
     let wire = bytes(path, name, "wire");
     let logical = shape.iter().product::<u64>();
     let input = Tensor::from_host(device, source_element, &[1, 1, logical], &wire).unwrap();
-    repack_weight::native_for_device_with(
+    declared::prepared(
         device,
-        repack_weight::Elements {
+        &repack_weight::native_entry_with(repack_weight::Elements {
             E: source_element,
             U: resident_element,
-        },
+        }),
         &seismic::NativeSpecialization::new(),
     )
     .unwrap()
@@ -136,7 +139,7 @@ fn report(path: &Path, label: &str, actual: Vec<f32>) {
 
 /// Metal and the CPU device.
 fn devices() -> Vec<Device> {
-    let catalog = DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     vec![
         catalog.open_backend(BackendName::Metal).unwrap(),
         catalog.open_backend(BackendName::Cpu).unwrap(),
@@ -202,33 +205,53 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf_on(device: &Device, path: &P
     // Bank 0 is the zero seed the advance reads; bank 1 is its successor.
     // One tape row per bank: the window holds C - 1 + 1 rows.
     let tape_row = (32 + 16) * 128 + 32;
-    let mut slabs = SlabTensor::new(&device, 2, 2, vec![
-        SlabRegion { element: Element::bf16(), row_shape: vec![4, 8192] },
-        SlabRegion { element: Element::f32(), row_shape: vec![32, 128, 128] },
-        SlabRegion { element: Element::f32(), row_shape: vec![1, tape_row as u64] },
-    ]).unwrap();
-    slabs.add_slab().unwrap();
+    let slabs = crate::common::slab_tensor(
+        &device,
+        2,
+        2,
+        &vec![
+            SlabRegion {
+                element: Element::bf16(),
+                row_shape: vec![4, 8192],
+            },
+            SlabRegion {
+                element: Element::f32(),
+                row_shape: vec![32, 128, 128],
+            },
+            SlabRegion {
+                element: Element::f32(),
+                row_shape: vec![1, tape_row as u64],
+            },
+        ]);
+    slabs.add_slab(seismic::SlabFill::Zeroed).unwrap();
     for (region, bytes) in [
         vec![0u8; 2 * 4 * 8192 * 2],
         vec![0u8; 2 * 32 * 128 * 128 * 4],
         vec![0u8; 2 * tape_row * 4],
-    ].into_iter().enumerate() {
-        slabs.region_rows(region, 0, 2).unwrap().write_from_host(&bytes).unwrap();
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        slabs
+            .region_rows(region, 0, 2)
+            .unwrap()
+            .write_from_host(&bytes)
+            .unwrap();
     }
     let mut window = slabs.logical_region(0).unwrap();
     let mut delta = slabs.logical_region(1).unwrap();
     let mut tape = slabs.logical_region(2).unwrap();
 
-    let projection = gated_delta_project::native_for_device_with(
+    let projection = declared::prepared(
         &device,
-        gated_delta_project::Elements {
+        &gated_delta_project::native_entry_with(gated_delta_project::Elements {
             NW: f32e,
             QW: q5,
             GW: q4,
             AW: q8,
             BW: q8,
             A: bf16,
-        },
+        }),
         &seismic::NativeSpecialization::new(),
     )
     .unwrap()
@@ -240,15 +263,17 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf_on(device: &Device, path: &P
         alpha_weight: &alpha,
         beta_weight: &beta,
         epsilon: 1e-6,
+        qkv_bound: &f32_tensor(device, &[0], &[]),
+        gate_bound: &f32_tensor(device, &[0], &[]),
     })
     .unwrap()
     .value;
     report(path, "projection", read_bf16(&projection));
 
     // The step publishes the gated rows; its raw outputs are internal.
-    let gated = gated_delta_step::native_for_device_with(
+    let gated = declared::prepared(
         &device,
-        gated_delta_step::Elements { RN: f32e, A: bf16 },
+        &gated_delta_step::native_entry_with(gated_delta_step::Elements { RN: f32e, A: bf16 }),
         &step_specialization(device),
     )
     .unwrap()
@@ -269,23 +294,32 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf_on(device: &Device, path: &P
         norm_epsilon: 128e-6,
         epsilon: 1e-6,
         grouped: false,
+        gate_function: 0,
         slab_banks: 2,
     })
     .unwrap()
     .value;
     report(path, "delta", read_f32(&delta.slice_leading(1, 2).unwrap()));
-    let projected = attention_output::native_for_device_with(
+    let projected = declared::prepared(
         &device,
-        attention_output::Elements { OW: q5, A: bf16 },
+        &attention_output::native_entry_with(attention_output::Elements { OW: q5, A: bf16 }),
         &seismic::NativeSpecialization::new(),
     )
     .unwrap()
     .call(attention_output::Args {
         hidden: &hidden,
+        inject: &no_inject(&device, hidden.extents()[0]),
         gated: &gated,
         output_weight: &output,
+        output_scale: &f32_tensor(device, &[0], &[]),
+        output_bound: &f32_tensor(device, &[0], &[]),
     })
     .unwrap()
     .value;
     report(path, "output", read_f32(&projected));
+}
+
+/// The inject port of a single residual stream: no columns.
+fn no_inject(device: &seismic::Device, rows: u64) -> seismic::Tensor {
+    seismic::Tensor::zeros(device, seismic::Element::f32(), &[rows, 0]).unwrap()
 }

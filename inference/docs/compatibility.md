@@ -103,9 +103,12 @@ The CPU backend is always available as the fallback.
   - `VK_KHR_workgroup_memory_explicit_layout`, with 8-bit, 16-bit, and scalar layouts
   - `VK_EXT_memory_budget`
 - **Numerics:**
-  - fp32 round-to-nearest-even
+  - fp32 round-to-nearest-even, declared as `RoundingModeRTE 32` only once the measurement job's
+    `rte_32_division` probe has shown the driver forming and rounding it as declared (the NVIDIA
+    580 driver's compiler traps on it); until then, and where it does not hold, fp32 rounds by
+    the device's default
   - fp32 signed zero, Inf, and NaN preservation
-  - a fused `fma`, either through `VK_KHR_shader_fma` or confirmed by a probe
+  - discovery reads device properties only; it opens no device and runs no probe
 - **Limits:**
   - 32 KiB of shared memory
   - 1024 invocations per workgroup, with workgroup size at least (1024, 1024, 64)
@@ -137,7 +140,9 @@ The CPU backend is always available as the fallback.
   - Required only alongside cooperative matrix.
   - Without it, kernels compute in fp32 over 16-bit storage.
 - **Cooperative matrix** (`VK_KHR_cooperative_matrix`, subgroup-scope 16×16×16).
-- **Shader float atomics, 64-bit shared atomics, and `VK_KHR_shader_fma`.**
+- **Shader float atomics and 64-bit shared atomics.**
+- **`VK_KHR_shader_fma`.** With it, `fma` compiles to `OpFmaKHR` and is fused. Without it,
+  `fma` is GLSL `fma`, which the driver may fuse or round twice.
 
 ### Coverage
 
@@ -162,17 +167,17 @@ Apple GPUs are served by Metal. MoltenVK is not a target.
   | Tier | Adds | Typical hardware |
   | --- | --- | --- |
   | x86v2 | SSE3–4.2, POPCNT | Atom-class Gemini Lake / Jasper Lake; 2017–2020 Pentium and Celeron; x86 under Rosetta |
-  | x86v3 | AVX2, FMA, F16C, BMI1/2 | Intel Haswell and newer (including all 12th gen and newer Core, and N100); AMD Zen 1–3 |
-  | x86v4 | AVX-512 F/CD/BW/DQ/VL | Intel Skylake-SP/X server and workstation parts |
-  | x86v4vnni | AVX-512 VNNI | Intel Ice Lake, Tiger Lake, Rocket Lake, Sapphire Rapids and newer Xeon; AMD Zen 4/5 |
+  | x86v3 | AVX2, FMA, F16C, BMI1/2 | Intel Haswell through Comet Lake Core; AMD Zen 1–3 |
+  | x86v3vnni | AVX-VNNI (VEX, 256-bit) | Intel 12th gen and newer Core, N100 and other Alder Lake-N parts |
+  | x86v4 | AVX-512 F/CD/BW/DQ/VL | Intel Skylake-SP/X server and workstation parts (before Cascade Lake) |
+  | x86v4vnni | AVX-512 VNNI | Intel Cascade Lake, Ice Lake, Tiger Lake, Rocket Lake, Sapphire Rapids and newer Xeon; AMD Zen 4 and Zen 5 |
   | neon | NEON | Every AArch64 CPU |
+  | neondot | `dotprod` (`sdot`) | Nearly every ARM CPU since 2018: Apple M1 and newer, Snapdragon X, Graviton 2+, Ampere Altra, Raspberry Pi 5 |
 
 - **v2 machines are supported but slow.** Hosts should prefer native builds: arm64 on Apple
   silicon and Windows on Arm.
 - **Planned tiers** (performance on hardware that is already supported):
-  - x86: AVX-VNNI, on Intel 12th gen and newer Core, N100, and Zen 5
-  - AArch64: `dotprod`, on nearly every ARM CPU since 2018 (Apple M1 and newer, Snapdragon X,
-    Graviton, Raspberry Pi 5)
+  - x86: AMX, on Sapphire Rapids and newer Xeon (x86v4vnni until then)
   - AArch64: `i8mm` and FP16 arithmetic
 - **Operating systems:**
   - Linux: glibc 2.35 (Ubuntu 22.04-compatible userspace)

@@ -1,6 +1,6 @@
 import { FileSystem } from "@effect/platform"
 import { InstallationOffer, InstallationChannel, verifyInstallationOffer } from "@magnitudedev/release/hosted-update"
-import { Effect, Schema } from "effect"
+import { Effect, Option, Schema } from "effect"
 import { homedir } from "node:os"
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path"
 import { ApplicationUpdateFailed } from "./application-update"
@@ -12,9 +12,9 @@ import { nativeMacUpdateAdmission } from "../desktop-native/mac-update-lease"
 import { nativeMacUpdateFilesystem } from "../desktop-native/mac-update-filesystem"
 import { MacBundleVerifier, nativeMacBundleVerifier } from "../desktop-native/mac-update-validation"
 import { NativeMacApplicationInstallation } from "../desktop-native/mac-update-installation"
-import { guardedCommandLayer } from "../desktop-native/guarded-command"
+import { guardedCommandLayer } from "@magnitudedev/utils/guarded-command"
 import { MacUpdateArchiveStager, makeMacUpdateArchiveStager } from "../desktop-native/mac-update-staging"
-import { makeMacCliRegistration } from "../desktop-native/mac-cli-registration"
+import { macCliRegistrationWarning, makeMacCliRegistration } from "../desktop-native/mac-cli-registration"
 
 const Path = Schema.NonEmptyString.pipe(Schema.maxLength(4096), Schema.filter(path => isAbsolute(path) && resolve(path) === path && !path.includes("\0")))
 export const MacArchiveInstallerRequest = Schema.Struct({
@@ -29,7 +29,7 @@ const contains = (parent: string, child: string) => {
   return path !== ".." && !path.startsWith("../") && !isAbsolute(path)
 }
 
-/** The shell verifies the extracted bootstrap bundle before invoking this finite entry point. */
+/** The shell verifies the extracted bootstrap bundle before invoking this finite entry point, and reports the result itself. */
 export const runMacArchiveInstallerCommand = (payload: string, stateDirectory: string, version: string) => Effect.gen(function* () {
   if (process.platform !== "darwin") return yield* new ApplicationUpdateFailed({ message: "This installer requires macOS." })
   const request = yield* decodeMacArchiveInstallerRequest(payload)
@@ -58,8 +58,8 @@ export const runMacArchiveInstallerCommand = (payload: string, stateDirectory: s
     yield* installMacApplicationArchive({ bundle, archive: request.archive, release: offer.release, architecture }).pipe(Effect.provideService(MacUpdateArchiveStager, stager))
     const environment = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined))
     const registration = yield* makeMacCliRegistration({ home: homedir(), resourcesDirectory: join(bundle, "Contents/Resources"), environment })
-    yield* registration.install
+    const warning = yield* macCliRegistrationWarning(registration.install)
+    if (Option.isSome(warning)) yield* Effect.sync(() => { process.stderr.write(`${warning.value}\n`) })
   }).pipe(Effect.provide([nativeHostLayer(addon), nativeMacUpdateAdmission(addon), nativeMacUpdateFilesystem(addon),
     nativeMacBundleVerifier(addon), NativeMacApplicationInstallation, guardedCommandLayer(join(resources, "magnitude-command"))])))
-  yield* Effect.sync(() => { process.stdout.write("Magnitude was installed. Run magnitude serve to start the server.\n") })
 }).pipe(Effect.mapError(error => new ApplicationUpdateFailed({ message: error.message })))

@@ -7,13 +7,19 @@
 //! tensor directory (a header-only open is sufficient), the model
 //! definition, the resolved model policy and the service limits.
 
-use crate::options::{ExecutionManifest, ResolvedMethod, ResolvedModelPolicy};
+use crate::assessment::Measurements;
+use crate::options::{DraftPolicy, ExecutionManifest, ResolvedMethod, ResolvedModelPolicy};
 use magnitude_batching::MAX_CLASS_ROWS;
 use magnitude_executor::{
-    image_cell_limit, platform::SelectedDevice, BackendPlan, ComponentSelection,
-    ExecutionPlanDraft, ExecutionPlanner, PlanError, PlannedMethod, ResourceLimits,
+    image_cell_limit, max_image_cells,
+    platform::{self, PlatformError, SelectedDevice},
+    BackendPlan, ComponentSelection,
+    DraftWidths,
+    ChargedDraft, ExecutionPlanDraft, ExecutionPlanner, HeldCharge, PlanError, PlanPrices, Placed, PlannedMethod, ResourceLimits, SettleRoom, StableRoom,
+    assessment::{decode_step, ExecutorCosts, Priced},
 };
 use magnitude_scheduler::ServiceLimits;
+use seismic::Devices;
 use std::fmt;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,14 +50,54 @@ impl fmt::Display for ExecutionPlanningError {
 
 impl std::error::Error for ExecutionPlanningError {}
 
+/// Select the manifest's device as a load and its preview do, measuring
+/// nothing: what its graphs hold is the measurement job's point, read from
+/// its kernel cache's records, its backend's bound until stored there
+/// (`platform::select_recorded`).
+pub(crate) fn select_load_device(
+    catalog: &Devices,
+    manifest: &ExecutionManifest,
+) -> Result<SelectedDevice, PlatformError> {
+    platform::select_recorded(catalog, manifest.path, manifest.device, &manifest.release, manifest.kernel_cache.as_deref())
+}
+
 /// Plan the manifest's model on the selected device: component selection,
 /// planned method, KV codec and resource limits resolved from the manifest,
-/// then `ExecutionPlanner::prepare`. Opens no device and reads no payload.
-pub fn plan_execution(
+/// then `ExecutionPlanner::prepare`, then its expert bank under the model
+/// policy's weight cap, if any, beside its arena, a streamed bank at the
+/// pass the machine's prices settle ([`plan_banked`]).
+/// Opens no device and reads no payload: its room is the stable fit's
+/// ([`StableRoom`]), an assessment's and a preview's, where a load's is the
+/// reading it holds ([`magnitude_executor::PlanningRoom`]). The draft comes
+/// with the memory charge its planning confirmed, each way of holding its
+/// experts charged as a `C` (`HeldCharge`).
+pub fn plan_execution<C: HeldCharge>(
+    manifest: &ExecutionManifest,
+    selected: &SelectedDevice,
+) -> Result<ChargedDraft<C>, ExecutionPlanningError> {
+    plan_resident(manifest, selected).and_then(|resident| {
+        plan_banked(manifest, selected, resident, Holding::Placed, &StableRoom::of_selected(selected))
+    })
+}
+
+/// How a plan holds its experts ([`plan_banked`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Holding {
+    /// As placement decides from the stable room: whole where it holds
+    /// them, else streamed.
+    Placed,
+    /// Streamed, whatever whole form the stable room holds: a load whose
+    /// target import claim refused its whole plan, its bank then fitted by
+    /// that claim.
+    Streamed,
+}
+
+/// [`plan_execution`]'s plan before its expert bank: every expert resident.
+pub fn plan_resident(
     manifest: &ExecutionManifest,
     selected: &SelectedDevice,
 ) -> Result<ExecutionPlanDraft, ExecutionPlanningError> {
-    let (selection, method, limits) = planner_inputs(manifest, selected.info.backend)?;
+    let (selection, method, limits) = planner_inputs(manifest, selected.info.backend())?;
     ExecutionPlanner::prepare(
         selected,
         &manifest.package,
@@ -63,6 +109,76 @@ pub fn plan_execution(
         limits,
     )
     .map_err(ExecutionPlanningError::Plan)
+}
+
+/// [`plan_execution`]'s plan from its `resident` plan, in two stages: its
+/// experts placed whole under the model policy's weight cap, if any, from
+/// memory alone, in `room` (`ExecutionPlanDraft::placed`); else streamed
+/// through the expert bank `room` holds beside its arena, at the pass the machine's
+/// prices settle ([`plan_prices`], `Unplaced::streamed`).
+///
+/// Every load, whole or streamed, is priced on its executor's costs as it
+/// serves (`execution::load_measures`), so none plans before the
+/// measurement job stored the costs' required figures: while they are
+/// pending the load waits for them (`PlanError::Unpriced`), holding nothing
+/// of the device, once per machine. Without a kernel cache nothing is
+/// measured for it and its prices are unavailable: a whole plan holds
+/// without them, and a streamed one fails (`PlanError::Unpriced`, an
+/// internal error).
+pub fn plan_banked<C: HeldCharge>(
+    manifest: &ExecutionManifest,
+    selected: &SelectedDevice,
+    resident: ExecutionPlanDraft,
+    holding: Holding,
+    room: &impl SettleRoom,
+) -> Result<ChargedDraft<C>, ExecutionPlanningError> {
+    let measurements = match manifest.kernel_cache.as_deref() {
+        None => Measurements::Unavailable { reason: "the load keeps no kernel cache, which holds the machine's figures".into() },
+        Some(kernels) => crate::assessment::stored_measurements(
+            &selected.reading.topology,
+            &selected.info,
+            kernels,
+            manifest.store(),
+        ),
+    };
+    if let Measurements::Pending = measurements {
+        return Err(ExecutionPlanningError::Plan(PlanError::Unpriced {
+            pending: true,
+            reason: "the executor's costs are not measured yet".into(),
+        }));
+    }
+    let short = match holding {
+        Holding::Placed => match resident.placed(&manifest.definition, manifest.model.weight_bound, room).map_err(ExecutionPlanningError::Plan)? {
+            Placed::Whole(whole) => return Ok(whole),
+            Placed::Short(short) => short,
+        },
+        Holding::Streamed => resident
+            .streaming(&manifest.definition, manifest.model.weight_bound, room)
+            .map_err(ExecutionPlanningError::Plan)?,
+    };
+    let prices = plan_prices(&measurements, short.draft());
+    short.streamed(&manifest.definition, &prices, room).map_err(ExecutionPlanningError::Plan)
+}
+
+/// The prices a plan of `definition` as `plan` (its plan before any bank)
+/// settles its held pass on (`PlanPrices`): the executor's costs and the
+/// streamed figures `measurements` hold, and its decode on those costs in
+/// each form, `plan`'s and the banked plan's streamed form's
+/// (`assessment::decode_step`). Pending or unavailable as the measurements
+/// or their streamed figures are: a plan that holds a bank waits for them.
+pub fn plan_prices(measurements: &Measurements, plan: &ExecutionPlanDraft) -> Priced<PlanPrices> {
+    match measurements {
+        Measurements::Pending => Priced::Pending("the executor's costs are not measured yet".into()),
+        Measurements::Unavailable { reason } => Priced::Unavailable(reason.clone()),
+        Measurements::Measured { costs, streamed, .. } => streamed.as_ref().and_then(|figures| {
+            let (resident, steps) = (plan.clone(), ExecutorCosts::clone(costs));
+            Priced::Measured(PlanPrices::new(
+                ExecutorCosts::clone(costs),
+                *figures,
+                Box::new(move |definition, banked| decode_step(definition, &resident, banked, steps.clone())),
+            ))
+        }),
+    }
 }
 
 /// Plan the manifest's model on `backend`, which is all planning reads of a
@@ -95,19 +211,31 @@ fn planner_inputs(
         head: !matches!(manifest.model.method, ResolvedMethod::Plain),
         vision: manifest.definition.vision.is_some(),
     };
+    // A fixed budget drafts its generated width, or a narrower one at a
+    // request's end; an adaptive load any width its controller chooses.
+    let widths = match manifest.model.draft_policy {
+        Some(DraftPolicy::Fixed(budget)) => DraftWidths::Fixed(budget.generated as u8),
+        Some(DraftPolicy::Adaptive) | None => DraftWidths::Adaptive,
+    };
     let method = match manifest.model.method {
         ResolvedMethod::Plain => PlannedMethod::Plain,
         ResolvedMethod::Mtp {
             greedy_proposals,
             sampled_proposals,
+            ..
         } => PlannedMethod::Mtp {
             greedy_proposals,
             sampled_proposals,
+            widths,
         },
-        ResolvedMethod::DFlash { proposals } => PlannedMethod::DFlash { proposals },
+        ResolvedMethod::DFlash { proposals } => PlannedMethod::DFlash { proposals, widths },
     };
-    let image_cells = image_cell_limit(&manifest.definition, manifest.service.launch_rows())
-        .map_err(ExecutionPlanningError::Plan)?;
+    let image_cells = image_cell_limit(
+        &manifest.definition,
+        manifest.service.launch_rows(),
+        max_image_cells(backend),
+    )
+    .map_err(ExecutionPlanningError::Plan)?;
     let limits = resource_limits(&manifest.service, &manifest.model, image_cells, backend)?;
     Ok((selection, method, limits))
 }
@@ -140,18 +268,23 @@ fn resource_limits(
             admitted: max_launch_rows,
         });
     }
+    // A CPU launch completes during its submission, so a queued successor
+    // would run before the owner could apply a cancellation, stop or
+    // admission, and it overlaps nothing.
+    let lookahead = model.lookahead && backend != seismic::BackendName::Cpu;
     Ok(ResourceLimits {
         max_launch_rows,
-        // Every request consumes at least one token in either phase. A
-        // prefill round can therefore have as many request slots as its
-        // larger token allowance admits.
-        max_launch_slots: max_launch_rows,
+        max_launch_slots: service.steps().launch_slots(),
         max_selected_rows: service.selection_bound(),
         max_drafting_slots: service.selection_bound(),
         exported_logits_rows: model.exported_logits_rows,
         max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
         max_image_cells: image_cells,
-        lookahead: model.lookahead,
+        lookahead,
+        // One launch until the load's chain is planned beside its weights
+        // (`ExecutionPlanDraft::with_bank`).
+        chain_capacity: std::num::NonZeroUsize::MIN,
+        conversations: service.conversations,
     })
 }
 
@@ -162,11 +295,13 @@ mod tests {
 
     fn model(exported_logits_rows: usize) -> ResolvedModelPolicy {
         ResolvedModelPolicy {
+            draft_policy: None,
             method: ResolvedMethod::Plain,
             kv_codec: KvCodec::AffineK8V4,
             lookahead: false,
             exported_logits_rows,
-            error_classes: Vec::new(),
+            numerical_profile: None,
+            weight_bound: None,
         }
     }
 
@@ -176,6 +311,7 @@ mod tests {
             decode_tokens,
             decode_share: 0.5,
             locality_seconds: 1.0,
+            conversations: std::num::NonZeroUsize::MIN,
         }
     }
 
@@ -221,6 +357,28 @@ mod tests {
     }
 
     #[test]
+    fn synchronous_cpu_launches_queue_no_lookahead() {
+        let model = ResolvedModelPolicy {
+            lookahead: true,
+            ..model(0)
+        };
+        for (backend, expected) in [
+            (seismic::BackendName::Cpu, false),
+            (seismic::BackendName::Metal, true),
+            (seismic::BackendName::Cuda, true),
+            (seismic::BackendName::Vulkan, true),
+        ] {
+            assert_eq!(
+                resource_limits(&service(512, 32), &model, 0, backend)
+                    .unwrap()
+                    .lookahead,
+                expected,
+                "{backend:?}"
+            );
+        }
+    }
+
+    #[test]
     fn large_prefill_classes_require_cuda() {
         let service = service(1024, 32);
         assert_eq!(
@@ -238,3 +396,4 @@ mod tests {
         );
     }
 }
+

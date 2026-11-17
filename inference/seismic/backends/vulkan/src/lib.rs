@@ -1,5 +1,4 @@
-//! Seismic's Vulkan backend: the direct native route only
-//! (`specs/26-09-24/vulkan-native-backend.md`). Authored GLSL compute
+//! Seismic's Vulkan backend: the direct native route only. Authored GLSL compute
 //! kernels are formed to SPIR-V with the statically linked glslang, sealed
 //! for Seismic's numerical environment, validated with SPIRV-Tools and run on
 //! one queue of the opened device through ash.
@@ -10,40 +9,85 @@ mod device;
 pub mod direct;
 mod facts;
 pub mod formation;
+mod graph_cost;
 mod instance;
 mod memory;
-mod probe;
+pub mod probe;
 pub mod seal;
 pub mod toolchain;
+pub mod topology;
+pub mod transfer;
 
-pub use device::{Device, MemoryBudget, OpenError, Rounded};
+pub use device::{Device, DeviceHandle, HeapBudget, MemoryBudget, OpenError};
 pub use facts::{
-    Calibration, Description, DeviceType, Facts, FormationFacts, Limits, SubgroupWidth,
-    SUBGROUP_WIDTH,
+    Allocation, Calibration, Description, DeviceType, Facts, FormationTarget, Limits, MemoryHeap,
+    MemoryLayout, MemoryType, Probed, Properties, SUBGROUP_WIDTH,
 };
-pub use instance::LoaderError;
-pub use memory::Buffer;
+pub use graph_cost::{graph_cost, UNMEASURED as UNMEASURED_GRAPH_COST};
 
-/// Enumerate the physical devices: no logical device is created. GPUs come
-/// first, so the first device of the backend is a GPU when there is one.
+/// The programs of one opened device under its toolchain: the one way the
+/// backend's code forms a program (the runtime's program former, over the
+/// process's program store).
+pub type VulkanPrograms = std::sync::Arc<dyn seismic_native_target::Programs<toolchain::VulkanToolchain>>;
+pub use instance::LoaderError;
+pub use memory::{Buffer, MemoryStores};
+
+/// Enumerate the physical devices against the floor, from their reported
+/// properties alone: discovery opens no logical device. GPUs come first, so
+/// the first device of the backend is a GPU when there is one.
 pub fn discover() -> Result<Vec<Description>, LoaderError> {
     let instance = instance::instance()?;
     let mut descriptions = instance
         .physical_devices()?
         .into_iter()
-        .map(|physical| facts::describe(instance, physical))
+        .map(|physical| facts::describe(&instance, physical))
         .collect::<Vec<_>>();
     descriptions.sort_by_key(|description| !description.facts.is_gpu());
     Ok(descriptions)
+}
+
+/// One tally, bounding nothing, as every store of a device of `facts`: a
+/// test's, and the probe process's, which allocates only its probes' few
+/// buffers and keeps no count of its stores apart.
+pub(crate) fn unbounded_stores(facts: &Facts) -> MemoryStores {
+    let tally: std::sync::Arc<dyn seismic_memory::entry::Store> =
+        std::sync::Arc::new(seismic_memory::entry::Tally::unbounded(seismic_topology::StoreIdentity::HostRam));
+    let kinds = (0..facts.memory.types.len() as u32).map(|kind| (kind, tally.clone())).collect();
+    MemoryStores { kinds, host: tally }
+}
+
+/// The devices meeting the floor a test exercises; none without a loader,
+/// or where the runner requests another backend
+/// (`seismic_lang::registry::requested_test_backend`). A run that requests
+/// Vulkan refuses a failed discovery or finding no such device.
+#[cfg(test)]
+pub(crate) fn test_devices() -> Vec<Description> {
+    seismic_lang::registry::test_device_reached("discovers the Vulkan test devices");
+    let requested = seismic_lang::registry::requested_test_backend();
+    if requested.is_some_and(|backend| backend != seismic_lang::registry::BackendName::Vulkan) {
+        return Vec::new();
+    }
+    let selected = requested.is_some();
+    let devices = match discover() {
+        Ok(devices) => devices,
+        Err(error) => {
+            assert!(!selected, "requested Vulkan discovery failed: {error}");
+            eprintln!("no Vulkan loader: {error}");
+            return Vec::new();
+        }
+    };
+    let devices = devices.into_iter().filter(|description| description.floor.is_ok()).collect::<Vec<_>>();
+    assert!(!selected || !devices.is_empty(), "no eligible requested Vulkan device");
+    devices
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Every device meeting the discovery floor opens, or fails only the
-    /// multiply-add probe (lavapipe); storage round-trips through host
-    /// writes and reads.
+    /// Every device discovery reports available opens, and one it reports
+    /// unavailable (below the floor) fails to open for the same reason;
+    /// storage round-trips through host writes and reads.
     #[test]
     fn devices_meeting_the_floor_open_and_round_trip_storage() {
         let devices = match discover() {
@@ -55,31 +99,30 @@ mod tests {
         };
         for description in devices {
             eprintln!(
-                "{} ({}, {}): floor {:?}, subgroup {:?}, f16 {}, matrix {}, denorm-preserve {}, rte32 {}, shader fma {:?}, uuid {}",
+                "{} ({}, {}): unprobed properties {:?}, subgroup size required {:?}, matrix path {}, shader fma {:?}, uuid {}",
                 description.facts.name,
                 description.facts.driver_name,
                 description.facts.driver_info,
-                description.floor,
-                description.facts.subgroup_width,
-                description.facts.float16,
-                description.facts.matrix,
-                description.facts.denorm_preserve_32,
-                description.facts.rounding_rte_32,
-                description.facts.shader_fma,
+                description.properties(&Probed::default()).as_ref().map(Properties::identity),
+                description.floor.is_ok().then(|| description.facts.requires_subgroup_size()),
+                description.facts.matrix_path,
+                description.facts.shader_fma(),
                 facts::hex(&description.facts.uuid)
             );
-            if description.floor.is_err() {
+            if let Err(reason) = &description.floor {
+                let error = Device::open(description.facts.uuid, crate::unbounded_stores(&description.facts), &Default::default())
+                    .err()
+                    .expect("a device discovery reports unavailable does not open");
+                eprintln!("  {error}");
+                if let Some(open_reason) = error.floor_reason() {
+                    assert_eq!(&open_reason, reason);
+                }
                 continue;
             }
-            let device = match Device::open(description.facts.uuid) {
-                Ok(device) => device,
-                Err(error @ (OpenError::MultiplyAdd { .. } | OpenError::Rounding { .. })) => {
-                    eprintln!("  {error}");
-                    continue;
-                }
-                Err(error) => panic!("a device meeting the floor opens: {error}"),
-            };
-            let buffer = device.allocate(1 << 20, 256).expect("allocation");
+            let device = Device::open(description.facts.uuid, crate::unbounded_stores(&description.facts), &Default::default()).unwrap_or_else(|error| {
+                panic!("a device discovery reports available opens: {error}")
+            });
+            let buffer = device.allocate(1 << 20, 256, &device.own()).expect("allocation");
             let bytes = (0..1u32 << 18)
                 .flat_map(|word| word.to_le_bytes())
                 .collect::<Vec<_>>();
@@ -89,13 +132,6 @@ mod tests {
             assert_eq!(back, bytes);
             let budget = device.memory_budget();
             assert!(budget.heap_budget_bytes > 0);
-            // Formed `fma` (OpFmaKHR where bound) is fused beside a sealed
-            // `a*b+c`, which is rounded twice (§7.3, §13.1).
-            probe::multiply_add(&device).expect("fma is fused and a*b+c is not contracted");
-            // fp32 rounds to nearest even whether RTE 32 is declared or
-            // probed at open.
-            probe::rounding(&device)
-                .expect("fp32 add, multiply and conversion round to nearest even");
         }
     }
 
@@ -137,9 +173,9 @@ mod tests {
             seal::unsealed(&sealed, &[16, 32]).expect("module"),
             (0, true)
         );
-        // The probed environment leaves out only `RoundingModeRTE 32`
-        // (4 words).
-        let probed = seal::seal(
+        // Where the driver cannot compile it, the environment leaves out
+        // only `RoundingModeRTE 32` (4 words).
+        let without_rte = seal::seal(
             &compiled,
             seal::Environment {
                 rounding_rte_32: false,
@@ -148,10 +184,10 @@ mod tests {
         )
         .expect("seal");
         assert_eq!(
-            seal::unsealed(&probed, &[16, 32]).expect("module"),
+            seal::unsealed(&without_rte, &[16, 32]).expect("module"),
             (0, false)
         );
-        assert_eq!(probed.len(), sealed.len() - 4);
+        assert_eq!(without_rte.len(), sealed.len() - 4);
         // Without fp16 arithmetic, the two fp16 modes (8 words) are left out
         // and the fp32 environment is complete.
         let fp32 = seal::seal(
@@ -165,7 +201,7 @@ mod tests {
         assert_eq!(seal::unsealed(&fp32, &[32]).expect("module"), (0, true));
         assert_eq!(seal::unsealed(&fp32, &[16]).expect("module"), (0, false));
         assert_eq!(fp32.len(), sealed.len() - 8);
-        formation::validate(&probed).expect("a sealed module validates");
+        formation::validate(&without_rte).expect("a sealed module validates");
         formation::validate(&sealed).expect("a sealed module validates");
         formation::validate(&fp32).expect("a sealed module validates");
         // `fma` becomes `OpFmaKHR` (opcode 4427, six words) with its

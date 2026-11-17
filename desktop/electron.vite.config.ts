@@ -83,6 +83,7 @@ export default defineConfig({
       rollupOptions: {
         input: {
           preload: resolve(__dirname, "src/preload.ts"),
+          "server-conflict-preload": resolve(__dirname, "src/server-conflict-preload.ts"),
         },
       },
     },
@@ -93,6 +94,7 @@ export default defineConfig({
       rollupOptions: {
         input: {
           index: resolve(__dirname, "index.html"),
+          "server-conflict": resolve(__dirname, "server-conflict.html"),
         },
       },
     },
@@ -103,16 +105,12 @@ export default defineConfig({
           replacement: resolve(__dirname, "../web/src"),
         },
         {
-          find: "@magnitudedev/web",
-          replacement: resolve(__dirname, "../web/src/index.tsx"),
-        },
-        {
           find: /^@magnitudedev\/sdk$/,
           replacement: resolve(__dirname, "../packages/sdk/src/index.ts"),
         },
         {
-          find: "@web-styles",
-          replacement: resolve(__dirname, "../web/src/styles"),
+          find: /^@magnitudedev\/web\/(.*)$/,
+          replacement: resolve(__dirname, "../web/src/$1"),
         },
       ],
     },
@@ -130,6 +128,16 @@ export default defineConfig({
       "process.versions": "{}",
     },
     optimizeDeps: {
+      // Workspace packages are served as source, so the startup scan reads them too; otherwise their
+      // dependencies are found mid-load and the re-optimization leaves the first window blank.
+      entries: [
+        "index.html",
+        "server-conflict.html",
+        "../web/src/**/*.{ts,tsx}",
+        "../packages/{client-common,sdk,acn-protocol,effect-query,utils,generate-id}/src/**/*.{ts,tsx}",
+        "!**/*.test.{ts,tsx}",
+        "!**/fixtures/**",
+      ],
       exclude: [
         "@magnitudedev/sdk",
           "@magnitudedev/sdk/desktop-host",
@@ -137,12 +145,11 @@ export default defineConfig({
           "@magnitudedev/daemon-management/desktop-native",
           "@magnitudedev/utils",
           "@magnitudedev/harness-connections",
-          "@magnitudedev/daemon-management/node",
+          "@magnitudedev/storage/sqlite/node",
           "@magnitudedev/storage",
           "@magnitudedev/release",
         "@magnitudedev/client-common",
         "@magnitudedev/generate-id",
-        "@magnitudedev/web",
       ],
     },
   },

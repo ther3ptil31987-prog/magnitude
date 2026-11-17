@@ -25,11 +25,14 @@ pub mod facts;
 pub mod intrinsic;
 pub mod profile;
 pub mod toolchain;
+pub mod topology;
 
 mod command;
 mod compile;
+mod registry_entry;
 mod render;
 mod services;
+mod timing;
 
 #[cfg(test)]
 mod test_support;
@@ -47,12 +50,17 @@ use std::time::Instant;
 
 pub use command::Pipeline;
 pub use compile::NativeCandidate;
-pub use device::{DeviceHandle, MetalBuffer, MetalDevice};
+pub use device::{DeviceHandle, MetalBuffer, MetalDevice, WritableMetalBuffer};
 pub use direct::{
     host_seconds, DirectBatch, DirectLaunch, DirectPipeline, DirectSubmission, LaunchTimestamps,
-    DIRECT_BUFFER_SLOTS, DIRECT_WORD_BYTES_LIMIT,
+    SharedEvent, DIRECT_BUFFER_SLOTS, DIRECT_WORD_BYTES_LIMIT,
 };
 pub use executor::MetalExecutor;
+
+/// The programs of one opened Metal device: the one way this backend forms
+/// a program ([`seismic_native_target::Programs`]).
+pub type MetalPrograms =
+    std::sync::Arc<dyn seismic_native_target::Programs<toolchain::MetalToolchain>>;
 pub use facts::MetalFacts;
 use seismic_ir::metal::MetalIntrinsic;
 
@@ -60,6 +68,23 @@ use seismic_ir::metal::MetalIntrinsic;
 /// an emission rule, a resource rule, or an execution-service rule changes
 /// this string and with it every cache identity (§15.1).
 pub const BACKEND_REVISION: &str = "seismic-metal-v11";
+
+/// Run `work`, which calls into Metal or Foundation, and release what
+/// those calls autoreleased when it returns.
+///
+/// Metal and Foundation hand back objects they have autoreleased: they
+/// live until the calling thread's innermost autorelease pool is drained.
+/// No thread of this process has a pool of its own (it has no run loop),
+/// so without one here they live until the thread exits, and the thread
+/// that submits serving's work never does. Measured on an M4 Max
+/// (2026-10-09): a submission (command buffer, encoder, commit, wait) left
+/// 180 bytes each on a thread with no pool, growing without bound, and
+/// none with one; a program compile left 22 KiB. Every entry of this
+/// backend that calls into Metal or Foundation therefore runs in a pool.
+/// Objects the work returns retained outlive the pool.
+pub(crate) fn pooled<R>(work: impl FnOnce() -> R) -> R {
+    objc2::rc::autoreleasepool(|_| work())
+}
 
 /// The Metal backend.
 #[derive(Debug)]
@@ -161,17 +186,17 @@ pub(crate) fn native_launch_constraints(
 }
 
 impl seismic_native_target::NativeCompiler<Metal> for MetalNativeCompiler {
-    type Context = DeviceHandle;
+    type Context = MetalPrograms;
     type Candidate = NativeCandidate;
     type Handle = Pipeline;
     fn form(
         &self,
         context: &Self::Context,
-        target: &DeviceDescription<Metal>,
+        _target: &DeviceDescription<Metal>,
         kernel: &seismic_ir::kernel::Kernel<Metal>,
         layout: &seismic_ir::physical_target::KernelEmissionLayout,
     ) -> Result<Self::Candidate, NativeCompilationError> {
-        compile::compile_kernel(context, target, kernel, layout)
+        pooled(|| compile::form_kernel(context, kernel, layout))
     }
     fn reflect(
         &self,
@@ -182,14 +207,14 @@ impl seismic_native_target::NativeCompiler<Metal> for MetalNativeCompiler {
     ) -> Result<NativeKernelReflection<Metal, Self::Handle>, NativeCompilationError> {
         let reflection_started = Instant::now();
         let pipeline_threads = u64::try_from(
-            candidate.pipeline.state.maxTotalThreadsPerThreadgroup(),
+            candidate.pipeline().state.maxTotalThreadsPerThreadgroup(),
         )
         .map_err(|_| {
             NativeCompilationError::MalformedToolchainOutput(
                 "Metal pipeline thread limit exceeds u64".into(),
             )
         })?;
-        let static_local = u64::try_from(candidate.pipeline.state.staticThreadgroupMemoryLength())
+        let static_local = u64::try_from(candidate.pipeline().state.staticThreadgroupMemoryLength())
             .map_err(|_| {
                 NativeCompilationError::MalformedToolchainOutput(
                     "Metal pipeline static threadgroup memory exceeds u64".into(),
@@ -200,7 +225,7 @@ impl seismic_native_target::NativeCompiler<Metal> for MetalNativeCompiler {
                 "Metal pipeline reflects an empty threadgroup domain".into(),
             ));
         }
-        let subgroup_width = u32::try_from(candidate.pipeline.state.threadExecutionWidth())
+        let subgroup_width = u32::try_from(candidate.pipeline().state.threadExecutionWidth())
             .map_err(|_| {
                 NativeCompilationError::MalformedToolchainOutput(
                     "Metal pipeline SIMD width exceeds u32".into(),
@@ -261,7 +286,7 @@ impl seismic_native_target::NativeCompiler<Metal> for MetalNativeCompiler {
             metadata_bytes: candidate.metadata_bytes,
         };
         Ok(NativeKernelReflection::new(
-            candidate.pipeline,
+            candidate.into_handle(),
             description,
             metrics,
         ))

@@ -22,6 +22,24 @@ impl fmt::Display for DeviceError {
 
 impl error::Error for DeviceError {}
 
+/// Weights a sequence's step named could not be read from the model's
+/// artifact: a stored table's rows (`StoredTable`) or a streamed layer's
+/// experts (`ExpertBank`). The step read other values in their place, so
+/// the sequence fails; nothing of a step other than the one that named them
+/// is affected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WeightReadError {
+    pub detail: String,
+}
+
+impl fmt::Display for WeightReadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "model weights could not be read: {}", self.detail)
+    }
+}
+
+impl error::Error for WeightReadError {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlanError {
     InvalidDefinition(String),
@@ -39,7 +57,92 @@ pub enum PlanError {
     Topology(&'static str),
     Arithmetic(&'static str),
     ResourcePlanning(String),
+    /// A kernel call of the load's programs at statics outside its kernel's
+    /// domain on the backend, found while charging the load's memory: the
+    /// model's shapes are beyond what the engine's kernels execute.
+    KernelDomain(seismic::KernelDomainViolation),
     Resource(CapacityError),
+    /// The load's weight bound (a cap or a device room) is below the
+    /// weights a load holds with its expert bank at its minimum: each group's least records, what its steps need
+    /// resident at once to make progress (`ExpertBankPlan::least_records`).
+    WeightBound { bound: crate::WeightBound, needed: u64 },
+    /// The load's routed experts cannot be streamed.
+    Unstreamed(UnstreamedExperts),
+    /// The plan's settle has no prices for its holdings
+    /// (`planning::PlanPrices`): the machine's standing figures are not
+    /// measured yet (`pending`), or cannot be, with why. A load of it waits
+    /// for the measurement job, as its assessment does.
+    Unpriced { pending: bool, reason: String },
+}
+
+/// Why a load's routed experts cannot be streamed through an expert bank.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UnstreamedExperts {
+    /// The backend lacks an entry of the bank of one of the model's routed
+    /// forms, or the shared-route decode form a fused bank-served decode
+    /// takes.
+    Backend(seismic::BackendName),
+    /// The device holds no host tier, which every miss lands in
+    /// (`platform::host_tier`), for `reason`.
+    Untiered { backend: seismic::BackendName, reason: String },
+    /// The bank's largest lent allocation (`ExpertBankPlan::largest_lent`)
+    /// of `lent` bytes exceeds the device's single allocation of `most`.
+    Allocation { lent: u64, most: u64 },
+    /// The model routes no experts.
+    Unrouted,
+    /// A routed layer whose record form (gated or up-only) or selected
+    /// experts differ from the first streamed layer's, which the bank's
+    /// entries and words share.
+    Shape(magnitude_family_contracts::SublayerIndex),
+    /// A routed layer that selects in another order than the first streamed
+    /// layer (form, score function, selection bias, router input, or the
+    /// elements of the weights a route reads of the next layer): a layer's
+    /// hints rank the next layer's choices by its own.
+    SelectionOrder(magnitude_family_contracts::SublayerIndex),
+    /// An expert stack whose experts are not each one range of its stored
+    /// experts' bytes, uploaded as stored, nor contiguous in its resident
+    /// form.
+    Record(WeightRole),
+    /// The expert stacks of a routed layer disagree on their experts.
+    Geometry(WeightRole),
+}
+
+impl fmt::Display for UnstreamedExperts {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Backend(backend) => {
+                write!(formatter, "{} has no expert-streaming entries", backend.as_str())
+            }
+            Self::Untiered { backend, reason } => write!(
+                formatter,
+                "this {} device holds no host tier for an expert bank's misses to land in: {reason}",
+                backend.as_str()
+            ),
+            Self::Allocation { lent, most } => write!(
+                formatter,
+                "the expert bank's lent records take one allocation of {lent} bytes, past the device's {most}"
+            ),
+            Self::Unrouted => formatter.write_str("the model routes no experts"),
+            Self::Shape(index) => write!(
+                formatter,
+                "routed layer {index:?} differs in record form or selected experts from the first streamed layer"
+            ),
+            Self::SelectionOrder(index) => write!(
+                formatter,
+                "routed layer {index:?} selects in another order than the first streamed layer"
+            ),
+            Self::Record(role) => write!(
+                formatter,
+                "{:?}/{:?} does not hold each expert as one range of its stored bytes",
+                role.scope, role.kind
+            ),
+            Self::Geometry(role) => write!(
+                formatter,
+                "{:?}/{:?} differs from its layer's expert geometry",
+                role.scope, role.kind
+            ),
+        }
+    }
 }
 
 impl fmt::Display for PlanError {
@@ -62,7 +165,16 @@ impl fmt::Display for PlanError {
             Self::ResourcePlanning(detail) => {
                 write!(formatter, "resource planning failed: {detail}")
             }
+            Self::KernelDomain(violation) => violation.fmt(formatter),
             Self::Resource(source) => source.fmt(formatter),
+            Self::WeightBound { bound, needed } => write!(
+                formatter,
+                "{bound} is below the {needed} bytes the load's weights need with its expert bank \
+                 at its minimum, the records its steps need at once"
+            ),
+            Self::Unstreamed(reason) => write!(formatter, "experts cannot stream: {reason}"),
+            Self::Unpriced { pending: true, reason } => write!(formatter, "the plan's prices are pending: {reason}"),
+            Self::Unpriced { pending: false, reason } => write!(formatter, "the plan has no prices: {reason}"),
         }
     }
 }
@@ -113,6 +225,10 @@ pub enum ResourceKind {
     DeviceMemory,
     /// Host RAM a dedicated device stages its uploads through.
     HostStaging,
+    /// The device memory a request's state reservation draws on, as it
+    /// opens or grows ahead of a step (`memory::ledger::Ledger::reserve`,
+    /// `memory::ledger::Ledger::extend`).
+    RequestState,
     StateRows,
     RecurrentBanks,
     Workspace,

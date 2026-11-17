@@ -6,16 +6,66 @@
 //! trait only, so adding a family changes nothing above this contract.
 
 use crate::{ModelDefinition, ModelInputAdapter, SublayerIndex, TapPoint};
-use magnitude_artifacts::{gguf::Directory, PackageIdentity, TokenId};
+use magnitude_artifacts::{
+    gguf::{Directory, Value},
+    PackageIdentity, TokenId, UnsupportedReason,
+};
 use std::{error, fmt};
 
-/// A registered family rejected material it recognized.
+/// A registered family rejected material it recognized: every unsupported
+/// feature it can name, and the developer text that describes the refusal.
+/// `reasons` is never empty: malformed material is `Unreadable`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FamilyError(pub String);
+pub struct FamilyError {
+    pub reasons: Vec<UnsupportedReason>,
+    pub detail: String,
+}
+
+impl FamilyError {
+    /// Material whose header does not describe a model the family can
+    /// build: a required weight is missing, or values contradict each other.
+    pub fn invalid(detail: impl Into<String>) -> Self {
+        Self::unsupported(vec![UnsupportedReason::Unreadable], detail)
+    }
+
+    /// A metadata key the family requires that the header omits.
+    pub fn missing_metadata(key: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self::unsupported(
+            vec![UnsupportedReason::MissingMetadata { key: key.into() }],
+            detail,
+        )
+    }
+
+    /// A metadata key present with a value the family does not read.
+    pub fn metadata(key: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self::unsupported(
+            vec![UnsupportedReason::UnrecognizedMetadata { key: key.into() }],
+            detail,
+        )
+    }
+
+    /// A drafter, head or projector that disagrees with the target it is
+    /// bound to.
+    pub fn mismatch(detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        Self::unsupported(
+            vec![UnsupportedReason::TargetMismatch {
+                detail: detail.clone(),
+            }],
+            detail,
+        )
+    }
+
+    pub fn unsupported(reasons: Vec<UnsupportedReason>, detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        debug_assert!(!reasons.is_empty(), "a family refusal names no reason: {detail}");
+        Self { reasons, detail }
+    }
+}
 
 impl fmt::Display for FamilyError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        formatter.write_str(&self.detail)
     }
 }
 
@@ -34,9 +84,27 @@ pub trait ModelFamily: Send + Sync {
     /// Stable family name, for diagnostics.
     fn name(&self) -> &'static str;
 
-    /// Whether this family claims the target from its header metadata alone.
-    /// Recognition interprets no geometry.
-    fn recognizes(&self, target: &Directory) -> bool;
+    /// The `general.architecture` values this family claims. Claiming an
+    /// architecture is recognition only: whether the family admits the
+    /// file's feature set is decided by [`Self::inspect`], so a refusal names
+    /// what it does not admit instead of disowning the file.
+    fn architectures(&self) -> &'static [&'static str];
+
+    /// Why Magnitude withholds this family from serving, when it does: a
+    /// defect that makes its output wrong although its packages interpret.
+    /// Recognition and inspection are unaffected, so the engine still runs
+    /// the family; the service refuses to serve it, with this reason.
+    fn withheld(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Whether this family claims the target's architecture.
+    fn recognizes(&self, target: &Directory) -> bool {
+        target
+            .value("general.architecture")
+            .and_then(Value::string)
+            .is_some_and(|architecture| self.architectures().contains(&architecture))
+    }
 
     /// Build the numerical definition of a recognized package from headers.
     fn inspect(
@@ -71,12 +139,13 @@ pub trait ModelFamily: Send + Sync {
         let blocks = definition.decoder.blocks.len() as u64;
         match layer.cmp(&blocks) {
             std::cmp::Ordering::Less => Ok(TapPoint::Sublayer(SublayerIndex {
-                block: u32::try_from(layer)
-                    .map_err(|_| FamilyError(format!("target layer {layer} exceeds u32")))?,
+                block: u32::try_from(layer).map_err(|_| {
+                    FamilyError::mismatch(format!("target layer {layer} exceeds u32"))
+                })?,
                 sublayer: 0,
             })),
             std::cmp::Ordering::Equal => Ok(TapPoint::Exit),
-            std::cmp::Ordering::Greater => Err(FamilyError(format!(
+            std::cmp::Ordering::Greater => Err(FamilyError::mismatch(format!(
                 "target layer {layer} is beyond the target's {blocks} layers"
             ))),
         }

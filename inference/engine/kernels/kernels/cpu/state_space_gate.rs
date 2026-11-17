@@ -6,6 +6,7 @@
 use lib::core::activation;
 use seismic::cpu::math;
 
+#[inline(always)]
 fn state_space_gate<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let (row, g) = (group[0] as usize, group[1] as usize);
     let (heads, width) = (cx.dim_u() as usize, cx.dim_p() as usize);
@@ -26,9 +27,9 @@ fn state_space_gate<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64
     let inverse = math::rsqrt(squares / (heads * width) as f32 + cx.arg_epsilon());
     for local in 0..heads {
         // SAFETY: each work item writes its own group's heads of its row.
-        let out = unsafe { normalized.row_mut([row, g * heads + local, 0]) };
+        let mut out = unsafe { normalized.row_mut([row, g * heads + local, 0]) };
         for (channel, out) in out.iter_mut().enumerate() {
-            *out = E::A::narrow(gated(local, channel) * inverse * norm.get([g, local, channel]));
+            out.set(gated(local, channel) * inverse * norm.get([g, local, channel]));
         }
     }
 }

@@ -1,0 +1,85 @@
+import { Cause, Context, Effect, Layer, Option, Ref, Stream } from "effect"
+import {
+  LocalModelMutationFailed,
+  Models,
+  sameModelId,
+  type ModelId,
+} from "@magnitudedev/acn-protocol"
+import { IcnLocalModels } from "@magnitudedev/icn"
+import { PROVIDER_ID as LOCAL_PROVIDER_ID } from "@magnitudedev/icn/provider"
+import type { CustomModelsConfig } from "@magnitudedev/storage"
+import { AcnChanges } from "./changes"
+import { CustomModels, isHidden, localModelsConfiguration } from "./custom-models"
+import { ModelLocations } from "./model-locations"
+import { ModelSlotController } from "./model-slot-controller"
+
+/**
+ * Delivers ACN's custom-model choices to ICN as one whole snapshot. Commands `push` it so ICN reflects
+ * a choice before they return.
+ */
+export interface CustomModelReconcilerApi {
+  readonly push: Effect.Effect<void, LocalModelMutationFailed>
+}
+export class CustomModelReconciler extends Context.Tag("CustomModelReconciler")<
+  CustomModelReconciler,
+  CustomModelReconcilerApi
+>() {}
+
+/** Models a change makes disappear from selection: forgotten added models and newly hidden models. */
+export const disappearedCustomModels = (
+  previous: CustomModelsConfig,
+  next: CustomModelsConfig,
+): readonly ModelId[] => {
+  const forgotten = (Object.keys(previous.added) as ModelId[]).filter((modelId) => !(modelId in next.added))
+  const hidden = next.hidden.filter((modelId) => !isHidden(previous, modelId))
+  return [...new Set([...forgotten, ...hidden])]
+}
+
+const pushFailed = () => new LocalModelMutationFailed({
+  code: "local_models_configuration_failed",
+  message: "The inference service did not accept your model choices. Try again.",
+  retryable: true,
+})
+
+export const CustomModelReconcilerLive: Layer.Layer<
+  CustomModelReconciler,
+  never,
+  CustomModels | ModelLocations | IcnLocalModels | ModelSlotController | AcnChanges
+> = Layer.scoped(CustomModelReconciler, Effect.gen(function* () {
+  const customModels = yield* CustomModels
+  const locations = yield* ModelLocations
+  const localModels = yield* IcnLocalModels
+  const slots = yield* ModelSlotController
+  const changes = yield* AcnChanges
+  const lock = yield* Effect.makeSemaphore(1)
+
+  const push = lock.withPermits(1)(Effect.gen(function* () {
+    const config = yield* customModels.get
+    const configuration = localModelsConfiguration(config, yield* locations.resolve)
+    yield* localModels.configure(configuration).pipe(Effect.mapError(pushFailed))
+  }))
+
+  const previous = yield* Ref.make(yield* customModels.get)
+  const reconcile = (next: CustomModelsConfig) => Effect.gen(function* () {
+    const disappeared = disappearedCustomModels(yield* Ref.get(previous), next)
+    if (disappeared.length > 0) {
+      const snapshot = (yield* slots.state).slots
+      for (const slot of [snapshot.primary, snapshot.secondary]) {
+        if (slot._tag !== "Unassigned" && slot.selection.providerId === LOCAL_PROVIDER_ID
+          && disappeared.some((modelId) => sameModelId(modelId, slot.selection.providerModelId))) {
+          yield* slots.updateModelSlot(slot.slotId, Option.none())
+        }
+      }
+    }
+    yield* Ref.set(previous, next)
+    yield* push
+    yield* changes.publish({ operation: Models.listModelLocations._tag })
+  }).pipe(Effect.catchAllCause((cause) => Effect.logError("Unable to reconcile custom models").pipe(
+    Effect.annotateLogs({ cause: Cause.pretty(cause).slice(0, 2_000) }),
+  )))
+
+  // The first emission is the current choices. Every later change is compared with the last one seen.
+  yield* customModels.changes.pipe(Stream.runForEach(reconcile), Effect.forkScoped)
+
+  return CustomModelReconciler.of({ push })
+}))

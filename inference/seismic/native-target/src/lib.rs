@@ -8,18 +8,27 @@
 
 mod description;
 mod error;
+mod gate;
 mod native;
+pub mod process;
 mod program;
+mod store;
+pub mod workers;
 
 pub use description::{
     CompatibilityIdentity, DeviceDescription, DeviceDescriptionIdentity, DeviceDescriptionParts,
     NativeNumericalModeIdentity, NumericalEnvironmentIdentity, TargetFamily,
 };
 pub use error::{NativeCompilationError, TargetDescriptionError, ToolchainUnavailable};
+pub use gate::{AnsweredBy, GateOpening, ParkAnswer};
 pub use native::{
     form_native_kernel, reconcile_native_kernel, ClusterPortability, NativeArtifactMetrics,
     NativeClusterDomain, NativeCompiler, NativeFormation, NativeKernel, NativeKernelCandidate,
     NativeKernelDescription, NativeKernelIdentity, NativeKernelReflection, NativeLaunchDomain,
     NativeResourceUsage, NativeResources,
 };
-pub use program::{ProgramCache, ProgramEntry, ProgramSource, Toolchain, ToolchainIdentity};
+pub use program::{
+    Artifact, Compile, Declined, Formed, LaunchProgram, ProgramEntry, ProgramSource, ProgramStatistic, Programs,
+    StatisticValue, Toolchain, ToolchainIdentity,
+};
+pub use store::{ArtifactKey, ArtifactStore, MemoryStore, PROBES};

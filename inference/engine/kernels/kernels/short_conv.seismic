@@ -29,7 +29,7 @@ fn short_conv_rows[M, B, S, CH, C, T](projection: &tensor[M, 2 * CH] f32,
     convolution: &tensor[CH, C] f32,
     segments: &tensor[B + 1, 2] i32, stop: &tensor[B] i32,
     previous_bank: &tensor[B] i32, previous_tape: &tensor[B] i32, following_bank: &tensor[B] i32,
-    window: &mut tensor[S, C - 1 + T, CH] f32,
+    window: &slab mut tensor[S, C - 1 + T, CH] f32,
     slab_banks: u32) -> tensor[M, CH] A where T >= 0:
     let mut gated = tensor[M, CH] A
     for row in 0..M:
@@ -91,3 +91,76 @@ native short_conv_rows for cpu from "cpu/short_conv_rows.rs":
         threadgroups (M + B, 1, 1)
         threads_per_threadgroup (1, 1, 1)
         shared_bytes (CH * 4)
+
+# LFM2's short-convolution input projection over every residual row: the RMS
+# prologue, the B, C and X row ranges of `in_proj` (bound as three weights),
+# and one F32 row per residual row, u = B ⊙ X in columns 0..CH and C in
+# CH..2CH, both from the F32 accumulators (`short_conv_rows` consumes them
+# unrounded).
+fn short_conv_project[M, H, CH, BS, CS, XS](residual: &tensor[M, H] f32, norm: &tensor[H] NW,
+    b_weight: &tensor[CH, H] BW, c_weight: &tensor[CH, H] CW,
+    x_weight: &tensor[CH, H] XW, eps: f32, b_scale: &tensor[BS] f32,
+    c_scale: &tensor[CS] f32, x_scale: &tensor[XS] f32) -> tensor[M, 2 * CH] f32 where BS >= 0 and CS >= 0 and XS >= 0 and BS <= 1 and CS <= 1 and XS <= 1 and operands(BW) == operands(CW) and operands(BW) == operands(XW):
+    let mut normalized = tensor[M, H] A
+    let mut b_sum = tensor[M, CH] f32
+    let mut c_sum = tensor[M, CH] f32
+    let mut x_sum = tensor[M, CH] f32
+    let mut b = tensor[M, CH] f32
+    let mut c = tensor[M, CH] f32
+    let mut x = tensor[M, CH] f32
+    let mut result = tensor[M, 2 * CH] f32
+    rms_norm(residual, norm, normalized, eps)
+    linear(normalized, b_weight, b_sum)
+    linear(normalized, c_weight, c_sum)
+    linear(normalized, x_weight, x_sum)
+    scale_rows(b_sum, b_scale, b)
+    scale_rows(c_sum, c_scale, c)
+    scale_rows(x_sum, x_scale, x)
+    parallel for row in 0..M:
+        parallel for channel in 0..CH:
+            result[row, channel] = b[row, channel] * x[row, channel]
+            result[row, CH + channel] = c[row, channel]
+    return result
+
+# Metal and CUDA: the `dense` projection (`dense.seismic`), segmented: the u
+# segment (the B and X streams paired, their F32 product) in the first
+# threadgroups along x and the C segment (one stream, stored F32) after it;
+# the CPU splits its row items the same way. Metal keeps the tile mapping it
+# ran before moving onto the projection for every GEMV row count
+# (SIMDGROUPS 16, ROWS 1, LANES 16). The GEMV row classes, and the batched rows,
+# normalize while staging; `normalize` normalizes once for the matrix GEMV and
+# every form past 16 rows, and `normalize_tall` in the tall GEMM's order.
+native short_conv_project for metal from "metal/short_conv_project.metal":
+    static (H, CH, BS, CS, XS)
+    where H > 0 and BS <= 1 and CS <= 1 and XS <= 1
+    project dense segmented ((b_weight, x_weight), c_weight)
+    restate single_gemv
+    scratch normalized bytes ((M + TALL * (ceil_div(M, 64) * 64 - M)) * H * 2) when M > VERIFY_ROWS and (M > 16 or MATRIX == 1)
+    launch short_conv_project_normalize before batch when M > VERIFY_ROWS and (M > 16 or MATRIX == 1) and (M <= 64 or TALL == 0 or PACK == 1):
+        staging
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch short_conv_project_normalize_tall before tall when M > 64 and TALL == 1 and PACK == 0:
+        staging
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native short_conv_project for vulkan from "vulkan/short_conv_project.comp":
+    static (H, CH, BS, CS, XS)
+    where H > 0 and BS <= 1 and CS <= 1 and XS <= 1
+    project dense segmented ((b_weight, x_weight), c_weight) rows rms
+
+# `dense_expand`'s bands over two segments along x: u (the B and X streams
+# paired) then C (one stream).
+native short_conv_project for cuda from "cuda/short_conv_project.cu":
+    static (H, CH, BS, CS, XS)
+    where H > 0 and BS <= 1 and CS <= 1 and XS <= 1
+    project dense segmented ((b_weight, x_weight), c_weight) rows rms
+
+native short_conv_project for cpu from "cpu/short_conv_project.rs":
+    static (H, BS, CS, XS)
+    where H > 0 and BS <= 1 and CS <= 1 and XS <= 1
+    project quantized tiled (BW, CW, XW) over (M, H) operand (residual normed (norm, eps))
+    launch short_conv_project_rows:
+        threadgroups (2 * ceil_div(CH, ROWS), 1, 1)
+        threads_per_threadgroup (1, 1, 1)

@@ -5,8 +5,8 @@ import { release } from "node:os"
 import { ApplicationUpdateControlFailed, type ApplicationUpdateAction } from "@magnitudedev/sdk/desktop-host"
 import { bundledWindowsNative } from "@magnitudedev/daemon-management/bun"
 import { acquireApplicationMaintenance, acquireUpdateInstallationLease, applicationNativeHostPath, nativeHostLayer, resolveInstalledApplicationRuntime,
-  PreparedUpdateStore, UpdatePreferences, unixPrivateFilePermissions, windowsPrivateFilePermissions, recoverWindowsUpdateDirectory } from "@magnitudedev/daemon-management/desktop-native"
-import { ApplicationUpdateSource, makeInstalledUpdatePreparation, readPreparedUpdateState, discardPreparedUpdate, runFiniteUpdatePreparation, completeLinuxForegroundUpdate, startMacForegroundInstallation } from "@magnitudedev/daemon-management/application-update"
+  PreparedUpdateStore, UpdatePreferences, unixPrivateFilePermissions, windowsPrivateFilePermissions, recoverWindowsUpdateDirectory, nodeTerminalCommand } from "@magnitudedev/daemon-management/desktop-native"
+import { ApplicationUpdateSource, makeInstalledUpdatePreparation, readPreparedUpdateState, discardPreparedUpdate, runFiniteUpdatePreparation, completeLinuxForegroundUpdate, startMacForegroundInstallation, UpdateHardwareSource, unavailableUpdateHardware } from "@magnitudedev/daemon-management/application-update"
 import { runWindowsInstalledUpdate } from "./windows-startup-update"
 import { CLI_VERSION } from "../version"
 import { isDevelopmentBuild } from "../runtime/environment"
@@ -28,13 +28,13 @@ export const runLocalUpdateMaintenance = (options: {
     ? (yield* Command.make("/usr/bin/sw_vers", "-productVersion").pipe(Command.string, Effect.timeout("5 seconds"))).trim()
     : release()
   return yield* Effect.gen(function* () {
-    if (options.action === "install" && platform === "win32") yield* runWindowsInstalledUpdate(runtime, options, options.stateDirectory, false)
+    if (options.action === "install" && platform === "win32") yield* runWindowsInstalledUpdate(runtime, options, options.stateDirectory)
     else if (options.action !== "status") {
       yield* acquireApplicationMaintenance(options.stateDirectory)
       if (platform === "win32") yield* recoverWindowsUpdateDirectory(addon, options.dataDirectory)
     }
     const preparation = yield* makeInstalledUpdatePreparation({ resources: runtime.resourcesDirectory, addonPath: addon,
-      dataDirectory: options.dataDirectory, version: CLI_VERSION, osVersion, platform, architecture, isolated: options.isolated })
+      dataDirectory: options.dataDirectory, version: CLI_VERSION, osVersion, platform, architecture, isolated: options.isolated, owner: "headless" })
     const execute = Effect.gen(function* () {
       if (options.action === "status") return yield* readPreparedUpdateState
       if (options.action === "install") {
@@ -43,11 +43,11 @@ export const runLocalUpdateMaintenance = (options: {
         if (platform === "darwin") return yield* startMacForegroundInstallation({ resources: runtime.resourcesDirectory,
           stateDirectory: options.stateDirectory, dataDirectory: options.dataDirectory, version: CLI_VERSION, architecture,
           operation: "Install", continuation: { _tag: "None" } })
-        yield* completeLinuxForegroundUpdate(options.dataDirectory, Boolean(process.stdin.isTTY && process.stderr.isTTY))
+        yield* completeLinuxForegroundUpdate(options.dataDirectory, process.stdin.isTTY && process.stderr.isTTY ? "Terminal" : "Unattended").pipe(Effect.provide(nodeTerminalCommand))
         return yield* readPreparedUpdateState
       }
       if (options.action === "discard") return yield* discardPreparedUpdate
-      const source = yield* preparation.makeSource
+      const source = yield* preparation.makeSource.pipe(Effect.provideService(UpdateHardwareSource, unavailableUpdateHardware))
       return yield* runFiniteUpdatePreparation(options.action === "check" ? "check" : "download").pipe(
         Effect.provideService(ApplicationUpdateSource, source))
     })

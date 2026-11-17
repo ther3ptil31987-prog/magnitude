@@ -7,21 +7,26 @@ use crate::driver::{self, DriverError, Event, Handle, JitError, Module};
 use crate::executor::Device;
 use crate::nvrtc::NvrtcError;
 use seismic_compiler::errors::ExecutionError;
-use seismic_native_target::NativeCompilationError;
+use seismic_compiler::graph_cost::GraphCensus;
+use seismic_native_target::{NativeCompilationError, ProgramStatistic, StatisticValue};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 
 // cuFuncGetAttribute / cuFuncSetAttribute keys.
 const MAX_THREADS_PER_BLOCK: i32 = 0;
 const SHARED_SIZE_BYTES: i32 = 1;
+const LOCAL_SIZE_BYTES: i32 = 3;
+const NUM_REGS: i32 = 4;
 const MAX_DYNAMIC_SHARED_SIZE_BYTES: i32 = 8;
 
 /// The kernel functions of one CUDA program, loaded on one device.
 pub struct DirectModule {
     /// Keeps the functions' module loaded.
-    _module: Arc<Module>,
+    module: Arc<Module>,
     functions: Vec<DirectFunction>,
+    /// The bytes of the CUBIN the module was loaded from.
+    image_bytes: u64,
     /// How a replayed launch of this module depends on the launch before
     /// it: programmatic when the source declares
     /// `SEISMIC_PROGRAMMATIC_DEPENDENCY` (every kernel waits for its
@@ -36,6 +41,10 @@ struct DirectFunction {
     raw: Handle,
     max_threads: u64,
     static_shared: u64,
+    /// What the driver reports the function uses: its registers, local
+    /// (spill and stack) and static shared bytes, and the block size those
+    /// admit.
+    statistics: Vec<ProgramStatistic>,
     /// Largest dynamic shared size currently admitted by the function
     /// attribute; raised on demand.
     dynamic_shared_limit: AtomicU64,
@@ -66,11 +75,16 @@ pub(crate) fn formation_error(error: NvrtcError) -> NativeCompilationError {
 }
 
 fn jit_error(error: JitError) -> NativeCompilationError {
-    NativeCompilationError::ToolchainFailure(match error {
+    NativeCompilationError::ToolchainFailure(jit_report(error))
+}
+
+/// What a JIT failure reports: the driver's error and its log.
+pub(crate) fn jit_report(error: JitError) -> String {
+    match error {
         JitError::Toolchain { error, log } => format!("{error}\n{log}"),
         JitError::Driver(error) => error.to_string(),
         JitError::MalformedImage(message) => message,
-    })
+    }
 }
 
 fn driver_failure(error: DriverError) -> NativeCompilationError {
@@ -86,6 +100,13 @@ fn submission(error: DriverError) -> ExecutionError {
 }
 
 impl DirectModule {
+    /// Whether a replayed launch of this module may start once the launch
+    /// before it has triggered, not completed (programmatic dependent
+    /// launch): how a graph node of it depends on the one before.
+    pub fn programmatic(&self) -> bool {
+        self.edge == driver::Edge::Programmatic
+    }
+
     /// Load a CUBIN image and each named kernel of it, in order.
     pub(crate) fn load(
         device: &Device,
@@ -103,12 +124,36 @@ impl DirectModule {
             let attribute = |key| {
                 driver::function_attribute(context, raw, key)
                     .map_err(driver_failure)
-                    .map(|value| u64::try_from(value).unwrap_or(0))
+                    .map(|value| {
+                        u64::try_from(value).expect("the driver reports a non-negative function attribute")
+                    })
             };
+            let max_threads = attribute(MAX_THREADS_PER_BLOCK)?;
+            let static_shared = attribute(SHARED_SIZE_BYTES)?;
+            let statistic = |name: &str, description: &str, value| ProgramStatistic {
+                name: name.into(),
+                description: description.into(),
+                value: StatisticValue::Uint(value),
+            };
+            let statistics = vec![
+                statistic("registers", "CU_FUNC_ATTRIBUTE_NUM_REGS: registers of one thread", attribute(NUM_REGS)?),
+                statistic(
+                    "local bytes",
+                    "CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES: local memory of one thread (spills and stack)",
+                    attribute(LOCAL_SIZE_BYTES)?,
+                ),
+                statistic("static shared bytes", "CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES: static shared memory of one block", static_shared),
+                statistic(
+                    "max threads per block",
+                    "CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK: the most threads a block may have, given its registers",
+                    max_threads,
+                ),
+            ];
             functions.push(DirectFunction {
                 raw,
-                max_threads: attribute(MAX_THREADS_PER_BLOCK)?,
-                static_shared: attribute(SHARED_SIZE_BYTES)?,
+                max_threads,
+                static_shared,
+                statistics,
                 dynamic_shared_limit: AtomicU64::new(attribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)?),
             });
         }
@@ -120,10 +165,26 @@ impl DirectModule {
             driver::Edge::Complete
         };
         Ok(Self {
-            _module: Arc::new(module),
+            module: Arc::new(module),
             functions,
+            image_bytes: u64::try_from(image.len()).expect("a CUBIN's size fits u64"),
             edge,
         })
+    }
+
+    /// The context the module is loaded in.
+    pub(crate) fn context(&self) -> &Arc<driver::Context> {
+        &self.module.context
+    }
+
+    /// The driver's handle of kernel `function`.
+    pub(crate) fn function(&self, function: usize) -> Handle {
+        self.functions[function].raw
+    }
+
+    /// The bytes of the CUBIN the module was loaded from.
+    pub fn image_bytes(&self) -> u64 {
+        self.image_bytes
     }
 
     pub fn max_threads_per_block(&self, function: usize) -> u64 {
@@ -132,6 +193,46 @@ impl DirectModule {
 
     pub fn static_shared_bytes(&self, function: usize) -> u64 {
         self.functions[function].static_shared
+    }
+
+    /// What the driver reports `function` uses.
+    pub fn statistics(&self, function: usize) -> &[ProgramStatistic] {
+        &self.functions[function].statistics
+    }
+
+    /// The blocks of `function` one multiprocessor holds at once with
+    /// `threads` threads and `shared_bytes` dynamic shared bytes each.
+    pub fn active_blocks(
+        &self,
+        device: &Device,
+        function: usize,
+        threads: u64,
+        shared_bytes: u64,
+    ) -> Result<u64, ExecutionError> {
+        let function = &self.functions[function];
+        function.admit_shared(device, shared_bytes)?;
+        let threads = u32::try_from(threads).map_err(|_| {
+            ExecutionError::SubmissionFailed("native block size exceeds driver ABI".into())
+        })?;
+        driver::occupancy_max_active_blocks(device.context(), function.raw, threads, shared_bytes)
+            .map(u64::from)
+            .map_err(submission)
+    }
+}
+
+impl DirectFunction {
+    /// Raises the function's dynamic shared-memory limit to `bytes` when it
+    /// is lower.
+    fn admit_shared(&self, device: &Device, bytes: u64) -> Result<(), ExecutionError> {
+        if bytes > self.dynamic_shared_limit.load(Ordering::Acquire) {
+            let value = i32::try_from(bytes).map_err(|_| {
+                ExecutionError::SubmissionFailed("dynamic shared size exceeds driver ABI".into())
+            })?;
+            driver::set_function_attribute(device.context(), self.raw, MAX_DYNAMIC_SHARED_SIZE_BYTES, value)
+                .map_err(submission)?;
+            self.dynamic_shared_limit.fetch_max(bytes, Ordering::AcqRel);
+        }
+        Ok(())
     }
 }
 
@@ -144,13 +245,23 @@ pub struct DirectLaunch<'a> {
     pub buffers: &'a [(&'a Buffer, u64)],
     /// The argument words, passed by value as one struct parameter.
     pub words: &'a [u8],
-    pub scalar_results: (&'a Buffer, u64),
+    /// Scalar-result slots, passed after the words; a null pointer for an
+    /// entry without scalar results.
+    pub scalar_results: Option<(&'a Buffer, u64)>,
     pub grid: [u64; 3],
     pub block: [u64; 3],
     pub shared_bytes: u64,
 }
 
+impl DirectLaunch<'_> {
+    /// Whether the launch does no device work: an empty grid or block.
+    pub fn is_empty(&self) -> bool {
+        self.grid.contains(&0) || self.block.contains(&0)
+    }
+}
+
 /// A non-empty launch checked against its function and in driver form.
+#[derive(PartialEq, Eq)]
 struct FormedLaunch {
     function: Handle,
     grid: [u32; 3],
@@ -162,13 +273,17 @@ struct FormedLaunch {
     edge: driver::Edge,
 }
 
+// A formed launch's function is a loaded, immutable driver object
+// (`DirectModule`), the rest plain values.
+unsafe impl Send for FormedLaunch {}
+unsafe impl Sync for FormedLaunch {}
+
 impl FormedLaunch {
-    /// `None` for an empty grid. Raises the function's dynamic shared-memory
-    /// limit when the launch needs more.
-    fn form(device: &Device, launch: &DirectLaunch<'_>) -> Result<Option<Self>, ExecutionError> {
-        if launch.grid.contains(&0) || launch.block.contains(&0) {
-            return Ok(None);
-        }
+    /// The launch as a node's parameters. Raises the function's dynamic
+    /// shared-memory limit when the launch needs more. A launch that does
+    /// not run (`enabled` false) may do no device work: an empty axis of its
+    /// grid is formed as one block, which the driver requires of any node.
+    fn form(device: &Device, launch: &DirectLaunch<'_>, enabled: bool) -> Result<Self, ExecutionError> {
         let function = &launch.module.functions[launch.function];
         let threads = launch.block.iter().product::<u64>();
         if threads > function.max_threads {
@@ -177,21 +292,7 @@ impl FormedLaunch {
                 function.max_threads
             )));
         }
-        if launch.shared_bytes > function.dynamic_shared_limit.load(Ordering::Acquire) {
-            let bytes = i32::try_from(launch.shared_bytes).map_err(|_| {
-                ExecutionError::SubmissionFailed("dynamic shared size exceeds driver ABI".into())
-            })?;
-            driver::set_function_attribute(
-                device.context(),
-                function.raw,
-                MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                bytes,
-            )
-            .map_err(submission)?;
-            function
-                .dynamic_shared_limit
-                .fetch_max(launch.shared_bytes, Ordering::AcqRel);
-        }
+        function.admit_shared(device, launch.shared_bytes)?;
         let mut pointers = Vec::with_capacity(launch.buffers.len() + 1);
         pointers.extend(
             launch
@@ -199,7 +300,11 @@ impl FormedLaunch {
                 .iter()
                 .map(|(buffer, offset)| buffer.pointer() + offset),
         );
-        pointers.push(launch.scalar_results.0.pointer() + launch.scalar_results.1);
+        pointers.push(
+            launch
+                .scalar_results
+                .map_or(0, |(buffer, offset)| buffer.pointer() + offset),
+        );
         // The prefix declares at least one word, so an entry without words
         // still passes one zeroed word.
         let words = if launch.words.is_empty() {
@@ -219,19 +324,40 @@ impl FormedLaunch {
                 dimension(values[2])?,
             ])
         };
-        Ok(Some(Self {
+        Ok(Self {
             function: function.raw,
-            grid: axes(launch.grid)?,
-            block: axes(launch.block)?,
+            grid: axes(match enabled {
+                true => launch.grid,
+                false => launch.grid.map(|blocks| blocks.max(1)),
+            })?,
+            block: axes(match enabled {
+                true => launch.block,
+                false => launch.block.map(|threads| threads.max(1)),
+            })?,
             shared_bytes: dimension(launch.shared_bytes)?,
             pointers,
             words,
             edge: launch.module.edge,
-        }))
+        })
+    }
+
+    /// The launch as a graph's kernel node, its arguments `parameters`
+    /// ([`Self::parameters`]).
+    fn node(&self, parameters: &mut [*mut c_void]) -> driver::KernelNodeParams {
+        driver::KernelNodeParams {
+            function: self.function,
+            grid: self.grid,
+            block: self.block,
+            shared_bytes: self.shared_bytes,
+            parameters: parameters.as_mut_ptr(),
+            extra: std::ptr::null_mut(),
+            kernel: std::ptr::null_mut(),
+            context: std::ptr::null_mut(),
+        }
     }
 
     /// The kernel parameter array, pointing into `self`: buffers, the words
-    /// struct (by value), the scalar-result address.
+    /// struct (by value) and the scalar-result address.
     fn parameters(&mut self) -> Vec<*mut c_void> {
         let (scalars, buffers) = self
             .pointers
@@ -249,10 +375,35 @@ impl FormedLaunch {
     }
 }
 
-/// Forms a [`DirectGraph`]: the launches of one submission, in order.
+/// Forms a [`DirectGraph`]: the launches of one submission, each after the
+/// earlier ones it depends on.
 pub struct DirectGraphBuilder {
     device: Device,
     graph: driver::Graph,
+    /// Each node's launch as formed, in order of addition, and whether it
+    /// runs.
+    formed: Vec<FormedLaunch>,
+    enabled: Vec<bool>,
+    /// What its marks record until a sampled run sets its own
+    /// ([`DirectGraph::sample`]), where it has any.
+    rest: Option<Arc<Event>>,
+    /// Each word-operation node as bound now, in order of addition.
+    words: Vec<WordNode>,
+    /// The launches added so far ([`DirectGraph::census`]).
+    launches: GraphCensus,
+}
+
+/// A word-operation node of a [`DirectGraph`]: a host gate's wait, or a
+/// write the word's host waiters wake behind.
+struct WordNode {
+    operation: driver::WordOperation,
+    /// The device address of the word it binds, and the value.
+    address: u64,
+    value: u32,
+    /// A write's: the event recorded as it lands, which the waiters' wake
+    /// follows ([`DirectBatch::replay`]), and the wake of the word it binds
+    /// ([`DirectGraph::bind_word`]).
+    written: Option<(Event, Arc<Wake>)>,
 }
 
 impl DirectGraphBuilder {
@@ -260,51 +411,451 @@ impl DirectGraphBuilder {
         Ok(Self {
             device: device.clone(),
             graph: driver::Graph::new(device.context()).map_err(submission)?,
+            formed: Vec::new(),
+            enabled: Vec::new(),
+            rest: None,
+            words: Vec::new(),
+            launches: GraphCensus::default(),
         })
     }
 
-    /// Append a launch after every launch added before it; an empty grid
-    /// adds nothing. The argument values are copied into the graph.
-    pub fn launch(&mut self, launch: &DirectLaunch<'_>) -> Result<(), ExecutionError> {
-        let Some(mut formed) = FormedLaunch::form(&self.device, launch)? else {
-            return Ok(());
-        };
-        let mut parameters = formed.parameters();
-        self.graph
-            .push_kernel(
-                &driver::KernelNodeParams {
-                    function: formed.function,
-                    grid: formed.grid,
-                    block: formed.block,
-                    shared_bytes: formed.shared_bytes,
-                    parameters: parameters.as_mut_ptr(),
-                    extra: std::ptr::null_mut(),
-                    kernel: std::ptr::null_mut(),
-                    context: std::ptr::null_mut(),
-                },
-                formed.edge,
-            )
-            .map_err(submission)
+    /// One launch more of the graph's memory.
+    fn count_launch(&mut self) -> Result<(), ExecutionError> {
+        self.launches = self.launches.plus(GraphCensus::launch(0)).ok_or_else(|| {
+            ExecutionError::SubmissionFailed("a graph's launch census overflows".into())
+        })?;
+        Ok(())
     }
 
+    /// Add a gate after the nodes added so far: the graph's later nodes run
+    /// once `word` reaches `value` (compared as [`DirectBatch::wait_word`]
+    /// does). A replay binds its word and value ([`DirectGraph::bind_word`]).
+    /// It counts as a launch of the graph's memory.
+    pub fn wait_word(&mut self, word: &HostWord, value: u32) -> Result<(), ExecutionError> {
+        self.word(driver::WordOperation::Wait, word, value, None)
+    }
+
+    /// Add a write after the nodes added so far: `word` becomes `value` once
+    /// they complete, their writes visible first (as
+    /// [`DirectBatch::write_word`]), followed by an event-record node of its
+    /// own the word's waiters wake behind as each replay lands it
+    /// ([`DirectBatch::replay`]). A replay binds its word and value
+    /// ([`DirectGraph::bind_word`]). It counts as two launches of the
+    /// graph's memory.
+    pub fn write_word(&mut self, word: &HostWord, value: u32) -> Result<(), ExecutionError> {
+        let written = Event::new(self.device.context()).map_err(submission)?;
+        self.word(driver::WordOperation::Write, word, value, Some(written))
+    }
+
+    fn word(&mut self, operation: driver::WordOperation, word: &HostWord, value: u32, written: Option<Event>) -> Result<(), ExecutionError> {
+        let address = word.device_address();
+        self.graph.push_word(operation, address, value).map_err(submission)?;
+        self.count_launch()?;
+        if let Some(written) = &written {
+            self.graph.push_event(written).map_err(submission)?;
+            self.count_launch()?;
+        }
+        let written = written.map(|written| (written, word.wake.clone()));
+        self.words.push(WordNode { operation, address, value, written });
+        Ok(())
+    }
+
+    /// Add a mark after the launches added so far: an event-record node in
+    /// the graph's chain, stamping its event as the launch before it
+    /// completes ([`DirectGraph::sample`]). It counts as a launch of the
+    /// graph's memory.
+    pub fn mark(&mut self) -> Result<(), ExecutionError> {
+        let rest = match &self.rest {
+            Some(rest) => rest.clone(),
+            None => Arc::new(Event::stamp(self.device.context()).map_err(submission)?),
+        };
+        self.graph.push_mark(&rest).map_err(submission)?;
+        self.rest = Some(rest);
+        self.count_launch()
+    }
+
+    /// Add a launch after the launches `after` names, by their order of
+    /// addition: it runs once they completed, beside every launch it does
+    /// not follow, by the module's edge from each, where `enabled`; a node
+    /// disabled runs as an empty one, its dependencies kept, until a replay
+    /// enables it ([`DirectGraph::bind`]). A disabled launch may do no
+    /// device work ([`DirectLaunch::is_empty`]). The argument values are
+    /// copied into the graph.
+    pub fn launch(&mut self, launch: &DirectLaunch<'_>, after: &[usize], enabled: bool) -> Result<(), ExecutionError> {
+        let mut formed = FormedLaunch::form(&self.device, launch, enabled)?;
+        let mut parameters = formed.parameters();
+        let node = formed.node(&mut parameters);
+        self.graph.push_kernel(&node, formed.edge, after).map_err(submission)?;
+        self.formed.push(formed);
+        self.enabled.push(enabled);
+        // Its memory follows no parameter byte
+        // (`seismic_compiler::graph_cost::argument_bytes`).
+        self.count_launch()
+    }
+
+    /// Instantiate the graph and upload it to the device
+    /// (`GraphExec::upload`), so its first launch does no setup. The driver
+    /// memory both take, which no allocation charges, is its census priced
+    /// with every live graph's ([`crate::graph_cost::GraphPool`]), held until
+    /// the graph is dropped. The driver has taken it once the graph exists,
+    /// so it is charged to the device store's own entry as taken, never
+    /// refused.
     pub fn instantiate(self) -> Result<DirectGraph, ExecutionError> {
+        let census = GraphCensus::graph(self.launches).ok_or_else(|| {
+            ExecutionError::SubmissionFailed("a graph's census overflows".into())
+        })?;
+        // The driver refusing memory for the graph is a capacity refusal of
+        // what its census takes; any other failure the submission's.
+        let required = crate::graph_cost::census_bytes(&self.device, census);
+        let refused = |error: driver::DriverError| match error.code {
+            crate::executor::OUT_OF_MEMORY => ExecutionError::DeviceRefused { required, reading: self.device.refusal_reading() },
+            _ => submission(error),
+        };
+        // The driver's instantiation and the record of what it took are one
+        // change.
+        let change = self.device.graphs().entry().change();
+        let exec = self.graph.instantiate().map_err(refused)?;
+        for (node, _) in self.enabled.iter().enumerate().filter(|(_, enabled)| !**enabled) {
+            exec.set_enabled(self.graph.node(node), false).map_err(submission)?;
+        }
+        exec.upload(self.device.stream()).map_err(refused)?;
+        let launched = Event::new(self.device.context()).map_err(submission)?;
+        self.device.graphs().instantiated(&change, &self.device, census)?;
         Ok(DirectGraph {
-            exec: self.graph.instantiate().map_err(submission)?,
+            device: self.device.clone(),
+            exec,
+            launched,
+            sampled: Vec::new(),
+            rest: self.rest,
+            graph: self.graph,
+            formed: self.formed,
+            enabled: self.enabled,
+            words: self.words,
+            census,
+            scope: seismic_memory::entry::DropScope::default(),
         })
     }
 }
 
 /// An instantiated CUDA graph of direct launches with fixed arguments. One
 /// graph launch replaces its launches' individual driver calls; the device
-/// runs them in order, as the stream would.
+/// runs each once those it depends on completed.
 pub struct DirectGraph {
     exec: driver::GraphExec,
+    /// Recorded behind each launch of the graph ([`DirectBatch::replay`]):
+    /// whether its last launch completed, before which no update of it is
+    /// made without waiting.
+    launched: Event,
+    /// The events a sampled run set on its marks, in order; empty where they
+    /// record `rest` ([`Self::sample`]).
+    sampled: Vec<Arc<Event>>,
+    /// What its marks record at rest, where it has any.
+    rest: Option<Arc<Event>>,
+    /// The graph `exec` was instantiated from, whose nodes name the
+    /// launches a parameter update sets ([`Self::bind`]).
+    graph: driver::Graph,
+    /// Each node's launch as the executable binds it now, and whether it
+    /// runs.
+    formed: Vec<FormedLaunch>,
+    enabled: Vec<bool>,
+    /// Each word-operation node as the executable binds it now.
+    words: Vec<WordNode>,
+    /// What the graph is made of, as its driver memory follows it.
+    census: GraphCensus,
+    /// The device whose graph pool holds its driver memory.
+    device: Device,
+    /// The change its drop runs in, which ends after every field has
+    /// dropped ([`DropScope`]): last.
+    scope: seismic_memory::entry::DropScope,
 }
 
-/// Launches issued in order on the device's stream. The stream orders each
-/// launch after the previous one's writes.
+impl DirectGraph {
+    /// Its launches.
+    pub fn census(&self) -> GraphCensus {
+        self.census
+    }
+
+    /// The graph's launches, enabled or not.
+    pub fn nodes(&self) -> usize {
+        self.formed.len()
+    }
+
+    /// The graph's word-operation nodes ([`DirectGraphBuilder::wait_word`],
+    /// [`DirectGraphBuilder::write_word`]).
+    pub fn words(&self) -> usize {
+        self.words.len()
+    }
+
+    /// Bind word-operation node `index` (by order of addition) to `word` at
+    /// `value` for every launch of the graph after this call: a write's
+    /// waiters are then `word`'s. Launches already queued keep what they
+    /// were queued with; its owner binds only an idle graph ([`Self::bind`]).
+    pub fn bind_word(&mut self, index: usize, word: &HostWord, value: u32) -> Result<(), ExecutionError> {
+        let node = &mut self.words[index];
+        let address = word.device_address();
+        if (node.address, node.value) != (address, value) {
+            self.exec.set_word(self.graph.word(index), node.operation, address, value).map_err(submission)?;
+            (node.address, node.value) = (address, value);
+        }
+        if let Some((_, wake)) = &mut node.written {
+            *wake = word.wake.clone();
+        }
+        Ok(())
+    }
+
+    /// Have its marks stamp `marks`, in order, for every launch of the graph
+    /// after this call, or none: the events a sampled run reads, or the
+    /// graph's own at rest. A mark is a node of the graph on every run: the
+    /// driver refuses to disable an event-record node
+    /// (`cuGraphNodeSetEnabled`, on an RTX 3090), so a run not sampled pays
+    /// its stamp and nothing more. Its owner samples only an idle graph
+    /// ([`Self::bind`]). The graph holds the events it stamps until it
+    /// stamps others.
+    pub fn sample(&mut self, marks: &[(&Stamps, usize)]) -> Result<(), ExecutionError> {
+        if marks.is_empty() && self.sampled.is_empty() {
+            return Ok(());
+        }
+        if marks.is_empty() {
+            let rest = self.rest.as_ref().expect("a graph that was sampled has marks");
+            for mark in 0..self.sampled.len() {
+                self.exec.set_event(self.graph.mark(mark), rest).map_err(submission)?;
+            }
+            self.sampled.clear();
+            return Ok(());
+        }
+        self.sampled.clear();
+        for (node, (stamps, mark)) in marks.iter().enumerate() {
+            let event = stamps.events[*mark].clone();
+            self.exec.set_event(self.graph.mark(node), &event).map_err(submission)?;
+            self.sampled.push(event);
+        }
+        Ok(())
+    }
+
+    /// Whether every launch of the graph queued so far completed: an update
+    /// of it then waits for nothing. Its fault where the context faulted.
+    pub fn idle(&self) -> Result<bool, ExecutionError> {
+        self.launched.query().map_err(submission)
+    }
+
+    /// Bind `launch` at node `node` (by order of addition) for every launch
+    /// of the graph after this call, running where `enabled`: its function,
+    /// geometry, shared memory and arguments set where they changed (a
+    /// graph is one per layout, every class, block and place of it binding
+    /// its own), and the node enabled or disabled where that changed. Only
+    /// how the node follows the one before is the graph's form, so another
+    /// is an invariant violation. Launches already queued run as they were
+    /// queued; binding a graph with launches in flight paces the host behind
+    /// them (`graph_cost::graph_update_cost_probe`), so its owner binds only
+    /// an idle graph ([`Self::idle`];
+    /// [`driver::GraphExec::set_kernel`], [`driver::GraphExec::set_enabled`]).
+    pub fn bind(&mut self, device: &Device, node: usize, launch: &DirectLaunch<'_>, enabled: bool) -> Result<(), ExecutionError> {
+        if enabled {
+            let mut formed = FormedLaunch::form(device, launch, true)?;
+            assert!(formed.edge == self.formed[node].edge, "a graph's launch binds only parameters: its shape fixes its edges");
+            if formed != self.formed[node] {
+                let mut parameters = formed.parameters();
+                let params = formed.node(&mut parameters);
+                self.exec.set_kernel(self.graph.node(node), &params).map_err(submission)?;
+                self.formed[node] = formed;
+            }
+        }
+        self.set_enabled(node, enabled)
+    }
+
+    /// Disable node `node` (by order of addition) for every launch of the
+    /// graph after this call: a launch the run does not make, which another
+    /// run of the graph's layout binds. Its parameters stay as they were.
+    pub fn disable(&mut self, node: usize) -> Result<(), ExecutionError> {
+        self.set_enabled(node, false)
+    }
+
+    fn set_enabled(&mut self, node: usize, enabled: bool) -> Result<(), ExecutionError> {
+        if enabled != self.enabled[node] {
+            self.exec.set_enabled(self.graph.node(node), enabled).map_err(submission)?;
+            self.enabled[node] = enabled;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for DirectGraph {
+    fn drop(&mut self) {
+        let change = self.scope.begin(self.device.graphs().entry());
+        self.device.graphs().dropped(change, &self.device, self.census);
+    }
+}
+
+/// A 32-bit word in pinned host memory mapped into the device's address
+/// space, which the host and the device's stream both write and wait on.
+/// A host thread waiting for it sleeps ([`Self::wait`]): every write, the
+/// host's, a stream's ([`DirectBatch::write_word`]) or a graph's
+/// ([`DirectGraphBuilder::write_word`]), wakes it.
+pub struct HostWord {
+    mapped: driver::HostMapped,
+    wake: Arc<Wake>,
+}
+
+/// What a [`HostWord`]'s waiters sleep on, which every write of the word
+/// notifies, under its lock, so no wake is lost between a waiter's look at
+/// the word and its sleep.
+pub(crate) struct Wake {
+    lock: Mutex<()>,
+    changed: Condvar,
+}
+
+impl Wake {
+    fn notify(&self) {
+        drop(self.lock.lock().expect("host word wake lock"));
+        self.changed.notify_all();
+    }
+
+    /// Wake the waiters once `written`'s last record, on `writer`,
+    /// completes: `writer`'s wake stream waits for it, then runs the wake,
+    /// so no work of `writer` waits for the host and no other stream's work
+    /// holds the wake ([`driver::Stream::wakes`]).
+    fn behind(self: &Arc<Self>, writer: &driver::Stream, written: &Event) -> Result<(), ExecutionError> {
+        let context = writer.context();
+        let wakes = writer.wakes().map_err(submission)?.raw();
+        let _current = context.enter().map_err(submission)?;
+        let issue = context.enqueue();
+        // SAFETY: both handles are this context's; the event may be
+        // destroyed once the wait is queued, and the wake's reference is the
+        // host function's to release.
+        unsafe {
+            context.driver.check(issue.stream_wait_event(wakes, written.raw()), "wake wait").map_err(submission)?;
+            let wake = Arc::into_raw(self.clone()).cast_mut().cast::<c_void>();
+            let status = issue.launch_host_function(wakes, wake_after_write, wake);
+            if status != 0 {
+                drop(Arc::from_raw(wake.cast::<Wake>().cast_const()));
+            }
+            context.driver.check(status, "wake launch").map_err(submission)
+        }
+    }
+}
+
+/// The host function a stream runs behind a device write of a word: `data`
+/// is the word's [`Wake`], an `Arc` leaked for it ([`Wake::behind`]).
+unsafe extern "system" fn wake_after_write(data: *mut c_void) {
+    // SAFETY: `Wake::behind` leaked one reference for this call.
+    let wake = unsafe { Arc::from_raw(data.cast::<Wake>().cast_const()) };
+    wake.notify();
+}
+
+impl HostWord {
+    /// A word at 0, its page charged to the device's host store's own
+    /// entry.
+    pub fn new(device: &Device) -> Result<Self, ExecutionError> {
+        Self::on(device.context(), &device.stores().host.own())
+    }
+
+    /// A word at 0 in `context`, its page charged to `entry`, an entry of
+    /// host RAM.
+    pub(crate) fn on(
+        context: &Arc<driver::Context>,
+        entry: &Arc<dyn seismic_memory::entry::Entry>,
+    ) -> Result<Self, ExecutionError> {
+        let mapped = driver::HostMapped::new(context, entry, 4)?;
+        mapped.write_at(0, &0u32.to_le_bytes());
+        Ok(Self { mapped, wake: Arc::new(Wake { lock: Mutex::new(()), changed: Condvar::new() }) })
+    }
+
+    /// Wake the word's waiters now: what they wait on besides the word
+    /// changed (a fault of its writer).
+    pub(crate) fn wake(&self) {
+        self.wake.notify();
+    }
+
+    /// Wake the word's waiters once `stream`'s work queued so far completes,
+    /// a device write of the word among it: an event recorded behind it,
+    /// which `stream`'s wake stream waits for before it runs their wake, so
+    /// no work of `stream` waits for the host. Every stream write
+    /// of a host word is followed by this, and every graph write by its own
+    /// event's wake ([`DirectBatch::replay`]), so every host wait sleeps.
+    pub(crate) fn wake_after(&self, stream: &driver::Stream) -> Result<(), ExecutionError> {
+        let written = Event::new(stream.context()).map_err(submission)?;
+        written.record(stream).map_err(submission)?;
+        self.wake.behind(stream, &written)
+    }
+
+    /// Wait at most `timeout` until `reached` holds of the word, sleeping
+    /// between its writes; whether it did.
+    pub fn wait(&self, reached: impl Fn(u32) -> bool, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut lock = self.wake.lock.lock().expect("host word wake lock");
+        loop {
+            if reached(self.load()) {
+                return true;
+            }
+            let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return false;
+            };
+            lock = self.wake.changed.wait_timeout(lock, left).expect("host word wake lock").0;
+        }
+    }
+
+    fn atomic(&self) -> &std::sync::atomic::AtomicU32 {
+        // SAFETY: the mapping is four aligned bytes owned by `self`; the
+        // device accesses them only through the word operations.
+        unsafe { &*self.mapped.host().cast::<std::sync::atomic::AtomicU32>() }
+    }
+
+    /// Set the word from the host, after every host write before it, and
+    /// wake its waiters.
+    pub fn store(&self, value: u32) {
+        self.atomic().store(value, Ordering::Release);
+        self.wake.notify();
+    }
+
+    /// The word, with every write the device made before it.
+    pub fn load(&self) -> u32 {
+        self.atomic().load(Ordering::Acquire)
+    }
+
+    /// The address device work writes and waits on the word at.
+    pub fn device_address(&self) -> u64 {
+        self.mapped.device
+    }
+}
+
+/// Device timestamps at marks of work on the device's stream: an event per
+/// mark, recorded as the stream passes it ([`DirectBatch::stamp`]) or as a
+/// graph's mark node does ([`DirectGraph::sample`]), so the device time
+/// between two marks is read once the work has passed both.
+pub struct Stamps {
+    events: Vec<Arc<Event>>,
+}
+
+impl Stamps {
+    /// The stamps of `marks` marks on `device`.
+    pub fn new(device: &Device, marks: usize) -> Result<Self, ExecutionError> {
+        let events = (0..marks)
+            .map(|_| Event::stamp(device.context()).map(Arc::new).map_err(submission))
+            .collect::<Result<_, _>>()?;
+        Ok(Self { events })
+    }
+
+    /// Who these stamps are while any graph or run holds them: what a graph
+    /// sampled by them is bound to.
+    pub fn identity(&self) -> u64 {
+        self.events.first().map_or(0, |event| event.raw() as u64)
+    }
+
+    /// The device seconds from mark `from` to mark `to`, once the stream has
+    /// passed `to` (waited for here).
+    pub fn seconds(&self, from: usize, to: usize) -> Result<f64, ExecutionError> {
+        self.events[to].synchronize().map_err(submission)?;
+        Event::elapsed_ns(&self.events[from], &self.events[to])
+            .map(|nanoseconds| nanoseconds / 1e9)
+            .map_err(submission)
+    }
+}
+
+/// Launches issued in order on one of the device's native streams. The
+/// stream orders each launch after the previous one's writes.
 pub struct DirectBatch {
     device: Device,
+    stream: std::sync::Arc<driver::Stream>,
     start: Event,
     /// For a timed batch, per `launch` call, the event recorded just before
     /// the launch (absent for an empty launch).
@@ -312,11 +863,14 @@ pub struct DirectBatch {
 }
 
 impl DirectBatch {
-    pub fn new(device: &Device) -> Result<Self, ExecutionError> {
+    /// A batch on native stream `stream`.
+    pub fn new(device: &Device, stream: crate::NativeStream) -> Result<Self, ExecutionError> {
+        let stream = device.native_stream(stream).clone();
         let start = Event::new(device.context()).map_err(submission)?;
-        start.record(device.stream()).map_err(submission)?;
+        start.record(&stream).map_err(submission)?;
         Ok(Self {
             device: device.clone(),
+            stream,
             start,
             marks: None,
         })
@@ -325,10 +879,22 @@ impl DirectBatch {
     /// A measurement batch that records an event before every launch, so
     /// each launch's device interval is known. The events add stream work;
     /// a timed batch attributes time but does not measure production.
-    pub fn timed(device: &Device) -> Result<Self, ExecutionError> {
-        let mut batch = Self::new(device)?;
+    pub fn timed(device: &Device, stream: crate::NativeStream) -> Result<Self, ExecutionError> {
+        let mut batch = Self::new(device, stream)?;
         batch.marks = Some(Vec::new());
         Ok(batch)
+    }
+
+    /// The batch's following work waits until `other`, issued on
+    /// another of the device's streams, has completed (`cuStreamWaitEvent`
+    /// on its end event): device work, waiting for no host.
+    pub fn follow(&mut self, other: &DirectSubmission) -> Result<(), ExecutionError> {
+        let context = self.device.context();
+        let _current = context.enter().map_err(submission)?;
+        // SAFETY: the stream and the event are this context's, and the end
+        // event was recorded when its submission committed.
+        let status = unsafe { context.enqueue().stream_wait_event(self.stream.raw(), other.end.raw()) };
+        context.driver.check(status, "cross-stream wait").map_err(submission)
     }
 
     /// Record a launch that does no device work (inactive, or an empty
@@ -341,30 +907,29 @@ impl DirectBatch {
     }
 
     pub fn launch(&mut self, launch: &DirectLaunch<'_>) -> Result<(), ExecutionError> {
-        let Some(mut formed) = FormedLaunch::form(&self.device, launch)? else {
+        if launch.is_empty() {
             self.skip();
             return Ok(());
-        };
+        }
+        let mut formed = FormedLaunch::form(&self.device, launch, true)?;
         if let Some(marks) = &mut self.marks {
             let mark = Event::new(self.device.context()).map_err(submission)?;
-            mark.record(self.device.stream()).map_err(submission)?;
+            mark.record(&self.stream).map_err(submission)?;
             marks.push(Some(mark));
         }
         let mut parameters = formed.parameters();
         let context = self.device.context();
         let _current = context.enter().map_err(submission)?;
+        let issue = context.enqueue();
         let driver = &context.driver;
         let status = unsafe {
-            (driver.launch)(
+            issue.launch(
+                false,
                 formed.function,
-                formed.grid[0],
-                formed.grid[1],
-                formed.grid[2],
-                formed.block[0],
-                formed.block[1],
-                formed.block[2],
+                formed.grid,
+                formed.block,
                 formed.shared_bytes,
-                self.device.stream().raw(),
+                self.stream.raw(),
                 parameters.as_mut_ptr(),
                 std::ptr::null_mut(),
             )
@@ -374,25 +939,142 @@ impl DirectBatch {
             .map_err(submission)
     }
 
-    /// Queue every launch of `graph`, in its order. A timed batch launches
-    /// individually instead, so it never replays.
+    /// Copy `bytes` bytes of the device's memory at `source` to
+    /// `destination` in stream order (`cuMemcpyDtoDAsync`): after the
+    /// stream's preceding work, before its following work, waiting for no
+    /// host.
+    pub fn copy(&mut self, destination: u64, source: u64, bytes: u64) -> Result<(), ExecutionError> {
+        let count = usize::try_from(bytes)
+            .map_err(|_| ExecutionError::SubmissionFailed("a device copy exceeds the host's address space".into()))?;
+        let context = self.device.context();
+        let _current = context.enter().map_err(submission)?;
+        // SAFETY: both ranges lie in live device allocations of this
+        // context, which the caller keeps until the batch completes.
+        let status = unsafe { context.enqueue().memcpy_device_async(destination, source, count, self.stream.raw()) };
+        context.driver.check(status, "device copy").map_err(submission)
+    }
+
+    /// Set the 8-byte-aligned word of the device's memory at `destination`
+    /// to `value` in stream order, as two `cuMemsetD32Async` of its halves
+    /// carrying the value in the call: no work of the stream runs between
+    /// them, and work of another stream that reads the word orders after
+    /// the batch, so no reader sees it half written.
+    pub fn write_u64(&mut self, destination: u64, value: u64) -> Result<(), ExecutionError> {
+        if destination % 8 != 0 {
+            return Err(ExecutionError::SubmissionFailed("a device word is not 8-byte aligned".into()));
+        }
+        let context = self.device.context();
+        let _current = context.enter().map_err(submission)?;
+        for (offset, half) in [(0, value as u32), (4, (value >> 32) as u32)] {
+            // SAFETY: a word of a live device allocation of this context.
+            let status = unsafe { context.enqueue().memset_d32_async(destination + offset, half, 1, self.stream.raw()) };
+            context.driver.check(status, "device word write").map_err(submission)?;
+        }
+        Ok(())
+    }
+
+    /// Stamp mark `mark` of `stamps` once the stream's preceding work
+    /// completes ([`Stamps`]).
+    pub fn stamp(&mut self, stamps: &Stamps, mark: usize) -> Result<(), ExecutionError> {
+        stamps.events[mark].record(&self.stream).map_err(submission)
+    }
+
+    /// The stream's following work waits until `word` reaches `value`
+    /// (`cuStreamWaitValue32`, compared cyclically: `word - value` as I32
+    /// at least 0): the host gate.
+    pub fn wait_word(&mut self, word: &HostWord, value: u32) -> Result<(), ExecutionError> {
+        self.word_operation(word, value, driver::WordOperation::Wait.flags(), |issue, stream, address, value, flags| unsafe {
+            issue.wait_value_32(stream, address, value, flags)
+        })
+    }
+
+    /// `word` becomes `value` once the stream's preceding work completes,
+    /// its writes visible first (`cuStreamWriteValue32` with its memory
+    /// barrier); the word's waiters wake then ([`HostWord::wake_after`]).
+    pub fn write_word(&mut self, word: &HostWord, value: u32) -> Result<(), ExecutionError> {
+        self.word_operation(word, value, driver::WordOperation::Write.flags(), |issue, stream, address, value, flags| unsafe {
+            issue.write_value_32(stream, address, value, flags)
+        })?;
+        word.wake_after(&self.stream)
+    }
+
+    fn word_operation(
+        &mut self,
+        word: &HostWord,
+        value: u32,
+        flags: u32,
+        operation: impl FnOnce(&crate::enqueue::Enqueue, Handle, u64, u32, std::ffi::c_uint) -> Option<std::ffi::c_int>,
+    ) -> Result<(), ExecutionError> {
+        let context = self.device.context();
+        let _current = context.enter().map_err(submission)?;
+        let status = operation(context.enqueue(), self.stream.raw(), word.mapped.device, value, flags)
+            .ok_or_else(|| {
+                ExecutionError::SubmissionFailed(
+                    "the CUDA driver predates driver API 11.7 stream memory operations".into(),
+                )
+            })?;
+        context
+            .driver
+            .check(status, "stream memory operation")
+            .map_err(submission)
+    }
+
+    /// Queue every launch of `graph`, in its order, and behind each of its
+    /// writes of a word the wake of that word's waiters, as the write lands
+    /// ([`DirectGraphBuilder::write_word`]), not as the graph ends. A timed
+    /// batch launches individually instead, so it never replays.
     pub fn replay(&mut self, graph: &DirectGraph) -> Result<(), ExecutionError> {
         assert!(
             self.marks.is_none(),
             "DirectBatch::replay precondition: a timed batch times each launch"
         );
-        graph.exec.launch(self.device.stream()).map_err(submission)
+        graph.exec.launch(&self.stream).map_err(submission)?;
+        graph.launched.record(&self.stream).map_err(submission)?;
+        for (written, wake) in graph.words.iter().filter_map(|node| node.written.as_ref()) {
+            wake.behind(&self.stream, written)?;
+        }
+        Ok(())
     }
 
     /// Record completion without waiting.
     pub fn commit(self) -> Result<DirectSubmission, ExecutionError> {
-        let end = Event::new(self.device.context()).map_err(submission)?;
-        end.record(self.device.stream()).map_err(submission)?;
-        Ok(DirectSubmission {
-            start: self.start,
-            end,
-            marks: self.marks,
-        })
+        self.end()
+    }
+
+    /// End a batch that failed: the work it issued runs on, and the
+    /// returned submission completes behind it, or, where its end event
+    /// could not be recorded, the error ([`Self::end`]).
+    pub fn abandon(mut self) -> Result<DirectSubmission, ExecutionError> {
+        self.marks = None;
+        self.end()
+    }
+
+    /// The submission an end event recorded behind every issued launch
+    /// completes. Where the event cannot be recorded the stream is waited
+    /// for first, and the error returned: the issued launches have
+    /// finished, or (the wait failing too, both errors returned) the
+    /// context's sticky error lets nothing more run, so no storage they
+    /// reach is reused while they run.
+    fn end(self) -> Result<DirectSubmission, ExecutionError> {
+        let end = Event::new(self.device.context()).and_then(|end| {
+            end.record(&self.stream)?;
+            Ok(end)
+        });
+        match end {
+            Ok(end) => Ok(DirectSubmission {
+                start: self.start,
+                end,
+                marks: self.marks,
+                complete: std::sync::atomic::AtomicBool::new(false),
+            }),
+            Err(error) => Err(match self.stream.synchronize() {
+                Ok(()) => submission(error),
+                Err(waited) => ExecutionError::IssueAndCompletionFailed {
+                    issue: Box::new(submission(error)),
+                    completion: Box::new(submission(waited)),
+                },
+            }),
+        }
     }
 }
 
@@ -435,6 +1117,9 @@ pub struct DirectSubmission {
     start: Event,
     end: Event,
     marks: Option<Vec<Option<Event>>>,
+    /// The work was seen complete, which it stays: no later look asks the
+    /// driver, whose event calls serialize with every other thread's.
+    complete: std::sync::atomic::AtomicBool,
 }
 
 // Events are driver objects usable from any thread with their context made
@@ -443,17 +1128,25 @@ unsafe impl Send for DirectSubmission {}
 unsafe impl Sync for DirectSubmission {}
 
 impl DirectSubmission {
-    pub fn is_complete(&self) -> bool {
-        // A failed query means the work cannot make further progress.
-        self.end.query().unwrap_or(true)
+    /// Whether the work completed, without waiting: `Ok(false)` while it
+    /// runs, and its fault where it ended without completing (the context
+    /// faulted, which runs none of it any more).
+    pub fn completed(&self) -> Result<bool, ExecutionError> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.complete.load(Relaxed) {
+            return Ok(true);
+        }
+        let complete = self.end.query().map_err(submission)?;
+        self.complete.store(complete, Relaxed);
+        Ok(complete)
     }
 
-    pub fn wait_complete(&self) {
-        let _ = self.end.synchronize();
-    }
-
+    /// Wait for the work to end and report its outcome: its fault where it
+    /// ended without completing.
     pub fn finish(&self) -> Result<(), ExecutionError> {
-        self.end.synchronize().map_err(submission)
+        self.end.synchronize().map_err(submission)?;
+        self.complete.store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
 
     /// Device execution time between the batch's start and end events.
@@ -493,5 +1186,75 @@ impl DirectSubmission {
             intervals.push(Some((anchor.place(mark)?, anchor.place(end)?)));
         }
         Ok(Some(intervals))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each launch spins (about 0.1 s) before writing `slot + 1` to
+    /// `out[slot]`, so a completion not behind it is seen as an unwritten
+    /// slot.
+    const SOURCE: &str = r#"
+struct Words { unsigned long long slot; };
+extern "C" __global__ void mark(unsigned int* out, Words words, unsigned int* scalars) {
+    long long start = clock64();
+    while (clock64() - start < 200000000LL) {}
+    out[words.slot] = (unsigned int)words.slot + 1;
+}
+"#;
+
+    /// A batch whose third launch fails to form after two were issued is
+    /// abandoned into a submission that completes behind both, so the
+    /// storage they write is fenced until they finish.
+    #[test]
+    fn an_abandoned_batch_completes_behind_the_launches_it_issued() {
+        let Some((
+            _exclusive,
+            crate::OpenedCuda {
+                service: device,
+                device: description,
+            },
+        )) = crate::test_device()
+        else {
+            return;
+        };
+        let capability = description.facts().compute_capability;
+        let architecture = u32::from(capability.major) * 10 + u32::from(capability.minor);
+        let cubin =
+            crate::nvrtc::compile_cubin_named(SOURCE, "abandon.cu", architecture, &["mark"])
+                .unwrap();
+        let module =
+            DirectModule::load(&device, &cubin.image, &[cubin.lowered_names[0].as_str()]).unwrap();
+        let out = device.allocate_mapped(8, &crate::test_entry()).unwrap();
+        let scalars = device.allocate_mapped(4, &crate::test_entry()).unwrap();
+        let host = out.host_address().unwrap().cast::<u32>();
+        // SAFETY: `out` maps 8 bytes the device does not use yet.
+        unsafe { host.as_ptr().write_bytes(0, 2) };
+        let buffers = [(&out, 0)];
+        let words = [0u64.to_le_bytes(), 1u64.to_le_bytes()];
+        let launch = |slot: usize, threads: u64| DirectLaunch {
+            module: &module,
+            function: 0,
+            buffers: &buffers,
+            words: &words[slot],
+            scalar_results: Some((&scalars, 0)),
+            grid: [1, 1, 1],
+            block: [threads, 1, 1],
+            shared_bytes: 0,
+        };
+        let mut batch = DirectBatch::new(&device, crate::NativeStream::Compute).unwrap();
+        batch.launch(&launch(0, 1)).unwrap();
+        batch.launch(&launch(1, 1)).unwrap();
+        let too_many = module.max_threads_per_block(0) + 1;
+        assert!(batch.launch(&launch(0, too_many)).is_err());
+        let submission = batch
+            .abandon()
+            .expect("the launches issued before the failure are fenced");
+        submission.finish().unwrap();
+        // SAFETY: the launches writing `out` have completed.
+        let written = unsafe { [host.as_ptr().read_volatile(), host.as_ptr().add(1).read_volatile()] };
+        assert_eq!(written, [1, 2]);
     }
 }

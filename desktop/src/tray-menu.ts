@@ -1,11 +1,11 @@
 import type { OwnedServiceState } from "@magnitudedev/sdk/desktop-host"
-import type { DesktopPage, ModelTrayPresentation } from "@magnitudedev/client-common"
+import type { ApplicationPage, ModelTrayPresentation } from "@magnitudedev/client-common"
 
 /** The id of the model line when it shows an active model: the item a native row replaces. */
 export const MODEL_STATUS_ITEM = "model-status"
 
 interface TrayActions {
-  readonly open: (page?: DesktopPage) => void
+  readonly open: (page?: ApplicationPage) => void
   readonly stopModel: () => void
   readonly quit: () => void
   readonly restartUpdate: () => void
@@ -21,8 +21,8 @@ export const buildTrayMenu = (state: {
     : { label: "Model status unavailable", enabled: false },
   { type: "separator" as const },
   { label: "Open Magnitude", click: () => actions.open() },
-  { label: "Discover Models", click: () => actions.open("discover") },
-  { label: "Status", click: () => actions.open("status") },
+  { label: "Models", click: () => actions.open("models") },
+  { label: "Settings", click: () => actions.open("settings") },
   ...(state.service === "Ready" && state.model.canStop ? [{ label: "Stop Model", click: actions.stopModel }] : []),
   { type: "separator" as const },
   ...(state.updateReady ? [{ label: "Restart to Update", click: actions.restartUpdate }] : []),

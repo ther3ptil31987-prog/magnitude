@@ -23,6 +23,7 @@ common_chat_params common_chat_params_init_lfm2(const common_chat_template &    
     const std::string THINK_START     = "<think>";
     const std::string THINK_END       = "</think>";
     const std::string GEN_PROMPT      = "<|im_start|>assistant\n";
+    const std::string UNTHOUGHT_TEXT  = "unthought-content";
 
     // Copy reasoning to the "thinking" field the template expects
     auto adjusted_messages = json::array();
@@ -33,32 +34,46 @@ common_chat_params common_chat_params_init_lfm2(const common_chat_template &    
         adjusted_messages.push_back(msg);
     }
 
-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs, adjusted_messages);
-    data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs, adjusted_messages);
+    auto rendered          = common_chat_template_render_prompt(tmpl, inputs, adjusted_messages);
+    data.prompt            = std::move(rendered.prompt);
+    data.generation_prompt = std::move(rendered.generation_prompt);
     data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
-    data.supports_thinking = true;
-    data.preserved_tokens  = { TOOL_CALL_START, TOOL_CALL_END, THINK_START, THINK_END };
+    data.preserved_tokens  = { TOOL_CALL_START, TOOL_CALL_END };
     if (tool_list_tokens) {
         data.preserved_tokens.push_back(TOOL_LIST_START);
         data.preserved_tokens.push_back(TOOL_LIST_END);
     }
 
-    data.thinking_start_tag = THINK_START;
-    data.thinking_end_tags  = {THINK_END};
+    // A template that opens a <think> block, or strips a closing </think> from
+    // history, serves models that write reasoning blocks; LFM2.5 1.2B leaves
+    // opening the block to the model. Only a template with neither tag is not
+    // a reasoning template.
+    auto supports_reasoning = tmpl.source().find(THINK_START) != std::string::npos ||
+                              tmpl.source().find(THINK_END) != std::string::npos;
+    data.supports_thinking  = supports_reasoning;
+    if (supports_reasoning) {
+        data.thinking_start_tag = THINK_START;
+        data.thinking_end_tags  = {THINK_END};
+        data.preserved_tokens.insert(data.preserved_tokens.end(), { THINK_START, THINK_END });
+    }
 
     auto has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
     auto has_response_format = !inputs.json_schema.is_null() && inputs.json_schema.is_object();
-    // Gate by reasoning format and whether the template supports <think>
-    auto extract_reasoning = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE &&
-                             tmpl.source().find(THINK_START) != std::string::npos;
+    auto extract_reasoning   = supports_reasoning && inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
     auto include_grammar   = has_response_format || (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE);
 
     if (inputs.has_continuation()) {
         const auto & msg = inputs.continue_msg;
 
-        data.generation_prompt = GEN_PROMPT + THINK_START + msg.reasoning_content;
+        data.generation_prompt = GEN_PROMPT;
+        if (supports_reasoning) {
+            data.generation_prompt += THINK_START + msg.reasoning_content;
+            if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+                data.generation_prompt += THINK_END;
+            }
+        }
         if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
-            data.generation_prompt += THINK_END + msg.render_content();
+            data.generation_prompt += msg.render_content();
         }
 
         data.prompt += data.generation_prompt;
@@ -68,9 +83,11 @@ common_chat_params common_chat_params_init_lfm2(const common_chat_template &    
         auto generation_prompt = p.literal(GEN_PROMPT);
         auto end = p.end();
 
-        auto reasoning = p.eps();
+        auto reasoning      = p.eps();
+        auto reasoning_text = p.eps();
         if (extract_reasoning) {
-            reasoning = p.optional(THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END);
+            reasoning_text = p.reasoning(p.until(THINK_END));
+            reasoning      = p.optional(p.rule("reasoning-block", THINK_START + reasoning_text + THINK_END));
         }
 
         if (!has_tools || inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
@@ -93,9 +110,19 @@ common_chat_params common_chat_params_init_lfm2(const common_chat_template &    
             tool_calls = p.optional(tool_calls);
         }
 
-        auto content = p.text_before_calls(p.content(p.until(TOOL_CALL_START)), inputs.tool_choice);
+        auto content = p.text_before_calls(p.rule("content-text", p.content(p.until(TOOL_CALL_START))), inputs.tool_choice);
+        auto preamble = reasoning + content;
+        if (extract_reasoning && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_REQUIRED) {
+            // Text beginning with <think> reads as reasoning whenever it can, so
+            // content that no reasoning precedes never begins with it.
+            preamble = p.gbnf(preamble, "(reasoning-block content-text | " + UNTHOUGHT_TEXT + ")");
+            // Reasoning that never closes ends with the output. It is read
+            // first: the parser's content would otherwise take its <think>.
+            auto unclosed = THINK_START + reasoning_text + end;
+            return generation_prompt + (unclosed | (preamble + tool_calls)) + end;
+        }
 
-        return generation_prompt + reasoning + content + tool_calls + end;
+        return generation_prompt + preamble + tool_calls + end;
     });
 
     data.parser = parser.save();
@@ -104,6 +131,10 @@ common_chat_params common_chat_params_init_lfm2(const common_chat_template &    
         data.grammar_lazy = false;  // Enforce the whole completion, including trigger bytes.
         data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
             parser.build_grammar(builder, data.grammar_lazy);
+            if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE &&
+                inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_REQUIRED && extract_reasoning) {
+                unopened_text_grammar(builder, UNTHOUGHT_TEXT, THINK_START, TOOL_CALL_START, false);
+            }
         });
 
         data.grammar_triggers = {

@@ -20,4 +20,3 @@ magnitude-state = { path = "../state" }
 seismic.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal"] }
-tracing-subscriber.workspace = true

@@ -1,7 +1,7 @@
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -11,6 +11,7 @@ use hf_hub::HFError;
 use magnitude_service_contracts::models::ModelPackage;
 use magnitude_service_contracts::{
     ContentIdentity, DownloadEventStream, DownloadFailure, DownloadFileProgress, DownloadStage,
+    HuggingFaceAccess,
     Integrity, InventoryError, InventoryModel, InventoryProperties, ModelAvailability,
     ModelComponent, ModelDownloadEvent, ModelLocation, ModelSource,
 };
@@ -21,9 +22,12 @@ use sha2_state::{Digest as StateDigest, Sha256 as StatefulSha256};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::watch;
 
-use crate::hugging_face::{require_requested_revision, revision_metadata_url};
+use crate::hugging_face::{HubCredential, require_requested_revision, revision_metadata_url};
 use crate::identity::{content_id, inventory_entry_id};
-use crate::inventory::{ManagedModelStore, build_model, hf_repo_dir, now, repository_lock_path};
+use crate::inventory::{
+    DownloadSpace, ManagedModelStore, build_model, hf_repo_dir, now,
+    repository_lock_path,
+};
 use crate::store_fs::{
     acquire_exclusive_lock, ensure_owned_directory as ensure_store_directory,
     quarantine_owned_path_sync,
@@ -33,31 +37,220 @@ use crate::validation::ValidatedDownloadPackage;
 const MAX_ATTEMPTS: usize = 5;
 const INTEGRITY_CHECKPOINT_INTERVAL: u64 = 256 * 1024 * 1024;
 const MAX_INTEGRITY_RECORD_BYTES: u64 = 4 * 1024;
+/// Longest a source request may go without delivering bytes before the attempt is abandoned as a
+/// retryable network interruption.
+const SOURCE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The store's writes to its volume, their one owner: the space the
+/// volume's reserve leaves them ([`DownloadSpace`]), every byte the store's
+/// downloads wrote there (beside which that space judges what other
+/// programs write), and what every live download has left to write.
+pub(crate) struct VolumeWrites {
+    space: Arc<dyn DownloadSpace>,
+    ledger: std::sync::Mutex<WriteLedger>,
+}
+
+#[derive(Default)]
+struct WriteLedger {
+    written: u64,
+    /// The bytes every live download has left to write.
+    committed: u64,
+}
+
+impl VolumeWrites {
+    pub(crate) fn new(space: Arc<dyn DownloadSpace>) -> Self {
+        Self {
+            space,
+            ledger: std::sync::Mutex::new(WriteLedger::default()),
+        }
+    }
+
+    fn ledger(&self) -> std::sync::MutexGuard<'_, WriteLedger> {
+        self.ledger
+            .lock()
+            .expect("a volume's write ledger is never left mid-update")
+    }
+
+    /// The bytes the volume lets the store's downloads still write.
+    fn space(&self, ledger: &WriteLedger) -> Result<u64, DownloadError> {
+        self.space
+            .available_bytes(ledger.written)
+            .map_err(|error| DownloadError {
+                kind: DownloadErrorKind::FileSystem,
+                message: error.to_string(),
+                retryable: true,
+                resumable: true,
+            })
+    }
+
+    /// A download of `required_bytes`, beside the bytes the volume leaves
+    /// it after every live download's: admitted, its bytes then reserved
+    /// until it writes them or ends, where they fit; refused otherwise.
+    fn admit(
+        self: &Arc<Self>,
+        required_bytes: u64,
+    ) -> Result<(u64, Result<DownloadWrites, DownloadError>), DownloadError> {
+        let mut ledger = self.ledger();
+        let available_bytes = self.space(&ledger)?.saturating_sub(ledger.committed);
+        if required_bytes > available_bytes {
+            return Ok((
+                available_bytes,
+                Err(insufficient_space(required_bytes, available_bytes)),
+            ));
+        }
+        ledger.committed += required_bytes;
+        Ok((
+            available_bytes,
+            Ok(DownloadWrites {
+                volume: Arc::clone(self),
+                remaining: AtomicU64::new(required_bytes),
+            }),
+        ))
+    }
+}
+
+fn insufficient_space(required_bytes: u64, available_bytes: u64) -> DownloadError {
+    DownloadError {
+        kind: DownloadErrorKind::InsufficientDiskSpace {
+            required_bytes,
+            available_bytes,
+        },
+        message: "insufficient disk space".to_owned(),
+        retryable: false,
+        resumable: true,
+    }
+}
+
+/// One admitted download's writes to the store's volume
+/// ([`VolumeWrites::admit`]). Before each write, the space the volume leaves
+/// must still hold what every live download has left to write; a download
+/// refused writes nothing more, its partial files kept to resume.
+struct DownloadWrites {
+    volume: Arc<VolumeWrites>,
+    /// Changed only under the volume's ledger.
+    remaining: AtomicU64,
+}
+
+impl DownloadWrites {
+    /// Writes to a volume without bound, for tests of what a download
+    /// fetches.
+    #[cfg(test)]
+    fn unbounded() -> Self {
+        let space: Arc<dyn DownloadSpace> = Arc::new(|_| Ok::<_, std::convert::Infallible>(u64::MAX));
+        let (_, writes) = Arc::new(VolumeWrites::new(space)).admit(0).expect("unbounded space");
+        writes.expect("unbounded space")
+    }
+
+    /// Refused where the volume no longer holds what every live download
+    /// has left to write.
+    fn admit(&self) -> Result<(), DownloadError> {
+        let ledger = self.volume.ledger();
+        let space = self.volume.space(&ledger)?;
+        if ledger.committed > space {
+            let remaining = self.remaining.load(Ordering::Acquire);
+            let others = ledger.committed - remaining;
+            return Err(insufficient_space(remaining, space.saturating_sub(others)));
+        }
+        Ok(())
+    }
+
+    fn wrote(&self, bytes: u64) {
+        let mut ledger = self.volume.ledger();
+        let remaining = self.remaining.load(Ordering::Acquire);
+        let settled = bytes.min(remaining);
+        self.remaining.store(remaining - settled, Ordering::Release);
+        ledger.written += bytes;
+        ledger.committed -= settled;
+    }
+}
+
+impl Drop for DownloadWrites {
+    fn drop(&mut self) {
+        let mut ledger = self.volume.ledger();
+        ledger.committed -= *self.remaining.get_mut();
+    }
+}
 
 pub(crate) struct DownloadOperation {
     sender: watch::Sender<ModelDownloadEvent>,
-    cancelled: AtomicBool,
+    control: TransferControl,
+    discard_partial: AtomicBool,
 }
 
 impl DownloadOperation {
+    fn new(initial: ModelDownloadEvent) -> Self {
+        Self {
+            sender: watch::channel(initial).0,
+            control: TransferControl::new(SOURCE_STALL_TIMEOUT),
+            discard_partial: AtomicBool::new(false),
+        }
+    }
+
     fn subscribe(&self) -> DownloadEventStream {
         watch_stream(self.sender.subscribe())
     }
 
     fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
+        self.control.cancel();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.control.is_cancelled()
     }
 
     fn ensure_active(&self) -> Result<(), DownloadError> {
-        if self.cancelled.load(Ordering::Acquire) {
-            Err(DownloadError {
-                kind: DownloadErrorKind::Cancelled,
-                message: "download was cancelled".to_owned(),
-                retryable: true,
-                resumable: true,
-            })
+        if self.is_cancelled() {
+            Err(cancelled_error())
         } else {
             Ok(())
+        }
+    }
+}
+
+/// Bounds every wait on the model source. Cancellation ends a wait immediately, so a stalled
+/// request or a retry backoff never delays settling a cancelled operation, and a wait that
+/// receives nothing for `stall_timeout` becomes a retryable network interruption.
+struct TransferControl {
+    cancelled: watch::Sender<bool>,
+    stall_timeout: Duration,
+}
+
+impl TransferControl {
+    fn new(stall_timeout: Duration) -> Self {
+        Self {
+            cancelled: watch::channel(false).0,
+            stall_timeout,
+        }
+    }
+
+    fn cancel(&self) {
+        self.cancelled.send_replace(true);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        *self.cancelled.borrow()
+    }
+
+    async fn cancellation(&self) {
+        let mut receiver = self.cancelled.subscribe();
+        let _ = receiver.wait_for(|cancelled| *cancelled).await;
+    }
+
+    async fn source_wait<T>(&self, future: impl Future<Output = T>) -> Result<T, DownloadError> {
+        tokio::select! {
+            biased;
+            () = self.cancellation() => Err(cancelled_error()),
+            result = tokio::time::timeout(self.stall_timeout, future) => {
+                result.map_err(|_| source_stalled(self.stall_timeout))
+            }
+        }
+    }
+
+    async fn backoff(&self, delay: Duration) -> Result<(), DownloadError> {
+        tokio::select! {
+            biased;
+            () = self.cancellation() => Err(cancelled_error()),
+            () = tokio::time::sleep(delay) => Ok(()),
         }
     }
 }
@@ -243,7 +436,10 @@ enum DownloadErrorKind {
         available_bytes: u64,
     },
     SourceUnavailable,
-    SourceAccessDenied,
+    CredentialRejected,
+    SourceAccessDenied {
+        credentialed: bool,
+    },
     MissingSource,
     Network,
     Integrity,
@@ -262,6 +458,14 @@ struct DownloadError {
 }
 
 impl DownloadError {
+    /// Records that the request the Hub refused with 403 presented the configured token.
+    fn presented_credential(mut self, credentialed: bool) -> Self {
+        if let DownloadErrorKind::SourceAccessDenied { credentialed: denied } = &mut self.kind {
+            *denied |= credentialed;
+        }
+        self
+    }
+
     fn resumable(&self) -> bool {
         self.resumable
     }
@@ -280,9 +484,20 @@ impl DownloadError {
                 required_bytes: *required_bytes,
                 available_bytes: *available_bytes,
             },
-            DownloadErrorKind::SourceUnavailable
-            | DownloadErrorKind::SourceAccessDenied
-            | DownloadErrorKind::MissingSource => DownloadFailure::SourceUnavailable,
+            DownloadErrorKind::CredentialRejected
+            | DownloadErrorKind::SourceAccessDenied {
+                credentialed: false,
+            } => DownloadFailure::HuggingFaceAccessRequired {
+                access: HuggingFaceAccess::SignIn,
+            },
+            DownloadErrorKind::SourceAccessDenied { credentialed: true } => {
+                DownloadFailure::HuggingFaceAccessRequired {
+                    access: HuggingFaceAccess::AcceptTerms,
+                }
+            }
+            DownloadErrorKind::SourceUnavailable | DownloadErrorKind::MissingSource => {
+                DownloadFailure::SourceUnavailable
+            }
             DownloadErrorKind::Network => DownloadFailure::NetworkUnavailable,
             DownloadErrorKind::Integrity => DownloadFailure::CorruptDownload,
             DownloadErrorKind::FileSystem => DownloadFailure::LocalStorageFailure,
@@ -311,18 +526,60 @@ impl ManagedModelStore {
             .collect::<Result<Vec<_>, _>>()?;
         let mut resolved_packages = Vec::with_capacity(packages.len());
         for (package_id, key, package) in packages {
-            let installed = match self.installed_package_from_snapshot(&package_id) {
+            let installed = match self.acquired_package_from_snapshot(&package_id) {
                 Ok((_package, resolved)) => Some(resolved.model),
                 Err(InventoryError::NotFound(_)) | Err(InventoryError::NotReady(_)) => None,
                 Err(error) => return Err(error),
             };
             resolved_packages.push((key, package, installed));
         }
-        let mut operations = self.operations.lock().await;
+        // What each package to admit would write, known before any operation is admitted: a
+        // failed probe of its sources admits none. The probes run without the operations lock,
+        // so cancellations and releases are not held up behind them; a package whose operation
+        // ended in the meantime is probed on the next round.
+        let mut owns = std::collections::BTreeMap::new();
+        let mut operations = loop {
+            let operations = self.operations.lock().await;
+            let unprobed = resolved_packages
+                .iter()
+                .filter(|(key, _, installed)| {
+                    installed.is_none()
+                        && !owns.contains_key(key)
+                        && !operations
+                            .get(key)
+                            .is_some_and(|operation| !operation.is_cancelled())
+                })
+                .map(|(key, package, _)| (key, package))
+                .collect::<Vec<_>>();
+            if unprobed.is_empty() {
+                break operations;
+            }
+            drop(operations);
+            for (key, package) in unprobed {
+                let own = self
+                    .outstanding_bytes(package)
+                    .await
+                    .map_err(|error| InventoryError::Io(error.to_string()))?;
+                owns.insert(key.clone(), own);
+            }
+        };
         let mut streams = Vec::with_capacity(resolved_packages.len());
-        let mut admitted = Vec::new();
+        let mut admitted: Vec<(String, String, ValidatedDownloadPackage, Arc<DownloadOperation>, u64)> =
+            Vec::new();
         for (key, package, installed) in resolved_packages {
-            if let Some(operation) = operations.get(&key) {
+            // A package admitted earlier in this request is joined. A cancelled operation is
+            // still settling; joining it would end the new request as cancelled. A fresh
+            // operation replaces it and waits on the repository lock.
+            let joined = admitted
+                .iter()
+                .find(|(admitted_key, ..)| *admitted_key == key)
+                .map(|(.., operation, _)| operation)
+                .or_else(|| {
+                    operations
+                        .get(&key)
+                        .filter(|operation| !operation.is_cancelled())
+                });
+            if let Some(operation) = joined {
                 streams.push(operation.subscribe());
                 continue;
             }
@@ -335,36 +592,45 @@ impl ManagedModelStore {
                 streams.push(watch_stream(receiver));
                 continue;
             }
+            // Probed above: under this lock, a package neither joined nor installed was.
+            let own = owns[&key];
             let (repository, revision) = package.repository_revision();
             let initial = ModelDownloadEvent::Resolving {
                 operation_id: operation_id.clone(),
                 repository: repository.to_owned(),
                 revision: revision.to_owned(),
             };
-            let (sender, _receiver) = watch::channel(initial);
-            let operation = Arc::new(DownloadOperation {
-                sender,
-                cancelled: AtomicBool::new(false),
-            });
+            let operation = Arc::new(DownloadOperation::new(initial));
             streams.push(operation.subscribe());
-            admitted.push((key.clone(), operation_id, package, Arc::clone(&operation)));
-            operations.insert(key, operation);
+            admitted.push((key, operation_id, package, operation, own));
+        }
+        for (key, _, _, operation, _) in &admitted {
+            operations.insert(key.clone(), Arc::clone(operation));
         }
         drop(operations);
-        for (key, operation_id, package, operation) in admitted {
+        // Packages admitted together, such as a model and its separate draft, need disk space
+        // together, so each checks against their combined need and reports the same shortfall.
+        let admitted_bytes = admitted
+            .iter()
+            .fold(0_u64, |sum, (.., own)| sum.saturating_add(*own));
+        for (key, operation_id, package, operation, own) in admitted {
+            let companion_bytes = admitted_bytes.saturating_sub(own);
             let manager = self.clone();
-            tokio::spawn(async move {
+            magnitude_service_utils::owner::spawn("a download", async move {
                 manager
-                    .run_download(key, operation_id, package, operation)
+                    .run_download(key, operation_id, package, operation, companion_bytes)
                     .await;
             });
         }
         Ok(streams)
     }
 
+    /// Stops a package download. A user's cancellation also discards its partial files; work
+    /// stopped because a sibling package failed keeps them so a retry resumes.
     pub(crate) async fn cancel_package_download(
         &self,
         package: &ModelPackage,
+        discard_partial: bool,
     ) -> Result<(), InventoryError> {
         ValidatedDownloadPackage::new(package.clone())?;
         let key = package_download_key(package);
@@ -375,8 +641,54 @@ impl ManagedModelStore {
             .get(&key)
             .cloned()
             .ok_or_else(|| InventoryError::NotFound("active download".to_owned()))?;
+        if discard_partial {
+            operation.discard_partial.store(true, Ordering::Release);
+        }
         operation.cancel();
         Ok(())
+    }
+
+    /// Bytes a package still has to write into this store's volume, from each component's source.
+    async fn outstanding_bytes(&self, package: &ValidatedDownloadPackage) -> std::io::Result<u64> {
+        let (repository, _) = package.repository_revision();
+        let repo_root = self.config.root.join("hub").join(hf_repo_dir(repository));
+        let components = package.components();
+        Ok(space_bytes(components, &self.component_sources(&repo_root, components).await?))
+    }
+
+    /// Where each of `components` of the repository at `repo_root` comes from: a file on this
+    /// computer holding its content (`local_sources`), cloned where the volume of the
+    /// repository's blobs clones it and copied otherwise, or the Hub, after what the store
+    /// already holds of it. The download takes each component exactly as decided here.
+    async fn component_sources(
+        &self,
+        repo_root: &Path,
+        components: &[ModelComponent],
+    ) -> std::io::Result<Vec<ComponentSource>> {
+        let mut sources = Vec::with_capacity(components.len());
+        for (component, local) in components.iter().zip(self.local_sources(components)) {
+            let resumed = component_partial_len(repo_root, component).await;
+            let local = match local {
+                Some(path) if resumed < component.size_bytes => {
+                    // The copy names the file itself: a Hugging Face snapshot entry is a
+                    // symbolic link.
+                    tokio::fs::canonicalize(&path).await.ok()
+                }
+                _ => None,
+            };
+            sources.push(match local {
+                None => ComponentSource::Hub { resumed },
+                Some(path) => {
+                    let (blobs, root) = (repo_root.join("blobs"), self.config.root.clone());
+                    let local = magnitude_service_utils::blocking::run(move || {
+                        LocalSource::probe(path, &blobs, &root)
+                    })
+                    .await?;
+                    ComponentSource::Local(local)
+                }
+            });
+        }
+        Ok(sources)
     }
 
     async fn run_download(
@@ -385,18 +697,22 @@ impl ManagedModelStore {
         operation_id: String,
         package: ValidatedDownloadPackage,
         operation: Arc<DownloadOperation>,
+        companion_bytes: u64,
     ) {
         let result = self
-            .run_download_inner(&operation_id, package, &operation)
+            .run_download_locked(&operation_id, package, &operation, companion_bytes)
             .await;
         if let Err(failure) = result {
             let model_id = current_model_id(&operation.sender.borrow());
             let (completed_bytes, total_bytes) = progress_totals(&operation.sender.borrow());
             let Some(download_failure) = failure.to_failure() else {
-                if let Some(model_id) = model_id.as_ref() {
-                    if let Ok(mut models) = self.models.write() {
-                        models.remove(model_id);
-                    }
+                if let Some(model_id) = model_id.as_ref()
+                    && let Ok(mut models) = self.models.write()
+                    && models.get(model_id).is_none_or(|model| {
+                        !downloading_by_another(&model.availability, &operation_id)
+                    })
+                {
+                    models.remove(model_id);
                 }
                 operation
                     .sender
@@ -406,13 +722,15 @@ impl ManagedModelStore {
                         completed_bytes,
                         total_bytes,
                     });
-                self.operations.lock().await.remove(&operation_key);
+                self.release_operation(&operation_key, &operation).await;
                 return;
             };
+            tracing::warn!(%operation_id, kind = ?failure.kind, error = %failure.message, "model download failed");
             let resumable = failure.resumable();
             if let Some(model_id) = model_id.as_ref()
                 && let Ok(mut models) = self.models.write()
                 && let Some(model) = models.get_mut(model_id)
+                && !downloading_by_another(&model.availability, &operation_id)
             {
                 let (completed_bytes, total_bytes) = progress_totals(&operation.sender.borrow());
                 model.availability = ModelAvailability::Interrupted {
@@ -433,7 +751,125 @@ impl ManagedModelStore {
                 resumable,
             });
         }
-        self.operations.lock().await.remove(&operation_key);
+        self.release_operation(&operation_key, &operation).await;
+    }
+
+    /// Removes the admission entry only while it still names this operation; a request admitted
+    /// after cancellation may already have replaced it.
+    /// For each component, a file on this computer outside Magnitude's store holding exactly its
+    /// content (an installation in a Hugging Face cache), which the download copies instead of
+    /// fetching.
+    fn local_sources(&self, components: &[ModelComponent]) -> Vec<Option<PathBuf>> {
+        let external = self
+            .models
+            .read()
+            .map(|models| {
+                models
+                    .values()
+                    .filter(|model| {
+                        !matches!(model.location, ModelLocation::MagnitudeCache { .. })
+                            && matches!(model.availability, ModelAvailability::Available { .. })
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut by_content = std::collections::BTreeMap::new();
+        for model in &external {
+            let Ok(resolved) = crate::service::resolve_components(&self.config.root, model) else {
+                continue;
+            };
+            for (declared, resolved) in model.location.components().iter().zip(resolved) {
+                if let ContentIdentity::Sha256 { value } = &declared.content {
+                    by_content
+                        .entry((value.clone(), declared.size_bytes))
+                        .or_insert(resolved.path);
+                }
+            }
+        }
+        components
+            .iter()
+            .map(|component| match &component.content {
+                ContentIdentity::Sha256 { value } => by_content
+                    .get(&(value.clone(), component.size_bytes))
+                    .cloned()
+                    .or_else(|| self.external_copy_by_header(value, component.size_bytes)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A file outside Magnitude's store whose header and size are a release-catalog file's (a
+    /// folder's file, which has no Hub SHA-256): the copy found models use for those bytes. It is
+    /// verified in full when copied, so a file that only shares the header is downloaded instead.
+    fn external_copy_by_header(&self, sha256: &str, size_bytes: u64) -> Option<PathBuf> {
+        use magnitude_service_contracts::models::ModelPackageInstallationOrigin;
+        let content = self.catalog_file_content(sha256, size_bytes);
+        content.header_digest.as_ref()?;
+        let records = self.installed_packages.read().ok()?;
+        records
+            .records
+            .values()
+            .filter(|record| {
+                record.installed.origin != ModelPackageInstallationOrigin::Magnitude
+                    && content.held_by(record)
+            })
+            .find_map(|record| {
+                let declared = record.model.location.components();
+                let resolved =
+                    crate::service::resolve_components(&self.config.root, &record.model).ok()?;
+                declared
+                    .iter()
+                    .zip(resolved)
+                    .find(|(declared, _)| declared.size_bytes == size_bytes)
+                    .map(|(_, resolved)| resolved.path)
+            })
+    }
+
+    async fn release_operation(&self, key: &str, operation: &Arc<DownloadOperation>) {
+        let mut operations = self.operations.lock().await;
+        if operations
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, operation))
+        {
+            operations.remove(key);
+        }
+    }
+
+    /// Runs one package download under its repository lock, and discards a cancelled download's
+    /// partial files while still holding it, so no other download can be resuming from them.
+    async fn run_download_locked(
+        &self,
+        operation_id: &str,
+        package: ValidatedDownloadPackage,
+        operation: &DownloadOperation,
+        companion_bytes: u64,
+    ) -> Result<(), DownloadError> {
+        operation.ensure_active()?;
+        let (repository, _) = package.repository_revision();
+        let repo_root = self.config.root.join("hub").join(hf_repo_dir(repository));
+        let repository_lock =
+            acquire_lock(repository_lock_path(&self.config.root, repository)).await?;
+        let components = package.components().to_vec();
+        let result = self
+            .run_download_inner(operation_id, package, operation, companion_bytes)
+            .await;
+        if result
+            .as_ref()
+            .is_err_and(|error| matches!(error.kind, DownloadErrorKind::Cancelled))
+            && operation.discard_partial.load(Ordering::Acquire)
+        {
+            discard_partial_components(&repo_root, &components).await;
+        }
+        if result.is_err() {
+            let pruned = repo_root.clone();
+            magnitude_service_utils::blocking::run(move || {
+                crate::store_fs::prune_empty_repository(&pruned);
+            })
+            .await;
+        }
+        drop(repository_lock);
+        result
     }
 
     async fn run_download_inner(
@@ -441,6 +877,7 @@ impl ManagedModelStore {
         operation_id: &str,
         package: ValidatedDownloadPackage,
         operation: &DownloadOperation,
+        companion_bytes: u64,
     ) -> Result<(), DownloadError> {
         operation.ensure_active()?;
         let (repository, revision) = package.repository_revision();
@@ -450,42 +887,26 @@ impl ManagedModelStore {
             retryable: false,
             resumable: false,
         })?;
-        let repo = self.client.model(owner.to_owned(), name.to_owned());
-        let repository_lock =
-            acquire_lock(repository_lock_path(&self.config.root, repository)).await?;
-
-        let pinned = resolve_download_revision(
+        let required = package.components();
+        let control = &operation.control;
+        let ((repo, commit), credentialed) = resolve_with_credential_fallback(
+            self.hub_credential(),
             &self.client,
-            &repo,
-            repository,
-            revision,
-            package.components(),
-            None,
-        )
-        .await;
-        let resolved = match pinned {
-            Ok(resolved) => resolved,
-            Err(error) if missing_upstream_content(&error) => {
-                let resolved = resolve_download_revision(
-                    &self.client,
-                    &repo,
+            |client, token| async move {
+                resolve_package(
+                    &client,
+                    token.as_deref(),
+                    owner,
+                    name,
                     repository,
-                    "main",
-                    package.components(),
-                    Some(revision),
+                    revision,
+                    required,
+                    control,
                 )
-                .await?;
-                tracing::info!(
-                    repository,
-                    pinned_revision = revision,
-                    resolved_revision = resolved,
-                    "using content-equivalent current revision for model acquisition"
-                );
-                resolved
-            }
-            Err(error) => return Err(error),
-        };
-        let commit = resolved;
+                .await
+            },
+        )
+        .await?;
         let (repository, revision, components) = package.into_parts();
         let content_id = content_id(&components);
         let repo_root = self.config.root.join("hub").join(hf_repo_dir(&repository));
@@ -510,36 +931,24 @@ impl ManagedModelStore {
         }
 
         let completed_bytes = resumable_bytes(&repo_root, &components).await;
-        let missing_bytes = total_bytes.saturating_sub(completed_bytes);
-        let available_bytes =
-            fs2::available_space(&self.config.root).map_err(|error| DownloadError {
-                kind: DownloadErrorKind::FileSystem,
-                message: error.to_string(),
-                retryable: true,
-                resumable: true,
-            })?;
+        let sources = self
+            .component_sources(&repo_root, &components)
+            .await
+            .map_err(download_io)?;
+        let required_bytes = space_bytes(&components, &sources).saturating_add(companion_bytes);
+        // What the volume has above its reserve, which its writer's space owns.
+        let (available_bytes, admitted) = self.volume.admit(required_bytes)?;
         operation
             .sender
             .send_replace(ModelDownloadEvent::CheckingSpace {
                 operation_id: operation_id.to_owned(),
                 model_id: model_id.clone(),
-                required_bytes: missing_bytes.saturating_add(self.config.disk_reserve_bytes),
+                required_bytes,
                 available_bytes,
                 completed_bytes,
                 total_bytes,
             });
-        let required_bytes = missing_bytes.saturating_add(self.config.disk_reserve_bytes);
-        if required_bytes > available_bytes {
-            return Err(DownloadError {
-                kind: DownloadErrorKind::InsufficientDiskSpace {
-                    required_bytes,
-                    available_bytes,
-                },
-                message: "insufficient disk space".to_owned(),
-                retryable: false,
-                resumable: true,
-            });
-        }
+        let writes = admitted?;
 
         let started_at = now();
         let planned = InventoryModel {
@@ -629,6 +1038,7 @@ impl ManagedModelStore {
                 &self.config.root,
                 &commit,
                 component,
+                sources[index].local(),
                 |file_completed, stage| {
                     let timestamp = Instant::now();
                     if file_completed != component.size_bytes
@@ -685,9 +1095,11 @@ impl ManagedModelStore {
                         model.updated_at = updated_at;
                     }
                 },
-                &operation.cancelled,
+                &operation.control,
+                &writes,
             )
-            .await?;
+            .await
+            .map_err(|error| error.presented_credential(credentialed))?;
         }
 
         if let Some(last) = components.last() {
@@ -715,11 +1127,13 @@ impl ManagedModelStore {
             .filter(|component| {
                 matches!(
                     component.role,
-                    magnitude_service_contracts::ComponentRole::Weights | magnitude_service_contracts::ComponentRole::Shard
+                    magnitude_service_contracts::ComponentRole::Weights
+                        | magnitude_service_contracts::ComponentRole::Shard
                 )
             })
             .min_by_key(|component| component.shard_index.unwrap_or(0))
             .map(|component| snapshot.join(&component.path))
+            .or_else(|| crate::inventory::package_primary_path(&snapshot, &components))
             .ok_or_else(|| DownloadError {
                 kind: DownloadErrorKind::Internal,
                 message: "published model has no runnable weight component".to_owned(),
@@ -767,7 +1181,6 @@ impl ManagedModelStore {
             operation_id: operation_id.to_owned(),
             model: Box::new(ready),
         });
-        drop(repository_lock);
         Ok(())
     }
 }
@@ -818,8 +1231,10 @@ async fn download_component_with_retry(
     root: &Path,
     commit: &str,
     component: &ModelComponent,
+    local_source: Option<&LocalSource>,
     mut progress: impl FnMut(u64, DownloadStage),
-    cancelled: &AtomicBool,
+    control: &TransferControl,
+    writes: &DownloadWrites,
 ) -> Result<(), DownloadError> {
     let blobs = root
         .join("hub")
@@ -830,13 +1245,25 @@ async fn download_component_with_retry(
         progress(component.size_bytes, DownloadStage::Verifying);
         return Ok(());
     }
+    if let Some(source) = local_source {
+        match copy_local_component(source, component, &paths, &mut progress, control, writes).await {
+            Ok(()) => return Ok(()),
+            Err(error) if matches!(error.kind, DownloadErrorKind::Cancelled) => return Err(error),
+            Err(error) => tracing::warn!(
+                path = %component.path.display(),
+                source = %source.path().display(),
+                %error,
+                "copying the component from this computer failed; downloading it instead"
+            ),
+        }
+    }
     for attempt in 0..MAX_ATTEMPTS {
         // Each attempt resumes from the durable checkpoint: streamed bytes
         // past it may have been counted without reaching the file (a
         // buffered write fails later, e.g. on a full disk).
         let mut integrity = recover_partial(&paths, component).await?;
         progress(integrity.bytes, DownloadStage::Downloading);
-        if cancelled.load(Ordering::Acquire) {
+        if control.is_cancelled() {
             return Err(cancelled_error());
         }
         match download_component_once(
@@ -846,13 +1273,23 @@ async fn download_component_with_retry(
             &paths,
             &mut integrity,
             &mut progress,
-            cancelled,
+            control,
+            writes,
         )
         .await
         {
             Ok(()) => return Ok(()),
             Err(error) if error.retryable() && attempt + 1 < MAX_ATTEMPTS => {
-                tokio::time::sleep(std::time::Duration::from_secs(1_u64 << attempt.min(4))).await;
+                tracing::warn!(
+                    path = %component.path.display(),
+                    attempt = attempt + 1,
+                    completed_bytes = integrity.checkpointed_bytes,
+                    error = %error,
+                    "model download attempt interrupted; resuming from the durable checkpoint"
+                );
+                control
+                    .backoff(Duration::from_secs(1_u64 << attempt.min(4)))
+                    .await?;
             }
             Err(error) => return Err(error),
         }
@@ -867,7 +1304,8 @@ async fn download_component_once(
     paths: &DownloadComponentPaths,
     integrity: &mut DownloadIntegrity,
     progress: &mut impl FnMut(u64, DownloadStage),
-    cancelled: &AtomicBool,
+    control: &TransferControl,
+    writes: &DownloadWrites,
 ) -> Result<(), DownloadError> {
     let mut offset = integrity.bytes;
     if offset == component.size_bytes {
@@ -880,29 +1318,30 @@ async fn download_component_once(
         return Ok(());
     }
 
-    let (_reported_length, mut stream) = repo
+    let request = repo
         .download_file_stream()
         .filename(component.path.to_string_lossy().into_owned())
         .revision(commit.to_owned())
         .range(offset..component.size_bytes)
-        .send()
-        .await
-        .map_err(map_hf_error)?;
+        .send();
+    let (_reported_length, mut stream) =
+        control.source_wait(request).await?.map_err(map_hf_error)?;
     let std_file = open_partial(&paths.partial)?;
     let mut file = tokio::fs::File::from_std(std_file);
     file.seek(std::io::SeekFrom::Start(offset))
         .await
         .map_err(download_io)?;
-    while let Some(chunk) = stream.next().await {
-        if cancelled.load(Ordering::Acquire) {
-            persist_integrity_checkpoint(paths, component, integrity, Some(&mut file)).await?;
-            return Err(cancelled_error());
-        }
-        let chunk = match chunk {
-            Ok(chunk) => chunk,
+    loop {
+        let chunk = match control
+            .source_wait(stream.next())
+            .await
+            .and_then(|chunk| chunk.transpose().map_err(map_hf_error))
+        {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
             Err(error) => {
                 persist_integrity_checkpoint(paths, component, integrity, Some(&mut file)).await?;
-                return Err(map_hf_error(error));
+                return Err(error);
             }
         };
         let chunk_len = u64::try_from(chunk.len()).map_err(|_| DownloadError {
@@ -925,7 +1364,12 @@ async fn download_component_once(
                 resumable: true,
             });
         }
+        if let Err(error) = writes.admit() {
+            persist_integrity_checkpoint(paths, component, integrity, Some(&mut file)).await?;
+            return Err(error);
+        }
         file.write_all(&chunk).await.map_err(download_io)?;
+        writes.wrote(chunk_len);
         integrity.update(&chunk)?;
         offset += chunk_len;
         progress(offset, DownloadStage::Downloading);
@@ -955,6 +1399,273 @@ async fn download_component_once(
     }
     publish_verified_blob(paths).await?;
     Ok(())
+}
+
+/// A component taken from a file already on this computer with the same content (the exact file
+/// in a Hugging Face cache) instead of fetched. The blob is always Magnitude's own file, never a
+/// link to the other one: a copy-on-write clone where the source was admitted as one, so the
+/// bytes stay shared on disk until either file changes, otherwise a streamed copy, which a clone
+/// that fails also falls back to. A copy, like a fetch, checks each write against the volume, so
+/// a clone admitted as writing nothing still writes only what the volume admits. Either way it is
+/// verified in full like a download before it becomes the blob, and the other file is only read.
+async fn copy_local_component(
+    source: &LocalSource,
+    component: &ModelComponent,
+    paths: &DownloadComponentPaths,
+    progress: &mut impl FnMut(u64, DownloadStage),
+    control: &TransferControl,
+    writes: &DownloadWrites,
+) -> Result<(), DownloadError> {
+    if !matches!(component.content, ContentIdentity::Sha256 { .. }) {
+        return Err(DownloadError {
+            kind: DownloadErrorKind::Integrity,
+            message: "only content with a SHA-256 identity is copied from this computer".to_owned(),
+            retryable: false,
+            resumable: false,
+        });
+    }
+    discard_component_files(paths).await?;
+    progress(0, DownloadStage::Verifying);
+    let result = async {
+        let cloned = match source {
+            LocalSource::Clone(path) => {
+                let (from, partial) = (path.clone(), paths.partial.clone());
+                magnitude_service_utils::blocking::run(move || clone_file(&from, &partial)).await
+            }
+            LocalSource::Copy(_) => false,
+        };
+        let integrity = if cloned {
+            verified_integrity(&paths.partial, component, progress, control).await?
+        } else {
+            streamed_copy(source.path(), &paths.partial, component, progress, control, writes).await?
+        };
+        atomic_json(&paths.checkpoint, &integrity.record(component)).await?;
+        publish_verified_blob(paths).await
+    }
+    .await;
+    if result.is_err() {
+        discard_component_files(paths).await?;
+    }
+    result
+}
+
+/// Where a component's bytes come from ([`ManagedModelStore::component_sources`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ComponentSource {
+    /// The Hub, after the `resumed` bytes the store already holds of it (all of them for a
+    /// completed blob).
+    Hub { resumed: u64 },
+    /// A file on this computer.
+    Local(LocalSource),
+}
+
+/// A file on this computer holding a component's content: the file itself, never a link to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LocalSource {
+    /// The volume of the repository's blobs clones it: the blob shares its extents.
+    Clone(PathBuf),
+    /// The volume of the repository's blobs cannot clone it: copied whole.
+    Copy(PathBuf),
+}
+
+impl ComponentSource {
+    /// What it writes to the store's volume for a component of `size_bytes`.
+    fn space_bytes(&self, size_bytes: u64) -> u64 {
+        match self {
+            Self::Hub { resumed } => size_bytes.saturating_sub(*resumed),
+            Self::Local(LocalSource::Clone(_)) => 0,
+            Self::Local(LocalSource::Copy(_)) => size_bytes,
+        }
+    }
+
+    /// The file on this computer it takes, if any.
+    fn local(&self) -> Option<&LocalSource> {
+        match self {
+            Self::Hub { .. } => None,
+            Self::Local(local) => Some(local),
+        }
+    }
+}
+
+impl LocalSource {
+    /// `path`, cloned where the file system that holds (or will hold) `blobs`, in the store at
+    /// `root`, clones it, and copied otherwise. The probe runs in `blobs`, or before the download
+    /// creates it in its nearest existing ancestor within the store, the directory it is created
+    /// in and so on its volume; never outside the store.
+    fn probe(path: PathBuf, blobs: &Path, root: &Path) -> std::io::Result<Self> {
+        let directory = blobs
+            .ancestors()
+            .take_while(|directory| directory.starts_with(root))
+            .find(|directory| directory.is_dir())
+            .ok_or_else(|| {
+                let message = format!("the model store {} does not exist", root.display());
+                std::io::Error::new(std::io::ErrorKind::NotFound, message)
+            })?;
+        Ok(if clones_into(&path, directory)? {
+            Self::Clone(path)
+        } else {
+            Self::Copy(path)
+        })
+    }
+
+    fn path(&self) -> &Path {
+        match self {
+            Self::Clone(path) | Self::Copy(path) => path,
+        }
+    }
+}
+
+/// What `components`, from `sources`, write to the store's volume.
+fn space_bytes(components: &[ModelComponent], sources: &[ComponentSource]) -> u64 {
+    components
+        .iter()
+        .zip(sources)
+        .fold(0_u64, |sum, (component, source)| {
+            sum.saturating_add(source.space_bytes(component.size_bytes))
+        })
+}
+
+/// Whether the file system holding `directory` clones `source` into it: a clone made in
+/// `directory` and removed again (a clone it cannot remove is an error, never left behind unnamed).
+fn clones_into(source: &Path, directory: &Path) -> std::io::Result<bool> {
+    let probe = random_id("clone-probe").map_err(std::io::Error::other)?;
+    let probe = directory.join(format!(".{probe}"));
+    let cloned = clone_file(source, &probe);
+    if cloned {
+        std::fs::remove_file(&probe).map_err(|error| {
+            let message = format!("removing the clone probe {}: {error}", probe.display());
+            std::io::Error::new(error.kind(), message)
+        })?;
+    }
+    Ok(cloned)
+}
+
+/// Creates `destination` as a copy-on-write clone of `source` (APFS `clonefile`), sharing its
+/// extents until either file changes. False where the file system cannot clone, leaving nothing
+/// at `destination`.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn clone_file(source: &Path, destination: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    const CLONE_NOFOLLOW: u32 = 0x0001;
+    let (Ok(source), Ok(destination)) = (
+        std::ffi::CString::new(source.as_os_str().as_bytes()),
+        std::ffi::CString::new(destination.as_os_str().as_bytes()),
+    ) else {
+        return false;
+    };
+    // SAFETY: both pointers are NUL-terminated paths that outlive the call. `clonefile` creates
+    // the destination atomically, so a failure leaves nothing behind.
+    unsafe { libc::clonefile(source.as_ptr(), destination.as_ptr(), CLONE_NOFOLLOW) == 0 }
+}
+
+/// Creates `destination` as a copy-on-write clone of `source` (the `FICLONE` reflink of btrfs,
+/// XFS and bcachefs), sharing its extents until either file changes. False where the file system
+/// cannot clone, leaving nothing at `destination`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn clone_file(source: &Path, destination: &Path) -> bool {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let Ok(input) = File::open(source) else {
+        return false;
+    };
+    let Ok(output) = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(0o600)
+        .open(destination)
+    else {
+        return false;
+    };
+    // SAFETY: both descriptors are open for the duration of the call.
+    let cloned = unsafe { libc::ioctl(output.as_raw_fd(), libc::FICLONE, input.as_raw_fd()) } == 0;
+    if !cloned {
+        drop(output);
+        let _ = std::fs::remove_file(destination);
+    }
+    cloned
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "android"
+)))]
+fn clone_file(_source: &Path, _destination: &Path) -> bool {
+    false
+}
+
+/// Copies `source` to the new partial file `destination`, hashing the bytes as they are written,
+/// and checks the copy is exactly `component`'s content.
+async fn streamed_copy(
+    source: &Path,
+    destination: &Path,
+    component: &ModelComponent,
+    progress: &mut impl FnMut(u64, DownloadStage),
+    control: &TransferControl,
+    writes: &DownloadWrites,
+) -> Result<DownloadIntegrity, DownloadError> {
+    use tokio::io::AsyncReadExt as _;
+    let mut input = tokio::fs::File::open(source).await.map_err(download_io)?;
+    let mut output = tokio::fs::File::from_std(open_partial(destination)?);
+    let mut integrity = DownloadIntegrity::empty(component);
+    let mut buffer = vec![0_u8; 8 * 1024 * 1024];
+    loop {
+        if control.is_cancelled() {
+            return Err(cancelled_error());
+        }
+        let read = input.read(&mut buffer).await.map_err(download_io)?;
+        if read == 0 {
+            break;
+        }
+        writes.admit()?;
+        output
+            .write_all(&buffer[..read])
+            .await
+            .map_err(download_io)?;
+        writes.wrote(read as u64);
+        integrity.update(&buffer[..read])?;
+        if integrity.bytes > component.size_bytes {
+            return Err(DownloadError {
+                kind: DownloadErrorKind::Integrity,
+                message: format!("unexpected size for {}", source.display()),
+                retryable: false,
+                resumable: false,
+            });
+        }
+        progress(integrity.bytes, DownloadStage::Verifying);
+    }
+    output.flush().await.map_err(download_io)?;
+    output.sync_data().await.map_err(download_io)?;
+    integrity.verify(component)?;
+    Ok(integrity)
+}
+
+/// Reads `path` in full and checks it is exactly `component`'s content.
+async fn verified_integrity(
+    path: &Path,
+    component: &ModelComponent,
+    progress: &mut impl FnMut(u64, DownloadStage),
+    control: &TransferControl,
+) -> Result<DownloadIntegrity, DownloadError> {
+    use tokio::io::AsyncReadExt as _;
+    let mut file = tokio::fs::File::open(path).await.map_err(download_io)?;
+    let mut integrity = DownloadIntegrity::empty(component);
+    let mut buffer = vec![0_u8; 8 * 1024 * 1024];
+    loop {
+        if control.is_cancelled() {
+            return Err(cancelled_error());
+        }
+        let read = file.read(&mut buffer).await.map_err(download_io)?;
+        if read == 0 {
+            break;
+        }
+        integrity.update(&buffer[..read])?;
+        progress(integrity.bytes, DownloadStage::Verifying);
+    }
+    integrity.verify(component)?;
+    Ok(integrity)
 }
 
 async fn recover_partial(
@@ -1083,6 +1794,25 @@ async fn discard_component_files(paths: &DownloadComponentPaths) -> Result<(), D
     Ok(())
 }
 
+/// Removes the partial file and checkpoint of every component whose blob is not complete. A
+/// complete blob may already be published by another snapshot, so it is kept.
+async fn discard_partial_components(repo_root: &Path, components: &[ModelComponent]) {
+    let blobs = repo_root.join("blobs");
+    for component in components {
+        let paths = DownloadComponentPaths::new(&blobs, &blob_key(&component.content));
+        if regular_file_len(&paths.blob).await.is_some() {
+            continue;
+        }
+        for path in [&paths.partial, &paths.checkpoint] {
+            if regular_file_len(path).await.is_some()
+                && let Err(error) = tokio::fs::remove_file(path).await
+            {
+                tracing::warn!(path = %path.display(), %error, "cancelled download file was not removed");
+            }
+        }
+    }
+}
+
 fn invalid_checkpoint(component: &ModelComponent) -> DownloadError {
     DownloadError {
         kind: DownloadErrorKind::Integrity,
@@ -1092,6 +1822,18 @@ fn invalid_checkpoint(component: &ModelComponent) -> DownloadError {
         ),
         retryable: true,
         resumable: false,
+    }
+}
+
+fn source_stalled(stall_timeout: Duration) -> DownloadError {
+    DownloadError {
+        kind: DownloadErrorKind::Network,
+        message: format!(
+            "the model source sent no data for {} seconds",
+            stall_timeout.as_secs()
+        ),
+        retryable: true,
+        resumable: true,
     }
 }
 
@@ -1131,7 +1873,7 @@ async fn publish_snapshot_link(
         });
     }
     let destination_clone = destination.clone();
-    tokio::task::spawn_blocking(move || -> Result<(), DownloadError> {
+    magnitude_service_utils::blocking::run(move || -> Result<(), DownloadError> {
         match destination_clone.symlink_metadata() {
             Ok(_) => {
                 let matching = same_file::is_same_file(&destination_clone, &blob).unwrap_or(false);
@@ -1155,13 +1897,6 @@ async fn publish_snapshot_link(
         Ok(())
     })
     .await
-    .map_err(|error| DownloadError {
-        kind: DownloadErrorKind::FileSystem,
-        message: error.to_string(),
-        retryable: true,
-        resumable: true,
-    })??;
-    Ok(())
 }
 
 fn pathdiff(path: &Path, base: &Path) -> PathBuf {
@@ -1280,16 +2015,10 @@ async fn quarantine(path: &Path) -> Result<(), DownloadError> {
 }
 
 async fn acquire_lock(path: PathBuf) -> Result<File, DownloadError> {
-    tokio::task::spawn_blocking(move || {
+    magnitude_service_utils::blocking::run(move || {
         acquire_exclusive_lock(&path).map_err(inventory_download_error)
     })
     .await
-    .map_err(|error| DownloadError {
-        kind: DownloadErrorKind::FileSystem,
-        message: error.to_string(),
-        retryable: true,
-        resumable: true,
-    })?
 }
 
 fn open_partial(path: &Path) -> Result<File, DownloadError> {
@@ -1313,6 +2042,15 @@ fn open_partial(path: &Path) -> Result<File, DownloadError> {
         options.mode(0o600);
     }
     options.open(path).map_err(download_io)
+}
+
+/// Whether a newer operation has taken over this inventory entry, so a settling operation must
+/// leave it alone.
+fn downloading_by_another(availability: &ModelAvailability, operation_id: &str) -> bool {
+    matches!(
+        availability,
+        ModelAvailability::Downloading { operation_id: current, .. } if current != operation_id
+    )
 }
 
 fn package_download_key(package: &ModelPackage) -> String {
@@ -1351,19 +2089,193 @@ fn inventory_download_error(error: InventoryError) -> DownloadError {
     }
 }
 
+/// A configured Hub credential is presented first. Hugging Face rejects an expired or revoked token
+/// outright, even for public repositories, so a rejected credential falls back to anonymous access
+/// rather than making every public package unavailable. Also returns whether the resolution that
+/// succeeded presented the credential.
+async fn resolve_with_credential_fallback<T, F, Fut>(
+    credential: Option<HubCredential>,
+    anonymous: &hf_hub::HFClient,
+    resolve: F,
+) -> Result<(T, bool), DownloadError>
+where
+    F: Fn(hf_hub::HFClient, Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<T, DownloadError>>,
+{
+    let Some(credential) = credential else {
+        return resolve(anonymous.clone(), None)
+            .await
+            .map(|resolved| (resolved, false));
+    };
+    match resolve(credential.client, Some(credential.token)).await {
+        Ok(resolved) => Ok((resolved, true)),
+        Err(error) if matches!(error.kind, DownloadErrorKind::CredentialRejected) => {
+            tracing::warn!(
+                reason = %error,
+                "Hugging Face rejected the configured token; retrying anonymously"
+            );
+            resolve(anonymous.clone(), None)
+                .await
+                .map(|resolved| (resolved, false))
+        }
+        Err(error) => Err(error.presented_credential(true)),
+    }
+}
+
+/// A repository revision as the Hub reports it: the commit it resolves to and the content of each
+/// file there, the LFS SHA-256 where the file is stored in LFS.
+pub(crate) struct HubRevisionFiles {
+    pub(crate) commit: String,
+    pub(crate) files: std::collections::BTreeMap<String, HubFileContent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HubFileContent {
+    pub(crate) size: Option<u64>,
+    pub(crate) sha256: Option<String>,
+}
+
+impl ManagedModelStore {
+    /// Reads `revision` of `repository` through the same metadata request as acquisition, with
+    /// the configured Hub credential when there is one and anonymously when the Hub rejects it.
+    pub(crate) async fn hub_revision_files(
+        &self,
+        repository: &str,
+        revision: &str,
+    ) -> Result<HubRevisionFiles, String> {
+        let (api, _) = resolve_with_credential_fallback(
+            self.hub_credential(),
+            &self.client,
+            |client, token| async move {
+                hub_api_metadata(&client, token.as_deref(), repository, revision).await
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let commit = api
+            .sha
+            .filter(|commit| is_immutable_commit(commit))
+            .ok_or_else(|| {
+                format!("Hugging Face did not resolve {repository}@{revision} to a commit")
+            })?;
+        let files = api
+            .siblings
+            .into_iter()
+            .map(|sibling| {
+                let content = match sibling.lfs {
+                    Some(lfs) => HubFileContent {
+                        size: Some(lfs.size),
+                        sha256: Some(lfs.sha256.to_ascii_lowercase()),
+                    },
+                    None => HubFileContent {
+                        size: sibling.size,
+                        sha256: None,
+                    },
+                };
+                (sibling.rfilename, content)
+            })
+            .collect();
+        Ok(HubRevisionFiles { commit, files })
+    }
+}
+
+/// `resolve_package_once`, retried like a component's transfer while its failure is retryable: a
+/// connection dropped while the Hub resolves the revision would otherwise fail the download at once.
+async fn resolve_package(
+    client: &hf_hub::HFClient,
+    token: Option<&str>,
+    owner: &str,
+    name: &str,
+    repository: &str,
+    revision: &str,
+    components: &[ModelComponent],
+    control: &TransferControl,
+) -> Result<(hf_hub::HFRepository<hf_hub::RepoTypeModel>, String), DownloadError> {
+    for attempt in 0..MAX_ATTEMPTS {
+        match resolve_package_once(
+            client, token, owner, name, repository, revision, components, control,
+        )
+        .await
+        {
+            Err(error) if error.retryable() && attempt + 1 < MAX_ATTEMPTS => {
+                tracing::warn!(
+                    repository,
+                    revision,
+                    attempt = attempt + 1,
+                    error = %error,
+                    "resolving the model's revision failed; retrying"
+                );
+                control
+                    .backoff(Duration::from_secs(1_u64 << attempt.min(4)))
+                    .await?;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("bounded retry loop returns on its final attempt")
+}
+
+async fn resolve_package_once(
+    client: &hf_hub::HFClient,
+    token: Option<&str>,
+    owner: &str,
+    name: &str,
+    repository: &str,
+    revision: &str,
+    components: &[ModelComponent],
+    control: &TransferControl,
+) -> Result<(hf_hub::HFRepository<hf_hub::RepoTypeModel>, String), DownloadError> {
+    let repo = client.model(owner.to_owned(), name.to_owned());
+    let pinned = resolve_download_revision(
+        client, token, &repo, repository, revision, components, None, control,
+    )
+    .await;
+    let commit = match pinned {
+        Ok(resolved) => resolved,
+        Err(error) if missing_upstream_content(&error) => {
+            let resolved = resolve_download_revision(
+                client,
+                token,
+                &repo,
+                repository,
+                "main",
+                components,
+                Some(revision),
+                control,
+            )
+            .await?;
+            tracing::info!(
+                repository,
+                pinned_revision = revision,
+                resolved_revision = resolved,
+                "using content-equivalent current revision for model acquisition"
+            );
+            resolved
+        }
+        Err(error) => return Err(error),
+    };
+    Ok((repo, commit))
+}
+
 fn missing_upstream_content(error: &DownloadError) -> bool {
     matches!(error.kind, DownloadErrorKind::MissingSource)
 }
 
 async fn resolve_download_revision(
     client: &hf_hub::HFClient,
+    token: Option<&str>,
     repo: &hf_hub::HFRepository<hf_hub::RepoTypeModel>,
     repository: &str,
     revision: &str,
     components: &[ModelComponent],
     equivalent_to_revision: Option<&str>,
+    control: &TransferControl,
 ) -> Result<String, DownloadError> {
-    let api = match hub_api_metadata(client, repository, revision).await {
+    let api = match control
+        .source_wait(hub_api_metadata(client, token, repository, revision))
+        .await
+        .and_then(|api| api)
+    {
         Ok(api) => api,
         Err(error) if equivalent_to_revision.is_some() && missing_upstream_content(&error) => {
             let pinned = equivalent_to_revision.expect("checked equivalent package");
@@ -1402,7 +2314,16 @@ async fn resolve_download_revision(
     }
 
     for component in components {
-        let metadata = match resolve_remote_metadata(repo, &api, &commit, &component.path).await {
+        let metadata = match control
+            .source_wait(resolve_remote_metadata(
+                repo,
+                &api,
+                &commit,
+                &component.path,
+            ))
+            .await
+            .and_then(|metadata| metadata)
+        {
             Ok(metadata) => metadata,
             Err(error) if equivalent_to_revision.is_some() && missing_upstream_content(&error) => {
                 let pinned = equivalent_to_revision.expect("checked equivalent package");
@@ -1507,6 +2428,7 @@ fn package_unavailable(
 
 async fn hub_api_metadata(
     client: &hf_hub::HFClient,
+    token: Option<&str>,
     repository: &str,
     revision: &str,
 ) -> Result<HubApiModel, DownloadError> {
@@ -1521,7 +2443,7 @@ async fn hub_api_metadata(
         })?;
     let http = reqwest::Client::builder().build().map_err(download_io)?;
     let mut request = http.get(url).query(&[("blobs", "true")]);
-    if let Some(token) = std::env::var_os("HF_TOKEN").and_then(|value| value.into_string().ok()) {
+    if let Some(token) = token {
         request = request.bearer_auth(token);
     }
     let response = request.send().await.map_err(reqwest_download_error)?;
@@ -1530,7 +2452,10 @@ async fn hub_api_metadata(
         let retryable = status.as_u16() == 429 || status.is_server_error();
         return Err(DownloadError {
             kind: match status.as_u16() {
-                401 | 403 => DownloadErrorKind::SourceAccessDenied,
+                401 => DownloadErrorKind::CredentialRejected,
+                403 => DownloadErrorKind::SourceAccessDenied {
+                    credentialed: token.is_some(),
+                },
                 404 => DownloadErrorKind::MissingSource,
                 _ if retryable => DownloadErrorKind::Network,
                 _ => DownloadErrorKind::InvalidRequest,
@@ -1604,10 +2529,22 @@ async fn resolve_remote_metadata(
     }
 }
 
+/// An error with every cause beneath it, so a log names what failed under a transport's summary.
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
+}
+
 fn reqwest_download_error(error: reqwest::Error) -> DownloadError {
     DownloadError {
         kind: DownloadErrorKind::Network,
-        message: error.to_string(),
+        message: error_chain(&error),
         retryable: error.is_timeout() || error.is_connect() || error.is_request(),
         resumable: false,
     }
@@ -1615,9 +2552,13 @@ fn reqwest_download_error(error: reqwest::Error) -> DownloadError {
 
 fn map_hf_error(error: HFError) -> DownloadError {
     let (kind, retryable) = match &error {
-        HFError::AuthRequired { .. } | HFError::Forbidden { .. } => {
-            (DownloadErrorKind::SourceAccessDenied, false)
-        }
+        HFError::AuthRequired { .. } => (DownloadErrorKind::CredentialRejected, false),
+        HFError::Forbidden { .. } => (
+            DownloadErrorKind::SourceAccessDenied {
+                credentialed: false,
+            },
+            false,
+        ),
         HFError::RepoNotFound { .. }
         | HFError::RevisionNotFound { .. }
         | HFError::EntryNotFound { .. } => (DownloadErrorKind::MissingSource, false),
@@ -1641,7 +2582,7 @@ fn map_hf_error(error: HFError) -> DownloadError {
     };
     DownloadError {
         kind,
-        message: error.to_string(),
+        message: error_chain(&error),
         retryable,
         resumable: retryable,
     }
@@ -1679,7 +2620,9 @@ fn watch_stream(receiver: watch::Receiver<ModelDownloadEvent>) -> DownloadEventS
     .boxed()
 }
 
-fn current_model_id(event: &ModelDownloadEvent) -> Option<magnitude_service_contracts::InventoryEntryId> {
+fn current_model_id(
+    event: &ModelDownloadEvent,
+) -> Option<magnitude_service_contracts::InventoryEntryId> {
     match event {
         ModelDownloadEvent::CheckingSpace { model_id, .. }
         | ModelDownloadEvent::Progress { model_id, .. } => Some(model_id.clone()),
@@ -1751,6 +2694,51 @@ mod tests {
             shard_index: None,
             relationship: None,
         }
+    }
+
+    /// A component cloned from this computer writes nothing to the store's volume; one copied
+    /// writes all of it, and one from the Hub what the store does not yet hold.
+    #[test]
+    fn space_counts_each_component_from_its_source() {
+        let components = [
+            model_component(b"cloned"),
+            model_component(b"copied!"),
+            model_component(b"resumed from the hub"),
+        ];
+        let sources = [
+            ComponentSource::Local(LocalSource::Clone(PathBuf::from("/volume/cloned.gguf"))),
+            ComponentSource::Local(LocalSource::Copy(PathBuf::from("/other/copied.gguf"))),
+            ComponentSource::Hub { resumed: 5 },
+        ];
+        assert_eq!(sources[0].space_bytes(components[0].size_bytes), 0);
+        assert_eq!(space_bytes(&components, &sources), 7 + (20 - 5));
+    }
+
+    /// The store's volume clones a file of its own into itself exactly where its file system
+    /// clones, and the probe leaves nothing behind.
+    #[test]
+    fn clone_probe_leaves_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.gguf");
+        std::fs::write(&source, b"weights").unwrap();
+        let probe = tempfile::tempdir_in(directory.path()).unwrap();
+        let cloned = clones_into(&source, probe.path()).unwrap();
+        assert_eq!(cloned, clone_file(&source, &directory.path().join("direct.gguf")));
+        assert_eq!(std::fs::read_dir(probe.path()).unwrap().count(), 0);
+    }
+
+    /// The clone probe stays within the store: without a store directory it probes nowhere,
+    /// leaving nothing in the directory around it.
+    #[test]
+    fn clone_probe_stays_within_the_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.gguf");
+        std::fs::write(&source, b"weights").unwrap();
+        let root = directory.path().join("store");
+        let blobs = root.join("hub").join("models--owner--repository").join("blobs");
+        let error = LocalSource::probe(source, &blobs, &root).expect_err("no store to probe in");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
     fn exact_package(path: &str, contents: &[u8]) -> ModelPackage {
@@ -1921,8 +2909,8 @@ mod tests {
             .await
             .expect("installed model");
         let mut config = InventoryConfig::with_roots(root, cache_root).expect("inventory config");
-        config.hf_cache_dirs.push(hf_cache);
-        let manager = ManagedModelStore::open(config)
+        config.add_hugging_face_caches([hf_cache]);
+        let manager = ManagedModelStore::open_unbounded(config)
             .await
             .expect("model manager");
         manager
@@ -1970,6 +2958,964 @@ mod tests {
             manager.installed_package_from_snapshot(&package.id),
             Err(InventoryError::NotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn a_drafter_for_an_installed_target_fetches_only_the_drafter_and_cancels() {
+        use crate::download_service::ManagedModelDownloads;
+        use crate::requested_downloads::{RequestedDownload, RequestedPart};
+        use magnitude_service_contracts::models::{
+            ModelDownloadState, ModelDownloads, ModelId, ServableModelBundle,
+            SpeculativeDraftSource, SpeculativeMethod,
+        };
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let hf_cache = directory.path().join("hugging-face");
+        let snapshot = hf_cache
+            .join("models--owner--repository")
+            .join("snapshots")
+            .join("a".repeat(40));
+        tokio::fs::create_dir_all(&snapshot)
+            .await
+            .expect("snapshot directory");
+        let mut gguf = Vec::new();
+        gguf.extend_from_slice(b"GGUF");
+        gguf.extend_from_slice(&3_u32.to_le_bytes());
+        gguf.extend_from_slice(&0_u64.to_le_bytes());
+        gguf.extend_from_slice(&0_u64.to_le_bytes());
+        gguf.resize(32, 0);
+        tokio::fs::write(snapshot.join("model.gguf"), gguf)
+            .await
+            .expect("installed target");
+        let mut config = InventoryConfig::with_roots(
+            directory.path().join("models"),
+            directory.path().join("cache"),
+        )
+        .expect("inventory config");
+        config.add_hugging_face_caches([hf_cache]);
+        let manager = Arc::new(
+            ManagedModelStore::open_unbounded(config)
+                .await
+                .expect("model manager"),
+        );
+        manager
+            .ensure_installed_model_inventory()
+            .await
+            .expect("initial inventory");
+        let model = manager
+            .models
+            .read()
+            .expect("inventory lock")
+            .values()
+            .next()
+            .cloned()
+            .expect("installed target model");
+        let target = validated_package_from_resolved(&ResolvedModel {
+            components: crate::service::resolve_components(manager.root(), &model)
+                .expect("resolved components"),
+            model,
+        })
+        .expect("installed package")
+        .package;
+        let mut draft = exact_package("draft.gguf", b"draft");
+        draft.id = ModelPackageId("package_draft".to_owned());
+        // The drafter's package work is live so nothing reaches the network.
+        let draft_work = Arc::new(DownloadOperation::new(ModelDownloadEvent::Resolving {
+            operation_id: "download_package_draft".to_owned(),
+            repository: "owner/repository".to_owned(),
+            revision: "a".repeat(40),
+        }));
+        manager
+            .operations
+            .lock()
+            .await
+            .insert(package_download_key(&draft), Arc::clone(&draft_work));
+        let downloads = ManagedModelDownloads::open(Arc::clone(&manager))
+            .await
+            .expect("model downloads");
+        let model: ModelId = "local:model:aaaaaaaaaaaa".parse().unwrap();
+        let started = downloads
+            .start_requested(
+                ServableModelBundle::SpeculativeDecoding {
+                    target,
+                    draft_source: SpeculativeDraftSource::Separate { draft },
+                    method: SpeculativeMethod::DFlash,
+                },
+                model.clone(),
+                RequestedDownload {
+                    model: model.clone(),
+                    part: Some(RequestedPart::Drafter),
+                },
+            )
+            .await
+            .expect("drafter-only download")
+            .download
+            .expect("the drafter is missing");
+        assert!(matches!(
+            started.state,
+            ModelDownloadState::Pending { total_bytes: 5, .. }
+        ));
+        let listed = downloads.list().await.unwrap().downloads;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].for_model, model,
+            "the model a drafter is fetched for is echoed in its download"
+        );
+        let cancelled = downloads.cancel(&started.id).await.expect("cancellation");
+        assert!(matches!(
+            cancelled.state,
+            ModelDownloadState::Cancelled { .. }
+        ));
+        assert!(draft_work.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn a_failed_bundle_stops_its_other_package_and_a_retry_admits_fresh_work() {
+        use crate::download_service::ManagedModelDownloads;
+        use crate::requested_downloads::RequestedDownload;
+        use magnitude_service_contracts::models::{
+            ModelId, ServableModelBundle, SpeculativeDraftSource, SpeculativeMethod,
+        };
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let config = InventoryConfig::with_roots(
+            directory.path().join("models"),
+            directory.path().join("cache"),
+        )
+        .expect("inventory config");
+        let manager = Arc::new(
+            ManagedModelStore::open_unbounded(config)
+                .await
+                .expect("model manager"),
+        );
+        let mut target = exact_package("target.gguf", b"target");
+        target.id = ModelPackageId("package_target".to_owned());
+        let mut draft = exact_package("draft.gguf", b"draft");
+        draft.id = ModelPackageId("package_draft".to_owned());
+        // Live package work for both packages, as while a bundle download is retrying: the
+        // bundle joins it, so nothing reaches the network.
+        let live = |package: &ModelPackage| {
+            Arc::new(DownloadOperation::new(ModelDownloadEvent::Resolving {
+                operation_id: format!("download_{}", package.id.0),
+                repository: "owner/repository".to_owned(),
+                revision: "a".repeat(40),
+            }))
+        };
+        let (target_work, draft_work) = (live(&target), live(&draft));
+        {
+            let mut operations = manager.operations.lock().await;
+            operations.insert(package_download_key(&target), Arc::clone(&target_work));
+            operations.insert(package_download_key(&draft), Arc::clone(&draft_work));
+        }
+        let downloads = ManagedModelDownloads::open(Arc::clone(&manager))
+            .await
+            .expect("model downloads");
+        let model: ModelId = "hf:owner/repository/target.gguf".parse().unwrap();
+        let start = || {
+            downloads.start_requested(
+                ServableModelBundle::SpeculativeDecoding {
+                    target: target.clone(),
+                    draft_source: SpeculativeDraftSource::Separate {
+                        draft: draft.clone(),
+                    },
+                    method: SpeculativeMethod::DSpark,
+                },
+                model.clone(),
+                RequestedDownload {
+                    model: model.clone(),
+                    part: None,
+                },
+            )
+        };
+        start().await.expect("download");
+
+        // The drafter exhausts its retries first; the target is still retrying.
+        draft_work.sender.send_replace(ModelDownloadEvent::Failed {
+            operation_id: "download_package_draft".to_owned(),
+            model_id: None,
+            error: DownloadFailure::NetworkUnavailable,
+            completed_bytes: 0,
+            total_bytes: 5,
+            resumable: true,
+        });
+        manager
+            .operations
+            .lock()
+            .await
+            .remove(&package_download_key(&draft));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !target_work.is_cancelled() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            target_work.is_cancelled(),
+            "the failed download's other package work keeps running"
+        );
+
+        // Holding the repository lock keeps fresh work from reaching the network.
+        let repository_lock = acquire_exclusive_lock(&repository_lock_path(
+            &manager.config.root,
+            "owner/repository",
+        ))
+        .expect("repository lock");
+        start().await.expect("retry");
+        let retried = Arc::clone(
+            manager
+                .operations
+                .lock()
+                .await
+                .get(&package_download_key(&target))
+                .expect("target work"),
+        );
+        assert!(
+            !Arc::ptr_eq(&retried, &target_work),
+            "the retry joined the failed download's package work"
+        );
+        assert!(!retried.is_cancelled());
+        drop(repository_lock);
+    }
+
+    #[tokio::test]
+    async fn a_user_cancellation_discards_partial_files_and_a_stopped_sibling_keeps_them() {
+        for discard_partial in [true, false] {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let config = InventoryConfig::with_roots(
+                directory.path().join("models"),
+                directory.path().join("cache"),
+            )
+            .expect("inventory config");
+            let manager = ManagedModelStore::open_unbounded(config)
+                .await
+                .expect("model manager");
+            let package = exact_package("model.gguf", b"model");
+            let blobs = manager
+                .config
+                .root
+                .join("hub")
+                .join(hf_repo_dir("owner/repository"))
+                .join("blobs");
+            let paths =
+                DownloadComponentPaths::new(&blobs, &blob_key(&model_component(b"model").content));
+            tokio::fs::create_dir_all(&blobs).await.expect("blobs");
+            tokio::fs::write(&paths.partial, b"mo")
+                .await
+                .expect("partial");
+            tokio::fs::write(&paths.checkpoint, b"{}")
+                .await
+                .expect("checkpoint");
+            // The operation waits on the repository lock, so it is cancelled before any transfer.
+            let repository_lock = acquire_exclusive_lock(&repository_lock_path(
+                &manager.config.root,
+                "owner/repository",
+            ))
+            .expect("repository lock");
+            let mut stream = manager
+                .start_target_downloads(vec![package.clone()])
+                .await
+                .expect("admission")
+                .pop()
+                .expect("download stream");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            manager
+                .cancel_package_download(&package, discard_partial)
+                .await
+                .expect("cancel");
+            drop(repository_lock);
+            while let Some(event) = stream.next().await {
+                if matches!(event, ModelDownloadEvent::Cancelled { .. }) {
+                    break;
+                }
+            }
+            assert_eq!(paths.partial.exists(), !discard_partial);
+            assert_eq!(paths.checkpoint.exists(), !discard_partial);
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_after_cancellation_starts_a_new_operation_instead_of_joining_it() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let config = InventoryConfig::with_roots(
+            directory.path().join("models"),
+            directory.path().join("cache"),
+        )
+        .expect("inventory config");
+        let manager = ManagedModelStore::open_unbounded(config)
+            .await
+            .expect("model manager");
+        let package = exact_package("model.gguf", b"model");
+        let key = package_download_key(&package);
+        let settling = Arc::new(DownloadOperation::new(ModelDownloadEvent::Resolving {
+            operation_id: "download_settling".to_owned(),
+            repository: "owner/repository".to_owned(),
+            revision: "a".repeat(40),
+        }));
+        settling.cancel();
+        manager
+            .operations
+            .lock()
+            .await
+            .insert(key.clone(), Arc::clone(&settling));
+        // Holding the repository lock keeps the new operation from reaching the network.
+        let repository_lock = acquire_exclusive_lock(&repository_lock_path(
+            &manager.config.root,
+            "owner/repository",
+        ))
+        .expect("repository lock");
+
+        let mut streams = manager
+            .start_target_downloads(vec![package])
+            .await
+            .expect("admission");
+        let event = streams
+            .pop()
+            .expect("download stream")
+            .next()
+            .await
+            .expect("first event");
+
+        assert!(matches!(
+            &event,
+            ModelDownloadEvent::Resolving { operation_id, .. } if operation_id != "download_settling"
+        ));
+        let admitted = Arc::clone(
+            manager
+                .operations
+                .lock()
+                .await
+                .get(&key)
+                .expect("admitted operation"),
+        );
+        assert!(!Arc::ptr_eq(&admitted, &settling));
+        assert!(!admitted.is_cancelled());
+
+        manager.release_operation(&key, &settling).await;
+        assert!(
+            manager
+                .operations
+                .lock()
+                .await
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, &admitted)),
+            "the settling operation must not remove its replacement"
+        );
+        drop(repository_lock);
+    }
+
+    #[test]
+    fn settling_operations_leave_inventory_owned_by_a_newer_operation() {
+        let downloading = |operation_id: &str| ModelAvailability::Downloading {
+            operation_id: operation_id.to_owned(),
+            stage: DownloadStage::Downloading,
+            completed_bytes: 0,
+            total_bytes: 1,
+            current_component: None,
+            started_at: 0,
+            updated_at: 0,
+        };
+        assert!(downloading_by_another(
+            &downloading("download_new"),
+            "download_old"
+        ));
+        assert!(!downloading_by_another(
+            &downloading("download_old"),
+            "download_old"
+        ));
+    }
+
+    #[test]
+    fn an_error_message_names_every_cause_beneath_it() {
+        #[derive(Debug)]
+        struct Layer(&'static str, Option<Box<Layer>>);
+        impl std::fmt::Display for Layer {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(self.0)
+            }
+        }
+        impl std::error::Error for Layer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.1.as_deref().map(|cause| cause as &(dyn std::error::Error + 'static))
+            }
+        }
+        let error = Layer(
+            "error sending request",
+            Some(Box::new(Layer("client error (Connect)", Some(Box::new(Layer("connection reset by peer", None)))))),
+        );
+        assert_eq!(
+            error_chain(&error),
+            "error sending request: client error (Connect): connection reset by peer"
+        );
+    }
+
+    /// Serves one file over HTTP the way the Hub resolve endpoint does. The first `stalled_gets`
+    /// GETs send `stall_after` body bytes and then go silent with the connection still open, like
+    /// a path whose packets are being dropped.
+    fn serve_source(
+        contents: Vec<u8>,
+        stall_after: usize,
+        stalled_gets: usize,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("source listener");
+        let endpoint = format!("http://{}", listener.local_addr().expect("source address"));
+        let ranges = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&ranges);
+        std::thread::spawn(move || {
+            let mut gets = 0_usize;
+            for connection in listener.incoming() {
+                let Ok(mut connection) = connection else {
+                    return;
+                };
+                let mut reader = BufReader::new(connection.try_clone().expect("source stream"));
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    continue;
+                }
+                let mut range = None;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("range")
+                    {
+                        range = Some(value.trim().to_owned());
+                    }
+                }
+                if request_line.starts_with("HEAD ") {
+                    let _ = write!(
+                        connection,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        contents.len()
+                    );
+                    continue;
+                }
+                let range = range.expect("ranged source request");
+                observed.lock().expect("ranges").push(range.clone());
+                let (start, end) = range
+                    .trim_start_matches("bytes=")
+                    .split_once('-')
+                    .map(|(start, end)| {
+                        (
+                            start.parse::<usize>().expect("range start"),
+                            end.parse::<usize>().expect("range end"),
+                        )
+                    })
+                    .expect("byte range");
+                let body = &contents[start..=end];
+                let _ = write!(
+                    connection,
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{}\r\nConnection: close\r\n\r\n",
+                    body.len(),
+                    contents.len()
+                );
+                let stalled = gets < stalled_gets;
+                gets += 1;
+                if stalled {
+                    let _ = connection.write_all(&body[..stall_after.min(body.len())]);
+                    let _ = connection.flush();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_secs(120));
+                        drop(connection);
+                    });
+                } else {
+                    let _ = connection.write_all(body);
+                }
+            }
+        });
+        (endpoint, ranges)
+    }
+
+    fn source_repository(
+        endpoint: &str,
+        directory: &Path,
+    ) -> hf_hub::HFRepository<hf_hub::RepoTypeModel> {
+        hf_hub::HFClient::builder()
+            .endpoint(endpoint)
+            .cache_dir(directory.join("hf-hub"))
+            .retry_max_attempts(0)
+            .build()
+            .expect("source client")
+            .model("owner".to_owned(), "repository".to_owned())
+    }
+
+    #[tokio::test]
+    async fn a_stalled_source_interrupts_the_attempt_and_the_retry_resumes_saved_bytes() {
+        let contents = (0..64 * 1024_u32)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let component = model_component(&contents);
+        let (endpoint, ranges) = serve_source(contents.clone(), 16 * 1024, 1);
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let repo = source_repository(&endpoint, directory.path());
+        let blobs = directory
+            .path()
+            .join("hub")
+            .join(hf_repo_dir(&repo.repo_path()))
+            .join("blobs");
+        tokio::fs::create_dir_all(&blobs).await.expect("blobs");
+        let paths = DownloadComponentPaths::new(&blobs, &blob_key(&component.content));
+        let control = TransferControl::new(Duration::from_millis(300));
+
+        let mut integrity = DownloadIntegrity::empty(&component);
+        let started = Instant::now();
+        let error = download_component_once(
+            &repo,
+            &"a".repeat(40),
+            &component,
+            &paths,
+            &mut integrity,
+            &mut |_, _| {},
+            &control,
+            &DownloadWrites::unbounded(),
+        )
+        .await
+        .expect_err("stalled source");
+        assert!(matches!(error.kind, DownloadErrorKind::Network));
+        assert!(error.retryable() && error.resumable());
+        assert!(matches!(
+            error.to_failure(),
+            Some(DownloadFailure::NetworkUnavailable)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(
+            recover_partial(&paths, &component)
+                .await
+                .expect("saved bytes")
+                .bytes,
+            16 * 1024
+        );
+
+        download_component_with_retry(
+            &repo,
+            directory.path(),
+            &"a".repeat(40),
+            &component,
+            None,
+            |_, _| {},
+            &control,
+            &DownloadWrites::unbounded(),
+        )
+        .await
+        .expect("resumed download");
+        assert_eq!(tokio::fs::read(&paths.blob).await.expect("blob"), contents);
+        assert_eq!(
+            *ranges.lock().expect("ranges"),
+            vec!["bytes=0-65535".to_owned(), "bytes=16384-65535".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_component_already_on_this_computer_is_copied_and_verified_without_fetching() {
+        let contents = vec![9_u8; 64 * 1024];
+        let component = model_component(&contents);
+        let (endpoint, ranges) = serve_source(contents.clone(), usize::MAX, 0);
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let repo = source_repository(&endpoint, directory.path());
+        let control = TransferControl::new(Duration::from_secs(60));
+        let found = directory.path().join("found-blob");
+        tokio::fs::write(&found, &contents)
+            .await
+            .expect("found file");
+        let snapshot_entry = directory.path().join("found.gguf");
+        std::os::unix::fs::symlink(&found, &snapshot_entry).expect("snapshot entry");
+        let blobs = directory
+            .path()
+            .join("hub")
+            .join(hf_repo_dir(&repo.repo_path()))
+            .join("blobs");
+        tokio::fs::create_dir_all(&blobs).await.expect("blobs");
+
+        download_component_with_retry(
+            &repo,
+            directory.path(),
+            &"a".repeat(40),
+            &component,
+            Some(&LocalSource::probe(found.clone(), &blobs, directory.path()).expect("probe")),
+            |_, _| {},
+            &control,
+            &DownloadWrites::unbounded(),
+        )
+        .await
+        .expect("copied component");
+        let paths = DownloadComponentPaths::new(&blobs, &blob_key(&component.content));
+        assert_eq!(tokio::fs::read(&paths.blob).await.expect("blob"), contents);
+        assert!(
+            ranges.lock().expect("ranges").is_empty(),
+            "nothing was fetched"
+        );
+        assert!(
+            recover_completed_blob(&paths, &component)
+                .await
+                .expect("recovery")
+        );
+        assert_eq!(tokio::fs::read(&found).await.expect("found file"), contents);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_hugging_face_cache_blob_is_the_local_source_of_its_content() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let contents = crate::test_gguf::gguf_bytes(
+            &[("general.architecture", crate::test_gguf::Meta::Str("llama"))],
+            &["token_embd.weight"],
+        );
+        let digest = format!("{:x}", Sha256::digest(&contents));
+        let repository = temporary
+            .path()
+            .join("hf-cache")
+            .join("models--owner--repository");
+        let blob = repository.join("blobs").join(&digest);
+        let snapshot = repository.join("snapshots").join("a".repeat(40));
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(&blob, &contents).unwrap();
+        std::os::unix::fs::symlink(format!("../../blobs/{digest}"), snapshot.join("model.gguf"))
+            .unwrap();
+        let mut config = InventoryConfig::with_roots(
+            temporary.path().join("store"),
+            temporary.path().join("cache"),
+        )
+        .unwrap();
+        config.add_hugging_face_caches([temporary.path().join("hf-cache")]);
+        let manager = ManagedModelStore::open_unbounded(config).await.unwrap();
+        manager.ensure_installed_model_inventory().await.unwrap();
+
+        let present = model_component(&contents);
+        let absent = model_component(b"other contents");
+        let sources = manager.local_sources(&[present, absent]);
+        let found = sources[0]
+            .as_ref()
+            .expect("the cached blob is a local source");
+        assert_eq!(std::fs::read(found).unwrap(), contents);
+        assert!(sources[1].is_none());
+    }
+
+    /// A local copy the store's volume cannot clone (here on tmpfs, another volume that clones
+    /// nothing) is an ordinary copy, never a refusal: the probe answers "no", the component counts
+    /// at its full size, and the package's admission count is that size.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_copy_on_another_volume_counts_at_full_size_and_is_admitted() {
+        let store = tempfile::tempdir().expect("store directory");
+        let other = tempfile::tempdir_in("/dev/shm").expect("a directory on tmpfs");
+        let contents = crate::test_gguf::gguf_bytes(
+            &[("general.architecture", crate::test_gguf::Meta::Str("llama"))],
+            &["token_embd.weight"],
+        );
+        let digest = format!("{:x}", Sha256::digest(&contents));
+        let repository = other.path().join("models--owner--repository");
+        let blob = repository.join("blobs").join(&digest);
+        let snapshot = repository.join("snapshots").join("a".repeat(40));
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(&blob, &contents).unwrap();
+        std::os::unix::fs::symlink(format!("../../blobs/{digest}"), snapshot.join("model.gguf"))
+            .unwrap();
+        let mut config =
+            InventoryConfig::with_roots(store.path().join("store"), store.path().join("cache"))
+                .unwrap();
+        config.add_hugging_face_caches([other.path().to_path_buf()]);
+        let manager = ManagedModelStore::open_unbounded(config).await.unwrap();
+        manager.ensure_installed_model_inventory().await.unwrap();
+
+        assert!(!clones_into(&blob, &manager.config.root).unwrap(), "tmpfs clones nothing");
+        let component = model_component(&contents);
+        let repo_root = manager.config.root.join("hub").join("models--owner--repository");
+        let sources = manager
+            .component_sources(&repo_root, std::slice::from_ref(&component))
+            .await
+            .expect("a copy that cannot be cloned is a source, not an error");
+        assert_eq!(
+            sources,
+            [ComponentSource::Local(LocalSource::Copy(blob.canonicalize().unwrap()))]
+        );
+        let package = ValidatedDownloadPackage::new(exact_package("model.gguf", &contents)).unwrap();
+        assert_eq!(
+            manager.outstanding_bytes(&package).await.expect("admitted"),
+            component.size_bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn a_local_copy_that_does_not_verify_is_downloaded_instead() {
+        let contents = vec![9_u8; 64 * 1024];
+        let component = model_component(&contents);
+        let (endpoint, ranges) = serve_source(contents.clone(), usize::MAX, 0);
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let repo = source_repository(&endpoint, directory.path());
+        let control = TransferControl::new(Duration::from_secs(60));
+        let changed = directory.path().join("changed.gguf");
+        tokio::fs::write(&changed, vec![8_u8; 64 * 1024])
+            .await
+            .expect("changed file");
+        let blobs = directory
+            .path()
+            .join("hub")
+            .join(hf_repo_dir(&repo.repo_path()))
+            .join("blobs");
+        tokio::fs::create_dir_all(&blobs).await.expect("blobs");
+
+        download_component_with_retry(
+            &repo,
+            directory.path(),
+            &"a".repeat(40),
+            &component,
+            Some(&LocalSource::probe(changed.clone(), &blobs, directory.path()).expect("probe")),
+            |_, _| {},
+            &control,
+            &DownloadWrites::unbounded(),
+        )
+        .await
+        .expect("downloaded component");
+        let paths = DownloadComponentPaths::new(&blobs, &blob_key(&component.content));
+        assert_eq!(tokio::fs::read(&paths.blob).await.expect("blob"), contents);
+        assert_eq!(ranges.lock().expect("ranges").len(), 1);
+        assert_eq!(
+            tokio::fs::read(&changed).await.expect("changed file"),
+            vec![8_u8; 64 * 1024],
+            "the other file is never written"
+        );
+    }
+
+    /// An exact copy elsewhere on this computer becomes Magnitude's own blob, a clone or a copy but
+    /// never a link to the other file, which is only read: its size, modification time and link
+    /// count stay as they were, and changing the blob leaves it alone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_exact_local_copy_becomes_a_separate_blob_and_the_other_file_is_untouched() {
+        use std::os::unix::fs::MetadataExt as _;
+        let contents = vec![5_u8; 64 * 1024];
+        let component = model_component(&contents);
+        let (endpoint, ranges) = serve_source(contents.clone(), usize::MAX, 0);
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let repo = source_repository(&endpoint, directory.path());
+        let control = TransferControl::new(Duration::from_secs(60));
+        let found = directory.path().join("found-blob");
+        tokio::fs::write(&found, &contents)
+            .await
+            .expect("found file");
+        let past = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&found)
+            .and_then(|file| file.set_modified(past))
+            .expect("found file time");
+        let before = std::fs::metadata(&found).expect("found file");
+        let snapshot_entry = directory.path().join("found.gguf");
+        std::os::unix::fs::symlink(&found, &snapshot_entry).expect("snapshot entry");
+        let blobs = directory
+            .path()
+            .join("hub")
+            .join(hf_repo_dir(&repo.repo_path()))
+            .join("blobs");
+        tokio::fs::create_dir_all(&blobs).await.expect("blobs");
+
+        download_component_with_retry(
+            &repo,
+            directory.path(),
+            &"a".repeat(40),
+            &component,
+            Some(
+                &LocalSource::probe(snapshot_entry.canonicalize().expect("entry"), &blobs, directory.path())
+                    .expect("probe"),
+            ),
+            |_, _| {},
+            &control,
+            &DownloadWrites::unbounded(),
+        )
+        .await
+        .expect("component from the local copy");
+        let paths = DownloadComponentPaths::new(&blobs, &blob_key(&component.content));
+        assert!(
+            std::fs::symlink_metadata(&paths.blob)
+                .expect("blob")
+                .is_file()
+        );
+        let blob = std::fs::metadata(&paths.blob).expect("blob");
+        let after = std::fs::metadata(&found).expect("found file");
+        assert_ne!((blob.dev(), blob.ino()), (after.dev(), after.ino()));
+        assert_eq!(blob.nlink(), 1);
+        assert_eq!(
+            (
+                after.ino(),
+                after.len(),
+                after.nlink(),
+                after.modified().unwrap()
+            ),
+            (
+                before.ino(),
+                before.len(),
+                before.nlink(),
+                before.modified().unwrap()
+            )
+        );
+        assert!(
+            ranges.lock().expect("ranges").is_empty(),
+            "nothing is fetched"
+        );
+        assert!(
+            recover_completed_blob(&paths, &component)
+                .await
+                .expect("recovery"),
+            "the copied blob is a complete, verified blob"
+        );
+
+        std::fs::write(&paths.blob, b"changed").expect("blob write");
+        assert_eq!(tokio::fs::read(&found).await.expect("found file"), contents);
+    }
+
+    /// Where the file system cannot clone, the blob is a streamed copy verified as it is written,
+    /// and a source with other bytes is refused without publishing anything.
+    #[tokio::test]
+    async fn a_streamed_copy_is_verified_and_a_mismatch_publishes_nothing() {
+        let contents = (0..3 * 1024 * 1024_u32)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let component = model_component(&contents);
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let control = TransferControl::new(Duration::from_secs(60));
+        let found = directory.path().join("found.gguf");
+        tokio::fs::write(&found, &contents)
+            .await
+            .expect("found file");
+        let blobs = directory.path().join("blobs");
+        tokio::fs::create_dir_all(&blobs).await.expect("blobs");
+        let paths = DownloadComponentPaths::new(&blobs, &blob_key(&component.content));
+
+        let mut reported = 0;
+        let integrity = streamed_copy(
+            &found,
+            &paths.partial,
+            &component,
+            &mut |bytes, _| reported = bytes,
+            &control,
+            &DownloadWrites::unbounded(),
+        )
+        .await
+        .expect("streamed copy");
+        assert_eq!(integrity.bytes, component.size_bytes);
+        assert_eq!(reported, component.size_bytes);
+        assert_eq!(
+            tokio::fs::read(&paths.partial).await.expect("copy"),
+            contents
+        );
+        discard_component_files(&paths).await.expect("discard");
+
+        let other = directory.path().join("other.gguf");
+        let mut changed = contents.clone();
+        changed[17] ^= 1;
+        tokio::fs::write(&other, &changed)
+            .await
+            .expect("other file");
+        let error = copy_local_component(&LocalSource::Copy(other.clone()), &component, &paths, &mut |_, _| {}, &control, &DownloadWrites::unbounded())
+            .await
+            .expect_err("mismatched source");
+        assert!(matches!(error.kind, DownloadErrorKind::Integrity));
+        for path in [&paths.partial, &paths.blob, &paths.checkpoint] {
+            assert!(!path.exists(), "{} was left behind", path.display());
+        }
+        assert_eq!(tokio::fs::read(&other).await.expect("other file"), changed);
+    }
+
+    /// A source admitted as a clone is taken from this computer whether or not the clone
+    /// succeeds: where the store's volume clones nothing (most file systems but APFS, btrfs, XFS
+    /// and bcachefs), the failed clone is copied instead, never fetched.
+    #[tokio::test]
+    async fn an_admitted_clone_that_fails_is_copied() {
+        let contents = vec![4_u8; 64 * 1024];
+        let component = model_component(&contents);
+        let (endpoint, ranges) = serve_source(contents.clone(), usize::MAX, 0);
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let repo = source_repository(&endpoint, directory.path());
+        let control = TransferControl::new(Duration::from_secs(60));
+        let found = directory.path().join("found.gguf");
+        std::fs::write(&found, &contents).expect("found file");
+        let blobs = directory
+            .path()
+            .join("hub")
+            .join(hf_repo_dir(&repo.repo_path()))
+            .join("blobs");
+        std::fs::create_dir_all(&blobs).expect("blobs");
+
+        download_component_with_retry(
+            &repo,
+            directory.path(),
+            &"a".repeat(40),
+            &component,
+            Some(&LocalSource::Clone(found)),
+            |_, _| {},
+            &control,
+            &DownloadWrites::unbounded(),
+        )
+        .await
+        .expect("a clone, or a copy where it fails");
+        let paths = DownloadComponentPaths::new(&blobs, &blob_key(&component.content));
+        assert_eq!(std::fs::read(&paths.blob).expect("blob"), contents);
+        assert!(ranges.lock().expect("ranges").is_empty(), "nothing is fetched");
+    }
+
+    /// A source admitted as a clone that can be neither cloned nor copied (it vanished) is
+    /// fetched, after both fail.
+    #[tokio::test]
+    async fn an_admitted_clone_that_cannot_be_copied_is_fetched() {
+        let contents = vec![5_u8; 64 * 1024];
+        let component = model_component(&contents);
+        let (endpoint, ranges) = serve_source(contents.clone(), usize::MAX, 0);
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let repo = source_repository(&endpoint, directory.path());
+        let control = TransferControl::new(Duration::from_secs(60));
+        let blobs = directory
+            .path()
+            .join("hub")
+            .join(hf_repo_dir(&repo.repo_path()))
+            .join("blobs");
+        std::fs::create_dir_all(&blobs).expect("blobs");
+
+        download_component_with_retry(
+            &repo,
+            directory.path(),
+            &"a".repeat(40),
+            &component,
+            Some(&LocalSource::Clone(directory.path().join("vanished.gguf"))),
+            |_, _| {},
+            &control,
+            &DownloadWrites::unbounded(),
+        )
+        .await
+        .expect("a vanished source is fetched instead");
+        let paths = DownloadComponentPaths::new(&blobs, &blob_key(&component.content));
+        assert_eq!(std::fs::read(&paths.blob).expect("blob"), contents);
+        assert!(!ranges.lock().expect("ranges").is_empty(), "the component is fetched");
+    }
+
+    #[tokio::test]
+    async fn cancellation_ends_a_stalled_transfer_without_waiting_for_the_stall_timeout() {
+        let contents = vec![7_u8; 64 * 1024];
+        let component = model_component(&contents);
+        let (endpoint, _ranges) = serve_source(contents, 1024, usize::MAX);
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let repo = source_repository(&endpoint, directory.path());
+        let control = Arc::new(TransferControl::new(Duration::from_secs(60)));
+        let cancel = Arc::clone(&control);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            cancel.cancel();
+        });
+
+        let started = Instant::now();
+        let error = download_component_with_retry(
+            &repo,
+            directory.path(),
+            &"a".repeat(40),
+            &component,
+            None,
+            |_, _| {},
+            &control,
+            &DownloadWrites::unbounded(),
+        )
+        .await
+        .expect_err("cancelled download");
+        assert!(matches!(error.kind, DownloadErrorKind::Cancelled));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
@@ -2106,6 +4052,35 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_downloads_are_admitted_only_together_within_the_volume() {
+        let volume = Arc::new(VolumeWrites::new(Arc::new(|written: u64| {
+            Ok::<_, std::convert::Infallible>(100_u64.saturating_sub(written))
+        })));
+        let refused = |admitted: Result<DownloadWrites, DownloadError>| match admitted {
+            Err(DownloadError {
+                kind:
+                    DownloadErrorKind::InsufficientDiskSpace {
+                        required_bytes,
+                        available_bytes,
+                    },
+                ..
+            }) => (required_bytes, available_bytes),
+            _ => panic!("admitted beyond the volume"),
+        };
+        let (_, first) = volume.admit(60).expect("space");
+        let first = first.expect("the first fits");
+        let (available, second) = volume.admit(60).expect("space");
+        assert_eq!(available, 40);
+        assert_eq!(refused(second), (60, 40));
+        // Written bytes leave what the first has left reserved.
+        first.wrote(30);
+        assert_eq!(refused(volume.admit(60).expect("space").1), (60, 40));
+        // Its end releases the rest.
+        drop(first);
+        assert!(volume.admit(60).expect("space").1.is_ok());
+    }
+
+    #[test]
     fn insufficient_disk_failure_preserves_required_and_available_bytes() {
         let failure = DownloadError {
             kind: DownloadErrorKind::InsufficientDiskSpace {
@@ -2231,5 +4206,123 @@ mod tests {
         assert!(!missing_upstream_content(&failure(
             DownloadErrorKind::Network
         )));
+    }
+
+    fn hub_client() -> hf_hub::HFClient {
+        hf_hub::HFClient::builder().build().expect("hub client")
+    }
+
+    #[tokio::test]
+    async fn rejected_credential_falls_back_to_anonymous_resolution() {
+        let credential = HubCredential {
+            client: hub_client(),
+            token: "expired".to_owned(),
+        };
+        let attempts = std::sync::Mutex::new(Vec::new());
+        let resolved =
+            resolve_with_credential_fallback(Some(credential), &hub_client(), |_client, token| {
+                attempts.lock().expect("attempts").push(token.clone());
+                async move {
+                    match token {
+                        Some(_) => Err(DownloadError {
+                            kind: DownloadErrorKind::CredentialRejected,
+                            message: "OAuth token has expired".to_owned(),
+                            retryable: false,
+                            resumable: false,
+                        }),
+                        None => Ok("resolved"),
+                    }
+                }
+            })
+            .await
+            .expect("anonymous resolution");
+
+        assert_eq!(resolved, ("resolved", false));
+        assert_eq!(
+            *attempts.lock().expect("attempts"),
+            vec![Some("expired".to_owned()), None]
+        );
+    }
+
+    #[tokio::test]
+    async fn other_failures_with_a_credential_are_not_retried_anonymously() {
+        let credential = HubCredential {
+            client: hub_client(),
+            token: "valid".to_owned(),
+        };
+        let attempts = std::sync::Mutex::new(Vec::new());
+        let error =
+            resolve_with_credential_fallback(Some(credential), &hub_client(), |_client, token| {
+                attempts.lock().expect("attempts").push(token);
+                async {
+                    Err::<(), _>(DownloadError {
+                        kind: DownloadErrorKind::SourceAccessDenied {
+                            credentialed: false,
+                        },
+                        message: String::new(),
+                        retryable: false,
+                        resumable: false,
+                    })
+                }
+            })
+            .await
+            .expect_err("forbidden content");
+
+        assert!(matches!(
+            error.kind,
+            DownloadErrorKind::SourceAccessDenied { credentialed: true }
+        ));
+        assert_eq!(
+            error.to_failure(),
+            Some(DownloadFailure::HuggingFaceAccessRequired {
+                access: HuggingFaceAccess::AcceptTerms
+            })
+        );
+        assert_eq!(
+            *attempts.lock().expect("attempts"),
+            vec![Some("valid".to_owned())]
+        );
+    }
+
+    #[tokio::test]
+    async fn resolution_without_a_credential_is_anonymous() {
+        let attempts = std::sync::Mutex::new(Vec::new());
+        resolve_with_credential_fallback(None, &hub_client(), |_client, token| {
+            attempts.lock().expect("attempts").push(token);
+            async { Ok(()) }
+        })
+        .await
+        .expect("anonymous resolution");
+
+        assert_eq!(*attempts.lock().expect("attempts"), vec![None]);
+    }
+
+    #[test]
+    fn refused_hub_files_ask_to_sign_in_unless_a_token_was_presented() {
+        let failure = |kind| {
+            DownloadError {
+                kind,
+                message: String::new(),
+                retryable: false,
+                resumable: false,
+            }
+            .to_failure()
+        };
+        let sign_in = Some(DownloadFailure::HuggingFaceAccessRequired {
+            access: HuggingFaceAccess::SignIn,
+        });
+        assert_eq!(failure(DownloadErrorKind::CredentialRejected), sign_in);
+        assert_eq!(
+            failure(DownloadErrorKind::SourceAccessDenied {
+                credentialed: false
+            }),
+            sign_in
+        );
+        assert_eq!(
+            failure(DownloadErrorKind::SourceAccessDenied { credentialed: true }),
+            Some(DownloadFailure::HuggingFaceAccessRequired {
+                access: HuggingFaceAccess::AcceptTerms
+            })
+        );
     }
 }

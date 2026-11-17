@@ -130,6 +130,82 @@ describe("Anthropic inference gateway", () => {
     expect(await forwarded?.text()).toBe(body)
   })
 
+  test("serves Claude models carrying Magnitude's placeholder credential from the loaded local model", async () => {
+    const requests: Array<Request> = []
+    const instances = {
+      revision: 3,
+      instances: [
+        { id: "a", modelId: "loading:model", lifecycle: { _tag: "Loading", fraction: 0.5 } },
+        { id: "b", modelId: "ready:model", lifecycle: { _tag: "Ready", allocation: {} } },
+      ],
+    }
+    const response = await proxyAnthropicInferenceRequest(
+      new Request("http://127.0.0.1:10100/inference/anthropic/proxies/claude-code/v1/messages?beta=true", {
+        method: "POST",
+        headers: { authorization: "Bearer magnitude-local", "content-type": "application/json" },
+        body: '{"model":"claude-opus-5","max_tokens":4,"messages":[]}',
+      }),
+      icn,
+      async (input, init) => {
+        const request = new Request(input, init)
+        requests.push(request)
+        return request.url.endsWith("/api/v1/instances") ? Response.json(instances) : Response.json({ ok: true })
+      },
+    )
+
+    expect(response.status).toBe(200)
+    expect(requests.map(({ url }) => url)).toEqual([
+      "http://127.0.0.1:9999/api/v1/instances",
+      "http://127.0.0.1:9999/anthropic/v1/messages",
+    ])
+    expect(requests[1]?.headers.get("authorization")).toBe("Bearer private-icn-token")
+    expect(requests[1]?.headers.get("magnitude-gateway-model")).toBe("anthropic-local/ready:model")
+    expect(await requests[1]?.json()).toMatchObject({ model: "ready:model", max_tokens: 4 })
+  })
+
+  test("explains a placeholder Claude request when no local model is loaded", async () => {
+    const requests: Array<string> = []
+    const response = await proxyAnthropicInferenceRequest(
+      new Request("http://127.0.0.1:10100/inference/anthropic/proxies/claude-code/v1/messages", {
+        method: "POST",
+        headers: { "x-api-key": "magnitude-local" },
+        body: '{"model":"claude-haiku-4-5","messages":[]}',
+      }),
+      icn,
+      async (input) => {
+        requests.push(String(input))
+        return Response.json({ revision: 0, instances: [] })
+      },
+    )
+
+    expect(requests).toEqual(["http://127.0.0.1:9999/api/v1/instances"])
+    expect(response.status).toBe(400)
+    expect(await response.json()).toMatchObject({
+      error: { type: "invalid_request_error", message: expect.stringContaining("No local model is loaded") },
+    })
+  })
+
+  test("forwards Claude models with a real bearer credential upstream unchanged", async () => {
+    const body = '{"model":"claude-sonnet-5","messages":[]}'
+    let forwarded: Request | undefined
+    await proxyAnthropicInferenceRequest(
+      new Request("http://127.0.0.1:10100/inference/anthropic/proxies/claude-code/v1/messages", {
+        method: "POST",
+        headers: { authorization: "Bearer sk-ant-oat-user" },
+        body,
+      }),
+      icn,
+      async (input, init) => {
+        forwarded = new Request(input, init)
+        return new Response("ok")
+      },
+    )
+
+    expect(forwarded?.url).toBe("https://api.anthropic.com/v1/messages")
+    expect(forwarded?.headers.get("authorization")).toBe("Bearer sk-ant-oat-user")
+    expect(await forwarded?.text()).toBe(body)
+  })
+
   test("preserves count-token bytes upstream and refuses the local operation", async () => {
     const upstreamBody = '{"model":"claude-upstream","future":true}'
     let forwarded: Request | undefined
@@ -484,6 +560,22 @@ describe("Codex inference gateway", () => {
       async () => new Response("unexpected"),
     )
     expect(oversized.status).toBe(413)
+
+    const mebibyte = 1024 * 1024
+    const frame = Bun.zstdCompressSync(new Uint8Array(mebibyte))
+    const expanding = Buffer.concat(
+      Array.from({ length: MAX_CODEX_ROUTING_BODY_BYTES / mebibyte + 1 }, () => frame),
+    )
+    const oversizedDecoded = await proxyCodexInferenceRequest(
+      new Request("http://127.0.0.1:10100/inference/v1/proxies/codex/responses", {
+        method: "POST",
+        headers: { "content-encoding": "zstd" },
+        body: Uint8Array.from(expanding).buffer,
+      }),
+      icn,
+      async () => new Response("unexpected"),
+    )
+    expect(oversizedDecoded.status).toBe(413)
   })
 
   test("rejects malformed, ambiguous, and empty local model selectors", async () => {
@@ -700,5 +792,183 @@ describe("upstream fetch timeout", () => {
       icn,
       fetchTarget,
     ))).toBe(false)
+  })
+})
+
+// Every route derives forwarded headers from the bytes it forwards: the source's
+// own bytes keep their body headers, rewritten bytes drop the stale encoding and
+// length, and a request without a body carries no body headers at all.
+describe("forwarded body headers", () => {
+  const ENCODED = { "content-encoding": "zstd", "content-length": "123" } as const
+
+  const captured = async (
+    proxy: (fetchTarget: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>) => Promise<Response>,
+  ): Promise<Array<{ readonly url: string; readonly headers: Headers; readonly body: string }>> => {
+    const sent: Array<{ readonly url: string; readonly headers: Headers; readonly body: string }> = []
+    await proxy(async (input, init) => {
+      const url = String(input)
+      sent.push({
+        url,
+        headers: new Headers(init?.headers),
+        body: await new Response(init?.body ?? null).text(),
+      })
+      return url.endsWith("/api/v1/instances")
+        ? Response.json({ instances: [{ modelId: "ready:model", lifecycle: { _tag: "Ready" } }] })
+        : Response.json({ ok: true })
+    })
+    return sent
+  }
+
+  const describesSource = (headers: Headers) => {
+    expect(headers.get("content-encoding")).toBe("zstd")
+    expect(headers.get("content-length")).toBe("123")
+  }
+  const describesRewrite = (headers: Headers) => {
+    expect(headers.get("content-encoding")).toBeNull()
+    expect(headers.get("content-length")).toBeNull()
+  }
+
+  const zstdRequest = (url: string, json: string, headers: Record<string, string> = {}) => {
+    const compressed = Bun.zstdCompressSync(Buffer.from(json))
+    return new Request(url, {
+      method: "POST",
+      headers: { ...headers, ...ENCODED },
+      body: Uint8Array.from(compressed).buffer,
+    })
+  }
+  test("opaque passthrough routes keep the source's body headers", async () => {
+    const opaque = () => new Request("http://127.0.0.1:10100/inference/v1/chat/completions", {
+      method: "POST",
+      headers: ENCODED,
+      body: "opaque-encoded-bytes",
+    })
+    for (const sent of [
+      await captured((fetchTarget) => proxyOpenAiInferenceRequest(opaque(), icn, fetchTarget)),
+      await captured((fetchTarget) => proxyLocalAnthropicInferenceRequest(
+        new Request("http://127.0.0.1:10100/inference/anthropic/v1/messages", opaque()),
+        icn,
+        fetchTarget,
+      )),
+      await captured((fetchTarget) => proxyCodexInferenceRequest(
+        new Request("http://127.0.0.1:10100/inference/v1/proxies/codex/files", opaque()),
+        icn,
+        fetchTarget,
+      )),
+    ]) {
+      expect(sent).toHaveLength(1)
+      describesSource(sent[0]!.headers)
+      expect(sent[0]!.body).toBe("opaque-encoded-bytes")
+    }
+  })
+
+  test("Codex HTTP keeps headers for unchanged upstream bytes and drops them for rewrites", async () => {
+    const url = "http://127.0.0.1:10100/inference/v1/proxies/codex/responses"
+    const unchanged = await captured((fetchTarget) => proxyCodexInferenceRequest(
+      zstdRequest(url, '{"model":"gpt-5.6-sol","input":[]}'),
+      icn,
+      fetchTarget,
+    ))
+    describesSource(unchanged[0]!.headers)
+
+    const portable = await captured((fetchTarget) => proxyCodexInferenceRequest(
+      zstdRequest(url, '{"model":"gpt-5.6-sol","previous_response_id":"resp_icn_1","input":[]}'),
+      icn,
+      fetchTarget,
+    ))
+    describesRewrite(portable[0]!.headers)
+    expect(JSON.parse(portable[0]!.body)).toEqual({ model: "gpt-5.6-sol", input: [] })
+
+    const local = await captured((fetchTarget) => proxyCodexInferenceRequest(
+      zstdRequest(url, `{"model":"${LOCAL_CODEX_MODEL_PREFIX}canonical:model","input":[]}`),
+      icn,
+      fetchTarget,
+    ))
+    describesRewrite(local[0]!.headers)
+    expect(local[0]!.body).toBe('{"model":"canonical:model","input":[]}')
+  })
+
+  test("Claude Code keeps headers upstream and drops them for local rewrites and model lookups", async () => {
+    const url = "http://127.0.0.1:10100/inference/anthropic/proxies/claude-code/v1/messages"
+    const request = (model: string, headers: Record<string, string>) => new Request(url, {
+      method: "POST",
+      headers: { ...ENCODED, "content-encoding": "identity", "content-type": "application/json", ...headers },
+      body: `{"model":"${model}","messages":[]}`,
+    })
+
+    const upstream = await captured((fetchTarget) => proxyAnthropicInferenceRequest(
+      request("claude-sonnet-5", { "x-api-key": "real" }),
+      icn,
+      fetchTarget,
+    ))
+    expect(upstream[0]!.headers.get("content-encoding")).toBe("identity")
+    expect(upstream[0]!.headers.get("content-length")).toBe("123")
+
+    const local = await captured((fetchTarget) => proxyAnthropicInferenceRequest(
+      request(`${LOCAL_ANTHROPIC_MODEL_PREFIX}canonical:model`, { "x-api-key": "real" }),
+      icn,
+      fetchTarget,
+    ))
+    describesRewrite(local[0]!.headers)
+    expect(local[0]!.headers.get("content-type")).toBe("application/json")
+
+    const placeholder = await captured((fetchTarget) => proxyAnthropicInferenceRequest(
+      request("claude-opus-5", { authorization: "Bearer magnitude-local" }),
+      icn,
+      fetchTarget,
+    ))
+    expect(placeholder.map(({ url }) => url)).toEqual([
+      "http://127.0.0.1:9999/api/v1/instances",
+      "http://127.0.0.1:9999/anthropic/v1/messages",
+    ])
+    describesRewrite(placeholder[0]!.headers)
+    expect(placeholder[0]!.headers.get("content-type")).toBeNull()
+    describesRewrite(placeholder[1]!.headers)
+    expect(JSON.parse(placeholder[1]!.body)).toMatchObject({ model: "ready:model" })
+  })
+
+  const frame = (format: "string" | "binary", json: string): string | Uint8Array =>
+    format === "string" ? json : new TextEncoder().encode(json)
+
+  // The handshake opens a socket that later frames reuse, so it never describes a frame.
+  test.each([
+    ["unchanged upstream", "string", '{"type":"response.create","model":"gpt-5.6-sol","input":[]}'],
+    ["unchanged upstream", "binary", '{"type":"response.create","model":"gpt-5.6-sol","input":[]}'],
+    ["rewritten upstream", "string", '{"type":"response.create","model":"gpt-5.6-sol","previous_response_id":"resp_icn_1","input":[]}'],
+    ["rewritten upstream", "binary", '{"type":"response.create","model":"gpt-5.6-sol","previous_response_id":"resp_icn_1","input":[]}'],
+    ["local", "string", `{"type":"response.create","model":"${LOCAL_CODEX_MODEL_PREFIX}canonical:model","input":[]}`],
+    ["local", "binary", `{"type":"response.create","model":"${LOCAL_CODEX_MODEL_PREFIX}canonical:model","input":[]}`],
+  ] as const)("Codex WebSocket handshake for a %s %s frame carries no body headers", (_route, format, json) => {
+    const sourceHeaders = new Headers({
+      ...ENCODED,
+      "content-type": "application/json",
+      "content-digest": "sha-256=:stale:",
+      authorization: "Bearer caller-token",
+      "openai-beta": "responses_websockets=2026-02-06",
+    })
+    const target = codexWebSocketTarget(frame(format, json), sourceHeaders, icn)
+    if (target._tag !== "Target") throw new Error("expected a target")
+    describesRewrite(target.headers)
+    expect(target.headers.get("content-type")).toBeNull()
+    expect(target.headers.get("content-digest")).toBeNull()
+    expect(target.headers.get("openai-beta")).toBe("responses_websockets=2026-02-06")
+    expect(target.headers.get("authorization")).toBe(
+      target.route === "local" ? "Bearer private-icn-token" : "Bearer caller-token",
+    )
+    describesSource(sourceHeaders)
+  })
+
+  test("rewritten HTTP bodies drop every header describing the original bytes", async () => {
+    const digests = { "content-md5": "stale", digest: "sha-256=stale", "content-digest": "sha-256=:stale:", "repr-digest": "sha-256=:stale:" }
+    const sent = await captured((fetchTarget) => proxyCodexInferenceRequest(
+      zstdRequest(
+        "http://127.0.0.1:10100/inference/v1/proxies/codex/responses",
+        `{"model":"${LOCAL_CODEX_MODEL_PREFIX}canonical:model","input":[]}`,
+        digests,
+      ),
+      icn,
+      fetchTarget,
+    ))
+    describesRewrite(sent[0]!.headers)
+    for (const header of Object.keys(digests)) expect(sent[0]!.headers.get(header)).toBeNull()
   })
 })

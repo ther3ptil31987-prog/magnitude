@@ -1,7 +1,7 @@
 //! Synchronous execution of the core-owned executable command vocabulary.
 
-use crate::buffer::{AllocationFailure, Buffer};
-use crate::workers::{LaunchFailure, LaunchFrame, NativeSteps, Workers};
+use crate::buffer::{Buffer, WritableBuffer};
+use crate::workers::{LaunchFailure, LaunchFrame, NativeSteps, SharedWorkers};
 use crate::Cpu;
 use seismic_compiler::errors::ExecutionError;
 use seismic_compiler::executable::{
@@ -11,19 +11,35 @@ use seismic_compiler::executable::{
 use seismic_ir::schedule::FillValue;
 use seismic_lang::expr::compiled::InvocationValues;
 use seismic_lang::expr::SymbolValue;
-use std::sync::{Arc, Mutex};
+use seismic_memory::entry::Entry;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Device;
 
-impl DeviceService<Cpu> for Device {
-    type Buffer = Buffer;
-
-    fn allocate(&self, bytes: u64, alignment: u64) -> Result<Buffer, ExecutionError> {
-        Buffer::new(bytes, alignment).map_err(allocation_error)
+impl Device {
+    /// One granule pool block of `bytes` in `kind`, the backend's one kind:
+    /// host pages of its own at the page, whatever its size, backed and
+    /// zero, charged exactly to `entry` ([`WritableBuffer::pages`]): the
+    /// pool lays granules from the block's base at its granule alignment.
+    pub fn allocate_block(&self, kind: u32, bytes: u64, entry: &Arc<dyn Entry>) -> Result<WritableBuffer, ExecutionError> {
+        assert_eq!(kind, crate::topology::kind().id, "invariant violated: a CPU block of kind {kind}");
+        WritableBuffer::pages(bytes, entry)
     }
 
-    fn write(&self, buffer: &Buffer, offset: u64, bytes: &[u8]) -> Result<(), ExecutionError> {
+}
+
+impl DeviceService<Cpu> for Device {
+    type Buffer = Buffer;
+    type Writable = WritableBuffer;
+
+    /// Host memory, the backend's one kind.
+    fn allocate(&self, kind: u32, bytes: u64, alignment: u64, entry: &Arc<dyn Entry>) -> Result<WritableBuffer, ExecutionError> {
+        assert_eq!(kind, crate::topology::kind().id, "invariant violated: a CPU allocation of kind {kind}");
+        WritableBuffer::new(bytes, alignment, entry)
+    }
+
+    fn write(&self, buffer: &WritableBuffer, offset: u64, bytes: &[u8]) -> Result<(), ExecutionError> {
         buffer.write(offset, bytes);
         Ok(())
     }
@@ -36,12 +52,32 @@ impl DeviceService<Cpu> for Device {
     fn buffer_len(&self, buffer: &Buffer) -> u64 {
         buffer.len()
     }
+
+    fn host_address(&self, buffer: &WritableBuffer) -> Option<std::ptr::NonNull<u8>> {
+        std::ptr::NonNull::new(buffer.data_pointer())
+    }
 }
 
 pub struct Executor {
     /// Shared by every CPU device of the process (`open_host`).
-    workers: Arc<Mutex<Workers>>,
+    workers: Arc<SharedWorkers>,
+    /// The device's own entry of the host store, which the pool's scratch
+    /// this device's launches grow is charged to.
+    own: Arc<dyn Entry>,
+    /// The device's properties (`seismic_lang::device::cpu`): its units are
+    /// the pool's participants, the submitting thread included.
+    properties: seismic_lang::device::cpu::Properties,
+}
+
+/// The sources of a CPU device's properties: its worker pool.
+struct Pool {
     participants: usize,
+}
+
+impl seismic_lang::device::cpu::Queries for Pool {
+    fn worker_cores(&self) -> Option<u64> {
+        Some(self.participants as u64)
+    }
 }
 
 impl Executor {
@@ -52,13 +88,19 @@ impl Executor {
         seismic_compiler::evaluation::AnalyticalEvaluationContext<Cpu>,
         seismic_compiler::errors::TargetError,
     > {
-        let mut workers = self.workers.lock().expect("CPU worker pool lock poisoned");
-        crate::profile::profile_for_workers(&mut workers, device)
+        let mut workers = self.workers.lock();
+        crate::profile::profile_for_workers(&mut workers, &self.own, device)
     }
 
-    /// Participants of the worker pool, the submitting thread included.
+    /// The device's properties.
+    pub fn properties(&self) -> &seismic_lang::device::cpu::Properties {
+        &self.properties
+    }
+
+    /// Participants of the worker pool, the submitting thread included: the
+    /// device's units.
     pub fn workers(&self) -> usize {
-        self.participants
+        self.properties.units.get() as usize
     }
 
     /// Run a sequence of authored native launches as one pool job and
@@ -70,20 +112,19 @@ impl Executor {
         steps: &dyn NativeSteps,
         clock: fn() -> f64,
     ) -> (Result<(), ExecutionError>, (f64, f64)) {
-        let mut workers = self.workers.lock().expect("CPU worker-pool lock poisoned");
+        let mut workers = self.workers.lock();
         let started = clock();
-        let outcome = workers.run_native(steps).map_err(launch_error);
+        let outcome = workers.run_native(&self.own, steps).map_err(launch_error);
         (outcome, (started, clock()))
     }
 
-    pub(crate) fn from_workers(workers: Arc<Mutex<Workers>>) -> Self {
-        let participants = workers
-            .lock()
-            .expect("CPU worker-pool lock poisoned")
-            .count();
+    pub(crate) fn from_workers(workers: Arc<SharedWorkers>, own: Arc<dyn Entry>) -> Self {
+        let participants = workers.lock().count();
         Self {
             workers,
-            participants,
+            own,
+            properties: seismic_lang::device::cpu::describe(&Pool { participants }, &Default::default())
+                .expect("a worker pool answers its participants"),
         }
     }
 }
@@ -96,12 +137,15 @@ impl NativeExecutor<Cpu> for Executor {
     fn begin_submission(&self) -> Result<Self::Submission, ExecutionError> {
         Ok(Submission {
             workers: self.workers.clone(),
+            own: self.own.clone(),
         })
     }
 }
 
 pub struct Submission {
-    workers: Arc<Mutex<Workers>>,
+    workers: Arc<SharedWorkers>,
+    /// The [`Executor`]'s own entry, which its scratch is charged to.
+    own: Arc<dyn Entry>,
 }
 
 pub struct Completed;
@@ -328,8 +372,8 @@ impl Submission {
         };
         self.workers
             .lock()
-            .expect("CPU worker-pool lock poisoned")
             .run(
+                &self.own,
                 kernel.entry,
                 &frame,
                 workgroups,
@@ -406,12 +450,8 @@ fn encode_symbol(value: SymbolValue) -> Result<u64, ExecutionError> {
     })
 }
 
-fn allocation_error(error: AllocationFailure) -> ExecutionError {
-    ExecutionError::AllocationFailed(error.to_string())
-}
-
 fn launch_error(error: LaunchFailure) -> ExecutionError {
     match error {
-        LaunchFailure::Scratch(error) => allocation_error(error),
+        LaunchFailure::Scratch(error) => error,
     }
 }

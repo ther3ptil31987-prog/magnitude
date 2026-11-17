@@ -251,6 +251,10 @@ struct parser_executor {
 
     common_peg_parse_result operator()(const common_peg_end_parser & /* p */) const {
         if (start_pos >= ctx.input.size()) { ++ctx.boundary_reads; }
+        // A lenient parse does not know whether its input has ended.
+        if (start_pos >= ctx.input.size() && ctx.is_lenient()) {
+            return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_NEED_MORE_INPUT, start_pos);
+        }
         return common_peg_parse_result(
             start_pos >= ctx.input.size() ? COMMON_PEG_PARSE_RESULT_SUCCESS : COMMON_PEG_PARSE_RESULT_FAIL,
             start_pos
@@ -462,6 +466,10 @@ struct parser_executor {
         }
 
         ctx.parse_depth--;
+        // Another repetition may follow.
+        if (pos >= ctx.input.size() && ctx.is_lenient() && (p.max_count == -1 || match_count < p.max_count)) {
+            return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_NEED_MORE_INPUT, start_pos, pos, std::move(nodes));
+        }
         if (ctx.is_debug()) {
             fprintf(stderr, "%sREPEAT -> SUCCESS (count=%d, nodes=%zu)\n", debug_indent().c_str(), match_count,
                     nodes.size());
@@ -523,6 +531,10 @@ struct parser_executor {
         }
 
         if (pos == ctx.input.size()) { ++ctx.boundary_reads; }
+        // More whitespace may follow.
+        if (pos == ctx.input.size() && ctx.is_lenient()) {
+            return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_NEED_MORE_INPUT, start_pos, pos);
+        }
         return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_SUCCESS, start_pos, pos);
     }
 
@@ -537,7 +549,8 @@ struct parser_executor {
 
             if (result.status == utf8_parse_result::INCOMPLETE) {
             ++ctx.boundary_reads;
-                if (match_count >= p.min_count) {
+                // More matching characters may follow.
+                if (match_count >= p.min_count && !ctx.is_lenient()) {
                     // We have enough matches, succeed with what we have
                     return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_SUCCESS, start_pos, pos);
                 }
@@ -726,8 +739,11 @@ struct parser_executor {
 
             if (match == common_trie::PARTIAL_MATCH) { ++ctx.boundary_reads; }
             if (match == common_trie::PARTIAL_MATCH && ctx.is_lenient()) {
-                // Found a partial match extending to end of input, return everything before it
-                return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_SUCCESS, start_pos, pos);
+                // A partial delimiter extends to the end of input. The text before it
+                // is read; the delimiter is undecided, so nothing after it is read:
+                // the parsers that follow would otherwise read its bytes as text that
+                // the completed delimiter takes back.
+                return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_NEED_MORE_INPUT, start_pos, pos);
             }
 
             pos += utf8_result.bytes_consumed;
@@ -1347,14 +1363,14 @@ common_peg_parser common_peg_parser_builder::python_dict() {
         auto ws = space();
         auto member = sequence({python_string(), ws, literal(":"), ws, python_value()});
         auto members = sequence({member, zero_or_more(sequence({ws, literal(","), ws, member}))});
+        // Whitespace around a value belongs to its container's separators.
         return sequence({
             literal("{"),
             ws,
             choice({
                 literal("}"),
                 sequence({members, ws, literal("}")})
-            }),
-            ws
+            })
         });
     });
 }
@@ -1362,15 +1378,14 @@ common_peg_parser common_peg_parser_builder::python_dict() {
 common_peg_parser common_peg_parser_builder::python_array() {
     return rule("python-array", [this]() {
         auto ws = space();
-        auto elements = sequence({python_value(), zero_or_more(sequence({literal(","), ws, python_value()}))});
+        auto elements = sequence({python_value(), zero_or_more(sequence({ws, literal(","), ws, python_value()}))});
         return sequence({
             literal("["),
             ws,
             choice({
                 literal("]"),
                 sequence({elements, ws, literal("]")})
-            }),
-            ws
+            })
         });
     });
 }
@@ -1513,8 +1528,10 @@ static std::string gbnf_ac_grammar(
 
     // An empty delimiter makes the start state terminal. Emit an entry rule
     // that matches the empty string so the returned reference stays valid.
+    // The empty string is spelled as a literal: a bare trailing "|" continues
+    // the alternation onto the next line and swallows the following rule.
     if (ac.is_terminal(0)) {
-        builder.add_rule(prefix, "|");
+        builder.add_rule(prefix, "\"\"");
     }
 
     return state_name(0);

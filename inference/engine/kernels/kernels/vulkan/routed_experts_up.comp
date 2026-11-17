@@ -1,77 +1,128 @@
 // Prefill projections of up-only experts over the grouped tables of
-// `routed_group`. The Vulkan form of `metal/routed_experts_up.metal`. Block b
-// (T tile rows of expert blocks[b]) is covered by ceil(T / TM) GEMM row
-// tiles; blocks of expert -1 exit.
+// `routed_group`. The Vulkan form of `metal/routed_experts_up.metal` (its
+// grids and its weights' places). Used block b (T tile rows of expert
+// blocks[b]) is covered by ceil(T / TM) GEMM row tiles.
 //
 // L1 (`routed_experts_up_expand`): K1 GEMM of the block's expert up rows with
 // the Grouped prologue and the Activated epilogue into the `product` scratch
 // [B * T, F].
 // L2 (`routed_experts_up_down`): K1 GEMM of the block's products against the
 // expert's down rows, published in A.
-// Every expert's up rows carry their `up_scale` entry; the down epilogue's
-// scale stays one.
+// The block's expert's up accumulators carry its `up_scale` entry where that
+// port is present (static US); the down epilogue's scale stays one.
+#if SEISMIC_STATIC_US != 0
 #define PROJECTION_SCALED
+#endif
+#define KERNEL_W0 SEISMIC_EXPERT_UP
+#define KERNEL_W1 SEISMIC_EXPERT_DOWN
 #include "lib/core/activation.glsl"
 #include "lib/routed/routed.glsl"
-#include "lib/routed/expert_up.glsl"
-#include "lib/routed/expert_down.glsl"
+#include "lib/streaming/control.glsl"
 
 #if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
 #define ROUTED_ACT ELEMENT_ACT
 #else
 #error "routed_experts_up requires a bf16 or f16 activation"
 #endif
+// The rows the up weights take (the normalized rows, or NVFP4 operands that
+// `routed_experts_up_stage` forms into `staged`), and the product rows the
+// down weights take (NVFP4 operands `routed_experts_up_quantize` forms in
+// place).
 
 #define EXPERTS_TM SEISMIC_TUNE_TILE_M
 #define EXPERTS_TN SEISMIC_TUNE_TILE_N
 #define EXPERTS_WM SEISMIC_TUNE_SUB_M
 #define EXPERTS_WN SEISMIC_TUNE_SUB_N
 
+void routed_experts_up_grids() {
+    routed_expert_grids(uint(element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_ROWS))),
+        uint(element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_USED))), uint(SEISMIC_DIM_T),
+        (uint(SEISMIC_DIM_T) + EXPERTS_TM - 1u) / EXPERTS_TM, (uint(SEISMIC_DIM_F) + EXPERTS_TN - 1u) / EXPERTS_TN,
+        (uint(SEISMIC_DIM_H) + EXPERTS_TN - 1u) / EXPERTS_TN, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGE_GRID),
+        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_EXPAND_GRID), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_QUANTIZE_GRID),
+        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_DOWN_GRID));
+}
+
+// The source the layer's map holds expert `expert` in for the step
+// (`held`, `streaming_held`: >= 0 a bank record, -2 - s scratch slot s, -1
+// skipped), or -2 - `expert` without a map (X = 0).
+int routed_expert_slot(const int expert) {
+    if (SEISMIC_DIM_X == 0ul)
+        return -2 - expert;
+    return streaming_held(SEISMIC_PTR(SEISMIC_BUFFER_MAP) + uint64_t(expert) * SEISMIC_MAP_STRIDE_0 * 4ul,
+        SEISMIC_MAP_STRIDE_1, streaming_step(SEISMIC_PTR(SEISMIC_BUFFER_STEP), SEISMIC_STEP_STRIDE_0));
+}
+#define EXPERTS_SLOT(expert) routed_expert_slot(expert)
+
+void routed_experts_up_stage() {
+    projection_stage(projection_operands(projection_plain(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED),
+        SEISMIC_NORMALIZED_STRIDE_0, SEISMIC_NORMALIZED_STRIDE_1, uint(SEISMIC_DIM_H), 0ul),
+        PROJECTION_OPERANDS_NVFP4), uint(element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_FIRST))) + gl_WorkGroupID.x,
+        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED), uint(SEISMIC_DIM_H));
+}
+
+void routed_experts_up_quantize() {
+    uint64_t block, tile_row;
+    seismic_split(gl_WorkGroupID.x, SEISMIC_DIM_T, block, tile_row);
+    const int expert = element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_BLOCKS) + block * SEISMIC_BLOCKS_STRIDE_0 * 4ul);
+    if (EXPERTS_SLOT(expert) == -1)
+        return;
+    projection_form_in_place(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT)
+        + uint64_t(gl_WorkGroupID.x) * SEISMIC_DIM_F * uint64_t(ELEMENT_BYTES(ROUTED_ACT)), uint(SEISMIC_DIM_F));
+}
+
 void routed_experts_up_expand() {
     const uint64_t tile_rows = SEISMIC_DIM_T;
-    const uint64_t subtiles = (tile_rows + EXPERTS_TM - 1u) / EXPERTS_TM;
-    const uint64_t block = gl_WorkGroupID.y / subtiles;
-    const uint tm_index = uint(gl_WorkGroupID.y % subtiles);
+    uint64_t block, subtile;
+    seismic_split(gl_WorkGroupID.y, (uint(tile_rows) + EXPERTS_TM - 1u) / EXPERTS_TM, block, subtile);
+    const uint tm_index = uint(subtile);
     const int expert = element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_BLOCKS) + block * SEISMIC_BLOCKS_STRIDE_0 * 4ul);
-    if (expert < 0)
+    const int slot = EXPERTS_SLOT(expert);
+    if (slot == -1)
         return;
     const uint hidden = uint(SEISMIC_DIM_H);
     const uint64_t order = SEISMIC_PTR(SEISMIC_BUFFER_ORDER) + block * SEISMIC_ORDER_STRIDE_0 * 4ul;
+#if defined(SEISMIC_EXPERT_UP_OPERANDS_NVFP4)
+    const projection_prologue x = projection_grouped(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED),
+        SEISMIC_DIM_H, 1ul, hidden, order, SEISMIC_ORDER_STRIDE_1);
+#else
     const projection_prologue x = projection_grouped(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED),
         SEISMIC_NORMALIZED_STRIDE_0, SEISMIC_NORMALIZED_STRIDE_1, hidden, order, SEISMIC_ORDER_STRIDE_1);
-    const projection_weights up = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP), EU_GEOMETRY,
-        routed_expert_row(uint64_t(expert), SEISMIC_DIM_F), hidden);
+#endif
+    const projection_weights up = routed_expert_matrix(slab_experts(SEISMIC_PTR(SEISMIC_BUFFER_RECORDS_UP),
+        SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP)), slab_source(slot), PACKETS_W0_STACKED_ROWS, hidden);
     const projection_epilogue out_ = projection_scaled(projection_activated(ROUTED_ACT,
-            SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT) + block * tile_rows * SEISMIC_DIM_F * uint64_t(ELEMENT_BYTES(ROUTED_ACT)),
+            out_offset(out_over_scratch(ROUTED_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT)), block * tile_rows * SEISMIC_DIM_F),
             SEISMIC_DIM_F, 1ul, int(SEISMIC_PARAM_ACTIVATION)),
-        projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_E, SEISMIC_UP_SCALE_STRIDE_0,
+        projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_US, SEISMIC_UP_SCALE_STRIDE_0,
             uint64_t(expert)),
         1.0);
     const uint live = routed_block_rows(order, SEISMIC_ORDER_STRIDE_1, uint(tile_rows));
-    projection_gemm(EU_KIND, EXPERTS_TM, EXPERTS_TN, EXPERTS_WM, EXPERTS_WN, x, out_, up, uint(tile_rows),
+    projection_gemm(PACKETS_W0, EXPERTS_TM, EXPERTS_TN, EXPERTS_WM, EXPERTS_WN, x, out_, up, uint(tile_rows),
         uint(SEISMIC_DIM_F), hidden, tm_index, gl_WorkGroupID.x, live);
 }
 
 void routed_experts_up_down() {
     const uint64_t tile_rows = SEISMIC_DIM_T;
-    const uint64_t subtiles = (tile_rows + EXPERTS_TM - 1u) / EXPERTS_TM;
-    const uint64_t block = gl_WorkGroupID.y / subtiles;
-    const uint tm_index = uint(gl_WorkGroupID.y % subtiles);
+    uint64_t block, subtile;
+    seismic_split(gl_WorkGroupID.y, (uint(tile_rows) + EXPERTS_TM - 1u) / EXPERTS_TM, block, subtile);
+    const uint tm_index = uint(subtile);
     const int expert = element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_BLOCKS) + block * SEISMIC_BLOCKS_STRIDE_0 * 4ul);
-    if (expert < 0)
+    const int slot = EXPERTS_SLOT(expert);
+    if (slot == -1)
         return;
     const uint features = uint(SEISMIC_DIM_F);
     const uint64_t bytes = uint64_t(ELEMENT_BYTES(ROUTED_ACT));
     const projection_prologue x = projection_plain(ROUTED_ACT,
         SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT) + block * tile_rows * SEISMIC_DIM_F * bytes, SEISMIC_DIM_F, 1ul,
         features, 0ul);
-    const projection_weights down = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_DOWN), ED_GEOMETRY,
-        routed_expert_row(uint64_t(expert), SEISMIC_DIM_H), features);
-    const projection_epilogue out_ = projection_store(ROUTED_ACT,
-        SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + block * SEISMIC_RESULT_0_STRIDE_0 * bytes, SEISMIC_RESULT_0_STRIDE_1,
+    const projection_weights down = routed_expert_matrix(slab_experts(SEISMIC_PTR(SEISMIC_BUFFER_RECORDS_DOWN),
+        SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_DOWN)), slab_source(slot), PACKETS_W1_STACKED_ROWS, features);
+    const projection_epilogue out_ = projection_store(
+        out_offset(SEISMIC_RESULT_0_OUT, block * SEISMIC_RESULT_0_STRIDE_0), SEISMIC_RESULT_0_STRIDE_1,
         SEISMIC_RESULT_0_STRIDE_2, 0ul);
     const uint live = routed_block_rows(SEISMIC_PTR(SEISMIC_BUFFER_ORDER) + block * SEISMIC_ORDER_STRIDE_0 * 4ul,
         SEISMIC_ORDER_STRIDE_1, uint(tile_rows));
-    projection_gemm(ED_KIND, EXPERTS_TM, EXPERTS_TN, EXPERTS_WM, EXPERTS_WN, x, out_, down, uint(tile_rows),
+    projection_gemm(PACKETS_W1, EXPERTS_TM, EXPERTS_TN, EXPERTS_WM, EXPERTS_WN, x, out_, down, uint(tile_rows),
         uint(SEISMIC_DIM_H), features, tm_index, gl_WorkGroupID.x, live);
 }

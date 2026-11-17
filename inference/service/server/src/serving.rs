@@ -44,10 +44,11 @@ impl ServedModels for ServiceModels {
     ) -> BoxFuture<'_, Result<Box<dyn ModelInvocation>, ServingError>> {
         let model = model.to_owned();
         let observer = progress.map(|progress| -> LoadingObserver {
-            Arc::new(move |stage, fraction| {
+            Arc::new(move |stage, fraction, details| {
                 progress(ModelLoadProgress {
                     stage: protocol_stage(stage),
                     fraction,
+                    details,
                 })
             })
         });
@@ -100,6 +101,12 @@ fn unavailable(error: InventoryError) -> ServingError {
         }
         InventoryError::Unsupported(message) => ModelUnavailable::Unsupported(message),
         InventoryError::Integrity(message) => ModelUnavailable::Integrity(message),
+        InventoryError::DoesNotFit(message) => ModelUnavailable::DoesNotFit(message),
+        InventoryError::ModelUnsupported { message, .. } => ModelUnavailable::Operation {
+            code: "model_unsupported".to_owned(),
+            message,
+            retryable: false,
+        },
         InventoryError::ModelOperation { code, .. } if code == "model_instance_stopped" => {
             ModelUnavailable::InstanceStopped
         }

@@ -1,0 +1,105 @@
+// ngram_inject (contract and portable body in ngram.seismic): the n-gram
+// input's dilated causal convolution over its banked window, added with the
+// gated value into the streams. The Vulkan form of `cuda/ngram_inject.cu`:
+// an invocation owns one channel of one item, item y < M computes row y (a
+// copy of `hidden` past the slots), item M + b publishes slot b's successor
+// window, and the y grid visits the items with a stride.
+#include <seismic/element.glsl>
+#include "lib/recurrent/versions.glsl"
+
+#if defined(SEISMIC_NORM_REPRESENTATION_F32)
+#define NGRAM_NORM ELEMENT_F32
+#elif defined(SEISMIC_NORM_REPRESENTATION_F16)
+#define NGRAM_NORM ELEMENT_F16
+#elif defined(SEISMIC_NORM_REPRESENTATION_BF16)
+#define NGRAM_NORM ELEMENT_BF16
+#else
+#error "ngram_inject requires a dense norm"
+#endif
+
+// u at launch row `row`, channel (`stream`, `column`).
+float ngram_u(uint64_t row, uint64_t stream, uint64_t column) {
+    const uint64_t scales = SEISMIC_PTR(SEISMIC_BUFFER_SCALES) + row * SEISMIC_SCALES_STRIDE_0 * 4ul;
+    const float gate = element_f32_at(scales + stream * SEISMIC_SCALES_STRIDE_1 * 4ul);
+    const float value = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_VALUE)
+        + (row * SEISMIC_VALUE_STRIDE_0 + column * SEISMIC_VALUE_STRIDE_1) * 4ul);
+    const float inverse = element_f32_at(scales + (SEISMIC_DIM_S + stream) * SEISMIC_SCALES_STRIDE_1 * 4ul);
+    const float norm = element_at(NGRAM_NORM, SEISMIC_PTR(SEISMIC_BUFFER_NORM),
+        stream * SEISMIC_NORM_STRIDE_0 + column * SEISMIC_NORM_STRIDE_1);
+    return seismic_mul_rn(seismic_mul_rn(seismic_mul_rn(gate, value), inverse), norm);
+}
+
+// Publishes channel `channel` (column `column` of stream `stream`) of slot
+// `index`'s successor window: the source bank's tape rows move unchanged, the
+// rows past the stop are u.
+void ngram_publish(uint64_t index, uint64_t channel, uint64_t stream, uint64_t column) {
+    const SlabOut window = SEISMIC_OUT_WINDOW;
+    const int reach = int(uint(SEISMIC_PARAM_DILATION)) * (int(SEISMIC_DIM_K) - 1);
+    const versions_slot slot = versions_slot_of(index);
+    const Out source = versions_out_bank(window, slot.source, SEISMIC_WINDOW_STRIDE_0);
+    const Out target = versions_out_bank(window, slot.target, SEISMIC_WINDOW_STRIDE_0);
+    // The tape holds T = R - reach rows.
+    const int published = reach + versions_tape_rows(slot, int(SEISMIC_DIM_R) - reach);
+    for (int tap = 0; tap < published; ++tap) {
+        const int position = slot.stop + tap - reach;
+        const uint64_t to = uint64_t(tap) * SEISMIC_WINDOW_STRIDE_1 + channel * SEISMIC_WINDOW_STRIDE_2;
+        if (position < 0)
+            out_move_stored(target, to, source,
+                uint64_t(slot.taped + slot.stop + tap) * SEISMIC_WINDOW_STRIDE_1 + channel * SEISMIC_WINDOW_STRIDE_2,
+                1ul);
+        else
+            out_put(target, to, ngram_u(uint64_t(slot.lo + position), stream, column));
+    }
+}
+
+// Channel `channel` (column `column` of stream `stream`) of row `row`.
+void ngram_row(int row, uint64_t channel, uint64_t stream, uint64_t column) {
+    const SlabOut window = SEISMIC_OUT_WINDOW;
+    const uint64_t convolution = SEISMIC_PTR(SEISMIC_BUFFER_CONVOLUTION);
+    const int dilation = int(uint(SEISMIC_PARAM_DILATION));
+    const int reach = dilation * (int(SEISMIC_DIM_K) - 1);
+    const Out result = SEISMIC_RESULT_0_OUT;
+    const uint64_t at = uint64_t(row) * SEISMIC_RESULT_0_STRIDE_0 + channel * SEISMIC_RESULT_0_STRIDE_1;
+    const uint64_t hidden_index = uint64_t(row) * SEISMIC_HIDDEN_STRIDE_0 + channel * SEISMIC_HIDDEN_STRIDE_1;
+    const uint64_t slot_index = versions_slot_index_of_row(row);
+    if (slot_index == SEISMIC_DIM_B) {
+        out_copy_stored(result, at, SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN), hidden_index, 1ul);
+        return;
+    }
+    const float residual = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN) + hidden_index * 4ul);
+    const versions_slot slot = versions_slot_of(slot_index);
+    const Out source = versions_out_bank(window, slot.source, SEISMIC_WINDOW_STRIDE_0);
+    const int local = row - slot.lo;
+    float sum = 0.0;
+    for (int tap = 0; tap < int(SEISMIC_DIM_K); ++tap) {
+        const int position = local + dilation * tap - reach;
+        const float tapped = position < 0
+            ? out_at(source, uint64_t(slot.taped + reach + position) * SEISMIC_WINDOW_STRIDE_1
+                + channel * SEISMIC_WINDOW_STRIDE_2)
+            : ngram_u(uint64_t(slot.lo + position), stream, column);
+        const float weight = element_f32_at(convolution
+            + (channel * SEISMIC_CONVOLUTION_STRIDE_0 + uint64_t(tap) * SEISMIC_CONVOLUTION_STRIDE_1) * 4ul);
+        sum = seismic_fma_rn(weight, tapped, sum);
+    }
+    const float gated = seismic_mul_rn(
+        element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_SCALES)
+            + (uint64_t(row) * SEISMIC_SCALES_STRIDE_0 + stream * SEISMIC_SCALES_STRIDE_1) * 4ul),
+        element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_VALUE)
+            + (uint64_t(row) * SEISMIC_VALUE_STRIDE_0 + column * SEISMIC_VALUE_STRIDE_1) * 4ul));
+    out_put(result, at, residual + (gated + seismic_div_rn(sum, 1.0 + exp(-sum))));
+}
+
+void ngram_inject() {
+    const uint64_t channel = uint64_t(gl_WorkGroupID.x) * gl_WorkGroupSize.x + gl_LocalInvocationIndex;
+    if (channel >= SEISMIC_DIM_S * SEISMIC_DIM_H)
+        return;
+    uint64_t stream, column;
+    seismic_split_group(gl_WorkGroupID.x, gl_WorkGroupSize.x, gl_LocalInvocationIndex, SEISMIC_DIM_H, stream, column);
+    const uint64_t rows = SEISMIC_DIM_M;
+    for (uint64_t item = gl_WorkGroupID.y; item < rows + SEISMIC_DIM_B; item += gl_NumWorkGroups.y) {
+        if (item >= rows)
+            ngram_publish(item - rows, channel, stream, column);
+        else
+            ngram_row(int(item), channel, stream, column);
+    }
+}

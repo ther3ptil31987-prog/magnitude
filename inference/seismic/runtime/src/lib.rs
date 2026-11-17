@@ -1,12 +1,14 @@
 //! Generic device, tensor, and prepared-kernel machinery over the frozen
 //! backend contracts (spec §2.3, §12, §24.1 R9). No planning lives here.
 //!
-//! The public surface is [`devices`] (the one device catalog, identities,
-//! memory pools and scoped observations) and [`api`] (the opened device, the
+//! The public surface is [`devices`] (opened execution resources over
+//! seismic-discovery's inventory) and [`api`] (the opened device, the
 //! tensor, and the call driver) which the public `seismic` crate composes.
 //! Everything else is private:
 //!
-//! - `memory`: per-pool allocation ledgers and per-device limits.
+//! - [`memory`]: the embedder's ledger handles a device charges every byte it
+//!   takes to, and which store each contract and kind lies in.
+//! - [`pool`]: a device's granule pools and the slab stores over them.
 //! - `driver`: the backend-generic opened device, preparation cache, and the
 //!   narrow primitive that issues one already-admitted node.
 //! - `native`: the explicitly selected authored-native route: formation,
@@ -30,15 +32,23 @@
 //! interprets the portable body.
 
 pub mod api;
+pub use backends::unmeasured_graph_cost;
+/// What the process's large-page host backing came to (the host pages of
+/// host ranges whose granules are whole large pages, backed in them or not),
+/// and the time their backing took by phase.
+pub use seismic_memory::{large_page_backing, LargePageBacking};
 pub mod artifacts;
 pub mod devices;
 
 mod backends;
+mod completion;
 mod driver;
 mod execution;
 pub mod formation;
 mod layout;
-mod memory;
+pub mod memory;
 pub mod native;
+pub mod pool;
+pub mod probes;
 mod resources;
 mod telemetry;

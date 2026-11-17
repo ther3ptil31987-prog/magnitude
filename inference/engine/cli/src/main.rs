@@ -1,5 +1,7 @@
 //! `magnitude-engine`: serve one explicit local model. The engine loads
-//! in-process (the same worker and protocol a worker process runs) and the
+//! in-process (the same worker and protocol a worker process runs), after
+//! the model's Prepare in a worker process of this executable when the
+//! kernel cache lacks tuning records (a load never searches), and the
 //! engine's protocol library serves it, with the standalone routes the
 //! benchmark adapters use: `/health`, `/v1/models` and `/v1/count`.
 use axum::Json;
@@ -13,12 +15,14 @@ use magnitude_engine::chat::SessionLimits;
 use magnitude_engine::composition::{EngineConfiguration, start_in_process};
 use magnitude_engine::invocation::{InvocationSource, SingleEngine};
 use magnitude_engine::options::{
-    ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection, standard_service_limits,
+    DraftPolicy, ExecutionManifest, ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection,
+    standard_service_limits,
 };
-use magnitude_engine::telemetry::{DEFAULT_TRACES_ENDPOINT, Telemetry};
-use magnitude_engine::worker::EngineClient;
-use magnitude_executor::ExecutionPath;
-use magnitude_executor::platform::{DeviceRequest, MemoryReserves};
+use magnitude_engine::telemetry::{DEFAULT_TRACES_ENDPOINT, Telemetry, log_to_stderr};
+use magnitude_engine::worker::transport::stdio_worker_transport;
+use magnitude_engine::worker::{EngineClient, WorkerExit, serve_worker};
+use magnitude_executor::platform::{DeviceRequest, ReleaseRate};
+use magnitude_executor::{ExecutionPath, WeightBound, TuningSettings};
 use magnitude_serving::engine::{EngineHost, EngineInvocation};
 use magnitude_serving::{
     HostChat, LoadProgress, ModelInvocation, ServedModels, Serving, ServingError,
@@ -27,7 +31,7 @@ use magnitude_state::KvCodec;
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 struct Options {
     target: PathBuf,
@@ -41,19 +45,33 @@ struct Options {
     prefill_tokens: usize,
     method: ModelMethod,
     mtp_proposals: Option<u8>,
-    kv_codec: KvCodec,
-    error_classes: Vec<String>,
+    draft_policy: Option<DraftPolicy>,
+    kv_codec: Option<KvCodec>,
+    numerical_profile: Option<magnitude_executor::NumericalProfile>,
     lookahead: bool,
+    weight_bound: Option<WeightBound>,
     telemetry_endpoint: String,
     device: DeviceRequest,
     kernel_cache: Option<PathBuf>,
+    tuning: TuningSettings,
+    tuning_trace: Option<PathBuf>,
 }
 
 const USAGE: &str = "magnitude-engine --model TARGET.gguf [--projector PROJECTOR.gguf | --no-projector] \
 [--draft DRAFT.gguf] [--host ADDR] [--port N] [--served-model NAME] [--context-tokens N] \
-[--output-capacity N] [--prefill-tokens N] [--method auto|plain|mtp|dflash|dspark|dflash2] [--mtp-proposals N] \
-[--kv-codec dense|affine-k8v4] [--admit-error-class CLASS]... [--lookahead on|off] [--telemetry URL] \
-[--device auto|metal|cuda|vulkan|cpu|SELECTOR] [--cache-dir DIR]";
+[--output-capacity N] [--prefill-tokens N] [--method auto|plain|mtp|dflash|dspark|dflash2|lilicorr] [--mtp-proposals N] [--draft-budget JSON|adaptive] \
+[--kv-codec dense|affine-k8v4] [--numerical-profile JSON_FILE] [--lookahead on|off] [--weight-cap BYTES | --device-room BYTES] [--telemetry URL] \
+[--device auto|metal|cuda|vulkan|cpu|SELECTOR] [--cache-dir DIR] \
+[--tuning-budget SECONDS] [--fresh-tuning] [--tuning-trace FILE]";
+
+/// The load's one weight bound, `given`: `--weight-cap` and `--device-room`
+/// bound the weights in ways of their own, so a load takes one of them.
+fn bound(set: Option<WeightBound>, given: WeightBound) -> Result<Option<WeightBound>, String> {
+    match set {
+        None => Ok(Some(given)),
+        Some(_) => Err("--weight-cap and --device-room are one bound each: give one, once".into()),
+    }
+}
 
 /// `on` or `off`.
 fn switch(flag: &str, value: &str) -> Result<bool, String> {
@@ -94,12 +112,16 @@ fn parse() -> Result<Options, String> {
     let mut prefill_tokens = standard_service_limits().prefill_tokens;
     let mut method = ModelMethod::Auto;
     let mut mtp_proposals = None;
+    let mut draft_policy = None;
     let mut kv_codec = defaults.kv_codec;
-    let mut error_classes = defaults.error_classes;
+    let mut numerical_profile = defaults.numerical_profile;
     let mut lookahead = defaults.lookahead;
+    let mut weight_bound = defaults.weight_bound;
     let mut telemetry_endpoint = DEFAULT_TRACES_ENDPOINT.to_owned();
     let mut device = DeviceRequest::Automatic;
     let mut kernel_cache = None;
+    let mut tuning = TuningSettings::STANDARD;
+    let mut tuning_trace = None;
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         match flag.as_str() {
@@ -116,20 +138,30 @@ fn parse() -> Result<Options, String> {
             "--output-capacity" => output_capacity = number(&flag, &mut args)?,
             "--prefill-tokens" => prefill_tokens = number(&flag, &mut args)?,
             "--method" => {
-                method = match value(&flag, &mut args)?.as_str() {
-                    "auto" => ModelMethod::Auto,
-                    "plain" => ModelMethod::Plain,
-                    "mtp" => ModelMethod::Mtp,
-                    "dflash" => ModelMethod::DFlash,
-                    "dspark" => ModelMethod::DSpark,
-                    "dflash2" => ModelMethod::DFlash2,
-                    other => return Err(format!("unknown generation method: {other}")),
-                }
+                let name = value(&flag, &mut args)?;
+                method = ModelMethod::named(&name)
+                    .ok_or_else(|| format!("unknown generation method: {name}"))?;
             }
             "--mtp-proposals" => mtp_proposals = Some(number(&flag, &mut args)?),
-            "--kv-codec" => kv_codec = value(&flag, &mut args)?.parse()?,
-            "--admit-error-class" => error_classes.push(value(&flag, &mut args)?),
+            "--draft-budget" => {
+                let budget = value(&flag, &mut args)?;
+                draft_policy = Some(if budget == "adaptive" {
+                    DraftPolicy::Adaptive
+                } else {
+                    DraftPolicy::Fixed(
+                        serde_json::from_str(&budget)
+                            .map_err(|error| format!("--draft-budget: {error}"))?,
+                    )
+                });
+            }
+            "--kv-codec" => kv_codec = Some(value(&flag, &mut args)?.parse()?),
+            "--numerical-profile" => {
+                let path = value(&flag, &mut args)?;
+                numerical_profile = Some(magnitude_executor::NumericalProfile::read(path.as_ref())?);
+            }
             "--lookahead" => lookahead = switch(&flag, &value(&flag, &mut args)?)?,
+            "--weight-cap" => weight_bound = bound(weight_bound, WeightBound::Cap(number(&flag, &mut args)?))?,
+            "--device-room" => weight_bound = bound(weight_bound, WeightBound::Room(number(&flag, &mut args)?))?,
             "--telemetry" => telemetry_endpoint = value(&flag, &mut args)?,
             "--device" => {
                 device = value(&flag, &mut args)?
@@ -137,6 +169,15 @@ fn parse() -> Result<Options, String> {
                     .map_err(|error| format!("--device: {error}"))?
             }
             "--cache-dir" => kernel_cache = Some(PathBuf::from(value(&flag, &mut args)?)),
+            "--tuning-budget" => {
+                let seconds: f64 = number(&flag, &mut args)?;
+                tuning.budget = Duration::try_from_secs_f64(seconds)
+                    .ok()
+                    .filter(|budget| !budget.is_zero())
+                    .ok_or("--tuning-budget takes a positive number of seconds")?;
+            }
+            "--fresh-tuning" => tuning.fresh = true,
+            "--tuning-trace" => tuning_trace = Some(PathBuf::from(value(&flag, &mut args)?)),
             "--help" | "-h" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -167,12 +208,16 @@ fn parse() -> Result<Options, String> {
         prefill_tokens,
         method,
         mtp_proposals,
+        draft_policy,
         kv_codec,
-        error_classes,
+        numerical_profile,
         lookahead,
+        weight_bound,
         telemetry_endpoint,
         device,
         kernel_cache,
+        tuning,
+        tuning_trace,
     })
 }
 
@@ -211,7 +256,24 @@ struct Identity {
     model: String,
     context_tokens: u64,
     vocabulary: u64,
+    /// What the load decodes with (`drafting`).
+    drafting: serde_json::Value,
     engine: EngineClient,
+}
+
+/// What a load decodes with, as its resolved policy states it
+/// (`ModelPolicy::resolve`): the method it serves (`plain` for a load that
+/// drafts nothing, a drafter it could not admit included), the widest draft a
+/// round may propose, and how rounds take their budget: `Adaptive` (each
+/// round chooses), `{"Fixed": {"generated", "verified"}}`, or null for a
+/// plain load or a fixed width alone (every round proposes `proposals`).
+fn drafting(manifest: &ExecutionManifest) -> Result<serde_json::Value, String> {
+    let model = &manifest.model;
+    Ok(json!({
+        "method": model.served_method(&manifest.definition)?.name(),
+        "proposals": model.method.proposals(),
+        "policy": model.draft_policy,
+    }))
 }
 
 async fn health(State(identity): State<Identity>) -> Response {
@@ -220,6 +282,7 @@ async fn health(State(identity): State<Identity>) -> Response {
             "model": identity.model,
             "context_tokens": identity.context_tokens,
             "vocabulary": identity.vocabulary,
+            "drafting": identity.drafting,
             "ready": true,
         }))
         .into_response(),
@@ -249,8 +312,28 @@ async fn memory(State(identity): State<Identity>) -> Response {
     }
 }
 
+/// The argument this executable runs the engine's worker under: what it
+/// starts itself as for a model's Prepare.
+const WORKER_ARGUMENT: &str = "--worker";
+
 fn main() {
+    magnitude_executor::diagnostics::install();
     magnitude_executor::platform::relax_gpu_watchdog();
+    if std::env::args().nth(1).as_deref() == Some(WORKER_ARGUMENT) {
+        if let Err(error) = log_to_stderr() {
+            eprintln!("magnitude-engine: {error}");
+            std::process::exit(1);
+        }
+        let served = serve_worker(stdio_worker_transport());
+        let code = match &served.exit {
+            WorkerExit::Prepared | WorkerExit::Shutdown => 0,
+            exit => {
+                eprintln!("magnitude-engine: worker ended: {exit:?}");
+                1
+            }
+        };
+        served.end_process(code);
+    }
     if let Err(error) = run() {
         eprintln!("magnitude-engine: {error}");
         std::process::exit(1);
@@ -261,48 +344,56 @@ fn run() -> Result<(), String> {
     let load_started = Instant::now();
     let options = parse()?;
     let _telemetry = Telemetry::open(&options.telemetry_endpoint);
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    log_to_stderr()?;
     let mut service = standard_service_limits();
     service.prefill_tokens = options.prefill_tokens;
-    let resolved = EngineConfiguration {
+    // The machine's figures live in the kernel cache, keyed by its host.
+    let topology = match &options.kernel_cache {
+        Some(_) => Some(seismic::Devices::discover(&[]).map_err(|error| error.to_string())?.topology()),
+        None => None,
+    };
+    let release = ReleaseRate::of_machine(options.kernel_cache.as_deref().zip(topology.as_deref()));
+    let mut resolved = EngineConfiguration {
         package: PackageOptions {
             target: options.target,
             projector: options.projector,
             draft: options.draft,
         },
         model: ModelPolicy {
+            draft_policy: options.draft_policy,
             method: options.method,
             mtp_proposals: options.mtp_proposals,
             kv_codec: options.kv_codec,
             lookahead: options.lookahead,
             exported_logits_rows: 0,
-            error_classes: options.error_classes,
+            numerical_profile: options.numerical_profile,
+            weight_bound: options.weight_bound,
         },
         context_tokens: options.context_tokens,
         service,
         path: ExecutionPath::Native,
         device: options.device,
         kernel_cache: options.kernel_cache,
-        reserves: MemoryReserves::standard(),
+        release,
     }
     .resolve()
     .map_err(|error| error.to_string())?;
+    resolved.manifest.tuning = options.tuning;
+    resolved.manifest.tuning_trace = options.tuning_trace;
     eprintln!(
         "magnitude-engine: host resolution in {:.2} s",
         load_started.elapsed().as_secs_f64()
     );
     let geometry = &resolved.host.definition().decoder;
     let (context_tokens, vocabulary) = (geometry.context_limit, geometry.vocabulary);
+    let drafting = drafting(&resolved.manifest)?;
     let worker_started = Instant::now();
     let mut reported = None;
-    let ready = start_in_process(resolved, |progress| {
+    let mut worker = std::process::Command::new(
+        std::env::current_exe().map_err(|error| format!("locating this executable: {error}"))?,
+    );
+    worker.arg(WORKER_ARGUMENT);
+    let ready = start_in_process(resolved, worker, |progress| {
         // Each step once; its measured progress repeats per unit and weight.
         let step = std::mem::discriminant(&progress);
         if reported != Some(step) {
@@ -321,6 +412,7 @@ fn run() -> Result<(), String> {
         model: options.served_model.clone(),
         context_tokens,
         vocabulary,
+        drafting,
         engine: engine.clone(),
     };
     let serving = Serving::new(Arc::new(Standalone {

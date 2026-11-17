@@ -1,45 +1,17 @@
 import { MagnitudeHealthResponseSchema } from "@magnitudedev/acn-protocol"
+export { MachineFormFactor, MachineIdentity, MachineIdentityObservation } from "@magnitudedev/acn-protocol"
 import { Schema } from "effect"
-import { DesktopUpdateState } from "./desktop-update"
-export { DesktopUpdateState } from "./desktop-update"
+import { ApplicationUpdateState, LoginStartupState } from "@magnitudedev/acn-protocol"
+export { ApplicationUpdateState, LoginStartupState, HuggingFaceArtifactSelectorSchema, HuggingFaceRepositoryIdSchema, type HuggingFaceArtifactSelector, type HuggingFaceRepositoryId } from "@magnitudedev/acn-protocol"
 
 export const AppearancePreference = Schema.Literal("system", "light", "dark")
 export type AppearancePreference = typeof AppearancePreference.Type
-
-/** Where downloaded models are stored. The engine reads the folder once at service start. */
-export const ModelStorageSettings = Schema.Struct({
-  active: Schema.String,
-  path: Schema.String,
-  source: Schema.Literal("Default", "Configured"),
-  defaultPath: Schema.String,
-  warning: Schema.NullOr(Schema.String),
-})
-export type ModelStorageSettings = typeof ModelStorageSettings.Type
-
-export const NetworkInterfaceAddress = Schema.Struct({ name: Schema.String, address: Schema.String, kind: Schema.Literal("lan", "tailscale", "virtual") })
-export const NetworkAccessSettings = Schema.Struct({
-  enabled: Schema.Boolean,
-  bind: Schema.NullOr(Schema.String),
-  requireApiKey: Schema.Boolean,
-  apiKey: Schema.NullOr(Schema.String),
-  interfaces: Schema.Array(NetworkInterfaceAddress),
-  port: Schema.Int,
-  pending: Schema.Boolean,
-  warning: Schema.NullOr(Schema.String),
-})
-export type NetworkAccessSettings = typeof NetworkAccessSettings.Type
-export const NetworkAccessChange = Schema.Struct({
-  enabled: Schema.optional(Schema.Boolean),
-  bind: Schema.optional(Schema.NullOr(Schema.String)),
-  requireApiKey: Schema.optional(Schema.Boolean),
-})
-export type NetworkAccessChange = typeof NetworkAccessChange.Type
 
 export const ApplicationUpdateAction = Schema.Literal("status", "check", "download", "install", "discard")
 export type ApplicationUpdateAction = typeof ApplicationUpdateAction.Type
 export class ApplicationUpdateControlFailed extends Schema.TaggedError<ApplicationUpdateControlFailed>()("ApplicationUpdateControlFailed", { message: Schema.String }) {}
 export const ApplicationUpdateRequest = Schema.Struct({ version: Schema.Literal(1), update: ApplicationUpdateAction })
-export const ApplicationUpdateReply = Schema.Union(Schema.TaggedStruct("Update", { state: DesktopUpdateState }), ApplicationUpdateControlFailed)
+export const ApplicationUpdateReply = Schema.Union(Schema.TaggedStruct("Update", { state: ApplicationUpdateState }), ApplicationUpdateControlFailed)
 
 export class Starting extends Schema.TaggedClass<Starting>()("Starting", {
   attempt: Schema.Int,
@@ -54,7 +26,10 @@ export class Stopped extends Schema.TaggedClass<Stopped>()("Stopped", {}) {}
 export const OwnedServiceState = Schema.Union(Starting, Ready, Failed, CleanupFailed, Stopping, Stopped)
 export type OwnedServiceState = typeof OwnedServiceState.Type
 
-export const ApplicationIntent = Schema.Literal("EnsureRunning", "ShowWindow", "Observe", "Retry", "Quit", "Yield")
+/** A `magnitude://` link handed to a later launch, forwarded to the owner, which validates it again. */
+export const ApplicationOpenUrl = Schema.TaggedStruct("OpenUrl", { url: Schema.String.pipe(Schema.minLength(1), Schema.maxLength(4096)) })
+export type ApplicationOpenUrl = typeof ApplicationOpenUrl.Type
+export const ApplicationIntent = Schema.Union(Schema.Literal("EnsureRunning", "ShowWindow", "Observe", "Retry", "Quit", "Yield"), ApplicationOpenUrl)
 export type ApplicationIntent = typeof ApplicationIntent.Type
 export const ApplicationRequest = Schema.Struct({ version: Schema.Literal(1), intent: ApplicationIntent })
 export const TrayRegistration = Schema.Union(
@@ -62,9 +37,10 @@ export const TrayRegistration = Schema.Union(
   Schema.TaggedStruct("Unavailable", { message: Schema.String }), Schema.TaggedStruct("Closed", {}),
 )
 export type TrayRegistration = typeof TrayRegistration.Type
+/** A Headless owner started as a Windows service is never taken over by the desktop. */
 export const ApplicationOwner = Schema.Union(
   Schema.TaggedStruct("Desktop", { tray: TrayRegistration }),
-  Schema.TaggedStruct("Headless", {}),
+  Schema.TaggedStruct("Headless", { service: Schema.optionalWith(Schema.Boolean, { default: () => false, exact: true }) }),
 )
 export type ApplicationOwner = typeof ApplicationOwner.Type
 export const ApplicationSnapshot = Schema.Struct({
@@ -73,47 +49,8 @@ export const ApplicationSnapshot = Schema.Struct({
 })
 export type ApplicationSnapshot = typeof ApplicationSnapshot.Type
 
-export const LoginStartupState = Schema.Union(
-  Schema.TaggedStruct("Enabled", {}),
-  Schema.TaggedStruct("Disabled", {}),
-  Schema.TaggedStruct("RequiresApproval", {}),
-  Schema.TaggedStruct("Unavailable", { message: Schema.String }),
-)
-export type LoginStartupState = typeof LoginStartupState.Type
 export const LoginStartupAction = Schema.Literal("read", "enable", "disable")
 export type LoginStartupAction = typeof LoginStartupAction.Type
 export class LoginStartupFailed extends Schema.TaggedError<LoginStartupFailed>()("LoginStartupFailed", { message: Schema.String }) {}
 export const ApplicationLoginRequest = Schema.Struct({ version: Schema.Literal(1), login: LoginStartupAction })
 export const ApplicationLoginReply = Schema.Union(Schema.TaggedStruct("LoginStartup", { state: LoginStartupState }), LoginStartupFailed)
-
-/** OS-attributed process memory, never catalog estimates or whole-machine used RAM. */
-export const ApplicationMemorySample = Schema.Struct({
-  bytes: Schema.Int.pipe(Schema.between(0, Number.MAX_SAFE_INTEGER)),
-  processCount: Schema.Int.pipe(Schema.between(1, 512)),
-  metric: Schema.Literal("PhysicalFootprint", "ProportionalResident", "PrivateWorkingSet"),
-})
-export const ApplicationMemoryObservation = Schema.Union(
-  Schema.TaggedStruct("Measured", {
-    ...ApplicationMemorySample.fields,
-    measuredAt: Schema.Int.pipe(Schema.between(0, Number.MAX_SAFE_INTEGER)),
-  }),
-  Schema.TaggedStruct("Unavailable", { message: Schema.String }),
-)
-export type ApplicationMemoryObservation = typeof ApplicationMemoryObservation.Type
-
-/** Host enclosure identity supplements, but never determines, inference capabilities. */
-export const MachineFormFactor = Schema.Literal("Portable", "Desktop", "AllInOne", "MiniPc", "Server", "Unknown")
-export type MachineFormFactor = typeof MachineFormFactor.Type
-const FirmwareLabel = Schema.Trimmed.pipe(Schema.minLength(1), Schema.maxLength(255))
-export const MachineIdentity = Schema.Struct({
-  manufacturer: Schema.Trimmed.pipe(Schema.minLength(1), Schema.maxLength(255)),
-  model: Schema.Trimmed.pipe(Schema.minLength(1), Schema.maxLength(255)),
-  family: Schema.optionalWith(FirmwareLabel, { as: "Option", exact: true }),
-  version: Schema.optionalWith(FirmwareLabel, { as: "Option", exact: true }),
-  formFactor: MachineFormFactor,
-})
-export const MachineIdentityObservation = Schema.Union(
-  Schema.TaggedStruct("Identified", MachineIdentity.fields),
-  Schema.TaggedStruct("Unavailable", { formFactor: MachineFormFactor }),
-)
-export type MachineIdentityObservation = typeof MachineIdentityObservation.Type

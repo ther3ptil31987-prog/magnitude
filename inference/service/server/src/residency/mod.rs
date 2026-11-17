@@ -10,12 +10,13 @@ pub mod supervisor;
 pub mod worker;
 
 use std::sync::Arc;
+use magnitude_serving::source::ModelLoadDetails;
 
 use magnitude_service_contracts::InventoryError;
 use magnitude_service_contracts::models::{
     MemoryShortage, ModelId, ModelInstance, ModelInstanceAllocation, ModelInstanceFailure,
     ModelInstanceId, ModelInstanceLifecycle, ModelInstancesInvalidation, ModelInstancesSnapshot,
-    ModelLoadPlan,
+    ModelLoadDevice, ModelLoadPlan,
     ModelLoadStage, ModelPackageId, ModelReleaseReason, ModelServingConfiguration,
     ModelStoppingAllocation,
 };
@@ -24,7 +25,7 @@ use magnitude_service_contracts::models::{
 pub const MEMORY_SHORTAGE_FAILURE_CODE: &str = "memory_shortage";
 
 /// Observes model loading: its stage and completed fraction in `[0, 1]`.
-pub type LoadingObserver = Arc<dyn Fn(ModelLoadStage, f32) + Send + Sync>;
+pub type LoadingObserver = Arc<dyn Fn(ModelLoadStage, f32, Option<ModelLoadDetails>) + Send + Sync>;
 
 pub enum ResidencyAcquisition {
     Inference { progress: Option<LoadingObserver> },
@@ -92,10 +93,22 @@ pub struct ResolvedResidencyTarget {
 pub trait ResidencyWorker: Send + Sync {
     fn pid(&self) -> Option<u32>;
     fn try_wait(&self) -> std::io::Result<Option<std::process::ExitStatus>>;
-    /// End the worker now; attached requests fail.
-    fn terminate(&self, code: &str, reason: &str);
+    /// End the worker now, attached requests failing: the kill is sent, never waited for (a
+    /// driver can delay the kernel's reap without bound), and its retirement is shown by
+    /// [`Self::try_wait`]. An error is a kill that could not be sent.
+    fn terminate(&self, code: &str, reason: &str) -> std::io::Result<()>;
+    /// [`Self::terminate`] where what follows shows the worker's retirement or reports it
+    /// unproven (its owner polls [`Self::try_wait`]): a kill that could not be sent is logged.
+    fn end(&self, code: &str, reason: &str) {
+        if let Err(error) = self.terminate(code, reason) {
+            tracing::error!(%error, code, "the inference worker's kill could not be sent");
+        }
+    }
     /// Ask the worker to unload and exit; attached requests end with the unload.
     fn shutdown(&self);
+    /// Whether the worker has answered its shutdown: it serves nothing more, every request it
+    /// held answered, and what is left of it is its release.
+    fn answered_shutdown(&self) -> bool;
 }
 
 fn verify_worker_retirement(worker: &dyn ResidencyWorker) -> Result<(), ModelOperationFailure> {
@@ -117,15 +130,19 @@ fn verify_worker_retirement(worker: &dyn ResidencyWorker) -> Result<(), ModelOpe
 pub struct PreparedResidency<R> {
     pub package_ids: Vec<ModelPackageId>,
     pub allocation: ModelInstanceAllocation,
+    /// The device the worker opened.
+    pub device: ModelLoadDevice,
     pub worker: Arc<dyn ResidencyWorker>,
     pub resident: R,
 }
 
 struct LoadingResidency<R> {
+    details: Option<ModelLoadDetails>,
     instance: ModelInstance,
     configuration: ModelServingConfiguration,
     configuration_key: String,
     operation: tokio::task::JoinHandle<()>,
+    gate: LoadGate,
     worker: Option<Arc<dyn ResidencyWorker>>,
     waiters: Vec<AcquisitionWaiter<R>>,
 }
@@ -165,7 +182,7 @@ impl ReleaseControl {
 
 enum ReleaseOperation<R> {
     StoppingLoad {
-        operation: tokio::task::JoinHandle<()>,
+        operation: magnitude_service_utils::owner::Owner,
         worker: Option<Arc<dyn ResidencyWorker>>,
     },
     Draining {
@@ -213,6 +230,7 @@ pub enum ResidencyNotification {
         instance_id: ModelInstanceId,
         stage: ModelLoadStage,
         fraction: f32,
+        details: Option<ModelLoadDetails>,
         planned_allocation: Option<ModelLoadPlan>,
     },
     LoadingStopCompleted {
@@ -255,7 +273,7 @@ enum ResidencyCommand<R> {
         reply: tokio::sync::oneshot::Sender<ModelInstancesSnapshot>,
     },
     AcquirePackageRemoval {
-        package_id: ModelPackageId,
+        package_ids: Vec<ModelPackageId>,
         reply: tokio::sync::oneshot::Sender<Result<PackageRemovalPermit, InventoryError>>,
     },
     LoadFinished {
@@ -322,6 +340,8 @@ impl<R> Clone for ResidencyClient<R> {
 pub struct ResidencyInbox<R> {
     commands: tokio::sync::mpsc::UnboundedReceiver<ResidencyCommand<R>>,
 }
+
+const PACKAGE_REMOVAL_ADMISSION: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn owner_stopped() -> InventoryError {
     InventoryError::Internal("model residency owner stopped".to_owned())
@@ -397,15 +417,26 @@ impl<R: Send + 'static> ResidencyClient<R> {
         response.await.map_err(|_| owner_stopped())
     }
 
+    /// One exclusive admission covering every package of a removal; asking for each package
+    /// separately while holding an earlier permit would wait on itself. Admission waits behind a
+    /// load, a release or another removal for at most `PACKAGE_REMOVAL_ADMISSION`, then refuses
+    /// with a retryable error, so a removal request never hangs.
     pub async fn acquire_package_removal(
         &self,
-        package_id: ModelPackageId,
+        package_ids: Vec<ModelPackageId>,
     ) -> Result<PackageRemovalPermit, InventoryError> {
         let (reply, response) = tokio::sync::oneshot::channel();
         self.commands
-            .send(ResidencyCommand::AcquirePackageRemoval { package_id, reply })
+            .send(ResidencyCommand::AcquirePackageRemoval { package_ids, reply })
             .map_err(|_| owner_stopped())?;
-        response.await.map_err(|_| owner_stopped())?
+        match tokio::time::timeout(PACKAGE_REMOVAL_ADMISSION, response).await {
+            Ok(result) => result.map_err(|_| owner_stopped())?,
+            Err(_) => Err(InventoryError::ModelOperation {
+                code: "model_removal_busy".to_owned(),
+                message: "Magnitude is still loading or stopping a model, or removing other files. Try again when that finishes.".to_owned(),
+                retryable: true,
+            }),
+        }
     }
 
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<ModelInstancesInvalidation> {
@@ -432,6 +463,11 @@ pub enum ModelOperationFailure {
         retryable: bool,
     },
     MemoryShortage(MemoryShortage),
+    /// The weight bound is below the load's least weights: the caller's bound, which no wait
+    /// clears, so never retryable. Reported to clients as an operation failure of its own code
+    /// with both numbers in its message: the bound is the service's evaluation's
+    /// (`serve --weight-cap`), which no client sets.
+    WeightBound(magnitude_engine::error::WeightBoundBelowWeights),
 }
 
 fn memory_shortage_message(shortage: &MemoryShortage) -> String {
@@ -442,9 +478,6 @@ fn memory_shortage_message(shortage: &MemoryShortage) -> String {
         } => format!(
             "not enough memory right now: the model requires {required_bytes} bytes and {available_bytes} bytes are available"
         ),
-        MemoryShortage::UnderPressure {} => {
-            "not enough memory right now: loading stopped because the system is under memory pressure".to_owned()
-        }
     }
 }
 
@@ -461,6 +494,7 @@ impl ModelOperationFailure {
         match self {
             Self::Operation { code, .. } => code,
             Self::MemoryShortage(_) => MEMORY_SHORTAGE_FAILURE_CODE,
+            Self::WeightBound(_) => magnitude_serving::error::WEIGHT_BOUND_BELOW_WEIGHTS,
         }
     }
 
@@ -468,6 +502,7 @@ impl ModelOperationFailure {
         match self {
             Self::Operation { message, .. } => message.clone(),
             Self::MemoryShortage(shortage) => memory_shortage_message(shortage),
+            Self::WeightBound(bound) => bound.to_string(),
         }
     }
 
@@ -475,6 +510,7 @@ impl ModelOperationFailure {
         match self {
             Self::Operation { retryable, .. } => *retryable,
             Self::MemoryShortage(_) => true,
+            Self::WeightBound(_) => false,
         }
     }
 
@@ -494,6 +530,11 @@ impl ModelOperationFailure {
                 message: memory_shortage_message(&shortage),
                 retryable: true,
                 shortage,
+            },
+            Self::WeightBound(bound) => ModelInstanceFailure::Operation {
+                code: magnitude_serving::error::WEIGHT_BOUND_BELOW_WEIGHTS.to_owned(),
+                message: bound.to_string(),
+                retryable: false,
             },
         }
     }
@@ -525,16 +566,76 @@ impl From<InventoryError> for ModelOperationFailure {
     }
 }
 
+/// A load's sequence of workers, which the driver's load runs: it starts each worker through
+/// [`Self::start`] and holds the sequence until its last worker is done with. Its pair
+/// ([`LoadGate`]) is the actor's.
+pub struct LoadSequence {
+    abandoned: Arc<std::sync::atomic::AtomicBool>,
+    ended: tokio::sync::watch::Sender<bool>,
+}
+
+/// The actor's end of a load's sequence: abandoning it closes the sequence to new workers at
+/// once, and its end is when the sequence, dropped by its load, is done with every worker.
+pub struct LoadGate {
+    abandoned: Arc<std::sync::atomic::AtomicBool>,
+    ended: tokio::sync::watch::Receiver<bool>,
+}
+
+/// A load's sequence and the actor's gate on it.
+fn load_sequence() -> (LoadSequence, LoadGate) {
+    let abandoned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (ended, receiver) = tokio::sync::watch::channel(false);
+    (
+        LoadSequence { abandoned: Arc::clone(&abandoned), ended },
+        LoadGate { abandoned, ended: receiver },
+    )
+}
+
+impl LoadSequence {
+    /// Start a worker by `start` (its spawn and the announcement that hands it to the actor),
+    /// unless the load is abandoned. A start begun before the abandonment announces its worker to
+    /// the stopping load, which ends it; the stop completes only once the sequence is done
+    /// ([`LoadGate::ended`]), so no worker is announced after.
+    pub fn start<T>(&self, start: impl FnOnce() -> T) -> Option<T> {
+        (!self.abandoned.load(std::sync::atomic::Ordering::Acquire)).then(start)
+    }
+}
+
+impl Drop for LoadSequence {
+    fn drop(&mut self) {
+        self.ended.send_replace(true);
+    }
+}
+
+impl LoadGate {
+    /// Start no further worker of the load.
+    fn abandon(&self) {
+        self.abandoned.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Once the sequence is done with every worker it started.
+    fn ended(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let mut ended = self.ended.clone();
+        async move {
+            // A dropped sequence sent its end as it dropped.
+            let _ = ended.wait_for(|ended| *ended).await;
+        }
+    }
+}
+
 /// Loads, supervises and releases workers for the actor.
 pub trait ModelResidencyDriver: Clone + Send + Sync + 'static {
     /// What a lease on a ready instance hands out.
     type Resident: Clone + Send + Sync + 'static;
     fn client(&self) -> &ResidencyClient<Self::Resident>;
     fn next_instance_id(&self) -> ModelInstanceId;
+    /// Start loading `target` as `instance_id`, its workers started through `sequence`, which
+    /// the load holds until it is done with every worker.
     fn start_model_load(
         &self,
         instance_id: ModelInstanceId,
         target: ResolvedResidencyTarget,
+        sequence: LoadSequence,
     ) -> Result<tokio::task::JoinHandle<()>, InventoryError>;
     fn start_worker_release(
         &self,
@@ -549,6 +650,14 @@ pub trait ModelResidencyDriver: Clone + Send + Sync + 'static {
         resident: Self::Resident,
     );
     fn idle_timeout(&self) -> std::time::Duration;
+    /// Residency's demand for the device (an instance loading, ready or releasing, or a load
+    /// queued) ended: the driver lets go of the device it held across the gaps between a release
+    /// and the next load.
+    fn demand_ended(&self);
+    /// The ready instance holding `resident` is idle (no lease holds it), or none is.
+    fn resident_idle(&self, resident: Option<(&ModelInstanceId, &Self::Resident)>);
+    /// The idle ready instance was leased for a request, which ends its idleness.
+    fn resident_leased(&self);
 }
 
 pub struct ModelResidency<D: ModelResidencyDriver> {
@@ -560,9 +669,14 @@ pub struct ModelResidency<D: ModelResidencyDriver> {
     next_lease_token: u64,
     package_removal_active: bool,
     package_removals: std::collections::VecDeque<(
-        ModelPackageId,
+        Vec<ModelPackageId>,
         tokio::sync::oneshot::Sender<Result<PackageRemovalPermit, InventoryError>>,
     )>,
+    /// The ready instance last published idle ([`ModelResidencyDriver::resident_idle`]).
+    idle: Option<ModelInstanceId>,
+    /// Whether residency has demand for the device, as it last stood: its end is the driver's
+    /// to act on ([`ModelResidencyDriver::demand_ended`]).
+    demanded: bool,
 }
 
 impl<D: ModelResidencyDriver> ModelResidency<D> {
@@ -576,6 +690,21 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             next_lease_token: 1,
             package_removal_active: false,
             package_removals: std::collections::VecDeque::new(),
+            idle: None,
+            demanded: false,
+        }
+    }
+
+    /// Publish the ready instance's idleness once it changes: idle while no lease holds it.
+    fn publish_idle(&mut self) {
+        let idle = match &self.state {
+            ResidencyState::Ready(ready) if ready.resources.leases.is_empty() => Some(ready),
+            _ => None,
+        };
+        let instance = idle.map(|ready| ready.instance.id.clone());
+        if instance != self.idle {
+            self.controller.resident_idle(idle.map(|ready| (&ready.instance.id, &ready.resources.resident)));
+            self.idle = instance;
         }
     }
 
@@ -601,8 +730,22 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 () = idle => {}
             }
             self.idle_expired();
+            self.publish_idle();
+            self.publish_demand();
         }
         self.shutdown();
+        self.publish_idle();
+        self.publish_demand();
+    }
+
+    /// Tell the driver once residency's demand for the device ends: a load takes the device as
+    /// demand begins, so its start is the load's, and only its end the driver's.
+    fn publish_demand(&mut self) {
+        let demanded = !matches!(self.state, ResidencyState::Vacant) || !self.queue.is_empty();
+        if self.demanded && !demanded {
+            self.controller.demand_ended();
+        }
+        self.demanded = demanded;
     }
 
     fn handle(&mut self, command: ResidencyCommand<D::Resident>) {
@@ -616,8 +759,8 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             ResidencyCommand::Snapshot { reply } => {
                 let _ = reply.send(self.snapshot());
             }
-            ResidencyCommand::AcquirePackageRemoval { package_id, reply } => {
-                self.package_removals.push_back((package_id, reply));
+            ResidencyCommand::AcquirePackageRemoval { package_ids, reply } => {
+                self.package_removals.push_back((package_ids, reply));
                 self.admit_package_removal();
             }
             ResidencyCommand::LoadFinished {
@@ -649,16 +792,23 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                     } = &mut releasing.operation
                 {
                     // The start notification may already be queued when cancellation is admitted.
-                    worker.terminate("model_instance_stopped", "model instance was stopped");
+                    worker.end("model_instance_stopped", "model instance was stopped");
                     *retained = Some(worker);
+                } else {
+                    // Every worker a sequence starts is announced before its load's end or its
+                    // stop's completion ([`LoadSequence::start`]); only a shutdown, which ends
+                    // the load with no completion, leaves one announced after. Nothing owns it but
+                    // here.
+                    worker.end("service_shutdown", "the inference service stopped");
                 }
             }
             ResidencyNotification::LoadProgress {
                 instance_id,
                 stage,
                 fraction,
+                details,
                 planned_allocation,
-            } => self.load_progress(instance_id, stage, fraction, planned_allocation),
+            } => self.load_progress(instance_id, stage, fraction, details, planned_allocation),
             ResidencyNotification::AllocationObserved {
                 instance_id,
                 allocation,
@@ -708,11 +858,17 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         if ready.instance.id != instance_id {
             return;
         }
-        let lifecycle = ModelInstanceLifecycle::Ready { allocation };
-        if ready.instance.lifecycle == lifecycle {
+        let ModelInstanceLifecycle::Ready {
+            allocation: published,
+            ..
+        } = &mut ready.instance.lifecycle
+        else {
+            unreachable!("Ready residency must project Ready lifecycle")
+        };
+        if *published == allocation {
             return;
         }
-        ready.instance.lifecycle = lifecycle;
+        *published = allocation;
         self.publish_current();
     }
 
@@ -721,17 +877,14 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             let _ = waiter.reply.send(Err(Self::inventory_failure(failure)));
             return;
         }
-        if self.package_removal_active || !self.package_removals.is_empty() {
-            self.queue.push_back(waiter);
-            return;
-        }
+        // A package removal excludes only new loads: demand for the current instance joins it.
+        let removing = self.package_removal_active || !self.package_removals.is_empty();
         match &mut self.state {
-            ResidencyState::Vacant => self.start_loading(waiter),
             ResidencyState::Loading(loading)
                 if loading.instance.model_id == waiter.target.model_id
                     && loading.configuration_key == waiter.target.configuration_key =>
             {
-                Self::notify_progress(&waiter, &loading.instance.lifecycle);
+                Self::notify_progress(&waiter, &loading.instance.lifecycle, loading.details.as_ref());
                 loading.waiters.push(waiter);
             }
             ResidencyState::Ready(ready)
@@ -740,14 +893,30 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             {
                 self.grant_ready(waiter);
             }
+            _ if removing => self.enqueue(waiter),
+            ResidencyState::Vacant => self.start_loading(waiter),
             ResidencyState::Loading(_) | ResidencyState::Releasing(_) => {
-                self.queue.push_back(waiter);
+                self.enqueue(waiter);
             }
             ResidencyState::Ready(_) => {
-                self.queue.push_back(waiter);
+                self.enqueue(waiter);
                 self.begin_ready_release(ModelReleaseReason::Replacement, Vec::new());
             }
         }
+    }
+
+    /// Waiting for residency is a model wait, before the engine has a request to schedule.
+    fn enqueue(&mut self, waiter: AcquisitionWaiter<D::Resident>) {
+        Self::notify_progress(
+            &waiter,
+            &ModelInstanceLifecycle::Loading {
+                stage: ModelLoadStage::Queued,
+                fraction: 0.0,
+                planned_allocation: None,
+            },
+            None,
+        );
+        self.queue.push_back(waiter);
     }
 
     fn admit_package_removal(&mut self) {
@@ -770,16 +939,18 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         {
             return;
         }
-        while let Some((package_id, reply)) = self.package_removals.pop_front() {
+        while let Some((package_ids, reply)) = self.package_removals.pop_front() {
             if reply.is_closed() {
                 continue;
             }
-            if matches!(
-                &self.state,
-                ResidencyState::Ready(ready)
-                    if ready.resources.package_ids.contains(&package_id)
-            ) {
-                let _ = reply.send(Err(InventoryError::Loaded(package_id.0)));
+            let loaded = match &self.state {
+                ResidencyState::Ready(ready) => package_ids
+                    .iter()
+                    .find(|package_id| ready.resources.package_ids.contains(package_id)),
+                _ => None,
+            };
+            if let Some(package_id) = loaded {
+                let _ = reply.send(Err(InventoryError::Loaded(package_id.0.clone())));
                 continue;
             }
             self.package_removal_active = true;
@@ -792,9 +963,10 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
 
     fn start_loading(&mut self, first: AcquisitionWaiter<D::Resident>) {
         let instance_id = self.controller.next_instance_id();
+        let (sequence, gate) = load_sequence();
         let operation = match self
             .controller
-            .start_model_load(instance_id.clone(), first.target.clone())
+            .start_model_load(instance_id.clone(), first.target.clone(), sequence)
         {
             Ok(operation) => operation,
             Err(error) => {
@@ -812,12 +984,14 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 planned_allocation: None,
             },
         };
-        Self::notify_progress(&first, &instance.lifecycle);
+        Self::notify_progress(&first, &instance.lifecycle, None);
         self.state = ResidencyState::Loading(LoadingResidency {
+            details: None,
             instance,
             configuration: first.target.configuration.clone(),
             configuration_key: first.target.configuration_key.clone(),
             operation,
+            gate,
             worker: None,
             waiters: vec![first],
         });
@@ -835,7 +1009,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         while let Some(waiter) = self.queue.pop_front() {
             if waiter.target == target {
                 if let ResidencyState::Loading(loading) = &mut self.state {
-                    Self::notify_progress(&waiter, &loading.instance.lifecycle);
+                    Self::notify_progress(&waiter, &loading.instance.lifecycle, loading.details.as_ref());
                     loading.waiters.push(waiter);
                 }
             } else {
@@ -872,6 +1046,11 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
     ) -> ResidencyLease<D::Resident> {
         let token = self.next_lease_token;
         self.next_lease_token = self.next_lease_token.saturating_add(1);
+        // The instance stops being idle before the lease is handed out, so nothing measured
+        // beside it starts once its holder could be served.
+        if self.idle.take().is_some() {
+            self.controller.resident_leased();
+        }
         ready.resources.leases.insert(token);
         ready.idle_deadline = None;
         ResidencyLease {
@@ -945,16 +1124,23 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 &ModelReleaseReason::UserStop,
             )));
         }
+        // The load's sequence is closed before its worker ends: it reacts to that end by starting
+        // its next worker, which the closed sequence refuses. A worker it started before is
+        // announced before the stop completes, which waits for the sequence to be done with every
+        // worker, so the next load never starts beside one.
+        loading.gate.abandon();
+        loading.operation.abort();
         let worker = loading.worker.take();
         if let Some(worker) = &worker {
-            worker.terminate("model_instance_stopped", "model instance was stopped");
+            worker.end("model_instance_stopped", "model instance was stopped");
         }
-        loading.operation.abort();
         let notifier = self.controller.client().notifier();
         let instance_id = loading.instance.id.clone();
         let operation = loading.operation;
-        let completion = tokio::spawn(async move {
+        let ended = loading.gate.ended();
+        let completion = magnitude_service_utils::owner::spawn("a stopped load's completion", async move {
             let _ = operation.await;
+            ended.await;
             notifier.send(ResidencyNotification::LoadingStopCompleted { instance_id });
         });
         let stopping = ModelInstance {
@@ -1033,6 +1219,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         instance_id: ModelInstanceId,
         stage: ModelLoadStage,
         fraction: f32,
+        details: Option<ModelLoadDetails>,
         planned_allocation: Option<ModelLoadPlan>,
     ) {
         let ResidencyState::Loading(loading) = &mut self.state else {
@@ -1046,14 +1233,18 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             fraction,
             planned_allocation,
         };
-        if loading.instance.lifecycle == lifecycle {
+        if loading.instance.lifecycle == lifecycle && loading.details == details {
             return;
         }
+        let lifecycle_changed = loading.instance.lifecycle != lifecycle;
+        loading.details = details;
         loading.instance.lifecycle = lifecycle;
         for waiter in &loading.waiters {
-            Self::notify_progress(waiter, &loading.instance.lifecycle);
+            Self::notify_progress(waiter, &loading.instance.lifecycle, loading.details.as_ref());
         }
-        self.publish_current();
+        if lifecycle_changed {
+            self.publish_current();
+        }
     }
 
     fn load_finished(
@@ -1076,7 +1267,8 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                     id: instance_id.clone(),
                     model_id: loading.instance.model_id,
                     lifecycle: ModelInstanceLifecycle::Ready {
-                        allocation: prepared.allocation.clone(),
+                        allocation: prepared.allocation,
+                        device: prepared.device,
                     },
                 };
                 let mut ready = ReadyResidency {
@@ -1112,6 +1304,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 self.publish_current();
                 self.admit_package_removal();
                 if !self.package_removal_active {
+                    self.queue.retain(|waiter| !waiter.reply.is_closed());
                     if self.queue.is_empty() {
                         self.refresh_idle_deadline();
                     } else {
@@ -1149,7 +1342,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 reason,
                 allocation: ModelStoppingAllocation::Resident {
                     allocation: match &ready.instance.lifecycle {
-                        ModelInstanceLifecycle::Ready { allocation } => allocation.clone(),
+                        ModelInstanceLifecycle::Ready { allocation, .. } => allocation.clone(),
                         _ => unreachable!("Ready residency must project Ready lifecycle"),
                     },
                 },
@@ -1305,7 +1498,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             } => ModelStoppingAllocation::Planned {
                 allocation: planned_allocation,
             },
-            ModelInstanceLifecycle::Ready { allocation } => {
+            ModelInstanceLifecycle::Ready { allocation, .. } => {
                 ModelStoppingAllocation::Resident { allocation }
             }
             _ => unreachable!("only a loading or ready worker can fail"),
@@ -1442,6 +1635,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
     }
 
     fn resume_pending(&mut self) {
+        self.queue.retain(|waiter| !waiter.reply.is_closed());
         self.admit_package_removal();
         if self.package_removal_active || !self.package_removals.is_empty() {
             return;
@@ -1547,7 +1741,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
         }
     }
 
-    fn notify_progress(waiter: &AcquisitionWaiter<D::Resident>, lifecycle: &ModelInstanceLifecycle) {
+    fn notify_progress(waiter: &AcquisitionWaiter<D::Resident>, lifecycle: &ModelInstanceLifecycle, details: Option<&ModelLoadDetails>) {
         let ResidencyAcquisition::Inference {
             progress: Some(observer),
         } = &waiter.purpose
@@ -1562,7 +1756,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             ModelInstanceLifecycle::Ready { .. } => (ModelLoadStage::Finalizing, 1.0),
             _ => return,
         };
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer(stage, fraction)));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer(stage, fraction, details.cloned())));
     }
 
     fn inventory_failure(failure: &ModelOperationFailure) -> InventoryError {
@@ -1576,15 +1770,16 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
     fn shutdown(&mut self) {
         match std::mem::replace(&mut self.state, ResidencyState::Vacant) {
             ResidencyState::Loading(loading) => {
+                loading.gate.abandon();
                 loading.operation.abort();
                 if let Some(worker) = loading.worker {
-                    worker.terminate("service_shutdown", "the inference service stopped");
+                    worker.end("service_shutdown", "the inference service stopped");
                 }
             }
             ResidencyState::Ready(ready) => ready
                 .resources
                 .worker
-                .terminate("service_shutdown", "the inference service stopped"),
+                .end("service_shutdown", "the inference service stopped"),
             ResidencyState::Releasing(ReleasingResidency {
                 operation:
                     ReleaseOperation::Draining {
@@ -1593,7 +1788,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                 ..
             }) => resources
                 .worker
-                .terminate("service_shutdown", "the inference service stopped"),
+                .end("service_shutdown", "the inference service stopped"),
             ResidencyState::Releasing(ReleasingResidency {
                 operation: ReleaseOperation::Draining { resources: None },
                 ..
@@ -1608,13 +1803,13 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
             }) => {
                 operation.abort();
                 if let Some(worker) = worker {
-                    worker.terminate("service_shutdown", "the inference service stopped");
+                    worker.end("service_shutdown", "the inference service stopped");
                 }
             }
             ResidencyState::Releasing(ReleasingResidency {
                 operation: ReleaseOperation::RetirementFailed { worker, .. },
                 ..
-            }) => worker.terminate("service_shutdown", "the inference service stopped"),
+            }) => worker.end("service_shutdown", "the inference service stopped"),
             ResidencyState::Vacant => {}
         }
     }
@@ -1626,7 +1821,22 @@ mod tests {
     use magnitude_service_contracts::models::ServableModelBundle;
     use std::path::PathBuf;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    /// A load's allocation holding nothing, without an expert bank.
+    fn allocation(context_window_tokens: u32) -> ModelInstanceAllocation {
+        ModelInstanceAllocation {
+            context_window_tokens,
+            memory_domains: Vec::new(),
+            prompt_group_places: magnitude_service_contracts::models::PromptGroupPlacesParts {
+                held: std::num::NonZeroU64::MIN,
+                capacity: std::num::NonZeroU64::MIN,
+            }
+            .try_into()
+            .unwrap(),
+            streaming: None,
+        }
+    }
 
     fn test_configuration(model_id: &str) -> ModelServingConfiguration {
         ModelServingConfiguration {
@@ -1670,13 +1880,10 @@ mod tests {
 
     #[test]
     fn a_memory_shortage_keeps_its_kind_and_is_retryable() {
-        for shortage in [
-            MemoryShortage::Blocked {
-                required_bytes: 10,
-                available_bytes: 8,
-            },
-            MemoryShortage::UnderPressure {},
-        ] {
+        for shortage in [MemoryShortage::Blocked {
+            required_bytes: 10,
+            available_bytes: 8,
+        }] {
             let failure = ModelOperationFailure::MemoryShortage(shortage.clone());
             assert_eq!(failure.code(), MEMORY_SHORTAGE_FAILURE_CODE);
             assert!(failure.retryable());
@@ -1695,6 +1902,16 @@ mod tests {
     /// Test residents name the model their load was for.
     type TestResident = String;
 
+    /// An idleness residency published.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Published {
+        Idle(TestResident),
+        /// A request's lease ended the idleness.
+        Leased,
+        /// The idleness ended otherwise: no idle instance is ready.
+        Gone,
+    }
+
     #[derive(Clone)]
     struct TestResidencyDriver {
         client: ResidencyClient<TestResident>,
@@ -1703,6 +1920,12 @@ mod tests {
         auto_ready: bool,
         workers: Arc<Mutex<Vec<Arc<TestResidencyWorker>>>>,
         idle_timeout: std::time::Duration,
+        /// Every idleness published, in order.
+        idles: Arc<Mutex<Vec<Published>>>,
+        /// Each load's sequence, held by its load's task until the task ends or is aborted.
+        sequences: Arc<Mutex<Vec<std::sync::Weak<LoadSequence>>>>,
+        /// How many times residency's demand for the device ended.
+        demand_ends: Arc<AtomicUsize>,
     }
 
     #[derive(Default)]
@@ -1729,12 +1952,14 @@ mod tests {
                 .then(|| std::process::ExitStatus::from_raw(0)))
         }
 
-        fn terminate(&self, _code: &str, _reason: &str) {
+        fn terminate(&self, _code: &str, _reason: &str) -> std::io::Result<()> {
             self.interrupted.fetch_add(1, Ordering::AcqRel);
-            self.retired.store(
-                !self.fail_retirement.load(Ordering::Acquire),
-                Ordering::Release,
-            );
+            let fails = self.fail_retirement.load(Ordering::Acquire);
+            self.retired.store(!fails, Ordering::Release);
+            match fails {
+                true => Err(std::io::Error::other("the test worker refuses its kill")),
+                false => Ok(()),
+            }
         }
 
         fn shutdown(&self) {
@@ -1743,6 +1968,11 @@ mod tests {
                 !self.fail_retirement.load(Ordering::Acquire),
                 Ordering::Release,
             );
+        }
+
+        /// Its shutdown retires it at once, or leaves it to the bound and its kill.
+        fn answered_shutdown(&self) -> bool {
+            false
         }
     }
 
@@ -1764,8 +1994,11 @@ mod tests {
             &self,
             instance_id: ModelInstanceId,
             target: ResolvedResidencyTarget,
+            sequence: LoadSequence,
         ) -> Result<tokio::task::JoinHandle<()>, InventoryError> {
             let model_id = target.model_id;
+            let sequence = Arc::new(sequence);
+            self.sequences.lock().expect("test sequences lock").push(Arc::downgrade(&sequence));
             self.loads
                 .send((instance_id.clone(), model_id.to_string()))
                 .expect("test load observer remains alive");
@@ -1778,6 +2011,7 @@ mod tests {
                 let notifier = self.client.notifier();
                 let completion = self.client.load_completion();
                 return Ok(tokio::spawn(async move {
+                    let _sequence = sequence;
                     tokio::task::yield_now().await;
                     let worker: Arc<dyn ResidencyWorker> = worker;
                     notifier.send(ResidencyNotification::LoadWorkerStarted {
@@ -1788,17 +2022,18 @@ mod tests {
                         instance_id,
                         Ok(PreparedResidency {
                             package_ids: Vec::new(),
-                            allocation: ModelInstanceAllocation {
-                                context_window_tokens: 1,
-                                memory_domains: Vec::new(),
-                            },
+                            allocation: allocation(1),
+                            device: test_device(),
                             worker,
                             resident: model_id.to_string(),
                         }),
                     );
                 }));
             }
-            Ok(tokio::spawn(std::future::pending()))
+            Ok(tokio::spawn(async move {
+                let _sequence = sequence;
+                std::future::pending::<()>().await
+            }))
         }
 
         fn start_worker_release(
@@ -1809,7 +2044,7 @@ mod tests {
         ) -> ReleaseControl {
             let (interrupt, _) = tokio::sync::watch::channel(interrupt_immediately);
             if interrupt_immediately {
-                worker.terminate("model_instance_stopped", "model instance was stopped");
+                worker.end("model_instance_stopped", "model instance was stopped");
             } else {
                 worker.shutdown();
             }
@@ -1834,6 +2069,21 @@ mod tests {
 
         fn idle_timeout(&self) -> std::time::Duration {
             self.idle_timeout
+        }
+
+        fn demand_ended(&self) {
+            self.demand_ends.fetch_add(1, Ordering::AcqRel);
+        }
+
+        fn resident_idle(&self, resident: Option<(&ModelInstanceId, &TestResident)>) {
+            self.idles.lock().unwrap().push(match resident {
+                Some((_, resident)) => Published::Idle(resident.clone()),
+                None => Published::Gone,
+            });
+        }
+
+        fn resident_leased(&self) {
+            self.idles.lock().unwrap().push(Published::Leased);
         }
     }
 
@@ -1867,9 +2117,93 @@ mod tests {
             auto_ready,
             workers: Arc::clone(&workers),
             idle_timeout,
+            idles: Arc::default(),
+            sequences: Arc::default(),
+            demand_ends: Arc::default(),
         };
         let actor = tokio::spawn(ModelResidency::new(driver).run(inbox));
         (client, load_events, workers, actor)
+    }
+
+    /// The ready instance is published idle while no lease holds it, and no longer once one does
+    /// or it stops: what a measurement beside it runs in, and is preempted by.
+    #[tokio::test]
+    async fn the_ready_instance_is_published_idle_while_no_lease_holds_it() {
+        let (client, inbox) = ResidencyClient::channel();
+        let (loads, _loads) = tokio::sync::mpsc::unbounded_channel();
+        let idles = Arc::new(Mutex::new(Vec::new()));
+        let driver = TestResidencyDriver {
+            client: client.clone(),
+            next_instance_id: Arc::new(AtomicU64::new(1)),
+            loads,
+            auto_ready: true,
+            workers: Arc::default(),
+            idle_timeout: std::time::Duration::from_secs(600),
+            idles: Arc::clone(&idles),
+            sequences: Arc::default(),
+            demand_ends: Arc::default(),
+        };
+        let _actor = tokio::spawn(ModelResidency::new(driver).run(inbox));
+        let published = || idles.lock().unwrap().clone();
+        let ResidencyGrant::Lease(lease) = client
+            .acquire(test_target("model-a"), ResidencyAcquisition::Inference { progress: None })
+            .await
+            .expect("inference acquisition")
+        else {
+            panic!("an inference acquisition is leased")
+        };
+        let instance = lease.instance_id().clone();
+        let resident = lease.resident().clone();
+        client.snapshot().await.unwrap();
+        assert!(published().is_empty(), "a leased instance is not idle");
+        drop(lease);
+        client.snapshot().await.unwrap();
+        assert_eq!(published(), [Published::Idle(resident.clone())]);
+        let lease = client.lease(instance.clone()).await.unwrap();
+        assert_eq!(
+            published(),
+            [Published::Idle(resident), Published::Leased],
+            "a request's lease ends its idleness before it holds the lease"
+        );
+        drop(lease);
+        client.stop(instance).await.unwrap();
+        assert_eq!(published().last(), Some(&Published::Gone), "a stopped instance is not idle, and no lease ended that");
+    }
+
+    /// Residency's demand for the device holds from the first load through a replacement, the
+    /// release and the next load among it, and ends only once nothing is resident or queued:
+    /// the device is never free between a release and the load queued behind it.
+    #[tokio::test]
+    async fn the_device_demand_spans_a_replacement_and_ends_when_nothing_is_resident() {
+        let (client, inbox) = ResidencyClient::channel();
+        let (loads, _loads) = tokio::sync::mpsc::unbounded_channel();
+        let demand_ends = Arc::new(AtomicUsize::new(0));
+        let driver = TestResidencyDriver {
+            client: client.clone(),
+            next_instance_id: Arc::new(AtomicU64::new(1)),
+            loads,
+            auto_ready: true,
+            workers: Arc::default(),
+            idle_timeout: std::time::Duration::from_secs(600),
+            idles: Arc::default(),
+            sequences: Arc::default(),
+            demand_ends: Arc::clone(&demand_ends),
+        };
+        let _actor = tokio::spawn(ModelResidency::new(driver).run(inbox));
+        let inference = || ResidencyAcquisition::Inference { progress: None };
+        let ResidencyGrant::Lease(first) = client.acquire(test_target("model-a"), inference()).await.unwrap() else {
+            panic!("an inference acquisition is leased")
+        };
+        drop(first);
+        let ResidencyGrant::Lease(second) = client.acquire(test_target("model-b"), inference()).await.unwrap() else {
+            panic!("an inference acquisition is leased")
+        };
+        assert_eq!(demand_ends.load(Ordering::Acquire), 0, "the replacement keeps the demand");
+        let instance = second.instance_id().clone();
+        drop(second);
+        client.stop(instance).await.unwrap();
+        client.snapshot().await.unwrap();
+        assert_eq!(demand_ends.load(Ordering::Acquire), 1, "the demand ends once nothing is resident");
     }
 
     fn assert_explicit_stop(result: Result<ResidencyGrant<TestResident>, InventoryError>) {
@@ -1885,6 +2219,61 @@ mod tests {
 
     fn test_target(model_id: &str) -> ResolvedResidencyTarget {
         test_target_with_key(model_id, &format!("configuration:{model_id}"))
+    }
+
+    /// The device every test worker opens.
+    fn test_device() -> ModelLoadDevice {
+        ModelLoadDevice {
+            id: magnitude_service_contracts::HardwareDeviceId::new(
+                "vulkan:00112233-4455-6677-8899-aabbccddeeff",
+            ),
+            backend: magnitude_service_contracts::ExecutionBackend::Vulkan,
+        }
+    }
+
+    /// A ready instance carries the device its worker opened, through a newer allocation
+    /// standing, and its stopped state carries none.
+    #[tokio::test]
+    async fn a_ready_instance_carries_its_workers_device_until_it_stops() {
+        let (client, mut loads, _, actor) = test_residency(true);
+        let ResidencyGrant::Ready(ready) = client
+            .acquire(test_target("model-a"), ResidencyAcquisition::Warm)
+            .await
+            .expect("warm acquisition")
+        else {
+            panic!("warm acquisition returned a lease")
+        };
+        let (instance_id, _) = loads.recv().await.expect("model load");
+        let ModelInstanceLifecycle::Ready { device, .. } = &ready.lifecycle else {
+            panic!("a warm grant is ready")
+        };
+        assert_eq!(*device, test_device());
+
+        let observed = allocation(2);
+        client
+            .notifier()
+            .send(ResidencyNotification::AllocationObserved {
+                instance_id: instance_id.clone(),
+                allocation: observed.clone(),
+            });
+        let snapshot = client.snapshot().await.unwrap();
+        assert_eq!(
+            snapshot.instances.last().map(|instance| &instance.lifecycle),
+            Some(&ModelInstanceLifecycle::Ready {
+                allocation: observed,
+                device: test_device(),
+            })
+        );
+
+        client.stop(instance_id).await.expect("ready stop");
+        let snapshot = client.snapshot().await.unwrap();
+        assert!(matches!(
+            snapshot.instances.last().map(|instance| &instance.lifecycle),
+            Some(ModelInstanceLifecycle::Stopped {
+                reason: ModelReleaseReason::UserStop
+            })
+        ));
+        actor.abort();
     }
 
     fn test_target_with_key(model_id: &str, configuration_key: &str) -> ResolvedResidencyTarget {
@@ -1991,7 +2380,7 @@ mod tests {
     async fn package_removal_admission_excludes_new_model_loads() {
         let (client, mut loads, _, actor) = test_residency(false);
         let permit = client
-            .acquire_package_removal(ModelPackageId("package-a".to_owned()))
+            .acquire_package_removal(vec![ModelPackageId("package-a".to_owned())])
             .await
             .expect("package removal admitted");
         let request = tokio::spawn({
@@ -2010,6 +2399,108 @@ mod tests {
         assert_eq!(model_id, "model-a:gguf:test");
         client.stop(instance_id).await.expect("load stopped");
         assert_explicit_stop(request.await.expect("request waiter"));
+        actor.abort();
+    }
+
+    /// Overnight soak: removing another installed model while a resident one served requests
+    /// released the resident with reason Replacement once the removal ended, because a request
+    /// for the resident arriving during the removal was queued as a load.
+    #[tokio::test]
+    async fn a_package_removal_neither_delays_nor_replaces_requests_for_the_resident_model() {
+        let (client, mut loads, workers, actor) = test_residency(true);
+        let serving = client
+            .acquire(
+                test_target("model-a"),
+                ResidencyAcquisition::Inference { progress: None },
+            )
+            .await
+            .expect("first acquisition");
+        let _ = loads.recv().await.expect("resident load");
+        let permit = client
+            .acquire_package_removal(vec![ModelPackageId("removed-package".to_owned())])
+            .await
+            .expect("removal of another model's package admitted");
+        let during = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.acquire(
+                test_target("model-a"),
+                ResidencyAcquisition::Inference { progress: None },
+            ),
+        )
+        .await
+        .expect("a request for the resident model is not queued behind the removal")
+        .expect("a request for the resident model is granted during the removal");
+        assert!(matches!(during, ResidencyGrant::Lease(_)));
+        drop(permit);
+        drop(during);
+        drop(serving);
+        let after = client
+            .acquire(test_target("model-a"), ResidencyAcquisition::Warm)
+            .await
+            .expect("the resident model is still granted");
+        assert!(matches!(after, ResidencyGrant::Ready(_)));
+        assert!(loads.try_recv().is_err(), "nothing was loaded again");
+        assert_eq!(
+            workers.lock().expect("test worker lock")[0]
+                .shutdown
+                .load(Ordering::Acquire),
+            0,
+            "the resident model was not released"
+        );
+        let snapshot = client.snapshot().await.unwrap();
+        assert!(matches!(
+            snapshot.instances.last().map(|instance| &instance.lifecycle),
+            Some(ModelInstanceLifecycle::Ready { .. })
+        ));
+        actor.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_permit_covers_a_target_and_its_drafter_after_the_model_stopped() {
+        let (client, mut loads, _, actor) = test_residency(true);
+        let ready = client
+            .acquire(test_target("model-a"), ResidencyAcquisition::Warm)
+            .await
+            .expect("warm acquisition");
+        assert!(matches!(ready, ResidencyGrant::Ready(_)));
+        let (instance_id, _) = loads.recv().await.expect("model load");
+        client.stop(instance_id).await.expect("model stopped");
+
+        let permit = client
+            .acquire_package_removal(vec![
+                ModelPackageId("target".to_owned()),
+                ModelPackageId("drafter".to_owned()),
+            ])
+            .await
+            .expect("removal of the target and its drafter admitted at once");
+        drop(permit);
+        client
+            .acquire_package_removal(vec![ModelPackageId("target".to_owned())])
+            .await
+            .expect("the finished removal released its admission");
+        actor.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blocked_package_removal_is_refused_instead_of_waiting_forever() {
+        let (client, _, _, actor) = test_residency(false);
+        let held = client
+            .acquire_package_removal(vec![ModelPackageId("package-a".to_owned())])
+            .await
+            .expect("first removal admitted");
+        let refused = client
+            .acquire_package_removal(vec![ModelPackageId("package-b".to_owned())])
+            .await;
+        assert!(matches!(
+            refused,
+            Err(InventoryError::ModelOperation { code, retryable: true, .. })
+                if code == "model_removal_busy"
+        ));
+        drop(held);
+        client
+            .acquire_package_removal(vec![ModelPackageId("package-b".to_owned())])
+            .await
+            .expect("an abandoned admission request does not block the next one");
         actor.abort();
     }
 
@@ -2153,7 +2644,7 @@ mod tests {
                 assert_eq!(snapshot.instances[0].id, instance_id);
                 assert!(matches!(snapshot.instances[0].lifecycle, ModelInstanceLifecycle::Stopping { .. }));
                 assert!(client.acquire(test_target("model-b"), ResidencyAcquisition::Warm).await.is_err());
-                assert!(client.acquire_package_removal(ModelPackageId("test-package".into())).await.is_err());
+                assert!(client.acquire_package_removal(vec![ModelPackageId("test-package".into())]).await.is_err());
                 assert!(loads.try_recv().is_err());
                 worker.fail_retirement.store(false, Ordering::Release);
                 client.stop(instance_id).await.expect("retry retires canceled load worker");
@@ -2166,6 +2657,64 @@ mod tests {
                 actor.abort();
             }
         }).await.expect("cancellation lost worker ownership or a reply");
+    }
+
+    /// A stop during a load's Prepare ends the load. Its sequence outlives
+    /// the load's task, so the stop closes it: the next worker (the Load after the Prepare) never
+    /// starts, and the stop completes, and the next load may start, only once the sequence is
+    /// done with every worker it started.
+    #[tokio::test]
+    async fn a_stop_during_a_loads_prepare_starts_no_further_worker_and_waits_for_the_sequence() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (client, inbox) = ResidencyClient::channel();
+            let (loads, mut load_events) = tokio::sync::mpsc::unbounded_channel();
+            let sequences = Arc::new(Mutex::new(Vec::new()));
+            let driver = TestResidencyDriver {
+                client: client.clone(),
+                next_instance_id: Arc::new(AtomicU64::new(1)),
+                loads,
+                auto_ready: false,
+                workers: Arc::default(),
+                idle_timeout: std::time::Duration::from_secs(600),
+                idles: Arc::default(),
+                sequences: Arc::clone(&sequences),
+                demand_ends: Arc::default(),
+            };
+            let actor = tokio::spawn(ModelResidency::new(driver).run(inbox));
+            let loading = tokio::spawn({ let client = client.clone(); async move {
+                client.acquire(test_target("model-a"), ResidencyAcquisition::Warm).await
+            }});
+            let (instance_id, _) = load_events.recv().await.unwrap();
+            // The sequence as its blocking thread holds it, past its task's abort.
+            let sequence = sequences.lock().unwrap()[0].upgrade().expect("the load holds its sequence");
+            let prepare = Arc::new(TestResidencyWorker::default());
+            sequence
+                .start(|| client.notifier().send(ResidencyNotification::LoadWorkerStarted {
+                    instance_id: instance_id.clone(),
+                    worker: prepare.clone(),
+                }))
+                .expect("an open sequence starts its worker");
+            client.snapshot().await.unwrap();
+            let stop = tokio::spawn({ let client = client.clone(); let instance_id = instance_id.clone(); async move {
+                client.stop(instance_id).await
+            }});
+            // The stop closes the sequence: its next worker is never started.
+            while sequence.start(|| ()).is_some() {
+                tokio::task::yield_now().await;
+            }
+            assert_explicit_stop(loading.await.unwrap());
+            assert!(prepare.interrupted.load(Ordering::Acquire) > 0, "the Prepare worker is ended");
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            assert!(!stop.is_finished(), "the stop completes only once the sequence ends");
+            drop(sequence);
+            stop.await.unwrap().expect("the stop completes as the sequence ends");
+            assert!(load_events.try_recv().is_err(), "no further load starts");
+            let snapshot = client.snapshot().await.unwrap();
+            assert!(snapshot.instances.iter().all(|instance| !matches!(instance.lifecycle, ModelInstanceLifecycle::Loading { .. })));
+            actor.abort();
+        }).await.expect("a stopped load's sequence started a worker or the stop outran it");
     }
 
     #[tokio::test]
@@ -2207,7 +2756,7 @@ mod tests {
                 assert_eq!(snapshot.instances[0].id, instance_id);
                 assert!(matches!(snapshot.instances[0].lifecycle,
                     ModelInstanceLifecycle::Stopping { reason: ModelReleaseReason::Failure, .. }));
-                assert!(client.acquire_package_removal(ModelPackageId("test-package".into())).await.is_err());
+                assert!(client.acquire_package_removal(vec![ModelPackageId("test-package".into())]).await.is_err());
                 assert!(loads.try_recv().is_err());
                 worker.fail_retirement.store(false, Ordering::Release);
                 client.stop(instance_id.clone()).await.expect("cleanup retry retires failed worker");
@@ -2246,7 +2795,7 @@ mod tests {
                 assert_eq!(snapshot.instances[0].id, first_id);
                 assert!(matches!(snapshot.instances[0].lifecycle, ModelInstanceLifecycle::Stopping { .. }));
                 assert!(client.acquire(test_target("model-b"), ResidencyAcquisition::Warm).await.is_err());
-                assert!(client.acquire_package_removal(ModelPackageId("test-package".into())).await.is_err());
+                assert!(client.acquire_package_removal(vec![ModelPackageId("test-package".into())]).await.is_err());
                 assert!(loads.try_recv().is_err(), "unproven retirement admitted a new load");
                 worker.fail_retirement.store(false, Ordering::Release);
                 client.stop(first_id.clone()).await.expect("retry retires the same worker");
@@ -2427,7 +2976,7 @@ mod tests {
 
         tokio::time::advance(timeout / 2).await;
         let permit = client
-            .acquire_package_removal(ModelPackageId("unrelated-package".to_owned()))
+            .acquire_package_removal(vec![ModelPackageId("unrelated-package".to_owned())])
             .await
             .expect("unrelated package removal admitted");
         drop(permit);

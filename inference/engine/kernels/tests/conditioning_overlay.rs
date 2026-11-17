@@ -1,8 +1,11 @@
+mod declared;
 use magnitude_kernels::conditioning_overlay;
+use seismic_lang::reference_math::conversion::canonical_nan;
+use seismic_lang::types::DType;
 
 /// The host's GPU (Metal on macOS, else Vulkan when present), then the CPU.
 fn devices() -> Vec<seismic::Device> {
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     let gpu = if cfg!(target_os = "macos") {
         Some(catalog.open_backend(seismic::BackendName::Metal).unwrap())
     } else {
@@ -15,10 +18,13 @@ fn devices() -> Vec<seismic::Device> {
         .collect()
 }
 
-/// The overlay publishes every conditioned value bit for bit (NaN payloads,
-/// infinities and signed zero included) over rows that held other values.
+/// The overlay publishes every conditioned value exactly (infinities, signed
+/// zero and subnormals included) over rows that held other values, and a NaN
+/// reads out as the registry's one NaN. Read from the host, a bit move and an
+/// F32 store agree on every non-NaN value, so this checks the values, not that
+/// the overlay moves bits.
 #[test]
-fn native_overlay_publishes_conditioned_rows_bit_exactly() {
+fn native_overlay_publishes_conditioned_rows_value_exactly() {
     for device in devices() {
         for (rows, width) in [(1usize, 2usize), (5, 37), (3, 2560)] {
             let special = [
@@ -57,16 +63,26 @@ fn native_overlay_publishes_conditioned_rows_bit_exactly() {
                 &bytes(&vec![0xdead_beef; rows * width]),
             )
             .unwrap();
-            conditioning_overlay::native_for_device(&device, &seismic::NativeSpecialization::new())
+            declared::prepared(&device, &conditioning_overlay::native_entry(), &seismic::NativeSpecialization::new())
                 .unwrap()
                 .call(conditioning_overlay::Args {
                     input: &source,
                     out: &mut out,
                 })
                 .unwrap();
+            let held = input
+                .iter()
+                .map(|&word| {
+                    if f32::from_bits(word).is_nan() {
+                        canonical_nan(DType::F32)
+                    } else {
+                        word
+                    }
+                })
+                .collect::<Vec<_>>();
             assert_eq!(
                 out.read_to_host().unwrap(),
-                bytes(&input),
+                bytes(&held),
                 "{:?} {rows}x{width}",
                 device.backend()
             );

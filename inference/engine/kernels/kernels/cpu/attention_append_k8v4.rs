@@ -1,10 +1,15 @@
 // Ordered cache publication before causal target attention.
-use lib::attention::attention::{self, Form, KEY_BITS, VALUE_BITS};
+use lib::attention::attention::{self, Form, Layout};
 use seismic::cpu::slab::SlabTensor;
 
+#[inline(always)]
 fn attention_append_k8v4<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
-    let form = Form::new(cx.dim_kv(), 0, cx.dim_p(), cx.dim_s(), 0, 0, cx.dim_f(), cx.dim_n(), cx.dim_nv()).affine();
+    // The keys' and values' form: no queries, so no query norm or output
+    // rotary.
+    let layout = Layout::new(cx.dim_ra(), cx.dim_rt());
+    let form = Form::new(cx.dim_kv(), 0, cx.dim_p(), cx.dim_s(), 0, 0, cx.dim_f(), 0, cx.dim_n(), cx.dim_nv(), layout, 0, cx.dim_vk())
+        .affine();
     let destination = cx.arg_destinations().get([row]);
     if !form.fresh || destination < 0 { return; }
     let (w, kv) = (form.heads.w, form.heads.kv);
@@ -15,25 +20,18 @@ fn attention_append_k8v4<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group:
         cx.arg_coordinates().row([row, 0]), cx.arg_rotary_components().row([0]),
         cx.arg_rotary_frequencies().row([0]), cx.arg_rotary_amplitudes().row([0]), cosines, sines);
     let (keys, values) = vectors.split_at_mut(kv * w);
-    let queries = &mut [];
     let (key_norm, value_norm) = (cx.arg_key_norm(), cx.arg_value_norm());
-    let norms = (
-        None,
-        form.norm.then(|| key_norm.row([0, 0])),
-        form.value_norm.then(|| value_norm.row([0, 0])),
-    );
+    let norms = (form.key_norm.then(|| key_norm.row([0, 0])), form.value_norm.then(|| value_norm.row([0, 0])));
     let (key, value) = (cx.arg_key(), cx.arg_value());
     let (key, value) = if form.fresh { (key.row([0, row, 0]), value.row([0, row, 0])) } else { (&[][..], &[][..]) };
     attention::prepare_form_row::<E::A>(
         form,
-        |_| &[],
         key,
         value,
         norms,
         cosines,
         sines,
         cx.arg_epsilon(),
-        queries,
         keys,
         values,
     );
@@ -52,17 +50,17 @@ fn attention_append_k8v4<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group:
             // SAFETY: destinations are distinct, freshly reserved history rows
             // the subsequent attention phase reads after this launch completes.
             unsafe {
-                attention::affine_encode(
+                attention::store_affine_head(
                     &keys[head * w..][..w],
-                    KEY_BITS,
-                    key_codes.row_mut([destination, head, 0]),
-                    key_coefficients.row_mut([destination, head, 0]),
-                );
-                attention::affine_encode(
                     &values[head * w..][..w],
-                    VALUE_BITS,
-                    value_codes.row_mut([destination, head, 0]),
-                    value_coefficients.row_mut([destination, head, 0]),
+                    (
+                        (32 * cx.dim_kc() / (2 * cx.dim_p() + cx.dim_s())) as u32,
+                        (32 * cx.dim_vc() / (2 * cx.dim_p() + cx.dim_s())) as u32,
+                    ),
+                    (&key_codes, &key_coefficients),
+                    (&value_codes, &value_coefficients),
+                    destination,
+                    head,
                 );
             }
         }

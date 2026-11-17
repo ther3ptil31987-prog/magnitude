@@ -6,8 +6,9 @@ common_chat_params common_chat_params_init_kimi_k2(const common_chat_template & 
                                                           const autoparser::generation_params & inputs) {
     common_chat_params data;
 
-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
-    data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs);
+    auto rendered          = common_chat_template_render_prompt(tmpl, inputs);
+    data.prompt            = std::move(rendered.prompt);
+    data.generation_prompt = std::move(rendered.generation_prompt);
     data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
     data.supports_thinking = true;
     data.preserved_tokens  = {
@@ -99,17 +100,34 @@ common_chat_params common_chat_params_init_kimi_k2(const common_chat_template & 
         // Tool calls section: <|tool_calls_section_begin|> tool_calls <|tool_calls_section_end|>
         auto min_calls  = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ? 1 : 0;
         auto max_calls  = inputs.parallel_tool_calls ? -1 : 1;
+        auto section_end = p.optional(p.literal(SECTION_END));
         // Use trigger_rule so grammar generator knows where to start generating rules
         auto tool_calls = p.rule("tool-calls",
             p.optional(p.literal(SECTION_BEGIN)) +
-            p.trigger_rule("tool-call", p.repeat(CALL_BEGIN + tool_choice, min_calls, max_calls) +
-                p.optional(p.literal(SECTION_END)))
+            p.trigger_rule("tool-call", p.repeat(CALL_BEGIN + tool_choice, min_calls, max_calls) + section_end)
         );
 
         auto content_before_tools =
             p.text_before_calls(p.content(p.until_one_of({ SECTION_BEGIN, CALL_BEGIN })), inputs.tool_choice);
+        if (!extract_reasoning) {
+            return generation_prompt + content_before_tools + tool_calls + end;
+        }
 
-        return generation_prompt + reasoning + content_before_tools + tool_calls + end;
+        // Reasoning closes with </think>, or runs into calls that begin with
+        // their opener, or, when no call is required, ends the output. An
+        // optional </think> would let reasoning end anywhere in the grammar
+        // and content begin within a call opener; the end of output is the
+        // last alternative, so nothing follows it in the grammar either.
+        auto opened_calls = p.rule("opened-tool-calls", p.choice({
+            p.literal(SECTION_BEGIN) + p.repeat(CALL_BEGIN + tool_choice, min_calls, max_calls) + section_end,
+            p.repeat(CALL_BEGIN + tool_choice, std::max(min_calls, 1), max_calls) + section_end,
+        }));
+        auto after_thought = (THINK_END + content_before_tools + tool_calls) | opened_calls;
+        if (min_calls == 0) {
+            after_thought |= end;
+        }
+        auto thought = THINK_START + p.reasoning(p.until_one_of({ THINK_END, SECTION_BEGIN, CALL_BEGIN })) + after_thought;
+        return generation_prompt + (thought | (content_before_tools + tool_calls)) + end;
     });
 
     data.parser = parser.save();

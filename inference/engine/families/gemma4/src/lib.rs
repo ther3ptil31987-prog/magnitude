@@ -1,17 +1,21 @@
 //! Gemma 4 artifact recognition and family-specific numerical interpretation.
 //!
 //! This adapter recognizes `gemma4` GGUF metadata and binds every stored
-//! tensor to the family-neutral decoder contract. Everything that varies
+//! tensor to the family-neutral decoder contract, except the key/value
+//! weights a converter may keep in layers that reuse an earlier layer's
+//! history, which are checked and never imported. Everything that varies
 //! between Gemma 4 models is read from metadata and tensor shapes: the
 //! window/full layer pattern, per-layer head widths and key/value heads,
 //! per-layer feed-forward widths, layers that reuse an earlier layer's
 //! history, layers whose values are their keys, per-layer inputs and routed
 //! experts.
 
+mod assistant;
 mod family;
 pub mod inputs;
 mod projector;
 
+pub use assistant::{inspect_assistant, ASSISTANT_ARCHITECTURE};
 pub use family::Gemma4Family;
 pub use projector::describe_projector;
 
@@ -19,18 +23,19 @@ use magnitude_artifacts::{
     gguf::{Directory, Value},
     Package, PackageIdentity,
 };
-use magnitude_family_common::{HeaderError, Metadata, Tensors};
+use magnitude_family_common::{rotary, HeaderError, Metadata, Tensors};
 use magnitude_family_contracts::{
     checked_product, ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Branch,
     BranchOutput, Decoder, DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm,
-    ExpertSelection, FamilyId, FeedForwardUp, HeadNorm, HistoryDomain, HistoryReads,
-    ImportTransform, InputNorm, InputSemantics, KeyValue, MediaRowAttention, ModelDefinition,
-    Operator, OutputForm, PerLayerEntry, PerLayerInput, ResidualForm, RmsNorm, Rotary,
-    RotaryDivisors, RotaryPair, RouteNormalization, RoutedFfn, Router, RouterInput, RowRange,
+    ExpertSelection, FamilyId, FeedForwardUp, HeadNorm, HistoryRows, HistorySource,
+    ImportTransform, InputNorm, InputSemantics, MediaRowAttention, ModelDefinition,
+    ProjectedRows, RowProducer, RowRounding, TokenDomain,
+    Operator, OutputForm, OutputProjection, PerLayerEntry, PerLayerInput,
+    QueryKeys, QueryProjection, ResidualForm, RmsNorm, Rotary,
+    RouteNormalization, RoutedFfn, Router, RouterInput, RowRange,
     ScoreFunction, Sublayer, SublayerIndex,
     UnweightedRms, ValueNorm, ValueSource, WeightDescriptor,
 };
-use std::{error, fmt};
 
 /// The GGUF architecture and family identity.
 pub const ARCHITECTURE: &str = "gemma4";
@@ -76,40 +81,12 @@ const FULL_ROTATED_PAIR_FRACTION: u64 = 4;
 /// (the released model maps every non-text id to row 0).
 const PER_LAYER_MEDIA_ROW: u64 = 0;
 
-/// Failure to recognize or interpret a Gemma 4 artifact.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Error(String);
-
-impl fmt::Display for Error {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl error::Error for Error {}
-
-impl From<HeaderError> for Error {
-    fn from(error: HeaderError) -> Self {
-        invalid(match error {
-            HeaderError::UnknownMetadata(key) => {
-                format!("Gemma artifact carries uninterpreted metadata {key}")
-            }
-            HeaderError::MissingWeight(name) => format!("missing Gemma weight {name:?}"),
-            HeaderError::WeightShape {
-                name,
-                expected,
-                received,
-            } => format!("Gemma weight {name:?}: expected {expected:?}, received {received:?}"),
-            HeaderError::UnboundWeight(name) => {
-                format!("Gemma artifact contains unbound weight role {name:?}")
-            }
-            error => error.to_string(),
-        })
-    }
-}
+/// Failure to recognize or interpret a Gemma 4 artifact: the family error,
+/// which names every unsupported feature a header carries.
+pub use magnitude_family_contracts::FamilyError as Error;
 
 fn invalid(message: impl Into<String>) -> Error {
-    Error(message.into())
+    Error::invalid(message)
 }
 
 fn product(dimensions: &[u64]) -> Result<u64, Error> {
@@ -149,7 +126,7 @@ enum LayerKind {
 struct KindGeometry {
     width: u64,
     rotary: Rotary,
-    domain: HistoryDomain,
+    domain: TokenDomain,
     media_rows: MediaRowAttention,
 }
 
@@ -168,34 +145,50 @@ fn window_media_rows(per_layer_inputs: bool) -> MediaRowAttention {
     }
 }
 
-/// NEOX rotary over a whole head: pair `p` rotates dimensions
-/// `(p, p + pairs)` at `base^(-p / pairs)` for the first `rotated` pairs; the
-/// other pairs have frequency zero (exact pass-through). `divisors` is the
-/// stored per-pair divisor table the frequencies were derived from, checked
-/// at load against the unscaled frequencies.
-fn rotary(
-    width: u64,
-    base: f64,
-    rotated: u64,
-    divisors: Option<WeightDescriptor>,
-) -> Result<Rotary, Error> {
-    let pairs = width / 2;
-    if !width.is_multiple_of(2) || rotated == 0 || rotated > pairs || base <= 1.0 {
-        return Err(invalid("invalid Gemma rotary geometry"));
+/// The geometry of window layers: whole heads rotated at the window base,
+/// reading the last `attention.sliding_window` rows.
+fn window_geometry(m: &Metadata, media_rows: MediaRowAttention) -> Result<KindGeometry, Error> {
+    let width = m.integer("attention.key_length_swa")?;
+    if m.integer("attention.value_length_swa")? != width
+        || m.integer("rope.dimension_count_swa")? != width
+    {
+        return Err(invalid(
+            "Gemma window layers must rotate whole heads of equal key and value width",
+        ));
     }
-    let bases: Vec<f64> = (0..pairs)
-        .map(|pair| base.powf(-(pair as f64) / pairs as f64))
-        .collect();
-    Ok(Rotary::Table {
-        pairs: bases
-            .iter()
-            .enumerate()
-            .map(|(pair, base)| RotaryPair {
-                frequency: if (pair as u64) < rotated { *base } else { 0.0 },
-                amplitude: 1.0,
-            })
-            .collect(),
-        divisors: divisors.map(|weight| RotaryDivisors { weight, bases }),
+    Ok(KindGeometry {
+        width,
+        rotary: rotary::table(width, width, m.positive_number("rope.freq_base_swa")?)?,
+        domain: TokenDomain::Window {
+            tokens: m.integer("attention.sliding_window")?,
+        },
+        media_rows,
+    })
+}
+
+/// The geometry of full layers, binding the stored rotary divisors.
+fn full_geometry(m: &Metadata, b: &mut Tensors) -> Result<KindGeometry, Error> {
+    let width = m.integer("attention.key_length")?;
+    if m.integer("attention.value_length")? != width
+        || m.integer("rope.dimension_count")? != width
+    {
+        return Err(invalid(
+            "Gemma full layers must span whole heads of equal key and value width",
+        ));
+    }
+    // The stored divisors encode the rotated fraction; the importer checks
+    // them against this table.
+    let divisors = b.bind("rope_freqs.weight", &[width / 2])?;
+    Ok(KindGeometry {
+        width,
+        rotary: rotary::zero_tail(
+            width,
+            m.positive_number("rope.freq_base")?,
+            width / 2 / FULL_ROTATED_PAIR_FRACTION,
+            divisors,
+        )?,
+        domain: TokenDomain::Token,
+        media_rows: MediaRowAttention::Causal,
     })
 }
 
@@ -285,53 +278,13 @@ pub fn inspect_components(
         }),
     };
 
-    let window = {
-        let width = m.integer("attention.key_length_swa")?;
-        if m.integer("attention.value_length_swa")? != width
-            || m.integer("rope.dimension_count_swa")? != width
-        {
-            return Err(invalid(
-                "Gemma window layers must rotate whole heads of equal key and value width",
-            ));
-        }
-        KindGeometry {
-            width,
-            rotary: rotary(width, m.positive_number("rope.freq_base_swa")?, width / 2, None)?,
-            domain: HistoryDomain::Window {
-                tokens: m.integer("attention.sliding_window")?,
-            },
-            media_rows: window_media_rows(per_layer_width > 0),
-        }
-    };
+    let window = window_geometry(&m, window_media_rows(per_layer_width > 0))?;
 
     let mut b = Tensors::new(directory);
     let vocabulary = b.rows("token_embd.weight")?;
     let embedding = b.bind("token_embd.weight", &[vocabulary, hidden])?;
     let output_norm = b.bind("output_norm.weight", &[hidden])?;
-    let full = {
-        let width = m.integer("attention.key_length")?;
-        if m.integer("attention.value_length")? != width
-            || m.integer("rope.dimension_count")? != width
-        {
-            return Err(invalid(
-                "Gemma full layers must span whole heads of equal key and value width",
-            ));
-        }
-        // The stored divisors encode the rotated fraction; the importer
-        // checks them against this table.
-        let divisors = b.bind("rope_freqs.weight", &[width / 2])?;
-        KindGeometry {
-            width,
-            rotary: rotary(
-                width,
-                m.positive_number("rope.freq_base")?,
-                width / 2 / FULL_ROTATED_PAIR_FRACTION,
-                Some(divisors),
-            )?,
-            domain: HistoryDomain::Token,
-            media_rows: MediaRowAttention::Causal,
-        }
-    };
+    let full = full_geometry(&m, &mut b)?;
 
     let per_layer = if per_layer_width == 0 {
         None
@@ -376,6 +329,17 @@ pub fn inspect_components(
             Some(source)
         };
         let attention = attention(&mut b, &shape, &p, geometry, kv_heads[index], key_value)?;
+        if key_value.is_some() {
+            // Converted checkpoints may keep a sharing layer's own key and
+            // value projections and key norm. The layer never computes keys
+            // or values (it reads its source's history), so they are checked
+            // and never imported. An assistant has no such excuse: its
+            // layers read the target's history and must store no keys.
+            let kv_rows = product(&[kv_heads[index], geometry.width])?;
+            b.bind_unused(&format!("{p}attn_k.weight"), &[kv_rows, shape.hidden])?;
+            b.bind_unused(&format!("{p}attn_v.weight"), &[kv_rows, shape.hidden])?;
+            b.bind_unused(&format!("{p}attn_k_norm.weight"), &[geometry.width])?;
+        }
         let (input, op) = if b.contains(&format!("{p}ffn_gate_inp.weight")) {
             let experts = experts.as_ref().ok_or_else(|| {
                 invalid(format!(
@@ -471,7 +435,6 @@ pub fn inspect_components(
                 scale: EmbeddingScale::SqrtHidden,
                 norm: None,
                 per_layer,
-                hash_routing: None,
             },
             blocks,
             exit: ExitForm {
@@ -503,20 +466,20 @@ fn attention(
     let (hidden, width) = (shape.hidden, geometry.width);
     let head_rows = product(&[shape.heads, width])?;
     let kv_rows = product(&[kv_heads, width])?;
-    let query = b.bind(&format!("{p}attn_q.weight"), &[head_rows, hidden])?;
+    let query = QueryProjection::Full(b.bind(&format!("{p}attn_q.weight"), &[head_rows, hidden])?);
     let query_norm =
         HeadNorm::Rms(shape.rms(b.bind(&format!("{p}attn_q_norm.weight"), &[width])?));
-    let key_value = match shared {
+    let rows = match shared {
         None => {
             let value_name = format!("{p}attn_v.weight");
-            KeyValue::Owned {
+            HistoryRows::Own(RowProducer::Projected(ProjectedRows {
                 key: b.bind(&format!("{p}attn_k.weight"), &[kv_rows, hidden])?,
                 // Full layers without their own value projection use their
                 // raw keys as values.
                 value: if b.contains(&value_name) {
                     ValueSource::Projected(b.bind(&value_name, &[kv_rows, hidden])?)
                 } else {
-                    ValueSource::Key
+                    ValueSource::RawKey
                 },
                 key_norm: HeadNorm::Rms(
                     shape.rms(b.bind(&format!("{p}attn_k_norm.weight"), &[width])?),
@@ -525,13 +488,15 @@ fn attention(
                     epsilon: shape.epsilon,
                 }),
                 domain: geometry.domain,
-            }
+                rounding: RowRounding::None,
+            }))
         }
-        Some(source) => KeyValue::Shared {
+        Some(source) => HistoryRows::Shared {
             source: SublayerIndex {
                 block: source as u32,
                 sublayer: 0,
             },
+            part: 0,
         },
     };
     Ok(Sublayer {
@@ -541,14 +506,17 @@ fn attention(
             kv_heads,
             width,
             query,
+            query_keys: QueryKeys::Direct,
             gate: AttentionGate::None,
             query_norm,
-            key_value,
+            history: vec![HistorySource::visible(rows)],
             rotary: geometry.rotary.clone(),
             scale: 1.0,
-            reads: HistoryReads::Visible,
             media_rows: geometry.media_rows,
-            output: b.bind(&format!("{p}attn_output.weight"), &[hidden, head_rows])?,
+            sinks: None,
+            output: OutputProjection::Full(
+                b.bind(&format!("{p}attn_output.weight"), &[hidden, head_rows])?,
+            ),
         })),
         output: OutputForm::PostNorm(
             shape.rms(b.bind(&format!("{p}post_attention_norm.weight"), &[hidden])?),
@@ -562,6 +530,7 @@ fn dense(b: &mut Tensors, p: &str, hidden: u64, intermediate: u64) -> Result<Ope
         intermediate,
         up: FeedForwardUp::Gated {
             activation: ActivationFunction::GeluTanh,
+            limit: None,
             gate: b.bind(&format!("{p}ffn_gate.weight"), &[intermediate, hidden])?,
             up: b.bind(&format!("{p}ffn_up.weight"), &[intermediate, hidden])?,
         },
@@ -589,6 +558,7 @@ fn routed(b: &mut Tensors, shape: &Shape, p: &str, experts: &Experts) -> Result<
     };
     let expert_up = FeedForwardUp::Gated {
         activation: ActivationFunction::GeluTanh,
+        limit: None,
         gate: half(0)?,
         up: half(experts.intermediate)?,
     };
@@ -608,6 +578,7 @@ fn routed(b: &mut Tensors, shape: &Shape, p: &str, experts: &Experts) -> Result<
             input: RouterInput::Residual(shape.rms(router_input)),
             score: ScoreFunction::Softmax,
             selection: ExpertSelection::TopK { bias: None },
+            media_bias: None,
             // The released router divides the selected probabilities by
             // their plain sum.
             normalization: RouteNormalization::Sum,

@@ -8,18 +8,21 @@
 mod policy;
 mod qualification;
 mod selection;
+mod volume;
 
+pub(crate) use policy::domain_readings;
 pub use policy::{
-    band_of, fit_capacities, host_distress, observe_domains, refresh_device_ceiling,
-    DomainReading, DomainRole, DomainThresholds, FitCapacity, HostDistress, MemoryBand,
-    MemoryConstraint, MemoryPolicyError, MemoryReserves,
+    DemandFit, DomainReading, DomainRole, Fit, FitMode, FitRefusal, MemoryConstraint, MemoryPolicyError,
+    PlacementFit, ReleaseRate, StorageDemand, StoreFit, observe_domains,
 };
+pub use volume::{VolumeReserve, VolumeReserves};
 pub use qualification::{
-    open_selected, select_device, OpenedPlatform, PlatformConfig, PlatformError, SelectedDevice,
+    FitReading, GraphPricing, OpenedPlatform, PlatformConfig, PlatformError, SelectedDevice, graph_pricing, host_tier, open_selected, select_device, select_recorded,
+    selected,
 };
 pub use selection::{
-    select, unusable_reason, DeviceRequest, DeviceRequestParseError, SelectionError,
-    AUTOMATIC_BACKEND_ORDER,
+    AUTOMATIC_BACKEND_ORDER, DeviceRequest, DeviceRequestParseError, SelectionError, select,
+    unusable_reason,
 };
 
 /// Relaxes the macOS GPU watchdog for this process. M1 and M2 GPUs cannot

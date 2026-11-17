@@ -5,22 +5,33 @@ use super::{
     TemplateVariant, TokenId, TokenizerError,
 };
 use magnitude_artifacts::{
-    gguf::{Scalar, Value as GgufValue},
-    TemplatePayload, TokenizerPayload,
+    gguf::{Array, Element, Elements, Kind, Scalar, Strings, Value as GgufValue},
+    TemplatePayload, TokenizerPayload, UnsupportedReason,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-fn strings(payload: &TokenizerPayload, key: &str) -> Result<Vec<String>, String> {
+/// The text array `key`, decoded from the container's payload.
+fn text<'a>(payload: &'a TokenizerPayload, key: &str) -> Result<&'a Strings, String> {
     match payload.value(key) {
-        Some(GgufValue::Array(values)) => values
-            .iter()
-            .map(|v| match v {
-                Scalar::String(s) => Ok(s.clone()),
+        Some(GgufValue::Array(values)) => {
+            match values.elements().map_err(|error| error.to_string())? {
+                Elements::String(values) => Ok(values),
                 _ => Err(format!("{key} requires strings")),
-            })
-            .collect(),
+            }
+        }
         _ => Err(format!("missing string array {key}")),
     }
+}
+
+/// The elements of an array, decoded from the container's payload.
+fn elements(value: &Array) -> Result<&Elements, TokenizerError> {
+    value
+        .elements()
+        .map_err(|error| TokenizerError::Invalid(error.to_string()))
+}
+
+fn strings(payload: &TokenizerPayload, key: &str) -> Result<Vec<String>, String> {
+    Ok(text(payload, key)?.iter().map(str::to_owned).collect())
 }
 
 /// Adapt literal package template sources and tokenizer special-token metadata
@@ -40,16 +51,13 @@ pub fn gguf_templates(
             },
         );
     }
-    let pieces = match tokenizer.value("tokenizer.ggml.tokens") {
-        Some(GgufValue::Array(pieces)) => pieces,
-        _ => return Err("missing string array tokenizer.ggml.tokens".into()),
+    // Only the pieces the special-token IDs name are read, each alone.
+    let key = "tokenizer.ggml.tokens";
+    let pieces = match tokenizer.value(key) {
+        Some(GgufValue::Array(pieces)) if pieces.kind() == Kind::String => pieces,
+        Some(GgufValue::Array(_)) => return Err(format!("{key} requires strings")),
+        _ => return Err(format!("missing string array {key}")),
     };
-    if !pieces
-        .iter()
-        .all(|piece| matches!(piece, Scalar::String(_)))
-    {
-        return Err("tokenizer.ggml.tokens requires strings".into());
-    }
     let mut tokens = BTreeMap::new();
     for (native, name) in [
         ("bos", "bos_token"),
@@ -65,12 +73,14 @@ pub fn gguf_templates(
                 .unsigned()
                 .and_then(|n| usize::try_from(n).ok())
                 .ok_or("invalid special-token ID")?;
-            let piece = match pieces.get(id) {
-                Some(Scalar::String(piece)) => piece,
-                Some(_) => return Err("tokenizer.ggml.tokens requires strings".into()),
-                None => return Err("special-token ID outside vocabulary".into()),
+            let Element::String(piece) = pieces
+                .element(id)
+                .map_err(|error| error.to_string())?
+                .ok_or("special-token ID outside vocabulary")?
+            else {
+                unreachable!("a text array's elements are text")
             };
-            tokens.insert(name.into(), piece.clone());
+            tokens.insert(name.into(), piece.to_owned());
         }
     }
     TemplateBundle::new(variants.into_values().collect(), "default".into(), tokens)
@@ -106,8 +116,8 @@ impl Profile {
     /// The profile the container's `tokenizer.ggml.model` and
     /// `tokenizer.ggml.pre` name. Profiles are container facts, never model
     /// family ownership.
-    fn select(model: &str, pre: Option<&str>) -> Result<Self, TokenizerError> {
-        use SplitBehavior::{Isolated, MergedWithNext};
+    fn select(model: &str, pre: Option<&str>) -> Result<Self, UnsupportedReason> {
+        use SplitBehavior::Isolated;
         let byte_level = |splits, ignore_merges, add_bos| Self {
             normalization: Normalization::None,
             splits,
@@ -130,6 +140,10 @@ impl Profile {
             // llama.cpp's Llama 3 pre-tokenizer: its pieces, merges ignored for
             // a piece in the vocabulary, the BOS by default.
             ("gpt2", Some("lfm2" | "llama-bpe")) => byte_level(&[(LLAMA3, Isolated)], true, true),
+            // GLM-4 and GLM-5 read Llama 3's pieces with merges ignored for a
+            // piece in the vocabulary and no BOS by default (cd959bae,
+            // `llama-vocab.cpp:414-417`, `:2609-2614`).
+            ("gpt2", Some("glm4" | "glm5")) => byte_level(&[(LLAMA3, Isolated)], true, false),
             // Digit groups of one to three first, then Llama 3 pieces over
             // whole digit runs.
             ("gpt2", Some("minicpm5")) => byte_level(
@@ -137,6 +151,24 @@ impl Profile {
                     (r"\p{N}{1,3}", Isolated),
                     (
                         r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}+| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+                        Isolated,
+                    ),
+                ],
+                false,
+                false,
+            ),
+            // DeepSeek V3's pieces (DeepSeek V4.1's `tokenizer.json`): digit
+            // groups of one to three, then CJK ideograph and kana runs, then
+            // letter runs that may follow one ASCII punctuation mark. llama.cpp
+            // reads `joyai-llm` with the same three expressions, merges ranked
+            // and no BOS by default (cd959bae, `llama-vocab.cpp:327-335`,
+            // `:2724-2727`).
+            ("gpt2", Some("joyai-llm")) => byte_level(
+                &[
+                    (r"\p{N}{1,3}", Isolated),
+                    ("[\u{4e00}-\u{9fa5}\u{3040}-\u{309f}\u{30a0}-\u{30ff}]+", Isolated),
+                    (
+                        r##"[!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"##,
                         Isolated,
                     ),
                 ],
@@ -153,8 +185,9 @@ impl Profile {
                 false,
             ),
             // Tekken pieces: case-split letter runs and single digits.
-            // llama.cpp reads this name with its Llama 3 expression instead.
-            ("gpt2", Some("pixtral")) => byte_level(
+            // llama.cpp reads `pixtral` with its Llama 3 expression instead,
+            // and `tekken` with this one.
+            ("gpt2", Some("pixtral" | "tekken")) => byte_level(
                 &[(
                     r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+",
                     Isolated,
@@ -173,7 +206,7 @@ impl Profile {
                 sequence_start: SequenceStart::Always,
             },
             _ => {
-                return Err(TokenizerError::UnsupportedProfile {
+                return Err(UnsupportedReason::Tokenizer {
                     model: model.into(),
                     pre: pre.map(Into::into),
                 })
@@ -194,6 +227,7 @@ const INTERPRETED_KEYS: &[&str] = &[
     "tokenizer.ggml.scores",
     "tokenizer.ggml.bos_token_id",
     "tokenizer.ggml.eos_token_id",
+    "tokenizer.ggml.eos_token_ids",
     "tokenizer.ggml.eot_token_id",
     "tokenizer.ggml.eom_token_id",
     "tokenizer.ggml.unknown_token_id",
@@ -207,7 +241,13 @@ const INTERPRETED_KEYS: &[&str] = &[
     // sequence.
     "tokenizer.ggml.add_sep_token",
     "tokenizer.ggml.add_space_prefix",
+    // Decoding emits every piece's bytes as they are: it never cleans up the
+    // spaces before punctuation.
+    "tokenizer.ggml.clean_spaces",
     "tokenizer.ggml.suppress_tokens",
+    // Whether text is NFC-normalized: it must agree with the profile's
+    // normalization, which the profile alone decides.
+    "tokenizer.ggml.normalizer.nfc",
 ];
 
 /// Pieces that end a turn by the GGUF convention (llama.cpp 18443257a30c,
@@ -291,16 +331,17 @@ pub fn gguf_tokenizer_vocabulary(payload: &TokenizerPayload) -> Result<usize, To
 }
 
 /// The supported profile a tokenizer payload names, and its vocabulary size.
+/// Every unknown key, an unsupported profile and every flag the engine does
+/// not implement are reported together.
 fn tokenizer_header(payload: &TokenizerPayload) -> Result<(Profile, usize), TokenizerError> {
-    if let Some(entry) = payload
+    let mut unsupported = payload
         .metadata
         .iter()
-        .find(|entry| !INTERPRETED_KEYS.contains(&entry.name.as_str()))
-    {
-        return Err(TokenizerError::UnsupportedMetadata {
+        .filter(|entry| !INTERPRETED_KEYS.contains(&entry.name.as_str()))
+        .map(|entry| UnsupportedReason::UnrecognizedMetadata {
             key: entry.name.clone(),
-        });
-    }
+        })
+        .collect::<Vec<_>>();
     let text = |key: &str| match payload.value(key) {
         None => Ok(None),
         Some(value) => value
@@ -311,15 +352,32 @@ fn tokenizer_header(payload: &TokenizerPayload) -> Result<(Profile, usize), Toke
     let profile = Profile::select(
         text("tokenizer.ggml.model")?.ok_or("missing tokenizer.ggml.model")?,
         text("tokenizer.ggml.pre")?,
-    )?;
+    );
     for key in [
         "tokenizer.ggml.add_eos_token",
         "tokenizer.ggml.add_space_prefix",
+        "tokenizer.ggml.clean_spaces",
     ] {
         if flag(payload, key)? == Some(true) {
-            return Err(TokenizerError::UnsupportedMetadata { key: key.into() });
+            unsupported.push(UnsupportedReason::UnrecognizedMetadata { key: key.into() });
         }
     }
+    let declared_nfc = flag(payload, "tokenizer.ggml.normalizer.nfc")?;
+    if let (Ok(profile), Some(nfc)) = (&profile, declared_nfc) {
+        if nfc != (profile.normalization == Normalization::Nfc) {
+            unsupported.push(UnsupportedReason::UnrecognizedMetadata {
+                key: "tokenizer.ggml.normalizer.nfc".into(),
+            });
+        }
+    }
+    let profile = match profile {
+        Ok(profile) if unsupported.is_empty() => profile,
+        Ok(_) => return Err(TokenizerError::Unsupported(unsupported)),
+        Err(reason) => {
+            unsupported.push(reason);
+            return Err(TokenizerError::Unsupported(unsupported));
+        }
+    };
     let length = |key: &str| match payload.value(key) {
         Some(GgufValue::Array(values)) => Ok(values.len()),
         _ => Err(TokenizerError::Invalid(format!("missing array {key}"))),
@@ -332,6 +390,7 @@ fn tokenizer_header(payload: &TokenizerPayload) -> Result<(Profile, usize), Toke
         return Err("GGUF token kinds do not cover the vocabulary".into());
     }
     length("tokenizer.ggml.merges")?;
+    additional_eos(payload, vocabulary)?;
     match payload
         .value("tokenizer.ggml.eos_token_id")
         .and_then(|value| value.unsigned())
@@ -339,6 +398,23 @@ fn tokenizer_header(payload: &TokenizerPayload) -> Result<(Profile, usize), Toke
         Some(eos) if eos < vocabulary as u64 => Ok((profile, vocabulary)),
         Some(_) => Err("tokenizer.ggml.eos_token_id is not a vocabulary token".into()),
         None => Err("missing EOS identity".into()),
+    }
+}
+
+/// Additional end-of-generation identities declared by the container.
+fn additional_eos(payload: &TokenizerPayload, vocabulary: usize) -> Result<Vec<TokenId>, TokenizerError> {
+    let key = "tokenizer.ggml.eos_token_ids";
+    match payload.value(key) {
+        None => Ok(Vec::new()),
+        Some(GgufValue::Array(values)) => elements(values)?.iter().map(|value| {
+            match value {
+                Element::Unsigned(n) => u32::try_from(n).ok(),
+                Element::Signed(n) => u32::try_from(n).ok(),
+                _ => None,
+            }.filter(|&n| (n as usize) < vocabulary).map(TokenId)
+                .ok_or_else(|| TokenizerError::Invalid(format!("{key} requires vocabulary tokens")))
+        }).collect(),
+        Some(_) => Err(TokenizerError::Invalid(format!("{key} requires an array"))),
     }
 }
 
@@ -351,12 +427,12 @@ pub fn gguf_byte_bpe(
     let (profile, _) = tokenizer_header(payload)?;
     let pieces = strings(payload, "tokenizer.ggml.tokens")?;
     let kinds = match payload.value("tokenizer.ggml.token_type") {
-        Some(GgufValue::Array(values)) => values
+        Some(GgufValue::Array(values)) => elements(values)?
             .iter()
             .map(|v| {
                 let kind = match v {
-                    Scalar::Unsigned(n) => *n,
-                    Scalar::Signed(n) => u64::try_from(*n).map_err(|_| "invalid piece kind")?,
+                    Element::Unsigned(n) => n,
+                    Element::Signed(n) => u64::try_from(n).map_err(|_| "invalid piece kind")?,
                     _ => return Err("invalid piece kind"),
                 };
                 Ok(match kind {
@@ -404,7 +480,8 @@ pub fn gguf_byte_bpe(
             token("tokenizer.ggml.eom_token_id")?,
         ]
         .into_iter()
-        .flatten(),
+        .flatten()
+        .chain(additional_eos(payload, pieces.len())?),
     );
     let add_bos = match profile.sequence_start {
         SequenceStart::Declared { default } => {
@@ -419,12 +496,12 @@ pub fn gguf_byte_bpe(
     };
     let suppressed_tokens = match payload.value("tokenizer.ggml.suppress_tokens") {
         None => BTreeSet::new(),
-        Some(GgufValue::Array(values)) => values
+        Some(GgufValue::Array(values)) => elements(values)?
             .iter()
             .map(|value| {
                 match value {
-                    Scalar::Signed(n) => u32::try_from(*n).ok(),
-                    Scalar::Unsigned(n) => u32::try_from(*n).ok(),
+                    Element::Signed(n) => u32::try_from(n).ok(),
+                    Element::Unsigned(n) => u32::try_from(n).ok(),
                     _ => None,
                 }
                 .filter(|&n| (n as usize) < pieces.len())
@@ -454,4 +531,105 @@ pub fn gguf_byte_bpe(
         stop_tokens,
         suppressed_tokens,
     })
+}
+
+#[cfg(test)]
+mod eos_tests {
+    use super::*;
+    use magnitude_artifacts::gguf::Metadata;
+
+    #[test]
+    fn eos_array_validates_integer_ids_and_vocabulary_bounds() {
+        let payload = |value| TokenizerPayload { metadata: vec![Metadata {
+            name: "tokenizer.ggml.eos_token_ids".into(), value,
+        }] };
+        assert_eq!(additional_eos(&TokenizerPayload {metadata: vec![]}, 4).unwrap(), vec![]);
+        for values in [Array::from(vec![1_u64, 3]), Array::from(vec![1_i64, 3])] {
+            assert_eq!(additional_eos(&payload(GgufValue::Array(values)), 4).unwrap(), vec![TokenId(1), TokenId(3)]);
+        }
+        for values in [
+            Array::from(vec![-1_i64]),
+            Array::from(vec![4_u64]),
+            Array::from(["1"].into_iter().collect::<Strings>()),
+        ] {
+            assert!(additional_eos(&payload(GgufValue::Array(values)), 4).is_err());
+        }
+    }
+
+    #[test]
+    fn tokens_read_from_a_header_decode_from_its_span_to_the_strings_written() {
+        use magnitude_artifacts::gguf::{
+            read_header, StoredHeader, StoredMetadata, StoredType, ValueType,
+        };
+        let pieces = ["<s>", "", "héllo", " world", "\u{1F600}"];
+        let built = Array::from(pieces.into_iter().collect::<Strings>());
+        let header = StoredHeader::new(
+            3,
+            vec![StoredMetadata {
+                metadata: Metadata {
+                    name: "tokenizer.ggml.tokens".into(),
+                    value: GgufValue::Array(built.clone()),
+                },
+                stored: StoredType::Array(ValueType::String),
+            }],
+            [],
+        )
+        .unwrap();
+        let read =
+            TokenizerPayload::from_directory(&read_header(header.encode().unwrap()).unwrap());
+        let built = TokenizerPayload {
+            metadata: vec![Metadata {
+                name: "tokenizer.ggml.tokens".into(),
+                value: GgufValue::Array(built),
+            }],
+        };
+        let decoded = strings(&read, "tokenizer.ggml.tokens").unwrap();
+        assert_eq!(decoded, pieces);
+        assert_eq!(decoded, strings(&built, "tokenizer.ggml.tokens").unwrap());
+        assert_eq!(read, built);
+    }
+}
+
+#[cfg(test)]
+mod normalization_tests {
+    use super::*;
+    use magnitude_artifacts::gguf::Metadata;
+
+    /// A one-piece BPE tokenizer with pre-tokenizer `pre`, and the NFC
+    /// declaration `nfc` when it has one.
+    fn payload(pre: &str, nfc: Option<bool>) -> TokenizerPayload {
+        let text = |value: &str| GgufValue::Scalar(Scalar::String(value.into()));
+        let strings = |values: &[&str]| GgufValue::Array(Array::from(values.iter().copied().collect::<Strings>()));
+        let mut metadata = vec![
+            Metadata { name: "tokenizer.ggml.model".into(), value: text("gpt2") },
+            Metadata { name: "tokenizer.ggml.pre".into(), value: text(pre) },
+            Metadata { name: "tokenizer.ggml.tokens".into(), value: strings(&["a"]) },
+            Metadata { name: "tokenizer.ggml.token_type".into(), value: GgufValue::Array(Array::from(vec![1_u64])) },
+            Metadata { name: "tokenizer.ggml.merges".into(), value: strings(&[]) },
+            Metadata { name: "tokenizer.ggml.eos_token_id".into(), value: GgufValue::Scalar(Scalar::Unsigned(0)) },
+        ];
+        if let Some(nfc) = nfc {
+            metadata.push(Metadata { name: "tokenizer.ggml.normalizer.nfc".into(), value: GgufValue::Scalar(Scalar::Bool(nfc)) });
+        }
+        TokenizerPayload { metadata }
+    }
+
+    /// The NFC declaration is read when it agrees with the profile's
+    /// normalization, and refused, naming it, when it does not.
+    #[test]
+    fn an_nfc_declaration_must_agree_with_the_profile() {
+        for (pre, nfc) in [("qwen35", None), ("qwen35", Some(true)), ("llama-bpe", Some(false))] {
+            assert_eq!(gguf_tokenizer_vocabulary(&payload(pre, nfc)).unwrap(), 1, "{pre} {nfc:?}");
+        }
+        for (pre, nfc) in [("qwen35", false), ("llama-bpe", true)] {
+            match gguf_tokenizer_vocabulary(&payload(pre, Some(nfc))) {
+                Err(TokenizerError::Unsupported(reasons)) => assert_eq!(
+                    reasons,
+                    [UnsupportedReason::UnrecognizedMetadata { key: "tokenizer.ggml.normalizer.nfc".into() }],
+                    "{pre} {nfc}"
+                ),
+                other => panic!("{pre} {nfc}: {other:?}"),
+            }
+        }
+    }
 }

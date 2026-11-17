@@ -1,0 +1,483 @@
+# Hyper-connection residual streams. The residual is S streams of H values
+# per row, one `[M, S * H]` F32 tensor (stream s at columns s * H ..). A
+# sublayer reads it through a mix site and writes back through a scatter:
+#   xn[s]  = rms(X[s]) * norm[s]                       (per-stream RMS norm)
+#   low    = silu(down(xn) / S)                        (`stream_mix_down`)
+#   inject = 2 sigmoid(inject(xn) / S)                 (`stream_mix_down`, C = 1)
+#   p[s]   = sigmoid(up(low))[s] * xn[s] / S           (`stream_mix_up`)
+# The sublayer's input row is the sum of the S partials p, formed by its
+# consumer entry (`form_input` in functions.seismic, PT = S, NM = 0), and its
+# output joins the streams through the output entry's `scatter` with the
+# inject values (`functions.seismic`). The decoder's exit is a mix site
+# without inject (C = 0) whose partials the readout sums. Under Sinkhorn
+# mixing a site is one entry (`stream_mix_sinkhorn`) mixing by the previous
+# site's pre or its own, and the exit collapses the streams by the last
+# site's pre or into their mean (`stream_collapse`).
+#
+# The mix entries read the streams and their norm through `[M, S, H]` and
+# `[S, H]` views of the row-major `[M, S * H]` and `[S * H]` tensors, which
+# name S and H; their natives read a row's S * H values at the innermost
+# stride.
+
+# The per-stream RMS normalization of the streams, rounded to the result's
+# element as rows of S * H, and each stream's inverse.
+fn group_rms[M, H, S](x: &tensor[M, S, H] f32, norm: &tensor[S, H] T,
+    y: &mut tensor[M, S * H] U, inverse: &mut tensor[M, S] f32, epsilon: f32):
+    parallel for row in 0..M:
+        parallel for stream in 0..S:
+            let mut squares = f32(0.0)
+            for column in 0..H:
+                let v = x[row, stream, column]
+                squares = squares + v * v
+            let scale = rsqrt(squares / f32(H) + epsilon)
+            inverse[row, stream] = scale
+            for column in 0..H:
+                y[row, stream * H + column] = x[row, stream, column] * scale * f32(norm[stream, column])
+
+# A mix site's first stage: the per-stream normalized streams (rounded to A)
+# through one segmented projection, down | inject. Results: the low-rank
+# rows `silu(v / S)` in A, the inject values `2 sigmoid(v / S)` in F32 (C = 1;
+# none for the exit site, C = 0), and the per-stream norm inverses the second
+# stage reads.
+fn stream_mix_down[M, H, S, LR, C](hidden: &tensor[M, S, H] f32, norm: &tensor[S, H] NW,
+    down_weight: &tensor[LR, S * H] DW, inject_weight: &tensor[C * S, S * H] IW, epsilon: f32)
+    -> (tensor[M, LR] A, tensor[M, C * S] f32, tensor[M, S] f32)
+    where S >= 1 and LR >= 1 and C >= 0 and C <= 1 and operands(DW) == 0 and operands(IW) == 0:
+    let mut normalized = tensor[M, S * H] A
+    let mut inverse = tensor[M, S] f32
+    let mut low_sum = tensor[M, LR] f32
+    let mut low = tensor[M, LR] A
+    let mut inject_sum = tensor[M, C * S] f32
+    let mut inject = tensor[M, C * S] f32
+    group_rms(hidden, norm, normalized, inverse, epsilon)
+    linear(normalized, down_weight, low_sum)
+    parallel for row in 0..M:
+        parallel for column in 0..LR:
+            let v = low_sum[row, column] / f32(S)
+            low[row, column] = v / (1.0 + exp(-v))
+    if C > 0:
+        linear(normalized, inject_weight, inject_sum)
+        parallel for row in 0..M:
+            parallel for column in 0..C * S:
+                inject[row, column] = 2.0 / (1.0 + exp(-inject_sum[row, column] / f32(S)))
+    return low, inject, inverse
+
+# A mix site's second stage: the low-rank rows through `up`, each output the
+# gate of its stream's column, publishing the per-stream partials
+# `sigmoid(v) * xn / S` in F32 (xn unrounded, from the first stage's
+# inverses).
+fn stream_mix_up[M, H, S, LR](low: &tensor[M, LR] A, up_weight: &tensor[S * H, LR] UW,
+    hidden: &tensor[M, S, H] f32, inverse: &tensor[M, S] f32, norm: &tensor[S, H] NW)
+    -> tensor[M, S * H] f32 where S >= 1 and LR >= 1 and operands(UW) == 0:
+    # The rows are dense activations: staging them in A (an exact copy)
+    # states that domain (`project_rows`).
+    let mut rows = tensor[M, LR] A
+    parallel for row in 0..M:
+        rows[row] = low[row]
+    let mut gate_sum = tensor[M, S * H] f32
+    let mut partials = tensor[M, S * H] f32
+    linear(rows, up_weight, gate_sum)
+    parallel for row in 0..M:
+        parallel for stream in 0..S:
+            parallel for column in 0..H:
+                let at = stream * H + column
+                let gate = 1.0 / (1.0 + exp(-gate_sum[row, at]))
+                let normalized = hidden[row, stream, column] * inverse[row, stream] * f32(norm[stream, column])
+                partials[row, at] = gate * normalized / f32(S)
+    return partials
+
+# A Sinkhorn mix site (`SinkhornSite`, DeepSeek V4.1's single pass) over
+# each row's streams X: one projection of the flattened S * H values by
+# `function` under one RMS statistic of all of them,
+#   m    = (function x) rsqrt(mean(x^2) + norm_epsilon)
+#   pre  = sigmoid(m[0:S] scale[0] + base[0:S]) + epsilon
+#   post = 2 sigmoid(m[S:2S] scale[1] + base[S:2S])
+#   comb = rowsoftmax(m[2S:] scale[2] + base[2S:]) + epsilon      ([S, S], source major)
+#   then `iterations` sweeps, each comb = comb / (rowsum + epsilon) (every
+#   sweep but the first) and comb = comb / (colsum + epsilon)
+# in F32. Results: the sublayer's input `sum_s pre'[s] X[s]` (which its
+# consumer normalizes: `form_input`, PT = 1), the pre the next site reads,
+# and the join row post | comb its sublayer's output entry scatters with
+# (`scatter`, IN = S + S * S). `P` names whose pre' mixes the input
+# (`SinkhornInput`): P = 1 the previous site's `previous`, and the site
+# publishes its own pre for the next; P = 0 its own, and nothing is carried
+# (`previous` and the published pre are empty). `iterations`, the model's
+# Sinkhorn iteration count, is a runtime argument, as epsilon is; zero
+# leaves comb at its softmax rows.
+fn stream_mix_sinkhorn[M, H, S, P](hidden: &tensor[M, S, H] f32, previous: &tensor[M, P * S] f32,
+    function: &tensor[(2 + S) * S, S * H] f32, base: &tensor[(2 + S) * S] f32, scale: &tensor[3] f32,
+    epsilon: f32, norm_epsilon: f32, iterations: u32)
+    -> (tensor[M, H] f32, tensor[M, P * S] f32, tensor[M, S + S * S] f32) where S >= 1 and P >= 0 and P <= 1:
+    let mut flat = tensor[M, S * H] f32
+    let mut mixes = tensor[M, (2 + S) * S] f32
+    let mut input = tensor[M, H] f32
+    let mut pre = tensor[M, S] f32
+    let mut carried = tensor[M, P * S] f32
+    let mut join = tensor[M, S + S * S] f32
+    parallel for row in 0..M:
+        parallel for stream in 0..S:
+            parallel for column in 0..H:
+                flat[row, stream * H + column] = hidden[row, stream, column]
+    linear(flat, function, mixes)
+    parallel for row in 0..M:
+        let mut squares = f32(0.0)
+        for at in 0..S * H:
+            let v = flat[row, at]
+            squares = squares + v * v
+        let inverse = rsqrt(squares / f32(S * H) + norm_epsilon)
+        for stream in 0..S:
+            pre[row, stream] = 1.0 / (1.0 + exp(-(mixes[row, stream] * inverse * scale[0] + base[stream]))) + epsilon
+            join[row, stream] = 2.0 / (1.0 + exp(-(mixes[row, S + stream] * inverse * scale[1] + base[S + stream])))
+        let mut comb = tensor[S, S] f32
+        for source in 0..S:
+            let mut maximum = -inf
+            for target in 0..S:
+                let at = 2 * S + source * S + target
+                comb[source, target] = mixes[row, at] * inverse * scale[2] + base[at]
+                maximum = max(maximum, comb[source, target])
+            let mut total = f32(0.0)
+            for target in 0..S:
+                comb[source, target] = exp(comb[source, target] - maximum)
+                total = total + comb[source, target]
+            for target in 0..S:
+                comb[source, target] = comb[source, target] / total + epsilon
+        for sweep in 0..iterations:
+            if sweep > 0:
+                for source in 0..S:
+                    let mut sum = f32(0.0)
+                    for target in 0..S:
+                        sum = sum + comb[source, target]
+                    for target in 0..S:
+                        comb[source, target] = comb[source, target] / (sum + epsilon)
+            for target in 0..S:
+                let mut sum = f32(0.0)
+                for source in 0..S:
+                    sum = sum + comb[source, target]
+                for source in 0..S:
+                    comb[source, target] = comb[source, target] / (sum + epsilon)
+        for source in 0..S:
+            for target in 0..S:
+                join[row, S + source * S + target] = comb[source, target]
+    parallel for row in 0..M:
+        parallel for stream in 0..P * S:
+            carried[row, stream] = pre[row, stream]
+    if P > 0:
+        collapse(hidden, previous[:, 0:S], input)
+    else:
+        collapse(hidden, pre, input)
+    return input, carried, join
+
+# Each row's streams collapsed by its per-stream scalars `carried`:
+# `sum_s carried[s] X[s]` in F32, in stream order. A Sinkhorn site's
+# sublayer input (with the previous site's pre or its own) and the
+# decoder's exit (`stream_collapse`).
+fn collapse[M, H, S](hidden: &tensor[M, S, H] f32, carried: &tensor[M, S] f32,
+    result: &mut tensor[M, H] f32):
+    parallel for row in 0..M:
+        parallel for column in 0..H:
+            let mut sum = f32(0.0)
+            for stream in 0..S:
+                sum = sum + carried[row, stream] * hidden[row, stream, column]
+            result[row, column] = sum
+
+# The decoder's exit over Sinkhorn streams, which the readout normalizes by
+# the exit norm. `P` names the exit, as it names a site's input
+# (`stream_mix_sinkhorn`): P = 1 the streams collapsed by the last site's
+# pre (`ExitSite::PreviousSite`); P = 0 their mean (`ExitSite::Mean`, `pre`
+# empty), summed in stream order and divided by S, `Σ_s X[s] / S` exactly
+# for any S.
+fn stream_collapse[M, H, S, P](hidden: &tensor[M, S, H] f32, pre: &tensor[M, P * S] f32)
+    -> tensor[M, H] f32 where S >= 1 and P >= 0 and P <= 1:
+    let mut result = tensor[M, H] f32
+    if P > 0:
+        collapse(hidden, pre[:, 0:S], result)
+    else:
+        parallel for row in 0..M:
+            parallel for column in 0..H:
+                let mut sum = f32(0.0)
+                for stream in 0..S:
+                    sum = sum + hidden[row, stream, column]
+                result[row, column] = sum / f32(S)
+    return result
+
+# A sublayer's F32 output `y` joining the streams by its site's inject
+# values (`scatter`: IN = SN, a low-rank site's; IN = SN + SN * SN, a
+# Sinkhorn site's post | comb; IN = 0, one stream), for a sublayer whose
+# output entry joins nothing itself (the general routed feed-forward's
+# branch, `RoutedSum::Branch`).
+fn stream_join[M, H, SN, IN](residual: &tensor[M, SN * H] f32, y: &tensor[M, H] f32,
+    inject: &tensor[M, IN] f32) -> tensor[M, SN * H] f32
+    where IN >= 0 and ((IN == 0 and SN == 1) or (IN == SN and SN >= 1) or (IN == SN + SN * SN and SN >= 1)):
+    let mut result = tensor[M, SN * H] f32
+    scatter(residual, y, inject, result)
+    return result
+
+# S scaled copies of each row: copy s is `scales[s]` times the row. The
+# streams' entry is the copies of the embedded rows at scale 1 (exact).
+fn repeat_rows[M, H, S](rows: &tensor[M, H] f32, scales: &tensor[S] f32) -> tensor[M, S * H] f32
+    where S >= 1:
+    let mut result = tensor[M, S * H] f32
+    parallel for row in 0..M:
+        parallel for stream in 0..S:
+            parallel for column in 0..H:
+                result[row, stream * H + column] = rows[row, column] * scales[stream]
+    return result
+
+# Metal: the `dense` projection (segmented) in S parts, the streams: the
+# GEMV row classes split K by stream (each threadgroup normalizes its stream;
+# the first row tile of each publishes its inverses), their partials added
+# in stream order by the last of a row tile's S threadgroups to arrive; the
+# batched rows (to 16) reduce every stream's square sums in each threadgroup
+# and normalize while staging, the first threadgroup publishing the
+# inverses. Past 16 rows `stage` publishes the normalized streams in A to
+# `normalized` with the inverses, one threadgroup per row and stream, and
+# the GEMM reads them. Every GEMV row class keeps the one GEMV launch's
+# tile mapping and lanes the entry ran; the matrix GEMV, the small and tall
+# GEMMs, PACK and the tile GEMVs read no parts (the projection's rule).
+native stream_mix_down for metal from "metal/stream_mix_down.metal":
+    static (H, S, LR, C)
+    where H % 32 == 0 and C <= 1
+    project dense segmented (down_weight, inject_weight) parts S rows rms
+    restate gemv SIMDGROUPS in [16, 8, 4, 2, 32] default 4
+    restate gemv_rows SIMDGROUPS in [16, 8, 4, 2, 32] default 4
+    restate gemv_rows ROWS in [1, 2, 4] default 1
+    restate gemv_pair SIMDGROUPS in [16, 8, 4, 2, 32] default 4
+    restate gemv_pair ROWS in [1, 2, 4] default 1
+    scratch normalized bytes (M * S * H * 2) when M > 16
+    launch stream_mix_down_stage before gemm when M > 16:
+        staging
+        threadgroups (M * S, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# CUDA: the `dense` projection (segmented) in S parts, the streams. Past one
+# row `stage` stages the normalized streams and publishes the inverses, one
+# block per row. The GEMV classes split K by stream: a block serves one
+# stream over tiles of down | inject (a one-row block forms the stream's row
+# itself, and the stream's first block publishes its inverse) into F32
+# partial sums, which the last block to arrive adds in stream order through
+# the epilogues. A stream is whole superblocks of 256 inputs. The int8 and
+# operand GEMMs and coefficient staging read no parts (the projection's rule).
+native stream_mix_down for cuda from "cuda/stream_mix_down.cu":
+    static (H, S, LR, C)
+    where H % 256 == 0 and C <= 1
+    project dense segmented (down_weight, inject_weight) parts S rows rms
+    restate arithmetic KSPLIT in [8, 4, 2] default 8
+
+# Vulkan: the `dense` projection (segmented) in S parts, the streams: the
+# GEMV classes (to 8 rows) split K by stream (a workgroup normalizes its
+# stream through the library's GEMV prologue, one norm group a row; the
+# stream's first workgroup publishes its inverses) into F32 partials, which
+# `combine` adds in stream order through the epilogues. Past 8 rows `stage`
+# normalizes every stream into `staged` (and publishes its inverse), one
+# workgroup per row and stream, and the GEMM reads the staged rows.
+native stream_mix_down for vulkan from "vulkan/stream_mix_down.comp":
+    static (H, S, LR, C)
+    where H % 32 == 0 and C <= 1
+    project dense segmented (down_weight, inject_weight) parts S rows rms
+    restate SIMDGROUPS in [16, 8, 4, 2, 32] default 4
+
+# CPU: one work item per row normalizes its streams (the norm decoded into
+# its shared bytes) and publishes the inverses; then the combined weight rows
+# of the segments down | inject split evenly over one work item per pool
+# participant (`device.units`, at most LR + C S), each against every row.
+# Each output column is its own row's dot whichever item forms it, so the
+# split never changes result bits.
+native stream_mix_down for cpu from "cpu/stream_mix_down.rs":
+    scratch normalized bytes (M * S * H * 4)
+    launch stream_mix_down_normalize:
+        staging
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (H * 4)
+    launch stream_mix_down_rows:
+        threadgroups (min(LR + C * S, device.units), 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+# Metal: the `dense` projection (single) over the plain low-rank rows, with
+# the `Mix` epilogue; one GEMV mapping for every row count below VERIFY_ROWS,
+# as it ran before the projection.
+native stream_mix_up for metal from "metal/stream_mix_up.metal":
+    static (H, S, LR)
+    where H % 32 == 0 and LR % 32 == 0
+    project dense single (up_weight)
+    restate single_gemv
+
+# CUDA: the `dense` projection (single) over the low-rank rows read in
+# place, without split-K by default (S * H columns are many).
+native stream_mix_up for cuda from "cuda/stream_mix_up.cu":
+    static (H, S, LR)
+    project dense single (up_weight)
+    restate arithmetic SPLIT in [1, 2] default 1
+
+# Vulkan: the `dense` projection (single) over the low-rank rows read in
+# place.
+native stream_mix_up for vulkan from "vulkan/stream_mix_up.comp":
+    static (H, S, LR)
+    project dense single (up_weight)
+
+# CPU: the projection operator over the low-rank rows, its operand (formed by
+# the operator's `form` launch); the row launch gives each work item ROWS
+# weight rows, the norm's columns of them decoded through its shared bytes (a
+# stream's H values at most). Each output column is its own row's dot
+# whichever item forms it.
+native stream_mix_up for cpu from "cpu/stream_mix_up.rs":
+    project quantized tiled (UW) over (M, LR) operand (low)
+    launch stream_mix_up_rows:
+        threadgroups (ceil_div(S * H, ROWS), 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (H * 4)
+
+# The threadgroups a Sinkhorn mix site's decode row is split across
+# (`stream_mix_sinkhorn`, Metal, CUDA and Vulkan): enough that a row's
+# function matrix streams through many cores, few enough that each
+# threadgroup's slice stays long. On M4 Pro at one decode row of DeepSeek
+# V4.1's sites (timed, µs a site at 16 / 32 / 64 / 128 / 1 threadgroups):
+# 42.6 / 42.6 / 43.7 / 45.0 / 89.2, and with the comb formed across the
+# threadgroup 27.2 / 28.5 / 30.8 / 32.6 / 92.2; 16 is the fastest measured.
+# At 16, 8 decode rows (128 threadgroups) take 36.5 µs against one row's
+# 28.5.
+const SINKHORN_SPLIT = 16
+
+# The rows a Sinkhorn mix site's prefill tile holds (`stream_mix_sinkhorn`,
+# Metal, CUDA and Vulkan): each of a tile's function columns is read once
+# for all its rows, two rows a simdgroup (warp, subgroup) of eight.
+const SINKHORN_TILE = 16
+
+# Metal, CUDA and Vulkan: at every row count SINKHORN_SPLIT threadgroups a
+# row tile each reduce a contiguous slice of its rows' columns into the
+# scratch and, under P = 1, mix their share of the input by the previous
+# site's pre; a second launch sums each row's partials in slice order and
+# forms the coefficients, and under P = 0 mixes the row's input by the pre
+# it formed: each mix a sum of the same S * H products in a fixed order. A decode row is a tile of its
+# own, its function matrix streaming through many cores; prefill rows
+# (M > VERIFY_ROWS) take tiles of SINKHORN_TILE rows that read each function
+# column once a tile. Vulkan declares its group memory: the slice sums, the
+# prefill tiles' staged columns, and the finishing launch's sums and comb.
+native stream_mix_sinkhorn for metal from "metal/stream_mix_sinkhorn.metal":
+    static (H, S, P)
+    where S <= 8
+    scratch partials bytes (M * SINKHORN_SPLIT * (1 + (2 + S) * S) * 4)
+    launch stream_mix_sinkhorn_split when M <= VERIFY_ROWS:
+        threadgroups (SINKHORN_SPLIT, M, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch stream_mix_sinkhorn_tiles when M > VERIFY_ROWS:
+        threadgroups (SINKHORN_SPLIT, ceil_div(M, SINKHORN_TILE), 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch stream_mix_sinkhorn_finish:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native stream_mix_sinkhorn for cuda from "cuda/stream_mix_sinkhorn.cu":
+    static (H, S, P)
+    where S <= 8
+    scratch partials bytes (M * SINKHORN_SPLIT * (1 + (2 + S) * S) * 4)
+    launch stream_mix_sinkhorn_split when M <= VERIFY_ROWS:
+        threadgroups (SINKHORN_SPLIT, M, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch stream_mix_sinkhorn_tiles when M > VERIFY_ROWS:
+        threadgroups (SINKHORN_SPLIT, ceil_div(M, SINKHORN_TILE), 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch stream_mix_sinkhorn_finish:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native stream_mix_sinkhorn for vulkan from "vulkan/stream_mix_sinkhorn.comp":
+    static (H, S, P)
+    where S <= 8
+    scratch partials bytes (M * SINKHORN_SPLIT * (1 + (2 + S) * S) * 4)
+    launch stream_mix_sinkhorn_split when M <= VERIFY_ROWS:
+        threadgroups (SINKHORN_SPLIT, M, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes ((1 + (2 + S) * S) * 8 * 4)
+    launch stream_mix_sinkhorn_tiles when M > VERIFY_ROWS:
+        threadgroups (SINKHORN_SPLIT, ceil_div(M, SINKHORN_TILE), 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (((1 + (2 + S) * S) * 8 + (2 + S) * S * (6144 / ((2 + S) * S) / 32 * 32)) * 4)
+    launch stream_mix_sinkhorn_finish:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes ((1 + (2 + S) * S + S * S) * 4)
+
+# CPU: one work item per row, which forms its coefficients in place (to 8
+# streams) and mixes its input row.
+native stream_mix_sinkhorn for cpu from "cpu/stream_mix_sinkhorn.rs":
+    static (S)
+    where S <= 8
+    launch stream_mix_sinkhorn:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+# Metal, CUDA and Vulkan: one threadgroup per row, its threads over the
+# columns.
+native stream_collapse for metal from "metal/stream_collapse.metal":
+    static (H, S, P)
+    launch stream_collapse:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native stream_collapse for cuda from "cuda/stream_collapse.cu":
+    static (H, S, P)
+    launch stream_collapse:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native stream_collapse for vulkan from "vulkan/stream_collapse.comp":
+    static (H, S, P)
+    launch stream_collapse:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# CPU: one work item per row.
+native stream_collapse for cpu from "cpu/stream_collapse.rs":
+    launch stream_collapse:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+# Metal, CUDA and Vulkan: the projection library's output join
+# (`projection::OutputOf`, the `Scatter` of every output entry's join;
+# Vulkan's `join_scatter`) over the F32 rows, one thread per column of a row.
+native stream_join for metal from "metal/stream_join.metal":
+    static (H, SN, IN)
+    launch stream_join:
+        threadgroups (ceil_div(M * H, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native stream_join for cuda from "cuda/stream_join.cu":
+    static (H, SN, IN)
+    launch stream_join:
+        threadgroups (ceil_div(M * H, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native stream_join for vulkan from "vulkan/stream_join.comp":
+    static (H, SN, IN)
+    launch stream_join:
+        threadgroups (ceil_div(M * H, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# CPU: one work item per row, through the projection epilogues' scatter
+# (`lib::core::functions::scatter`).
+native stream_join for cpu from "cpu/stream_join.rs":
+    launch stream_join:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+# One thread per value.
+native repeat_rows for metal from "metal/repeat_rows.metal":
+    launch repeat_rows:
+        threadgroups (ceil_div(M * S * H, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native repeat_rows for cuda from "cuda/repeat_rows.cu":
+    launch repeat_rows:
+        threadgroups (ceil_div(M * S * H, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native repeat_rows for vulkan from "vulkan/repeat_rows.comp":
+    launch repeat_rows:
+        threadgroups (min(ceil_div(M * S * H, 256), 65535), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native repeat_rows for cpu from "cpu/repeat_rows.rs":
+    launch repeat_rows:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)

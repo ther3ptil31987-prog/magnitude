@@ -1,9 +1,9 @@
-import { DesktopConnectRequest, DesktopConnectionsSnapshot, ModelTrayPresentation } from "@magnitudedev/client-common/desktop/contracts"
+import { HostAction, ModelTrayPresentation } from "@magnitudedev/client-common/application/contracts"
 import { contextBridge, ipcRenderer } from "electron"
 import { RpcClient } from "@effect/rpc"
 import { Cause, Context, Effect, Exit, Fiber, Layer, ManagedRuntime, Option, Schema, Stream } from "effect"
 import { ApplicationSnapshot } from "@magnitudedev/sdk/desktop-host"
-import { HostError, InferenceHostRpcs, type InferenceHostClient, type DesktopApi } from "./desktop-rpc"
+import { HostError, InferenceHostRpcs, OpenPathRequest, OpenPathResult, type InferenceHostClient, type DesktopApi } from "./desktop-rpc"
 import { makeElectronRpcClientLayer } from "./electron-rpc"
 class HostClient extends Context.Tag("InferenceHostClient")<HostClient, InferenceHostClient>() {}
 const runtime = ManagedRuntime.make(Layer.scoped(HostClient, RpcClient.make(InferenceHostRpcs)).pipe(Layer.provide(makeElectronRpcClientLayer(ipcRenderer))))
@@ -20,7 +20,7 @@ const command = (select: (client: InferenceHostClient) => Effect.Effect<unknown,
     const failure = Cause.failureOption(cause)
     // contextBridge preserves ordinary Error messages, not Effect's FiberFailure identity.
     throw new Error(Option.isSome(failure) && Schema.is(HostError)(failure.value)
-      ? failure.value.message : "Magnitude could not complete this action. Try again or check Status.")
+      ? failure.value.message : "Magnitude could not complete this action. Try again or check Settings.")
   },
 }))
 const query = <A>(select: (client: InferenceHostClient) => Effect.Effect<A, unknown>) => runtime.runPromiseExit(Effect.flatMap(HostClient, select)).then(Exit.match({
@@ -28,38 +28,18 @@ const query = <A>(select: (client: InferenceHostClient) => Effect.Effect<A, unkn
   onFailure: cause => {
     const failure = Cause.failureOption(cause)
     throw new Error(Option.isSome(failure) && Schema.is(HostError)(failure.value)
-      ? failure.value.message : "Magnitude could not complete this action. Try again or check Status.")
+      ? failure.value.message : "Magnitude could not complete this action. Try again or check Settings.")
   },
 }))
 const api: DesktopApi = {
-  memory: (value, error) => observe(client => client.Memory({}), value, error),
-  machineIdentity: () => runtime.runPromise(Effect.flatMap(HostClient, client => client.MachineIdentity({}))),
-  applicationInfo: () => runtime.runPromise(Effect.flatMap(HostClient, client => client.ApplicationInfo({}))),
-  updates: (value, error) => observe(client => client.Updates({}), value, error),
-  setAutoDownload: enabled => command(client => client.SetAutoDownload({ enabled })),
-  checkUpdate: () => command(client => client.CheckUpdate({})),
-  discardUpdate: () => command(client => client.DiscardUpdate({})),
-  downloadUpdate: () => command(client => client.DownloadUpdate({})),
-  restartUpdate: () => command(client => client.RestartUpdate({})),
   platform: process.platform,
   observe: (value, error) => observe(client => client.Observe({}), state => value(Schema.encodeSync(ApplicationSnapshot)(state)), error),
-  actions: value => observe(client => client.Actions({}), value, message => console.error(message)),
+  actions: (value, error) => observe(client => client.Actions({}), action => value(Schema.encodeSync(HostAction)(action)), error),
   presentModel: value => command(client => client.PresentModel(Schema.decodeUnknownSync(ModelTrayPresentation)(value))),
   getAppearance: () => runtime.runPromise(Effect.flatMap(HostClient, client => client.GetAppearance({}))),
   setAppearance: preference => command(client => client.SetAppearance({ preference })),
-  getModelStorage: () => query(client => client.GetModelStorage({})),
-  setModelStorage: path => command(client => client.SetModelStorage({ path })),
-  chooseModelStorageDirectory: () => query(client => client.ChooseModelStorageDirectory({})).then(result => result.path),
-  relaunch: () => command(client => client.Relaunch({})),
-  getNetworkAccess: () => query(client => client.GetNetworkAccess({})),
-  setNetworkAccess: change => command(client => client.SetNetworkAccess(change)),
-  regenerateNetworkApiKey: () => command(client => client.RegenerateNetworkApiKey({})),
-  loginStartup: (value, error) => observe(client => client.LoginStartup({}), value, error),
-  setLoginStartup: enabled => command(client => client.SetLoginStartup({ enabled })),
-  connections: (value, error) => observe(client => client.Connections({}), rows => value(Schema.encodeSync(DesktopConnectionsSnapshot)(rows)), error),
-  connect: input => command(client => client.Connect(Schema.decodeUnknownSync(DesktopConnectRequest)(input))),
-  disconnect: harness => command(client => client.Disconnect({ harness })),
   retry: () => command(client => client.Retry({})),
-  quit: () => command(client => client.Quit({})),
+  resolveQuitFailure: decision => command(client => client.ResolveQuitFailure({ decision })),
+  chooseOpenPath: request => query(client => client.ChooseOpenPath(Schema.decodeUnknownSync(OpenPathRequest)(request))).then(Schema.encodeSync(OpenPathResult)),
 }
 contextBridge.exposeInMainWorld("__magnitudeDesktop", api)

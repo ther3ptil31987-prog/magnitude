@@ -4,13 +4,14 @@ import { Config, Effect, Schema } from "effect"
 import { generateKeyPairSync } from "node:crypto"
 import { join, resolve } from "node:path"
 import { acceptanceInferenceInstallation } from "./inference-installation"
-import { appleSigning, signAppleCode } from "../apple/signing"
+import { appleCommand, appleSigning, signAppleCode } from "../apple/signing"
 import { compileAppleBun } from "../apple/compile-bun"
 import { desktopUpdateArchive } from "../../src/targets"
 import { sha256File } from "../../src/macos-app"
 import { signUpdateRelease, UpdateRelease } from "../../src/hosted-update/release"
 import { signUpdateManifest, UpdateManifest } from "../../src/hosted-update/manifest"
 import { writeInstallationDistribution } from "../build/installation-distribution"
+import { writeInstallerOfferFixture } from "./installer-offer-fixture"
 import { makePreparedUpdateStore } from "../../../daemon-management/src/desktop-native/prepared-update"
 import { unixPrivateFilePermissions } from "../../../daemon-management/src/desktop-native/private-files"
 
@@ -58,13 +59,16 @@ const run = Effect.gen(function* () {
     artifact: { id: "desktop-update-darwin-arm64", target: { os: "darwin", arch: "arm64", package: "mac-zip" }, filename: archiveName,
       bytes: Number((yield* fs.stat(initialArchive)).size), sha256: yield* sha256File(initialArchive) } })
   const hosting = join(output, "script-hosting")
+  const publicKey = keys.publicKey.export({ type: "spki", format: "pem" }).toString()
   yield* writeInstallationDistribution({ output: hosting, origin: "https://localhost:18443", appleTeam: yield* Config.string("APPLE_TEAM_ID"),
-    windowsPublisher: "Magnitude Update Acceptance", publicKey: keys.publicKey.export({ type: "spki", format: "pem" }).toString(),
-    publications: [yield* signUpdateManifest(manifest, keys.privateKey)] })
+    windowsPublisher: "Magnitude Update Acceptance", publicKey })
+  yield* writeInstallerOfferFixture(hosting, yield* signUpdateManifest(manifest, keys.privateKey), publicKey)
   const downloadDirectory = join(hosting, "magnitudedev/magnitude/releases/download", manifest.tag)
   yield* fs.makeDirectory(downloadDirectory, { recursive: true })
   yield* fs.copyFile(initialArchive, join(downloadDirectory, archiveName))
   yield* command("/bin/bash", [join(import.meta.dir, "test-mac-install-script.sh"), hosting, bundle, versions[0], dataDirectory, stateDirectory], environment)
+  // Stapler reaches Apple's ticket service, so the script's installation is validated through the retrying Apple command.
+  yield* appleCommand("/usr/bin/xcrun", "stapler", "validate", bundle)
   yield* command(process.execPath, [join(import.meta.dir, "test-installed-headless.ts")], {
     MAGNITUDE_INSTALLED_ACCEPTANCE_OUTPUT: join(output, "script-serve"),
     MAGNITUDE_INSTALLED_ACCEPTANCE_PROFILE: join(output, "script-serve", "profile"),
@@ -83,7 +87,7 @@ const run = Effect.gen(function* () {
     yield* fs.copyFile(archive, transfer)
     yield* Effect.gen(function* () {
       const store = yield* makePreparedUpdateStore({ dataDirectory, target: { os: "darwin", arch: "arm64", package: "mac-zip" }, trustedPublishers: new Map([["isolated", keys.publicKey]]) })
-      yield* store.prepare(transfer, release)
+      yield* store.prepare(transfer, release, previous)
     }).pipe(Effect.provide(unixPrivateFilePermissions))
     if (previous === versions[0]) yield* command(join(resources, "magnitude"), ["update", "install"], environment)
     else yield* Effect.scoped(Effect.gen(function* () {
@@ -111,7 +115,7 @@ const run = Effect.gen(function* () {
       return yield* new AcceptanceFailed({ message: "Installed version or transaction retirement did not match the signed update" })
     }
     yield* command("/usr/bin/codesign", ["--verify", "--deep", "--strict", bundle])
-    yield* command("/usr/bin/xcrun", ["stapler", "validate", bundle])
+    yield* appleCommand("/usr/bin/xcrun", "stapler", "validate", bundle)
     yield* command("/usr/sbin/spctl", ["--assess", "--type", "execute", "--verbose", bundle])
   }
   yield* fs.writeFileString(join(output, "result.json"), yield* Schema.encode(Schema.parseJson(Evidence))({ installedVersion: versions[3], preparedRecordRetired: true, helperRetired: true, transactionRetired: true, scriptInstallation: true }))

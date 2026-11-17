@@ -19,6 +19,7 @@ import { FSM } from "@magnitudedev/utils";
 import {
   Cause,
   Context,
+  Data,
   Deferred,
   Duration,
   Effect,
@@ -42,6 +43,9 @@ import {
 import { acnSubscriptionProtocol } from "./acn-jit/acn-subscription-protocol";
 import { isInterruptedExit, makeRecoveringProtocol } from "./jit-rpc";
 import { MAGNITUDE_SERVICE_ORIGIN } from "@magnitudedev/acn-protocol";
+
+class HealthUnanswered extends Data.TaggedError("HealthUnanswered") {}
+const UNANSWERED_HEALTH_RETRIES = 2;
 
 export const ServiceInfoSchema = Schema.Struct({
   id: AcnInstanceIdSchema,
@@ -95,6 +99,12 @@ export const MagnitudeClient = Object.assign(
 export interface ClientOptions {
   readonly origin?: string;
   readonly connectTimeout?: Duration.DurationInput;
+  /**
+   * Who reconnects after a connection fails. "Automatic" (the default) lets any request or
+   * subscription reach the service again; "OnConnect" keeps a failed connection failed, without
+   * network traffic, until `connection.connect` is called, so the host decides when to retry.
+   */
+  readonly reconnect?: "Automatic" | "OnConnect";
 }
 export function clientLayer(
   options: ClientOptions & { readonly autoStart: false }
@@ -172,13 +182,13 @@ const makeClient = (
     type ObservedHealth = typeof AcnHealthResponseSchema.Type & {
       readonly rpcVersion: number;
     };
-    const probe: Effect.Effect<ObservedHealth, ConnectionError> = http.get(`${origin}/health`).pipe(
+    const probeOnce: Effect.Effect<ObservedHealth, ConnectionError | HealthUnanswered> = http.get(`${origin}/health`).pipe(
       Effect.timeoutFail({
         duration: "2 seconds",
-        onTimeout: () => unavailable("Magnitude service health timed out"),
+        onTimeout: () => new HealthUnanswered(),
       }),
       Effect.mapError((error) =>
-        error instanceof ServiceUnavailable
+        error instanceof HealthUnanswered
           ? error
           : unavailable("Magnitude service is unavailable")
       ),
@@ -204,6 +214,17 @@ const makeClient = (
                   })
               )
             )
+      )
+    );
+    // A service that accepted the request but did not answer in time is busy, not absent, so one
+    // slow answer is asked again before the service is reported unavailable.
+    const probe: Effect.Effect<ObservedHealth, ConnectionError> = probeOnce.pipe(
+      Effect.retry({
+        times: UNANSWERED_HEALTH_RETRIES,
+        while: (error) => error instanceof HealthUnanswered,
+      }),
+      Effect.catchTag("HealthUnanswered", () =>
+        Effect.fail(unavailable("Magnitude service health timed out"))
       )
     );
     const report = (activity: typeof ServiceStartProgressSchema.Type) =>
@@ -302,7 +323,8 @@ const makeClient = (
     );
 
     const select = (
-      failedId?: string
+      failedId?: string,
+      requested = false
     ): Effect.Effect<ServiceInfo, ConnectionError> =>
       Effect.flatten(
         admission
@@ -316,6 +338,8 @@ const makeClient = (
               )
                 return Effect.succeed(current.service);
               if (active !== undefined) return Deferred.await(active);
+              if (current._tag === "Failed" && !requested && options.reconnect === "OnConnect")
+                return Effect.fail(current.error);
               const pending = yield* Deferred.make<
                 ServiceInfo,
                 ConnectionError
@@ -423,7 +447,7 @@ const makeClient = (
         ...mapped.connection,
         state: SubscriptionRef.get(state),
         changes: state.changes,
-        connect: select().pipe(Effect.asVoid),
+        connect: select(undefined, true).pipe(Effect.asVoid),
       },
     });
   });

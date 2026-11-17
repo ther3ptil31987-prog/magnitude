@@ -28,15 +28,18 @@ mod command;
 mod compile;
 mod emit;
 mod executor;
+mod library;
 pub mod model;
 mod numeric;
 mod open;
 mod profile;
 mod registry;
 mod services;
+pub mod toolchain;
+pub mod topology;
 mod workers;
 
-pub use buffer::Buffer;
+pub use buffer::{Buffer, WritableBuffer};
 pub use command::CompiledKernel;
 pub use compile::NativeCandidate;
 pub use executor::{Device, Executor};
@@ -112,6 +115,10 @@ impl seismic_native_target::TargetFamily for Cpu {
     type NativeProperties = ();
 }
 
+/// The programs of an opened CPU device: the one way this backend forms a
+/// program ([`seismic_native_target::Programs`]).
+pub type CpuPrograms = std::sync::Arc<dyn seismic_native_target::Programs<toolchain::CpuToolchain>>;
+
 pub struct CpuNativeCompiler;
 static CPU_NATIVE_COMPILER: CpuNativeCompiler = CpuNativeCompiler;
 
@@ -120,17 +127,17 @@ pub fn native_compiler() -> &'static CpuNativeCompiler {
 }
 
 impl seismic_native_target::NativeCompiler<Cpu> for CpuNativeCompiler {
-    type Context = ();
+    type Context = CpuPrograms;
     type Candidate = NativeCandidate;
     type Handle = CompiledKernel;
     fn form(
         &self,
-        _context: &Self::Context,
+        programs: &Self::Context,
         target: &DeviceDescription<Cpu>,
         kernel: &seismic_ir::kernel::Kernel<Cpu>,
         layout: &seismic_ir::physical_target::KernelEmissionLayout,
     ) -> Result<Self::Candidate, NativeCompilationError> {
-        compile::compile_kernel(target, kernel, layout)
+        compile::compile_kernel(programs, target, kernel, layout)
     }
     fn reflect(
         &self,
@@ -194,5 +201,7 @@ impl seismic_ir::identity::CanonicalIdentity for CpuLaunchMode {
     }
 }
 
+#[cfg(test)]
+mod code_tests;
 #[cfg(test)]
 mod plane_tests;

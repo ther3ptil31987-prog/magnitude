@@ -15,6 +15,9 @@ pub(crate) struct VulkanFeatures {
     pub(crate) float16: bool,
     /// Subgroup 16x16x16 cooperative matrix, f16->f32 and s8->s32.
     pub(crate) matrix: bool,
+    /// The device has cooperative matrices, formed or not
+    /// (`SEISMIC_HAS_MATRIX_HARDWARE`): only the machine line's probe reads it.
+    pub(crate) matrix_hardware: bool,
     /// Accumulator arrays of more than 4 matrix fragments compile correctly.
     pub(crate) wide_accumulators: bool,
     /// Mixed-signedness packed 4x8 dot product is accelerated.
@@ -25,11 +28,12 @@ pub(crate) struct VulkanFeatures {
 
 impl VulkanFeatures {
     /// The features a device with `facts` exposes.
-    pub(crate) fn of(facts: &seismic_vulkan::FormationFacts) -> Self {
+    pub(crate) fn of(facts: &seismic_vulkan::FormationTarget) -> Self {
         Self {
             subgroup_lanes: facts.subgroup_lanes,
             float16: facts.float16,
             matrix: facts.matrix,
+            matrix_hardware: facts.matrix_hardware,
             wide_accumulators: facts.wide_accumulators,
             mixed_dot: facts.mixed_dot,
             f32_atomic_add: facts.f32_atomic_add,
@@ -82,7 +86,7 @@ pub(crate) fn shared_footprint(shared_bytes: u64) -> u64 {
 const PRELUDE: &str = include_str!("../vulkan_prelude.glsl");
 
 /// Extensions every Vulkan source enables: the device floor's.
-const EXTENSIONS: [&str; 21] = [
+const EXTENSIONS: [&str; 22] = [
     "GL_GOOGLE_cpp_style_line_directive",
     "GL_EXT_buffer_reference",
     "GL_EXT_buffer_reference2",
@@ -104,6 +108,7 @@ const EXTENSIONS: [&str; 21] = [
     "GL_KHR_shader_subgroup_clustered",
     "GL_KHR_shader_subgroup_quad",
     "GL_EXT_shader_subgroup_extended_types_int8",
+    "GL_EXT_shader_atomic_int64",
 ];
 
 /// `#version`, the extensions, the device feature macros and the prelude.
@@ -114,9 +119,8 @@ pub(super) fn header(features: VulkanFeatures) -> String {
             features.float16,
             "GL_EXT_shader_subgroup_extended_types_float16",
         ),
-        (features.matrix, "GL_KHR_cooperative_matrix"),
+        (features.matrix || features.matrix_hardware, "GL_KHR_cooperative_matrix"),
         (features.f32_atomic_add, "GL_EXT_shader_atomic_float"),
-        (features.shared_int64_atomics, "GL_EXT_shader_atomic_int64"),
     ];
     for extension in EXTENSIONS
         .iter()
@@ -131,6 +135,7 @@ pub(super) fn header(features: VulkanFeatures) -> String {
     for (name, on) in [
         ("FLOAT16", features.float16),
         ("MATRIX", features.matrix),
+        ("MATRIX_HARDWARE", features.matrix_hardware),
         ("WIDE_ACCUMULATORS", features.wide_accumulators),
         ("MIXED_DOT", features.mixed_dot),
         ("F32_ATOMIC_ADD", features.f32_atomic_add),
@@ -143,15 +148,21 @@ pub(super) fn header(features: VulkanFeatures) -> String {
 }
 
 /// The argument block (buffer addresses, the scalar-result address, then
-/// the words: there is no words buffer), read-only flags, workgroup size and
-/// group-memory views of a source with `buffers` buffers.
-pub(super) fn tail(buffers: usize, read_only: impl Iterator<Item = bool>) -> String {
+/// the words: there is no words buffer), read-only flags and workgroup size
+/// of a source with one buffer per `absent` flag, each absent one's address
+/// 0 (`super::addresses`).
+pub(super) fn tail(read_only: impl Iterator<Item = bool>, absent: &[bool]) -> String {
+    let buffers = absent.len();
     let mut tail = format!("#define SEISMIC_BUFFER_SCALAR_RESULTS {buffers}\n");
     tail.push_str(
         "layout(push_constant, scalar) uniform seismic_push_t { uint64_t seismic_arguments; };\n\
-         layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer seismic_argument_block_t { uint64_t w[]; };\n\
-         #define SEISMIC_PTR(index) (seismic_argument_block_t(seismic_arguments).w[index])\n",
+         layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer seismic_argument_block_t { uint64_t w[]; };\n",
     );
+    tail.push_str(&super::addresses(
+        absent,
+        |index| format!("(seismic_argument_block_t(seismic_arguments).w[{index}])"),
+        |_| "0ul".to_owned(),
+    ));
     tail.push_str(&format!(
         "#define SEISMIC_SCALAR_RESULTS (seismic_argument_block_t(seismic_arguments).w[{buffers}])\n\
          #define seismic_words (seismic_argument_block_t(seismic_arguments + {}ul).w)\n",
@@ -162,15 +173,23 @@ pub(super) fn tail(buffers: usize, read_only: impl Iterator<Item = bool>) -> Str
         tail.push_str(&format!("#define SEISMIC_READONLY_{index} {read_only}\n"));
     }
     tail.push_str("layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;\n");
+    tail
+}
+
+/// The group-memory views (`SHARED_VIEWS`), declared before the
+/// representations and conversions, whose code reads them (a conversion's
+/// `_SHARED` functions).
+pub(super) fn shared_views() -> String {
+    let mut views = String::new();
     for (ordinal, (name, ty, bytes)) in SHARED_VIEWS.iter().enumerate() {
         let lower = name.to_ascii_lowercase();
-        tail.push_str(&format!(
+        views.push_str(&format!(
             "layout(constant_id = {}) const uint SEISMIC_SHARED_{name} = {}u;\nshared seismic_shared_{lower}_t {{ {ty} seismic_shared_{lower}[SEISMIC_SHARED_{name}]; }};\n",
             SHARED_VIEW_CONSTANT + ordinal,
             SHARED_DEFAULT_BYTES / bytes
         ));
     }
-    tail
+    views
 }
 
 /// The group-memory region the compiler sees before specialization: the
@@ -189,7 +208,9 @@ pub(super) const SUFFIX: &str = "\nvoid main() {\n    SEISMIC_KERNEL();\n}\n";
 #[cfg(all(test, not(target_os = "macos")))]
 mod tests {
     use super::*;
-    use seismic_native_target::{ProgramEntry, ProgramSource, Toolchain};
+    use crate::artifacts::ProgramStore;
+    use crate::formation::ProgramFormer;
+    use seismic_native_target::{ProgramEntry, ProgramSource};
     use seismic_vulkan::direct::{DirectBatch, DirectLaunch};
     use seismic_vulkan::toolchain::VulkanToolchain;
 
@@ -243,30 +264,31 @@ void main() {
             eprintln!("no Vulkan GPU meets the floor");
             return;
         };
-        let device = seismic_vulkan::Device::open(description.facts.uuid).expect("device opens");
+        let stores = crate::backends::vulkan::test_stores(&description.facts);
+        let own = stores.host.own();
+        let device = seismic_vulkan::Device::open(description.facts.uuid, stores, &Default::default()).expect("device opens");
         let features = VulkanFeatures {
-            subgroup_lanes: device.facts().subgroup_width().lanes(),
-            float16: device.facts().float16,
+            subgroup_lanes: device.formation().subgroup_lanes,
+            float16: device.formation().float16,
             matrix: false,
+            matrix_hardware: false,
             wide_accumulators: false,
             mixed_dot: false,
             f32_atomic_add: false,
             shared_int64_atomics: false,
         };
         let source = format!("{}{KERNEL}", header(features));
-        let module = VulkanToolchain::new(device.clone())
-            .compile(
-                &ProgramSource {
-                    text: source,
-                    entries: vec![ProgramEntry {
-                        symbol: "numerics".into(),
-                        group_size: Some([64, 1, 1]),
-                        constants: Vec::new(),
-                    }],
-                },
-                None,
-            )
-            .expect("the numerics kernel forms");
+        let former = ProgramFormer::new(VulkanToolchain::new(device.clone()), ProgramStore::user());
+        let source = ProgramSource {
+            text: source,
+            entries: vec![ProgramEntry {
+                symbol: "numerics".into(),
+                group_size: Some([64, 1, 1]),
+                constants: Vec::new(),
+            }],
+        };
+        let formed = former.form(std::slice::from_ref(&source)).expect("the numerics kernel forms");
+        let (module, _) = formed[0].program(&source.entries[0]);
 
         let specials = [
             0.0f32,
@@ -330,17 +352,18 @@ void main() {
             }
         }
         let total = bytes.len() + cases.len() * 16;
-        let data = device.allocate(total as u64, 256).expect("allocation");
+        let data = device.allocate(total as u64, 256, &own).expect("allocation");
         device.write(&data, 0, &bytes).expect("upload");
         let mut batch = DirectBatch::new(&device).expect("batch");
         batch
             .launch(&DirectLaunch {
-                module: &module,
+                module,
                 function: 0,
                 buffers: &[],
                 words: &[],
-                scalar_results: (&data, 0),
+                scalar_results: Some((&data, 0)),
                 groups: [u64::from(count.div_ceil(64)), 1, 1],
+                grid: None,
             })
             .expect("launch");
         batch
@@ -354,7 +377,7 @@ void main() {
         // Without `DenormPreserve 32` the driver's default applies (NVIDIA:
         // flush to zero, §7.3): `fma` with a subnormal operand or result is
         // then outside the oracle. The integer paths preserve subnormals.
-        let flushes = !device.facts().denorm_preserve_32;
+        let flushes = !device.properties().denorm_preserve_32.holds();
         let subnormal = |value: f32| value.is_subnormal();
         let mut failures = Vec::new();
         for (index, (a, b, c)) in cases.iter().enumerate() {
@@ -443,30 +466,31 @@ void main() {
             eprintln!("no Vulkan GPU meets the floor");
             return;
         };
-        let device = seismic_vulkan::Device::open(description.facts.uuid).expect("device opens");
+        let stores = crate::backends::vulkan::test_stores(&description.facts);
+        let own = stores.host.own();
+        let device = seismic_vulkan::Device::open(description.facts.uuid, stores, &Default::default()).expect("device opens");
         let features = VulkanFeatures {
-            subgroup_lanes: device.facts().subgroup_width().lanes(),
+            subgroup_lanes: device.formation().subgroup_lanes,
             float16: false,
             matrix: false,
+            matrix_hardware: false,
             wide_accumulators: false,
             mixed_dot: false,
             f32_atomic_add: false,
             shared_int64_atomics: false,
         };
         let source = format!("{}{HALVES}", header(features));
-        let module = VulkanToolchain::new(device.clone())
-            .compile(
-                &ProgramSource {
-                    text: source,
-                    entries: vec![ProgramEntry {
-                        symbol: "halves".into(),
-                        group_size: Some([64, 1, 1]),
-                        constants: Vec::new(),
-                    }],
-                },
-                None,
-            )
-            .expect("the conversion kernel forms");
+        let former = ProgramFormer::new(VulkanToolchain::new(device.clone()), ProgramStore::user());
+        let source = ProgramSource {
+            text: source,
+            entries: vec![ProgramEntry {
+                symbol: "halves".into(),
+                group_size: Some([64, 1, 1]),
+                constants: Vec::new(),
+            }],
+        };
+        let formed = former.form(std::slice::from_ref(&source)).expect("the conversion kernel forms");
+        let (module, _) = formed[0].program(&source.entries[0]);
 
         let mut inputs = Vec::new();
         for half in 0..=u16::MAX {
@@ -500,17 +524,18 @@ void main() {
             bytes.extend_from_slice(&input.to_le_bytes());
         }
         let total = bytes.len() + inputs.len() * 8;
-        let data = device.allocate(total as u64, 256).expect("allocation");
+        let data = device.allocate(total as u64, 256, &own).expect("allocation");
         device.write(&data, 0, &bytes).expect("upload");
         let mut batch = DirectBatch::new(&device).expect("batch");
         batch
             .launch(&DirectLaunch {
-                module: &module,
+                module,
                 function: 0,
                 buffers: &[],
                 words: &[],
-                scalar_results: (&data, 0),
+                scalar_results: Some((&data, 0)),
                 groups: [u64::from(count.div_ceil(64)), 1, 1],
+                grid: None,
             })
             .expect("launch");
         batch

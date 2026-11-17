@@ -4,12 +4,12 @@
 //! three-stage erf-GELU adapter to the decoder width.
 
 use crate::{invalid, product, Error};
-use magnitude_artifacts::gguf::{Directory, Scalar, Value};
-use magnitude_family_common::{rotary, Tensors};
+use magnitude_artifacts::gguf::{Directory, Element, PROJECTOR_ARCHITECTURE, Scalar, Value};
+use magnitude_family_common::{architecture_keys, array_elements, projector_type, rotary, Tensors};
 use magnitude_family_contracts::{
     ActivationDType, CellReduction, ImportTransform, MergerStage, PositionSampling,
     VisionActivation, VisionAttention, VisionAttentionScale, VisionAttentionSpan, VisionBlock,
-    VisionDescription, VisionFeedForward, VisionLinear, VisionMerger, VisionNorm,
+    VisionDescription, VisionFeedForward, VisionLinear, VisionMerger, VisionNorm, VisionOperator,
     VisionPositions, VisionPreprocessing, VisionResampling, VisionResize, VisionStem, VisionUp,
 };
 
@@ -60,10 +60,10 @@ fn number(directory: &Directory, key: &str) -> Result<f64, Error> {
 
 fn triple(directory: &Directory, key: &str) -> Result<[f64; 3], Error> {
     let values = match directory.value(key) {
-        Some(Value::Array(values)) if values.len() == 3 => values
+        Some(Value::Array(values)) if values.len() == 3 => array_elements(key, values)?
             .iter()
             .map(|value| match value {
-                Scalar::Float(value) if value.is_finite() => Some(*value),
+                Element::Float(value) if value.is_finite() => Some(value),
                 _ => None,
             })
             .collect::<Option<Vec<_>>>(),
@@ -81,23 +81,14 @@ pub fn describe_projector(
     output_hidden: u64,
     feature_epsilon: f64,
 ) -> Result<VisionDescription, Error> {
-    if directory.value("general.architecture").and_then(Value::string) != Some("clip")
-        || directory.value("general.type").and_then(Value::string) != Some("mmproj")
-        || directory.value("clip.has_vision_encoder")
-            != Some(&Value::Scalar(Scalar::Bool(true)))
-        || directory.value("clip.projector_type").and_then(Value::string)
-            != Some("muse-glimmer")
+    projector_type(directory, &[("muse-glimmer", ())], output_hidden)?;
+    if let Some((_, entry)) = architecture_keys(directory, PROJECTOR_ARCHITECTURE)
+        .find(|(_, entry)| !KEYS.contains(&entry.name.as_str()))
     {
-        return Err(invalid("unsupported Muse Glimmer projector identity"));
-    }
-    if let Some(entry) = directory.metadata.iter().find(|entry| {
-        !entry.name.starts_with("general.") && !KEYS.contains(&entry.name.as_str())
-    }) {
         return Err(invalid(format!("unknown metadata {:?}", entry.name)));
     }
-    if unsigned(directory, "clip.vision.projection_dim")? != output_hidden {
-        return Err(invalid("projector width differs from the decoder width"));
-    }
+    // Declared, and the target's (`projector_type`).
+    unsigned(directory, "clip.vision.projection_dim")?;
     let hidden = unsigned(directory, "clip.vision.embedding_length")?;
     let intermediate = unsigned(directory, "clip.vision.feed_forward_length")?;
     let depth = unsigned(directory, "clip.vision.block_count")?;
@@ -152,9 +143,10 @@ pub fn describe_projector(
         let p = format!("v.blk.{index}.");
         let global = index + 1 == depth || (index + 1) % GLOBAL_PERIOD == 0;
         blocks.push(VisionBlock {
-            attention_norm: layer_norm(&mut t, &format!("{p}ln1"))?,
-            attention: VisionAttention {
+            operator_norm: layer_norm(&mut t, &format!("{p}ln1"))?,
+            operator: VisionOperator::Attention(VisionAttention {
                 heads,
+                kv_heads: heads,
                 width,
                 query: linear(&mut t, &format!("{p}attn_q"), hidden, hidden, rotary.clone())?,
                 key: linear(&mut t, &format!("{p}attn_k"), hidden, hidden, rotary.clone())?,
@@ -162,7 +154,7 @@ pub fn describe_projector(
                 query_norm: None,
                 key_norm: None,
                 value_norm: None,
-                rotary_base: ROTARY_BASE,
+                rotary_base: Some(ROTARY_BASE),
                 scale: VisionAttentionScale::InverseSqrtWidth,
                 span: if global {
                     VisionAttentionSpan::Full
@@ -170,8 +162,8 @@ pub fn describe_projector(
                     VisionAttentionSpan::Window
                 },
                 output: linear(&mut t, &format!("{p}attn_out"), hidden, hidden, Vec::new())?,
-            },
-            attention_post_norm: None,
+            }),
+            operator_post_norm: None,
             feedforward_norm: layer_norm(&mut t, &format!("{p}ln2"))?,
             feedforward: VisionFeedForward {
                 up: VisionUp::Plain(linear(
@@ -191,6 +183,7 @@ pub fn describe_projector(
     let adapter = t.rows("mm.0.weight")?;
     let mut stage = |name: &str, outputs, inputs, activation| {
         Ok::<_, Error>(MergerStage {
+            norm: None,
             linear: VisionLinear {
                 weight: t.bind(name, &[outputs, inputs])?,
                 bias: None,
@@ -226,11 +219,12 @@ pub fn describe_projector(
         stem: VisionStem::Patch {
             frames: vec![frame],
             bias: None,
-            positions: VisionPositions {
+            positions: Some(VisionPositions {
                 table,
                 sampling: PositionSampling::PixelCenters { side },
-            },
+            }),
             norm: Some(pre_norm),
+            registers: None,
         },
         window: Some(side),
         blocks,
@@ -240,6 +234,7 @@ pub fn describe_projector(
             standardize: None,
             projection_norm: None,
             stages,
+            feed_forward: None,
             output_norm: Some(VisionNorm::Rms {
                 weight: None,
                 epsilon: feature_epsilon,

@@ -2,6 +2,8 @@ use seismic_build::{BackendName, NativeCoverage};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+include!("tests/gguf_formats/widths.rs");
+
 /// Every entry is implemented on each of these backends, one asset per
 /// backend at `kernels/<backend>/<entry>.<extension>`, apart from
 /// `ENTRY_EXCEPTIONS`.
@@ -20,8 +22,8 @@ const BACKENDS: [BackendName; 4] = [
 const ENTRY_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
     (
         "routed_route_shared",
-        &[BackendName::Metal],
-        "decode routing that also expands the shared expert in the router launch; the other backends run `routed_route`, then `routed_expand`, until the form is measured there",
+        &[BackendName::Metal, BackendName::Cuda, BackendName::Vulkan],
+        "decode routing that also expands the shared expert, the decode form of the backends that stream decode; the other backends run `routed_route`, then `routed_expand`",
     ),
     (
         "gated_delta_project_convolved",
@@ -32,7 +34,13 @@ const ENTRY_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "gated_delta_step_convolved",
         &[BackendName::Metal],
         "the convolved recurrent decode form's step over the projection's convolved channels; the other backends convolve in `gated_delta_step`",
-    ),    (
+    ),
+    (
+        "packing_bound",
+        &[BackendName::Metal],
+        "a weight's packing bound, which only Metal's token-packing projection forms read",
+    ),
+    (
         "readout_top_rows",
         &[BackendName::Metal, BackendName::Cuda],
         "level one of the progressive head's certified selection (decode rows)",
@@ -54,17 +62,66 @@ const ENTRY_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
     ),
 ];
 
+/// Expert streaming's entries (routed.seismic's streaming section), on the
+/// backends that stream (`STREAMING_BACKENDS`): the CPU backend streams no
+/// experts.
+const STREAMING_ENTRIES: &[&str] = &[
+    "routed_route_streamed",
+    "routed_hint_route",
+    "routed_select_streamed",
+    "routed_hint_select",
+    "routed_land",
+    "routed_site_request",
+    "routed_down_project",
+    "routed_down_sited",
+    "routed_output_project",
+    "routed_output_sited",
+    "routed_step",
+    "routed_scratch_request",
+    "routed_round",
+    "routed_scratch_grids",
+    "routed_copy",
+    "routed_list_grid",
+    "routed_pass_map",
+    "routed_seed_commit",
+];
+
+const STREAMING_BACKENDS: &[BackendName] =
+    &[BackendName::Metal, BackendName::Cuda, BackendName::Vulkan];
+
+/// Every entry exception: `ENTRY_EXCEPTIONS`, then `STREAMING_ENTRIES`.
+fn entry_exceptions() -> impl Iterator<Item = (&'static str, &'static [BackendName], &'static str)>
+{
+    let streaming = "expert streaming's entry, on the backends that stream";
+    ENTRY_EXCEPTIONS.iter().copied().chain(
+        STREAMING_ENTRIES
+            .iter()
+            .map(move |&entry| (entry, STREAMING_BACKENDS, streaming)),
+    )
+}
+
 /// Files of the per-backend trees that exist on only some backends: (path
 /// relative to `kernels/<backend>/`, without extension; the backends that have
 /// it; why). Every other file — entry asset or library file, at any depth —
-/// exists on all of `BACKENDS`. An exception whose actual presence differs,
+/// exists on all of `BACKENDS`, apart from `STREAMING_LIBRARIES` and the
+/// assets of `entry_exceptions`. An exception whose actual presence differs,
 /// including one now on every backend, fails the build so this list cannot go
 /// stale.
 const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
     (
+        "lib/routed/resolve",
+        &[BackendName::Cuda],
+        "the streamed routes' resolve over their bank ports is separate from CUDA's streaming shim so the other streaming entries bind none of them",
+    ),
+    (
         "lib/attention/inputs",
         &[BackendName::Cuda],
         "query and visibility ABI macros are separate from CUDA shared attention helpers so cache-publication entries bind only K/V state inputs",
+    ),
+    (
+        "lib/projection/join",
+        &[BackendName::Cuda, BackendName::Vulkan],
+        "the residual and stream joins are separate from the projection header (CUDA's requires an activation element; Vulkan's binds weight packets), so `stream_join` (which binds neither) joins through the same code; Metal keeps them in `projection.h`",
     ),
     (
         "lib/attention/decode_merge",
@@ -77,14 +134,39 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "prefill attention body (CUDA tensor-core flash, Vulkan tiled); Metal keeps its prefill in `attention.h`",
     ),
     (
+        "lib/attention/vector",
+        &[BackendName::Vulkan],
+        "the vector attention body shared by the decode entry and the prefill entry's vector form, apart from `attention.glsl` so the K8/V4 entries, which bind other history ports, include none of it; Metal and CUDA keep their vector decode in their entries",
+    ),
+    (
+        "lib/core/matrix",
+        &[BackendName::Vulkan],
+        "cooperative-matrix fragment types and the one zero accumulator every Vulkan matrix body clears with",
+    ),
+    (
         "lib/attention/flash",
         &[BackendName::Vulkan],
         "cooperative-matrix tile pieces shared by the prefill and vision attention bodies",
     ),
     (
+        "lib/projection/operator",
+        &[BackendName::Metal, BackendName::Cuda, BackendName::Vulkan],
+        "the `dense` projection's form bodies (`dense.seismic`), which the GPU entries take; the CPU takes its `quantized` projection from `cpu/lib/projection`",
+    ),
+    (
+        "lib/routed/decode",
+        &[BackendName::Cuda],
+        "the routed decode GEMVs' block shape, shared by the routed entries and the per-row gathered `gather_choice` launches, apart from `routed.cuh` so a dense entry binds none of its routed state; Metal and Vulkan size their decode blocks in the routed bodies themselves",
+    ),
+    (
+        "lib/projection/planes",
+        &[BackendName::Cuda],
+        "the `dense` projection's `planes` form (`dense.seismic`), the progressive readout's plane-set GEMV, which only CUDA serves as its own form; Metal projects a plane set through its GEMVs' packets (`gemv.h`)",
+    ),
+    (
         "lib/core/arrive",
-        &[BackendName::Metal],
-        "last-threadgroup arrival over `sync` scratch; only Metal natives declare sync scratch so far",
+        &[BackendName::Metal, BackendName::Cuda, BackendName::Cpu],
+        "last-work-item arrival over `sync` scratch, for the natives that declare sync scratch",
     ),
     (
         "lib/core/gumbel",
@@ -92,9 +174,19 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "the sampler's Gumbel noise, shared by `sample_rows` and the certified selection's bounds",
     ),
     (
+        "lib/indexer/indexer",
+        &[BackendName::Metal, BackendName::Cuda, BackendName::Vulkan],
+        "the general indexer's lane helpers (Metal: the simdgroup head preparation and threadgroup scan; CUDA and Vulkan: the span walk, the head norm, rotation and scans in `head`, `rotary` and `reduce`), shared by `indexer_keys`, `indexer_score`, `rows_topk`, `candidate_rows` and `pool_rows`; the CPU's are `lib/core/spans`",
+    ),
+    (
         "lib/readout/progressive",
         &[BackendName::Metal, BackendName::Cuda],
         "the progressive head's plane decoding and certified levels",
+    ),
+    (
+        "lib/core/staging",
+        &[BackendName::Vulkan],
+        "the power-of-two exponent Vulkan stages F32 and BF16 matrix operands in F16 by (projection and attention prefill); Metal and CUDA take their matrix operands in the activation element and stage nothing",
     ),
     (
         "lib/core/precise",
@@ -107,24 +199,39 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "the token-packing GEMM of the projection entries' PACK form, on simdgroup matrices",
     ),
     (
+        "lib/projection/gemv",
+        &[BackendName::Metal],
+        "the projection family's GEMV row classes, apart from `projection.h` so a library that runs no GEMV (a GEMM's, a batched GEMV's) compiles none of them: Metal compiles a launch's library whole",
+    ),
+    (
+        "lib/core/head",
+        &[BackendName::Metal, BackendName::Cuda, BackendName::Vulkan],
+        "a lane-held head row's RMS norm (Metal's simdgroup, CUDA's warp, Vulkan's logical subgroup), shared by attention, pooled rows and the indexers; the CPU's natives norm a row in their own work item",
+    ),
+    (
+        "lib/core/order",
+        &[BackendName::Metal, BackendName::Cuda, BackendName::Vulkan],
+        "the F32 order key (`ordered_key`) shared by the sampling shape, `rows_topk` and the progressive readout's values; the CPU's is `functions::ordered_key`, beside the functions it shares",
+    ),
+    (
+        "lib/core/streams",
+        &[BackendName::Metal, BackendName::Cuda, BackendName::Vulkan],
+        "the hyper-connection stream collapse shared by `stream_collapse` and `stream_mix_sinkhorn`; the CPU's is `functions::collapse`",
+    ),
+    (
+        "lib/core/spans",
+        &[BackendName::Cpu],
+        "the list spans' one predicate and row walk, shared by the CPU's attention, pooled-row, indexer and candidate entries; the GPU bodies keep theirs in `lib/indexer/indexer`, beside the lane helpers that walk them",
+    ),
+    (
+        "lib/core/flat",
+        &[BackendName::Cpu],
+        "the split of a launch's rows, flattened, into equal spans over the pool's participants, shared by the CPU's sampling and shaping entries; the GPU bodies split their rows by threadgroup",
+    ),
+    (
         "lib/core/rotary",
-        &[BackendName::Vulkan],
-        "rotary sin/cos shared by attention and vision; inside `attention.h` / `attention.cuh` elsewhere",
-    ),
-    (
-        "lib/routed/expert_gate",
-        &[BackendName::Vulkan],
-        "representation ladder of `expert_gate` (GLSL has no templates); Metal and CUDA bind it through `packets` slots",
-    ),
-    (
-        "lib/routed/expert_up",
-        &[BackendName::Vulkan],
-        "representation ladder of `expert_up` (GLSL has no templates); Metal and CUDA bind it through `packets` slots",
-    ),
-    (
-        "lib/routed/expert_down",
-        &[BackendName::Vulkan],
-        "representation ladder of `expert_down` (GLSL has no templates); Metal and CUDA bind it through `packets` slots",
+        &[BackendName::Metal, BackendName::Cuda, BackendName::Vulkan],
+        "rotary layouts and the lane rotation shared by attention, vision, the pooled rows and the indexers; the CPU rotates in `attention.rs`",
     ),
     (
         "lib/recurrent/convolution",
@@ -132,39 +239,128 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "the gated-delta convolution and window publication, apart from `recurrent.h` because the Metal-only `gated_delta_step_convolved` binds no window; the other backends keep them in their recurrent library",
     ),
     (
-        "lib/routed/router",
-        &[BackendName::Metal],
-        "decode router logits shared by the Metal route and select GEMVs over the projection GEMV body (any activation element, unlike `routed.h`); CUDA and Vulkan keep their router GEMVs inline",
+        "lib/recurrent/chunk",
+        &[BackendName::Metal, BackendName::Cuda, BackendName::Vulkan],
+        "the chunked delta-rule entries' common code, shared by `gated_delta_chunk` and `kimi_delta_chunk` (CUDA and Metal: the piece geometry and helpers beside each rule's WY form; Vulkan: both entries' launches); the CPU's chunk entries run the row-sequential advance of `lib/recurrent/recurrent`",
     ),
     (
-        "lib/routed/route",
+        "lib/routed/channels",
         &[BackendName::Metal],
-        "decode router threadgroups of the `routed_route` contract, shared by `routed_route` and the Metal-only `routed_route_shared`",
+        "the decode down projections over the projection GEMV body, shared by `down.h` and `output.h`, apart from `routed.h` so the expert GEMMs' libraries compile no GEMV; CUDA and Vulkan keep them in their down and output files",
+    ),
+    (
+        "lib/projection/segments",
+        &[BackendName::Vulkan],
+        "segmented projection weight and output configuration shared by `operator.glsl` and `ordered.glsl` so non-ordered entries bind no ordered tuning parameters",
+    ),
+    (
+        "lib/projection/ordered",
+        &[BackendName::Vulkan],
+        "the `dense` projection's ordered 8-lane GEMV and scalar-FMA GEMM bodies (`dense.seismic`), apart from `operator.glsl` so entries with no ordered segment bind none of their tuning parameters",
+    ),
+    (
+        "lib/routed/streamed",
+        &[BackendName::Vulkan],
+        "the streamed routes' resolve over their bank ports (`resolve.cuh`'s Vulkan counterpart), apart from Vulkan's streaming shim so the other streaming entries bind none of them",
     ),
 ];
 
+/// Expert streaming's library files, on the backends that stream
+/// (`STREAMING_BACKENDS`): (path as in `TREE_EXCEPTIONS`; why it is a file of
+/// its own). The CPU backend streams no experts and keeps the resident bodies
+/// these share inline in its entries.
+const STREAMING_LIBRARIES: &[(&str, &str)] = &[
+    (
+        "lib/routed/down",
+        "the general decode combine's projections, shared by `routed_down` and `routed_down_project`, apart from `routed.h` so the entries that include that bind none of the combine's ports",
+    ),
+    (
+        "lib/routed/down_sum",
+        "the general decode combine's slot-order sum, shared by `routed_down` and `routed_down_sited`, apart from the projections so the sited sum binds no weights",
+    ),
+    (
+        "lib/routed/output",
+        "the fused decode output's projections, shared by `routed_output` and `routed_output_project`, apart from `routed.h` so the entries that include that bind none of the combine's ports",
+    ),
+    (
+        "lib/routed/output_sum",
+        "the fused decode output's join, shared by `routed_output` and `routed_output_sited`, apart from the projections so the sited join binds no weights",
+    ),
+    (
+        "lib/routed/sited",
+        "the wait for the CPU's answer of the streamed decode sums, apart from them so the resident combines bind no answer port",
+    ),
+    (
+        "lib/routed/route",
+        "decode router threadgroups of the `routed_route` contract, shared by `routed_route`, `routed_route_shared` and `routed_route_streamed`",
+    ),
+    (
+        "lib/repack/repack",
+        "the GGUF -> resident tile conversion over a binding (templates; on Vulkan, macros), so `repack_weight` and the streaming convert hold one conversion each per tensor pair; the CPU keeps it in `repack_weight`",
+    ),
+    (
+        "lib/streaming/control",
+        "expert streaming's backend shim (system-coherent accesses, system-scope fences, barriers, the spin wait, byte copies) under the protocol the GPU backends share in `kernels/streaming/`, for the streaming entries",
+    ),
+    (
+        "lib/routed/selection",
+        "the decode launches' bodies of the `routed_select` contract, shared by `routed_select` and `routed_select_streamed`",
+    ),
+    (
+        "lib/streaming/window",
+        "expert streaming's windowed conversion of host-staged records over `lib/repack`, used by the landing launches",
+    ),
+    (
+        "lib/streaming/land",
+        "expert streaming's landing launch (`routed_land`, `routed_round`): the shared protocol `streaming/land.hpp` over the backend's window conversion",
+    ),
+];
+
+/// Every tree exception: `TREE_EXCEPTIONS`, then `STREAMING_LIBRARIES`.
+fn tree_exceptions() -> impl Iterator<Item = (&'static str, &'static [BackendName], &'static str)>
+{
+    TREE_EXCEPTIONS.iter().copied().chain(
+        STREAMING_LIBRARIES
+            .iter()
+            .map(|&(path, reason)| (path, STREAMING_BACKENDS, reason)),
+    )
+}
+
 fn main() {
-    let artifacts = seismic_build::Build::new("kernels")
-        .source("kernels")
-        // Keep newly introduced stage roots explicit so Cargo notices their
-        // first addition; the recursive directory source deduplicates them.
-        .source("kernels/draft.seismic")
-        .source("kernels/readout.seismic")
-        .source("kernels/vision.seismic")
-        .source("kernels/recurrent.seismic")
-        .source("kernels/short_conv.seismic")
-        .source("kernels/state_space.seismic")
-        .source("kernels/residual.seismic")
-        .source("kernels/functions.seismic")
+    // The one source is the `kernels` directory, which the build reruns on
+    // (`cargo:rerun-if-changed` of a directory watches every file under it,
+    // a new one included).
+    let mut build = seismic_build::Build::new("kernels").source("kernels");
+    // The machine's line probes (`line/`), a development measurement
+    // (`magnitude-engine`'s `machine-line` feature, which `magnitude-harness`
+    // and `magnitude-assess` enable): built only with this crate's
+    // `machine-line` feature, so no served engine carries them. They are a
+    // source root of their own, whose per-backend assets are optional by
+    // design (a backend whose forms multiply no such operand has none), so
+    // the parity of `kernels/` below does not cover them.
+    if std::env::var_os("CARGO_FEATURE_MACHINE_LINE").is_some() {
+        build = build.source("line");
+    }
+    let artifacts = build
         .run()
         .unwrap_or_else(|error| {
             panic!("checking engine Seismic sources and generating bindings failed: {error}")
         });
 
+    gguf_format_tests(&PathBuf::from(
+        std::env::var_os("OUT_DIR").expect("cargo sets OUT_DIR"),
+    ));
+
     let kernels = Path::new("kernels")
         .canonicalize()
         .expect("the kernels directory exists");
-    let mut violations = entry_parity(&kernels, &artifacts.natives);
+    let natives = artifacts
+        .natives
+        .iter()
+        .filter(|native| native.asset.starts_with(&kernels))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut violations = entry_parity(&kernels, &natives);
     violations.extend(tree_parity(&kernels));
     if !violations.is_empty() {
         panic!(
@@ -173,6 +369,112 @@ fn main() {
             violations.join("\n  - ")
         );
     }
+    let incoherent = metal_arrival_coherence(&kernels.join("metal"));
+    if !incoherent.is_empty() {
+        panic!(
+            "Metal arrival handoffs are not device-coherent ({} violations):\n  - {}",
+            incoherent.len(),
+            incoherent.join("\n  - ")
+        );
+    }
+}
+
+/// Writes `gguf_format_tests.rs`: the macro `gguf_format_tests!`, whose arm
+/// for a layout (`rows16; every: [..]; partial_block: [..]; own_storage:
+/// [..]`) expands to `mod gguf` with one module for each storage the
+/// registry converts GGUF formats into in that layout, holding one module
+/// for each such format, in ggml id order, a format under a scale grid
+/// named for it too (`gguf::q2g256::tq2_0`, `gguf::mxfp8g32::f8_e4m3_e8m0_32x32`,
+/// `gguf::fp8g128::f8_e4m3_f32_128x128`).
+/// A format's module has a test for each of the `every` functions, and for
+/// each `partial_block` function when whole blocks of it fill a
+/// `PARTIAL_BLOCK_WIDTHS` width (`partial_block_widths`). A storage's
+/// module has a test for each `own_storage` function, of its first format,
+/// when it is a rounded element (an element of another operand recipe
+/// shares its storage). Each test calls `crate::<function>(format)` with the
+/// format's `crate::Format`.
+fn gguf_format_tests(out: &Path) {
+    use magnitude_ggml::Encoding;
+    use seismic_lang::registry::{self, GgufScales, Grid, Layout, OperandRecipe};
+    let mut arms = String::new();
+    for layout in Layout::ALL {
+        // Each storage's modules, in the order its first format comes.
+        let mut storages: Vec<(String, String)> = Vec::new();
+        for (encoding, scales) in Encoding::ALL
+            .into_iter()
+            .flat_map(|encoding| GgufScales::ALL.map(|scales| (encoding, scales)))
+        {
+            let Some(source) = registry::gguf_packet_source(encoding, scales) else {
+                continue;
+            };
+            let packet = registry::external_packet(source).expect("a GGUF source is external storage");
+            let block = u64::from(packet.logical_group);
+            // Its modules' name, and its `GgufScales` expression: under its
+            // own scales its type's, under a grid its source's, which
+            // states the grid (`gguf_f8_e4m3_e8m0_32x32`: `f8_e4m3_e8m0_32x32`).
+            let (module, scales) = match scales {
+                GgufScales::Own => (
+                    encoding.ggml_name().to_ascii_lowercase(),
+                    "::seismic::GgufScales::Own".to_owned(),
+                ),
+                GgufScales::Grid(Grid { scale, tile: [rows, columns] }) => (
+                    registry::representation_info(source)
+                        .name
+                        .strip_prefix("gguf_")
+                        .expect("a GGUF source's name is `gguf_` and its own")
+                        .to_owned(),
+                    format!(
+                        "::seismic::GgufScales::Grid(::seismic::Grid {{ scale: ::seismic::GridScale::{scale:?}, tile: [{rows}, {columns}] }})"
+                    ),
+                ),
+            };
+            for operands in OperandRecipe::ALL {
+                let Some(element) = registry::conversion_destination(source, layout, operands)
+                else {
+                    continue;
+                };
+                let name = format!(
+                    "{}{}",
+                    registry::representation_info(element).representation,
+                    operands.suffix()
+                );
+                let index = storages
+                    .iter()
+                    .position(|(known, _)| *known == name)
+                    .unwrap_or_else(|| {
+                        let own = if operands == OperandRecipe::Rounded {
+                            format!(
+                                " crate::gguf_format_tests!(@tests {encoding:?} [{scales}] {operands:?}: $($own)*);"
+                            )
+                        } else {
+                            String::new()
+                        };
+                        storages.push((name, own));
+                        storages.len() - 1
+                    });
+                let mut tests = String::from("$($every)*");
+                if partial_block_widths(block as usize).next().is_some() {
+                    tests.push_str(" $($partial)*");
+                }
+                storages[index].1.push_str(&format!(
+                    " pub mod {module} {{ crate::gguf_format_tests!(@tests {encoding:?} [{scales}] {operands:?}: {tests}); }}"
+                ));
+            }
+        }
+        let modules: String = storages
+            .iter()
+            .map(|(name, body)| format!("            pub mod {name} {{{body} }}\n"))
+            .collect();
+        arms.push_str(&format!(
+            "    ({}; every: [$($every:ident)*]; partial_block: [$($partial:ident)*]; own_storage: [$($own:ident)*] $(;)?) => {{\n        mod gguf {{\n{modules}        }}\n    }};\n",
+            layout.as_str()
+        ));
+    }
+    let text = format!(
+        "/// Generated by `build.rs` (`gguf_format_tests`) from the registry.\nmacro_rules! gguf_format_tests {{\n{arms}    (@tests $encoding:ident [$scales:expr] $operands:ident: $($test:ident)*) => {{\n        $(\n            #[test]\n            fn $test() {{\n                crate::$test(crate::Format {{\n                    encoding: ::magnitude_ggml::Encoding::$encoding,\n                    scales: $scales,\n                    operands: ::seismic::OperandRecipe::$operands,\n                }});\n            }}\n        )*\n    }};\n}}\n"
+    );
+    std::fs::write(out.join("gguf_format_tests.rs"), text)
+        .unwrap_or_else(|error| panic!("writing gguf_format_tests.rs: {error}"));
 }
 
 const fn entry_extension(backend: BackendName) -> &'static str {
@@ -195,7 +497,8 @@ const fn library_extension(backend: BackendName) -> &'static str {
 
 /// Every entry with a native implementation has one on each of `BACKENDS`
 /// (on exactly its listed backends, for an `ENTRY_EXCEPTIONS` entry), at the
-/// path named after the entry.
+/// path named after the entry, and every file directly in a backend's tree
+/// is an entry's asset.
 fn entry_parity(kernels: &Path, natives: &[NativeCoverage]) -> Vec<String> {
     let mut by_entry = BTreeMap::<&str, BTreeMap<BackendName, &Path>>::new();
     for native in natives {
@@ -205,23 +508,33 @@ fn entry_parity(kernels: &Path, natives: &[NativeCoverage]) -> Vec<String> {
             .insert(native.backend, &native.asset);
     }
     let mut violations = Vec::new();
-    for (entry, _, _) in ENTRY_EXCEPTIONS {
+    for backend in BACKENDS {
+        let tree = kernels.join(backend.as_str());
+        let assets = std::fs::read_dir(&tree)
+            .unwrap_or_else(|error| panic!("reading {}: {error}", tree.display()));
+        for asset in assets {
+            let path = asset.expect("a kernel directory entry").path();
+            let entry = path.file_stem().and_then(|stem| stem.to_str());
+            if path.is_file() && !entry.is_some_and(|entry| by_entry.contains_key(entry)) {
+                violations.push(format!("`{}` is no entry's asset", relative(kernels, &path).display()));
+            }
+        }
+    }
+    for (entry, _, _) in entry_exceptions() {
         if !by_entry.contains_key(entry) {
             violations.push(format!(
-                "ENTRY_EXCEPTIONS lists `{entry}`, but no backend implements it; remove the exception"
+                "the entry exceptions list `{entry}`, but no backend implements it; remove the exception"
             ));
         }
     }
     for (entry, assets) in by_entry {
-        let exception = ENTRY_EXCEPTIONS
-            .iter()
-            .find(|(candidate, _, _)| *candidate == entry);
+        let exception = entry_exceptions().find(|(candidate, _, _)| *candidate == entry);
         if let Some((_, declared, _)) = exception {
             let declared = declared.iter().copied().collect::<BTreeSet<_>>();
             let actual = assets.keys().copied().collect::<BTreeSet<_>>();
             if declared != actual {
                 violations.push(format!(
-                    "ENTRY_EXCEPTIONS lists `{entry}` on {}, but it is implemented on {}; update or remove the exception",
+                    "the entry exceptions list `{entry}` on {}, but it is implemented on {}; update or remove the exception",
                     names(&declared),
                     names(&actual)
                 ));
@@ -256,7 +569,7 @@ fn entry_parity(kernels: &Path, natives: &[NativeCoverage]) -> Vec<String> {
 
 /// The per-backend trees `kernels/<backend>/` of `BACKENDS` hold the same
 /// files — entry assets and library files, at any depth — by relative path
-/// without extension, apart from `TREE_EXCEPTIONS`.
+/// without extension, apart from `tree_exceptions` and `entry_exceptions`.
 fn tree_parity(kernels: &Path) -> Vec<String> {
     let mut presence = BTreeMap::<String, BTreeSet<BackendName>>::new();
     let mut violations = Vec::new();
@@ -282,10 +595,9 @@ fn tree_parity(kernels: &Path) -> Vec<String> {
             presence.entry(stem).or_default().insert(backend);
         }
     }
-    let exceptions: BTreeMap<&str, (BTreeSet<BackendName>, &str)> = TREE_EXCEPTIONS
-        .iter()
-        .chain(ENTRY_EXCEPTIONS)
-        .map(|(stem, backends, reason)| (*stem, (backends.iter().copied().collect(), *reason)))
+    let exceptions: BTreeMap<&str, (BTreeSet<BackendName>, &str)> = tree_exceptions()
+        .chain(entry_exceptions())
+        .map(|(stem, backends, reason)| (stem, (backends.iter().copied().collect(), reason)))
         .collect();
     for (stem, backends) in &presence {
         let complete = backends.len() == BACKENDS.len();
@@ -297,7 +609,7 @@ fn tree_parity(kernels: &Path) -> Vec<String> {
                 names(&BACKENDS.iter().copied().filter(|backend| !backends.contains(backend)).collect())
             )),
             Some((declared, _)) if declared != backends => violations.push(format!(
-                "TREE_EXCEPTIONS lists `{stem}` on {}, but it exists on {}; update or remove the exception",
+                "`{stem}` is excepted on {}, but it exists on {}; update or remove the exception",
                 names(declared),
                 names(backends)
             )),
@@ -307,12 +619,112 @@ fn tree_parity(kernels: &Path) -> Vec<String> {
     for (stem, (declared, _)) in &exceptions {
         if !presence.contains_key(*stem) {
             violations.push(format!(
-                "TREE_EXCEPTIONS lists `{stem}` on {}, but no backend has it; remove the exception",
+                "`{stem}` is excepted on {}, but no backend has it; remove the exception",
                 names(declared)
             ));
         }
     }
     violations
+}
+
+/// A Metal kernel that counts arrivals over atomic scratch, so that the last
+/// of its threadgroups finishes the work (`arrive::last`), declares every
+/// other writable scratch buffer device-coherent (`arrive::coherent_device`):
+/// the last threadgroup's plain loads of another threadgroup's stores are
+/// otherwise served from a stale cache on M1 Max-class GPUs
+/// (`lib/core/arrive.h`). Read-only (`const`) scratch was written by an
+/// earlier launch and needs nothing, and so does the scratch of another
+/// launch of the entry that counts none.
+fn metal_arrival_coherence(metal: &Path) -> Vec<String> {
+    let mut violations = Vec::new();
+    let entries = std::fs::read_dir(metal)
+        .unwrap_or_else(|error| panic!("reading {}: {error}", metal.display()));
+    for entry in entries {
+        let path = entry.expect("a Metal kernel directory entry").path();
+        if path.extension().and_then(|value| value.to_str()) != Some("metal") {
+            continue;
+        }
+        let mut seen = BTreeSet::new();
+        let text = expand_includes(metal, &path, &mut seen);
+        let name = relative(metal, &path).display().to_string();
+        // Each kernel's parameters, from its `kernel` to the next one's.
+        for kernel in text.split("kernel void").skip(1) {
+            let declarations = scratch_declarations(kernel);
+            // A kernel that binds atomic scratch counts arrivals over it
+            // (the `sync` scratch of `arrive::last`).
+            if !declarations
+                .iter()
+                .any(|declaration| declaration.contains("atomic_"))
+            {
+                continue;
+            }
+            for declaration in declarations {
+                let coherent = declaration.contains("coherent");
+                let atomic = declaration.contains("atomic_");
+                let read_only = declaration.contains("const ");
+                if !(coherent || atomic || read_only) {
+                    violations.push(format!(
+                        "`metal/{name}` hands work to its last-arriving threadgroup but declares writable scratch `{}` without `arrive::coherent_device` (lib/core/arrive.h)",
+                        declaration.split_whitespace().collect::<Vec<_>>().join(" ")
+                    ));
+                }
+            }
+        }
+    }
+    violations
+}
+
+/// `path`'s text with each local `#include "..."` replaced by the included
+/// file's (relative to the including file, else to the Metal root), each file
+/// once.
+fn expand_includes(metal: &Path, path: &Path, seen: &mut BTreeSet<PathBuf>) -> String {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if !seen.insert(path.clone()) {
+        return String::new();
+    }
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()));
+    let mut expanded = String::new();
+    for line in text.lines() {
+        let included = line
+            .trim_start()
+            .strip_prefix("#include \"")
+            .and_then(|rest| rest.split('"').next());
+        match included {
+            Some(name) => {
+                let beside = path.parent().map(|parent| parent.join(name));
+                let file = beside
+                    .filter(|candidate| candidate.exists())
+                    .unwrap_or_else(|| metal.join(name));
+                if file.exists() {
+                    expanded.push_str(&expand_includes(metal, &file, seen));
+                }
+            }
+            None => {
+                expanded.push_str(line);
+                expanded.push('\n');
+            }
+        }
+    }
+    expanded
+}
+
+/// The parameter declarations bound to scratch buffers
+/// (`[[buffer(SEISMIC_BUFFER_SCRATCH_...)]]`), from the preceding parameter
+/// separator.
+fn scratch_declarations(text: &str) -> Vec<String> {
+    let mut declarations = Vec::new();
+    let marker = "[[buffer(SEISMIC_BUFFER_SCRATCH_";
+    let mut from = 0;
+    while let Some(found) = text[from..].find(marker) {
+        let at = from + found;
+        let start = text[..at]
+            .rfind([',', '('])
+            .map_or(0, |position| position + 1);
+        declarations.push(text[start..at].replace('\\', " ").trim().to_owned());
+        from = at + marker.len();
+    }
+    declarations
 }
 
 /// Every file under `directory`, recursively. Each visited directory is a

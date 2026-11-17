@@ -8,6 +8,7 @@ import {
   OPENAI_COMPATIBLE_PACKAGE,
   defineConnector,
   jsonObject,
+  magnitudeSelection,
   readOr,
   removeJsoncPaths,
   updateJsonc,
@@ -66,8 +67,11 @@ export const makeOpenCodeConnector = (paths: HarnessConnectionPaths, baseUrl = O
   id: "opencode",
   name: "OpenCode",
   executable: "opencode",
+  versionArguments: ["--version"],
   skillInstallationTarget: "shared-agents",
   configurationFiles: openCodeConfigurationFiles(paths),
+  selectedModel: readOpenCodeConfiguration(paths).pipe(Effect.map((configuration) =>
+    magnitudeSelection(valueAt(configuration, ["model"]), "magnitude/"))),
   connect: (spec) => Effect.gen(function* () {
     const source = yield* readOr(paths.opencode, "{}\n")
     const previous = valueAt(yield* readOpenCodeConfiguration(paths), ["model"])

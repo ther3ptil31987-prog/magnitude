@@ -5,7 +5,7 @@ use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use magnitude_chat::{ChatError, output::JournalError};
-use magnitude_engine::error::{LoadError, RequestError, UnloadCause, UnsupportedModel};
+use magnitude_engine::error::{LoadError, RequestError, UnloadCause};
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use utoipa::ToSchema;
@@ -27,6 +27,8 @@ pub enum ModelUnavailable {
     Unsupported(String),
     /// Installed material failed integrity validation.
     Integrity(String),
+    /// The model's assessment says it cannot fit this machine's memory.
+    DoesNotFit(String),
     /// The instance serving this request was stopped or replaced.
     InstanceStopped,
     /// A managed-model operation failed with a source-defined code.
@@ -71,6 +73,7 @@ impl std::fmt::Display for ServingError {
                 | ModelUnavailable::Busy(message)
                 | ModelUnavailable::Unsupported(message)
                 | ModelUnavailable::Integrity(message)
+                | ModelUnavailable::DoesNotFit(message)
                 | ModelUnavailable::Operation { message, .. }
                 | ModelUnavailable::Internal(message) => formatter.write_str(message),
                 ModelUnavailable::InstanceStopped => {
@@ -272,10 +275,12 @@ fn request_class(error: &RequestError) -> Class {
             (StatusCode::BAD_REQUEST, INVALID, "context_length_exceeded", false)
         }
         RequestError::InsufficientMemory(_) => (unavailable, SERVER, "insufficient_memory", true),
+        RequestError::ContextExceedsMemory(_) => {
+            (StatusCode::BAD_REQUEST, INVALID, "context_exceeds_memory", false)
+        }
         RequestError::MemoryObservationUnavailable { .. } => {
             (unavailable, SERVER, "memory_observation_unavailable", true)
         }
-        RequestError::MemoryReclaim => (unavailable, SERVER, "memory_pressure", true),
         RequestError::ModelUnloaded {
             cause: UnloadCause::MemoryPressure,
         } => (unavailable, SERVER, "model_unloaded", true),
@@ -284,6 +289,9 @@ fn request_class(error: &RequestError) -> Class {
         }
         | RequestError::DeviceLost { .. } => {
             (StatusCode::INTERNAL_SERVER_ERROR, SERVER, "device_lost", true)
+        }
+        RequestError::WeightReadFailed { .. } => {
+            (StatusCode::INTERNAL_SERVER_ERROR, SERVER, "weight_read_failed", true)
         }
         RequestError::ModelUnloaded {
             cause: UnloadCause::Shutdown,
@@ -302,15 +310,16 @@ fn request_class(error: &RequestError) -> Class {
     }
 }
 
+/// The failure code of a load whose weight bound (a cap or a device room) is below its least weights: the caller's bound,
+/// which no wait clears.
+pub const WEIGHT_BOUND_BELOW_WEIGHTS: &str = "weight_bound_below_weights";
+
 /// Load failures surfaced to a request that triggered the load.
 fn load_class(error: &LoadError) -> Class {
     match error {
-        LoadError::Unsupported(UnsupportedModel::Family { .. })
-        | LoadError::Unsupported(UnsupportedModel::Representation { .. })
-        | LoadError::Unsupported(UnsupportedModel::Backend { .. })
-        | LoadError::Unsupported(UnsupportedModel::KernelDomain { .. }) => {
-            (StatusCode::CONFLICT, MODEL, "unsupported_model", false)
-        }
+        LoadError::Unsupported(_) => (StatusCode::CONFLICT, MODEL, "unsupported_model", false),
+        LoadError::Configuration { .. } => (StatusCode::CONFLICT, MODEL, "invalid_model_configuration", false),
+        LoadError::WeightBound(_) => (StatusCode::CONFLICT, MODEL, WEIGHT_BOUND_BELOW_WEIGHTS, false),
         LoadError::Artifact(_) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             INVALID,
@@ -319,9 +328,6 @@ fn load_class(error: &LoadError) -> Class {
         ),
         LoadError::InsufficientMemory { .. } => {
             (StatusCode::SERVICE_UNAVAILABLE, SERVER, "insufficient_memory", true)
-        }
-        LoadError::MemoryPressure { .. } => {
-            (StatusCode::SERVICE_UNAVAILABLE, SERVER, "memory_pressure", true)
         }
         LoadError::MemoryObservationUnavailable { .. } => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -333,6 +339,9 @@ fn load_class(error: &LoadError) -> Class {
             (StatusCode::INTERNAL_SERVER_ERROR, SERVER, "device_lost", true)
         }
         LoadError::Device(_) => (StatusCode::CONFLICT, MODEL, "device_unavailable", true),
+        LoadError::PricesPending { .. } => {
+            (StatusCode::SERVICE_UNAVAILABLE, SERVER, "prices_pending", true)
+        }
         LoadError::WorkerLost { .. } => {
             (StatusCode::INTERNAL_SERVER_ERROR, SERVER, "worker_exited", true)
         }
@@ -357,6 +366,12 @@ fn model_class(error: &ModelUnavailable) -> Class {
             "integrity_failed",
             false,
         ),
+        ModelUnavailable::DoesNotFit(_) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            INVALID,
+            "model_does_not_fit",
+            false,
+        ),
         ModelUnavailable::InstanceStopped => {
             (StatusCode::CONFLICT, MODEL, "model_instance_stopped", false)
         }
@@ -376,6 +391,7 @@ fn model_class(error: &ModelUnavailable) -> Class {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use magnitude_engine::error::{UnsupportedModel, UnsupportedReason};
 
     #[test]
     fn transient_unavailability_asks_clients_to_retry_in_words_and_headers() {
@@ -413,11 +429,6 @@ mod tests {
     fn engine_outcomes_use_the_integration_error_codes() {
         for (error, status, code) in [
             (
-                RequestError::MemoryReclaim,
-                StatusCode::SERVICE_UNAVAILABLE,
-                "memory_pressure",
-            ),
-            (
                 RequestError::Overloaded,
                 StatusCode::SERVICE_UNAVAILABLE,
                 "overloaded",
@@ -442,9 +453,7 @@ mod tests {
             assert!(error.body.retryable);
         }
         let unsupported = ApiError::from(ServingError::Load(LoadError::Unsupported(
-            UnsupportedModel::Family {
-                reason: "unknown".into(),
-            },
+            UnsupportedModel::reason(UnsupportedReason::Unreadable, "unknown"),
         )));
         assert_eq!(unsupported.status, StatusCode::CONFLICT);
         assert_eq!(unsupported.body.code, "unsupported_model");

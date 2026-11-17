@@ -6,25 +6,33 @@
 //! ports.
 
 use crate::operators::gated_delta::graph::{
-    bank_ports, chunked, RecurrentControlPorts, RecurrentStatePorts,
+    RecurrentControlPorts, RecurrentStatePorts, chunked, slab_banks,
 };
-use crate::programs::graph::{draft::GraphDraft, GraphError};
-use crate::programs::native_target_graph::{weight, WeightPort};
-use crate::{
-    native::StateSpaceKernels, ModelLoadPlan, StateResourcePlan, StateSpaceBinding, StateSpaceShape,
+use crate::operators::{InputForm, Join, RecurrentBank, split_bank};
+use crate::programs::graph::facts::Numbers;
+use seismic::Argument;
+use crate::programs::graph::{
+    GraphError,
+    draft::{ControlSource, GraphDraft},
 };
-use magnitude_family_contracts::{WeightKind, WeightScope};
+use crate::programs::native_constants::GraphConstant;
+use crate::programs::native_target_graph::{
+    PackingBound, PlannedWeights, WeightPort, scaled_weight, weight,
+};
+use crate::{StateResourcePlan, StateSpaceBinding, StateSpaceShape, native::StateSpaceKernels};
+use magnitude_family_contracts::{StateSpace, WeightKind, WeightRole, WeightScope};
 use magnitude_kernels::{
     attention_output, attention_project, state_space_chunk, state_space_gate, state_space_step,
 };
-use seismic::{Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
+use seismic::{Dim, Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
 
+/// A state-space block's entries; each projection's by row range.
 pub(crate) struct StateSpaceGraphEntries<'a, G: GraphDraft + 'a> {
-    pub project: G::Binding<'a, attention_project::Entry>,
+    pub project: G::Ranged<'a, attention_project::Entry>,
     pub step: G::Binding<'a, state_space_step::Entry>,
     pub chunk: G::Binding<'a, state_space_chunk::Entry>,
     pub gate: G::Binding<'a, state_space_gate::Entry>,
-    pub output: G::Binding<'a, attention_output::Entry>,
+    pub output: G::Ranged<'a, attention_output::Entry>,
 }
 
 impl<'a> From<&'a StateSpaceKernels> for StateSpaceGraphEntries<'a, NativeGraph> {
@@ -41,8 +49,9 @@ impl<'a> From<&'a StateSpaceKernels> for StateSpaceGraphEntries<'a, NativeGraph>
 
 /// Entry element assignments from the program binding. The projection's
 /// empty segments are views of the projection weight.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CheckedStateSpaceEntries {
-    project: [(&'static str, Element); 6],
+    project: [(&'static str, Element); 7],
     activation: [(&'static str, Element); 1],
     output: [(&'static str, Element); 2],
 }
@@ -57,6 +66,7 @@ impl CheckedStateSpaceEntries {
                 ("KW", binding.projection),
                 ("VW", binding.projection),
                 ("A", binding.activation),
+                ("Y", binding.activation),
             ],
             activation: [("A", binding.activation)],
             output: [("OW", binding.output), ("A", binding.activation)],
@@ -74,67 +84,168 @@ impl CheckedStateSpaceEntries {
     }
 }
 
-/// One state-space block at one graph class.
-pub(crate) struct StateSpaceBlock {
-    pub rows: u64,
-    pub slots: u64,
-    pub slab_banks: u32,
-    pub shape: StateSpaceShape,
+/// What decides a state-space block's graph beside its entries: no model
+/// number. Its reals `R` (`RecurrentTopology`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct StateSpaceTopology<R = Argument<f64>> {
     /// The input norm's epsilon.
-    pub epsilon: f32,
+    pub epsilon: R,
     /// The output group norm's epsilon.
-    pub norm_epsilon: f32,
-    /// Index of this layer's window component in the store's recurrent
-    /// components; its state and tape components follow it.
-    pub component_index: usize,
+    pub norm_epsilon: R,
+    /// The elements of the layer's window, state and tape components.
+    pub bank: [Element; 3],
+    /// How the graph takes its launch's slot tables.
+    pub controls: ControlSource,
+}
+
+impl<R> Numbers<R> for StateSpaceTopology<R> {
+    type Of<E> = StateSpaceTopology<E>;
+    fn map<E>(self, f: &mut impl FnMut(R) -> E) -> StateSpaceTopology<E> {
+        StateSpaceTopology {
+            epsilon: f(self.epsilon),
+            norm_epsilon: f(self.norm_epsilon),
+            bank: self.bank,
+            controls: self.controls,
+        }
+    }
+}
+
+/// The numbers of one state-space block at one graph class.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct StateSpaceBlock<D = Dim> {
+    pub rows: D,
+    pub slots: D,
+    pub shape: StateSpaceShape<D>,
+    pub bank: RecurrentBank<D, 3>,
+}
+
+impl<D> Numbers<D> for StateSpaceBlock<D> {
+    type Of<E> = StateSpaceBlock<E>;
+    fn map<E>(self, f: &mut impl FnMut(D) -> E) -> StateSpaceBlock<E> {
+        StateSpaceBlock {
+            rows: f(self.rows),
+            slots: f(self.slots),
+            shape: self.shape.map(f),
+            bank: self.bank.map(f),
+        }
+    }
+}
+
+/// The topology and numbers of the state-space block of `space` over a
+/// `hidden`-wide residual at a class of `rows` rows and `slots` slots, its
+/// bank `state`'s components from `component_index` on.
+pub(crate) fn split(
+    space: &StateSpace,
+    hidden: u64,
+    rows: u64,
+    slots: u64,
+    epsilon: f32,
+    state: &StateResourcePlan,
+    component_index: usize,
+    controls: ControlSource,
+) -> Result<(StateSpaceTopology<f64>, StateSpaceBlock<u64>), GraphError> {
+    let (elements, bank) = split_bank(state, component_index)?;
+    Ok((
+        StateSpaceTopology {
+            epsilon: f64::from(epsilon),
+            norm_epsilon: space.norm.epsilon,
+            bank: elements,
+            controls,
+        },
+        StateSpaceBlock {
+            rows,
+            slots,
+            shape: StateSpaceShape::of(hidden, space).map_err(|error| error.to_string())?,
+            bank,
+        },
+    ))
 }
 
 pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
     graph: &mut G,
     kernels: StateSpaceGraphEntries<'a, G>,
-    state: &StateResourcePlan,
-    load: &ModelLoadPlan,
+    topology: &StateSpaceTopology,
+    block: &StateSpaceBlock,
+    weights: &(impl PlannedWeights + ?Sized),
     scope: WeightScope,
-    weights: &mut Vec<(WeightPort, NativePort)>,
+    ports: &mut Vec<(WeightPort, NativePort)>,
+    constants: &mut Vec<GraphConstant>,
     hidden: &WorkflowTensor,
-    block: StateSpaceBlock,
+    join: &Join,
 ) -> Result<(WorkflowTensor, RecurrentStatePorts, RecurrentControlPorts), GraphError> {
-    let shape = block.shape;
-    let mut weight = |graph: &mut G, kind| weight(graph, load, scope, kind, weights);
+    let shape = &block.shape;
+    let mut bound = |graph: &mut G, kind| {
+        PackingBound::planned(graph, weights, WeightRole { scope, kind }, ports, constants)
+    };
+    let projection_bound = bound(graph, WeightKind::StateSpaceProjection)?;
+    let output_bound = bound(graph, WeightKind::RecurrentOutput)?;
+    // The projection's other segments are absent, and so are their bounds
+    // and scales.
+    let absent = PackingBound::absent(graph, constants)?;
+    let projection_weight =
+        scaled_weight(graph, weights, scope, WeightKind::StateSpaceProjection, ports, constants)?;
+    let output_weight =
+        scaled_weight(graph, weights, scope, WeightKind::RecurrentOutput, ports, constants)?;
+    let mut weight = |graph: &mut G, kind| weight(graph, weights, scope, kind, ports);
     let input_norm = weight(graph, WeightKind::InputNorm)?;
-    let projection_weight = weight(graph, WeightKind::StateSpaceProjection)?;
     let convolution = weight(graph, WeightKind::RecurrentConvolution)?;
     let convolution_bias = weight(graph, WeightKind::RecurrentConvolutionBias)?;
     let time_bias = weight(graph, WeightKind::RecurrentTimeBias)?;
     let rate = weight(graph, WeightKind::RecurrentDecay)?;
     let skip = weight(graph, WeightKind::StateSpaceSkip)?;
     let state_norm = weight(graph, WeightKind::StateSpaceNorm)?;
-    let output_weight = weight(graph, WeightKind::RecurrentOutput)?;
 
-    let (mut ports, banks, tape_rows) = bank_ports(graph, state, block.component_index)?;
+    let (mut bank, tape_rows) = RecurrentStatePorts::of(graph, &topology.bank, &block.bank)?;
+    let slab_banks = slab_banks(&block.bank)?;
     // The projection has only its query segment: the others read zero rows
     // of the projection weight.
-    let empty = projection_weight.slice_leading(0, 0);
+    let empty = projection_weight.weight.slice_leading(0, 0);
+    let none = || Dim::from(0u64);
     let projection = graph
         .enqueue(
-            kernels.project,
-            &shape.project_dimensions(block.rows),
+            G::pick(kernels.project, &block.rows),
+            &[
+                shape.project_dimensions(&block.rows).as_slice(),
+                &[
+                    ("QS", projection_weight.scale.extent.clone()),
+                    ("GS", none()),
+                    ("KS", none()),
+                    ("VS", none()),
+                    ("QB", projection_bound.extent.clone()),
+                    ("GB", none()),
+                    ("KB", none()),
+                    ("VB", none()),
+                ],
+                &InputForm::SINGLE.dimensions(shape.hidden.clone()),
+            ]
+            .concat(),
             attention_project::WorkflowArgs {
                 hidden: hidden.into(),
                 input_norm: (&input_norm).into(),
-                query_weight: (&projection_weight).into(),
+                query_weight: (&projection_weight.weight).into(),
                 gate_weight: (&empty).into(),
                 key_weight: (&empty).into(),
                 value_weight: (&empty).into(),
-                epsilon: block.epsilon,
-                project_mode: 0,
+                epsilon: topology.epsilon.f32(),
+                project_mode: 0.into(),
+                query_scale: (&projection_weight.scale.tensor).into(),
+                gate_scale: (&absent.tensor).into(),
+                key_scale: (&absent.tensor).into(),
+                value_scale: (&absent.tensor).into(),
+                query_bound: (&projection_bound.tensor).into(),
+                gate_bound: (&absent.tensor).into(),
+                key_bound: (&absent.tensor).into(),
+                value_bound: (&absent.tensor).into(),
             },
         )?
         .r0;
-    let dimensions = shape.state_dimensions(block.rows, block.slots, banks, tape_rows);
+    let dimensions =
+        shape.state_dimensions(&block.rows, &block.slots, &block.bank.banks, &tape_rows);
     // The step and chunk entries share one contract, so their inputs have the
     // same geometry whichever advances this class.
-    let input = |graph: &mut G, name: &str| graph.input_for(kernels.step, name, &dimensions);
+    let input = |graph: &mut G, name: &str| {
+        graph.control_for(topology.controls, kernels.step, name, &dimensions)
+    };
     let controls = RecurrentControlPorts {
         segments: input(graph, "segments")?,
         stop: input(graph, "stop")?,
@@ -160,68 +271,86 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
                         previous_bank: controls.previous_bank.tensor().into(),
                         previous_tape: controls.previous_tape.tensor().into(),
                         following_bank: controls.following_bank.tensor().into(),
-                        window: ports.window.tensor_mut().into(),
-                        state: ports.delta.tensor_mut().into(),
-                        tape: ports.tape.tensor_mut().into(),
-                        slab_banks: block.slab_banks,
+                        window: bank.window.tensor_mut().into(),
+                        state: bank.delta.tensor_mut().into(),
+                        tape: bank.tape.tensor_mut().into(),
+                        slab_banks,
                     },
                 )?
                 .value
         };
     }
-    let mixed = if chunked(block.rows) {
+    let mixed = if chunked(&block.rows) {
         advance!(state_space_chunk, kernels.chunk)
     } else {
         advance!(state_space_step, kernels.step)
     };
     // The stored `[groups, group width]` norm, flattened by the family, is
     // the gate's `[G, U, P]`.
-    let state_norm = state_norm.reshape(&[shape.norm_groups(), shape.norm_heads, shape.head_width]);
+    let state_norm = state_norm.reshape(&[
+        shape.norm_groups(),
+        shape.norm_heads.clone(),
+        shape.head_width.clone(),
+    ]);
     let gated = graph
         .enqueue(
             kernels.gate,
-            &shape.gate_dimensions(block.rows),
+            &shape.gate_dimensions(&block.rows),
             state_space_gate::WorkflowArgs {
                 mixed: (&mixed).into(),
                 projection: (&projection).into(),
                 state_norm: (&state_norm).into(),
-                epsilon: block.norm_epsilon,
+                epsilon: topology.norm_epsilon.f32(),
             },
         )?
         .value;
+    let inject = join.inject(graph, &block.rows, constants)?;
     let output = graph
         .enqueue(
-            kernels.output,
-            &shape.output_dimensions(block.rows),
+            G::pick(kernels.output, &block.rows),
+            &[
+                shape.output_dimensions(&block.rows).as_slice(),
+                &[
+                    ("OS", output_weight.scale.extent.clone()),
+                    ("OB", output_bound.extent.clone()),
+                ],
+            ]
+            .concat(),
             attention_output::WorkflowArgs {
                 hidden: hidden.into(),
+                inject: (&inject).into(),
                 gated: (&gated).into(),
-                output_weight: (&output_weight).into(),
+                output_weight: (&output_weight.weight).into(),
+                output_scale: (&output_weight.scale.tensor).into(),
+                output_bound: (&output_bound.tensor).into(),
             },
         )?
         .value;
-    Ok((output, ports, controls))
+    Ok((output, bank, controls))
 }
 
 #[cfg(test)]
 mod tests {
     use crate::programs::native_target_graph::checked_target_family_storage;
     use crate::{
-        resident_layout, source_element, ComponentSelection, ExecutionPath, FeedForwardProgramSlot,
-        MixerProgramSlot, ModelLoadPlan, PlannedMethod, ResourceCapacity, ResourceLimits,
-        ResourcePlanner,
+        ComponentSelection, ExecutionPath, FeedForwardProgramSlot, MixerProgramSlot, ModelLoadPlan,
+        PlannedMethod, ResourceCapacity, ResourceLimits, ResourcePlanner, resident_layout,
+        source_element,
     };
-    use crate::{DenseScales, GeneralRoutedScales, PlanError};
+    use crate::{DenseScales, ExpertScales, GeneralRoutedScales, PlanError, StateSpaceScales};
     use magnitude_artifacts::{
-        gguf::{Encoding, TensorDescriptor},
         ArtifactIdentity, ComponentFile, ComponentManifest, PackageIdentity, PackageManifest,
+        gguf::{Encoding, TensorDescriptor},
     };
     use magnitude_family_contracts::{
         ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder,
         EmbeddingScale, EntryForm, ExitForm, ExitNorm, ExpertSelection, FamilyId, FeedForwardUp,
-        HeadNorm, HistoryDomain, HistoryReads, ImportTransform, InputNorm, InputSemantics,
-        KeyValue, LatentExperts, MediaRowAttention, ModelDefinition, Operator, OutputForm,
-        ResidualForm, RmsNorm, Rotary, RouteNormalization, RoutedFfn, Router, RouterInput,
+        HeadNorm, HistoryRows, HistorySource, ImportTransform, InputNorm, InputSemantics,
+        LatentExperts, MediaRowAttention, ModelDefinition, Operator, OutputForm,
+        OutputProjection, ProjectedRows, QueryKeys, QueryProjection, ResidualForm, RmsNorm, Rotary,
+        RouteNormalization, RoutedFfn, Router, RouterInput, RowProducer, RowRounding,
+        TokenDomain,
+        ScaledActivations,
         ScoreFunction, SharedExpert, SharedExpertGate, StateSpace, Sublayer, SublayerIndex,
         ValueNorm, ValueSource, WeightDescriptor, WeightKind, WeightRole, WeightScope,
     };
@@ -250,7 +379,7 @@ mod tests {
         let mut offset = 0;
         let mut tensor = |name: String, shape: Vec<u64>| {
             let mut stored = |name: String, shape: Vec<u64>, encoding: Encoding| {
-                let nbytes = source_element(encoding)
+                let nbytes = source_element(encoding, *shape.last().unwrap())
                     .unwrap()
                     .canonical_byte_len(&shape)
                     .unwrap();
@@ -271,7 +400,10 @@ mod tests {
                     stored(scale_name.clone(), scale, Encoding::F32);
                     descriptor
                         .transforms
-                        .push(ImportTransform::ScaleByTensor { tensor: scale_name });
+                        .push(ImportTransform::ScaleByTensor {
+                            tensor: scale_name,
+                            activations: ScaledActivations::Rounded,
+                        });
                 }
                 None if shape.len() > 1 => stored(name, shape, Encoding::BF16),
                 None => stored(name, shape, Encoding::F32),
@@ -333,6 +465,7 @@ mod tests {
                         selection: ExpertSelection::TopK {
                             bias: Some(tensor(name("exp_probs_b"), vec![experts])),
                         },
+                        media_bias: None,
                         normalization: RouteNormalization::SumPlusEpsilon(1e-20),
                         scale: 2.5,
                     },
@@ -363,21 +496,28 @@ mod tests {
                     heads: 4,
                     kv_heads: 2,
                     width: 128,
-                    query: tensor(name("attn_q"), vec![512, HIDDEN]),
+                    query: QueryProjection::Full(tensor(name("attn_q"), vec![512, HIDDEN])),
+                    query_keys: QueryKeys::Direct,
                     gate: AttentionGate::None,
                     query_norm: HeadNorm::None,
-                    key_value: KeyValue::Owned {
-                        key: tensor(name("attn_k"), vec![256, HIDDEN]),
-                        value: ValueSource::Projected(tensor(name("attn_v"), vec![256, HIDDEN])),
-                        key_norm: HeadNorm::None,
-                        value_norm: ValueNorm::None,
-                        domain: HistoryDomain::Token,
-                    },
+                    history: vec![HistorySource::visible(HistoryRows::Own(
+                        RowProducer::Projected(ProjectedRows {
+                            key: tensor(name("attn_k"), vec![256, HIDDEN]),
+                            value: ValueSource::Projected(tensor(
+                                name("attn_v"),
+                                vec![256, HIDDEN],
+                            )),
+                            key_norm: HeadNorm::None,
+                            value_norm: ValueNorm::None,
+                            domain: TokenDomain::Token,
+                            rounding: RowRounding::None,
+                        }),
+                    ))],
                     rotary: Rotary::None,
                     scale: 1.0 / 128f64.sqrt(),
-                    reads: HistoryReads::Visible,
                     media_rows: MediaRowAttention::Causal,
-                    output: tensor(name("attn_output"), vec![HIDDEN, 512]),
+                    sinks: None,
+                    output: OutputProjection::Full(tensor(name("attn_output"), vec![HIDDEN, 512])),
                 })),
                 output: OutputForm::Residual,
             }
@@ -417,7 +557,6 @@ mod tests {
                     scale: EmbeddingScale::Unit,
                     norm: None,
                     per_layer: None,
-                    hash_routing: None,
                 },
                 blocks,
                 exit: ExitForm {
@@ -461,6 +600,8 @@ mod tests {
             max_images_per_request: 1,
             max_image_cells: 0,
             lookahead: false,
+            chain_capacity: std::num::NonZeroUsize::MIN,
+            conversations: std::num::NonZeroUsize::MIN,
         };
         for backend in [
             BackendName::Cpu,
@@ -476,6 +617,8 @@ mod tests {
                     vision: false,
                 },
                 resident_layout(ExecutionPath::Native, backend),
+                crate::PlannedMethod::Plain,
+                crate::planning::fixtures::LIMITS,
             )
             .unwrap();
             let plan = load.program_plan(&definition, KvCodec::Dense).unwrap();
@@ -499,6 +642,7 @@ mod tests {
                 ResourceCapacity {
                     domain_bytes: 16 * 1024 * 1024 * 1024,
                     tensor_operations: crate::TensorOperations::Absent,
+                    allocations: seismic::NativeAllocations::EXACT,
                 },
             )
             .unwrap();
@@ -512,27 +656,43 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
             // The decode step streams every block's state and weights.
-            let demand = crate::assessment::DecodeDemand::from_model(
+            let demand = crate::assessment::demand::tests::demand_on(
                 &definition,
                 &load,
                 magnitude_state::KvCodec::Dense,
+                backend,
             )
             .unwrap();
-            assert!(demand.streamed_bytes > 0 && demand.launches > 0, "{backend:?}");
+            assert!(
+                crate::assessment::demand::tests::streamed(&demand) > 0,
+                "{backend:?}"
+            );
         }
     }
 
     /// The matrices Nemotron's NVFP4 files scale: routed experts per expert
     /// (block 2's up weight stores one value for its whole stack), shared
-    /// experts, latent projections and the vocabulary projection per tensor.
+    /// experts, latent projections, the Mamba-2 input and output projections
+    /// and the vocabulary projection per tensor.
     fn nemotron_scales(name: &str) -> Option<Vec<u64>> {
         match name {
             "blk.4.ffn_up_exps" => Some(vec![1]),
             name if name.ends_with("_exps") => Some(vec![32]),
             name if name.ends_with("_shexp") || name.contains("ffn_latent") => Some(vec![1]),
+            name if name.ends_with(".ssm_in") || name.ends_with(".ssm_out") => Some(vec![1]),
+            name if [".attn_q", ".attn_k", ".attn_v", ".attn_output"]
+                .iter()
+                .any(|suffix| name.ends_with(suffix)) =>
+            {
+                Some(vec![1])
+            }
             "output" => Some(vec![1]),
             _ => None,
         }
+    }
+
+    fn mixer_scope(block: u32) -> WeightScope {
+        WeightScope::TargetSublayer(SublayerIndex { block, sublayer: 0 })
     }
 
     fn feed_forward_scope(block: u32) -> WeightScope {
@@ -557,6 +717,8 @@ mod tests {
             max_images_per_request: 1,
             max_image_cells: 0,
             lookahead: false,
+            chain_capacity: std::num::NonZeroUsize::MIN,
+            conversations: std::num::NonZeroUsize::MIN,
         };
         let selection = ComponentSelection {
             head: false,
@@ -569,7 +731,7 @@ mod tests {
             BackendName::Vulkan,
         ] {
             let layout = resident_layout(ExecutionPath::Native, backend);
-            let load = ModelLoadPlan::derive(&manifest, &definition, selection, layout).unwrap();
+            let load = ModelLoadPlan::derive(&manifest, &definition, selection, layout, crate::PlannedMethod::Plain, crate::planning::fixtures::LIMITS).unwrap();
             let extent = |scope, kind| {
                 let plan = load
                     .target()
@@ -592,6 +754,24 @@ mod tests {
                 extent(WeightScope::Target, WeightKind::Output),
                 (1, Some(4))
             );
+            for block in [0, 1] {
+                assert_eq!(
+                    extent(mixer_scope(block), WeightKind::StateSpaceProjection),
+                    (1, Some(4))
+                );
+                assert_eq!(
+                    extent(mixer_scope(block), WeightKind::RecurrentOutput),
+                    (1, Some(4))
+                );
+            }
+            for kind in [
+                WeightKind::Query,
+                WeightKind::Key,
+                WeightKind::Value,
+                WeightKind::AttentionOutput,
+            ] {
+                assert_eq!(extent(mixer_scope(2), kind), (1, Some(4)));
+            }
             assert_eq!(extent(plain, WeightKind::Router), (0, None));
             let scale_bytes = load
                 .target()
@@ -615,6 +795,19 @@ mod tests {
 
             let plan = load.program_plan(&definition, KvCodec::Dense).unwrap();
             let blocks = plan.target().blocks();
+            // Both state-space mixers bind their projections' scales.
+            for block in &blocks[..2] {
+                let MixerProgramSlot::StateSpace(binding) = block.mixer() else {
+                    panic!("blocks 0 and 1 are state-space");
+                };
+                assert_eq!(
+                    binding.scales,
+                    StateSpaceScales {
+                        projection: 1,
+                        output: 1
+                    }
+                );
+            }
             let Some(FeedForwardProgramSlot::GeneralRouted(latent_binding)) =
                 blocks[1].feed_forward()
             else {
@@ -623,8 +816,11 @@ mod tests {
             assert_eq!(
                 latent_binding.scales,
                 GeneralRoutedScales {
-                    expert_up: 32,
-                    expert_down: 32,
+                    experts: ExpertScales {
+                        gate: 0,
+                        up: 32,
+                        down: 32,
+                    },
                     shared: DenseScales {
                         gate: 0,
                         up: 1,
@@ -635,7 +831,10 @@ mod tests {
             );
             assert!(matches!(
                 plan.target().readout().head,
-                crate::ReadoutHead::Packed { weight_scale: 1, .. }
+                crate::ReadoutHead::Packed {
+                    weight_scale: 1,
+                    ..
+                }
             ));
 
             let state = ResourcePlanner::state_plan(
@@ -647,6 +846,7 @@ mod tests {
                 ResourceCapacity {
                     domain_bytes: 16 * 1024 * 1024 * 1024,
                     tensor_operations: crate::TensorOperations::Absent,
+                    allocations: seismic::NativeAllocations::EXACT,
                 },
             )
             .unwrap();
@@ -660,59 +860,53 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
 
-            // Scales change no launch or history read: they ride with their
+            // Scales change no call or history read: they ride with their
             // weights.
             let shape = |definition: &ModelDefinition, load: &ModelLoadPlan| {
-                let demand =
-                    crate::assessment::DecodeDemand::from_model(definition, load, KvCodec::Dense)
-                        .unwrap();
-                (demand.launches, demand.history)
+                let demand = crate::assessment::demand::tests::demand_on(
+                    definition,
+                    load,
+                    KvCodec::Dense,
+                    backend,
+                )
+                .unwrap();
+                demand
+                    .calls
+                    .iter()
+                    .map(|call| (call.launches.kernel(), call.work.history))
+                    .collect::<Vec<_>>()
             };
             let unscaled_load =
-                ModelLoadPlan::derive(&unscaled_manifest, &unscaled, selection, layout).unwrap();
+                ModelLoadPlan::derive(&unscaled_manifest, &unscaled, selection, layout, crate::PlannedMethod::Plain, crate::planning::fixtures::LIMITS).unwrap();
             assert_eq!(shape(&definition, &load), shape(&unscaled, &unscaled_load));
         }
     }
 
     /// A scaled weight whose entry has no accumulator-scale port (the
-    /// attention projections, the router) is refused at plan time.
+    /// router's) is refused at plan time.
     #[test]
     fn a_scaled_weight_without_a_scale_port_is_refused_at_plan_time() {
-        for (name, role) in [
-            (
-                "blk.3.attn_q",
-                WeightRole {
-                    scope: WeightScope::TargetSublayer(SublayerIndex {
-                        block: 2,
-                        sublayer: 0,
-                    }),
-                    kind: WeightKind::Query,
-                },
-            ),
-            (
-                "blk.4.ffn_gate_inp",
-                WeightRole {
-                    scope: feed_forward_scope(2),
-                    kind: WeightKind::Router,
-                },
-            ),
-        ] {
-            let (definition, manifest) = hybrid_stored(|stored| (stored == name).then(|| vec![1]));
-            let load = ModelLoadPlan::derive(
-                &manifest,
-                &definition,
-                ComponentSelection {
-                    head: false,
-                    vision: false,
-                },
-                resident_layout(ExecutionPath::Native, BackendName::Metal),
-            )
-            .unwrap();
-            assert_eq!(
-                load.program_plan(&definition, KvCodec::Dense).unwrap_err(),
-                PlanError::UnportedScale(role)
-            );
-        }
+        let (definition, manifest) =
+            hybrid_stored(|stored| (stored == "blk.4.ffn_gate_inp").then(|| vec![1]));
+        let load = ModelLoadPlan::derive(
+            &manifest,
+            &definition,
+            ComponentSelection {
+                head: false,
+                vision: false,
+            },
+            resident_layout(ExecutionPath::Native, BackendName::Metal),
+            crate::PlannedMethod::Plain,
+            crate::planning::fixtures::LIMITS,
+        )
+        .unwrap();
+        assert_eq!(
+            load.program_plan(&definition, KvCodec::Dense).unwrap_err(),
+            PlanError::UnportedScale(WeightRole {
+                scope: feed_forward_scope(2),
+                kind: WeightKind::Router,
+            })
+        );
     }
 
     /// A scale that is not one F32 value, or one per matrix, is refused
@@ -729,6 +923,8 @@ mod tests {
                     vision: false,
                 },
                 resident_layout(ExecutionPath::Native, BackendName::Cpu),
+                crate::PlannedMethod::Plain,
+                crate::planning::fixtures::LIMITS,
             )
         };
         // Neither one value nor one per expert.
@@ -751,6 +947,8 @@ mod tests {
                 vision: false,
             },
             resident_layout(ExecutionPath::Native, BackendName::Cpu),
+            crate::PlannedMethod::Plain,
+            crate::planning::fixtures::LIMITS,
         )
         .unwrap_err();
         assert!(error.contains("absent from its component"), "{error}");

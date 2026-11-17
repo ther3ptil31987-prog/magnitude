@@ -1,5 +1,6 @@
 import type {
   LocalInferenceHardware,
+  CustomModelAcquisitionState,
   MemoryShortage,
   ModelInstanceAllocation,
   ModelInstanceFailure,
@@ -15,14 +16,8 @@ import { formatMemorySize } from "./format-bytes"
 export const MEMORY_SHORTAGE_TITLE = "Not enough memory right now"
 
 /** What a memory shortage means for the user and what they can do about it. */
-export const describeMemoryShortage = (shortage: MemoryShortage): string => {
-  switch (shortage._tag) {
-    case "Blocked":
-      return `This model needs ${formatMemorySize(shortage.requiredBytes, { rounding: "up" })} and ${formatMemorySize(shortage.availableBytes)} is available. Quit apps you aren’t using, or choose a smaller model.`
-    case "UnderPressure":
-      return "Loading stopped because your computer ran low on memory. Quit apps you aren’t using, or choose a smaller model."
-  }
-}
+export const describeMemoryShortage = (shortage: MemoryShortage): string =>
+  `This model needs ${formatMemorySize(shortage.requiredBytes, { rounding: "up" })} and ${formatMemorySize(shortage.availableBytes)} is available. Quit apps you aren’t using, or choose a smaller model.`
 
 /** A load failure in the user's terms: a shortage is described, anything else is the service's message. */
 export const describeModelLoadFailure = (failure: ModelInstanceFailure): string =>
@@ -70,11 +65,9 @@ const describeOptimizing = (
   device: Option.Option<ModelLoadDevice>,
   hardware: Option.Option<LocalInferenceHardware>,
 ): string => Option.match(
-  Option.flatMap(device, (selected) => Option.flatMap(hardware, (snapshot) => {
-    // Accelerators and load devices are both identified by the service's hardware device id.
-    const deviceId: string = selected.deviceId
-    return Option.fromNullable(snapshot.accelerators.find((accelerator) => accelerator.acceleratorId === deviceId))
-  })),
+  Option.flatMap(device, (selected) => Option.flatMap(hardware, (snapshot) =>
+    Option.fromNullable(snapshot.accelerators.find((accelerator) =>
+      accelerator.executors.some(executor => executor.deviceId === selected.deviceId))))),
   {
     onNone: () => "Optimizing…",
     onSome: (accelerator) => `Optimizing for ${accelerator.name}…`,
@@ -94,6 +87,19 @@ export const describeModelOptimization = (
 ): string => progress.stage === "preparing"
   ? "Preparing to optimize…"
   : describeOptimizing(progress.device, hardware)
+
+/** Post-download optimization that has not finished and waits for the device a loaded model holds. */
+export const MODEL_OPTIMIZATION_PENDING = "Optimization pending"
+
+export const MODEL_OPTIMIZATION_PENDING_DETAIL = "One-time setup for this device runs when no model is loaded."
+
+/** Whether a model's optimization is pending while nothing of the model itself runs: a running model shows its own state. */
+export const modelOptimizationPendingIdle = (acquisition: CustomModelAcquisitionState): boolean =>
+  acquisition._tag === "OptimizationPending" && !modelResidencyActive(acquisition.residencyState)
+
+/** Whether a model is requested, loading, ready or stopping. */
+export const modelResidencyActive = (residency: ModelResidency): boolean =>
+  residency._tag === "Requested" || residency._tag === "Loading" || residency._tag === "Ready" || residency._tag === "Stopping"
 
 /** Post-download optimization where space is short (the CLI). */
 export const formatModelOptimization = (progress: ModelOptimizationProgress): string => Option.match(

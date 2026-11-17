@@ -9,9 +9,10 @@ use std::sync::Arc;
 
 use seismic_compiler::errors::ExecutionError;
 use seismic_cpu::{NativeStep, NativeSteps};
-use seismic_native_cpu::{Tier, WeightKernels};
+use seismic_native_cpu::{Tier, WeightOperand};
 
 use super::trace::host_seconds;
+use super::timeline::{TimelineAction, TimelineKind};
 use super::{Dispatch, DispatchList, NativeRoute};
 use crate::backends::CpuOpened;
 use crate::driver::typed_buffer;
@@ -32,6 +33,25 @@ pub struct CpuVariant {
     pub elements: &'static [&'static str],
     pub function: CpuKernelFn,
 }
+
+/// A variant of every tier ([`Tier::EVERY`]) whose function never runs:
+/// the launches of a test kernel that is formed, never run.
+#[cfg(test)]
+pub(crate) static UNRUN_VARIANTS: [CpuVariant; Tier::EVERY.len()] = {
+    unsafe fn unused(_: &CpuInvocation<'_>, _: [u64; 3], _: &mut [u8]) {}
+    const UNRUN: CpuVariant = CpuVariant {
+        tier: Tier::X86V2,
+        elements: &[],
+        function: unused,
+    };
+    let mut variants = [UNRUN; Tier::EVERY.len()];
+    let mut index = 0;
+    while index < variants.len() {
+        variants[index].tier = Tier::EVERY[index];
+        index += 1;
+    }
+    variants
+};
 
 /// The compiled forms of one launch.
 pub struct CpuLaunchVariants {
@@ -73,11 +93,12 @@ impl CpuNativeKernels {
 /// same layout as the GPU argument words.
 pub struct CpuInvocation<'a> {
     pub(crate) buffers: &'a [*mut u8],
-    /// Registry name of each buffer's representation; scratch is `"bytes"`.
+    /// Registry storage name of each buffer (`registry::storage_of`); scratch
+    /// is `"bytes"`.
     pub(crate) representations: &'a [&'static str],
     /// The components of each buffer's representation on the call's tier,
-    /// for buffers of a weight representation.
-    pub(crate) weights: &'a [Option<&'static WeightKernels>],
+    /// with its operand recipe, for buffers of a weight representation.
+    pub(crate) weights: &'a [Option<WeightOperand>],
     pub(crate) words: &'a [u64],
     /// Values of the declared tuning parameters, in declaration order.
     pub(crate) params: &'a [u64],
@@ -99,7 +120,7 @@ impl CpuInvocation<'_> {
         self.representations[index]
     }
     /// The components of buffer `index`, a weight operand.
-    pub fn weights(&self, index: usize) -> &'static WeightKernels {
+    pub fn weights(&self, index: usize) -> WeightOperand {
         self.weights[index].unwrap_or_else(|| {
             panic!(
                 "buffer {index} (`{}`) is not bound to a weight representation",
@@ -132,6 +153,7 @@ impl CpuInvocation<'_> {
 }
 
 /// The CPU route of one prepared implementation.
+#[derive(Clone)]
 pub(crate) struct CpuRoute {
     pub(crate) opened: Arc<CpuOpened>,
     pub(crate) tier: Tier,
@@ -148,8 +170,27 @@ struct Step<'a> {
     function: CpuKernelFn,
     invocation: CpuInvocation<'a>,
     items: u64,
+    /// The three 32-bit group counts an earlier launch wrote, read when the
+    /// step runs (`NativeLaunch::grid`); `items` is then their bound.
+    grid: Option<*const u32>,
     shared_bytes: u64,
     workers: usize,
+}
+
+// Work items only read the grid, which the steps before them wrote.
+unsafe impl Sync for Step<'_> {}
+
+impl Step<'_> {
+    /// The groups the step runs on each axis.
+    fn groups(&self) -> [u64; 3] {
+        match self.grid {
+            // SAFETY: the grid is a live binding of three aligned words,
+            // which the step only reads; the steps before it, which wrote
+            // them, completed.
+            Some(grid) => std::array::from_fn(|axis| u64::from(unsafe { grid.add(axis).read() })),
+            None => self.invocation.groups,
+        }
+    }
 }
 
 /// The active launches of one pass over a submission's calls, repeated.
@@ -172,9 +213,14 @@ impl NativeSteps for Steps<'_> {
         }
     }
 
+    fn items(&self, index: usize) -> u64 {
+        let step = &self.steps[index % self.steps.len()];
+        step.groups().iter().product()
+    }
+
     fn run(&self, index: usize, item: u64, shared: &mut [u8]) {
         let step = &self.steps[index % self.steps.len()];
-        let [x, y, _] = step.invocation.groups;
+        let [x, y, _] = step.groups();
         // SAFETY: the route selected the function for a tier the device has
         // (`CpuRoute::tier`, validated at preparation).
         unsafe {
@@ -187,36 +233,126 @@ impl NativeSteps for Steps<'_> {
     }
 }
 
-/// Runs `repetitions` passes over `list` as one pool job: one wake of the
-/// pool, a barrier between consecutive launches. Returns the outcome and the
-/// interval the job ran, on the [`host_seconds`] clock.
+/// Runs `repetitions` passes over `list`: as one pool job (one wake of the
+/// pool, a barrier between consecutive launches), split into a job at each
+/// timeline boundary where it has any, and at launch detail (`per_launch`)
+/// into a job per launch, so a launch's interval is the device time of that
+/// launch alone. Returns the outcome, the interval the run took and, at
+/// launch detail, each launch's interval in encode order (`None` for an
+/// inactive launch), on the [`host_seconds`] clock.
 pub(super) fn run(
     opened: &Arc<CpuOpened>,
     list: &impl DispatchList,
     repetitions: usize,
-) -> (Result<(), ExecutionError>, (f64, f64)) {
+    per_launch: bool,
+) -> (Result<(), ExecutionError>, (f64, f64), Option<Vec<Option<(f64, f64)>>>) {
     let executor = opened.executor();
     let mut pointers = Vec::new();
+    let mut storages = Vec::new();
     let mut weights = Vec::new();
-    let calls = calls(list, &mut pointers, &mut weights);
+    let calls = calls(list, &mut pointers, &mut storages, &mut weights);
+    let tables = Tables {
+        pointers: &pointers,
+        storages: &storages,
+        weights: &weights,
+    };
     let now = host_seconds();
-    match steps(&calls, &pointers, &weights, executor.workers()) {
-        Ok(steps) if steps.is_empty() => (Ok(()), (now, now)),
-        Ok(steps) => executor.run_native(&Steps { steps, repetitions }, host_seconds),
-        Err(error) => (Err(error), (now, now)),
+    if !per_launch && !list.has_timelines() {
+        let (outcome, interval) = match steps(&calls, tables, executor.workers()) {
+            Ok(steps) if steps.is_empty() => (Ok(()), (now, now)),
+            Ok(steps) => executor.run_native(&Steps { steps, repetitions }, host_seconds),
+            Err(error) => (Err(error), (now, now)),
+        };
+        return (outcome, interval, None);
     }
+    let job = |steps| {
+        executor.run_native(
+            &Steps {
+                steps,
+                repetitions: 1,
+            },
+            host_seconds,
+        )
+    };
+    // The calls between job boundaries run as pool jobs of their own; at a
+    // timeline boundary this thread waits for, or signals, its timelines.
+    let mut launches = per_launch.then(Vec::new);
+    let mut end = now;
+    for _ in 0..repetitions {
+        let mut first = 0;
+        for boundary in 0..=calls.len() {
+            let operations = list.timelines(boundary);
+            if operations.is_empty() && boundary < calls.len() && !per_launch {
+                continue;
+            }
+            let run = &calls[first..boundary];
+            first = boundary;
+            let steps = match steps(run, tables, executor.workers()) {
+                Ok(steps) => steps,
+                Err(error) => return (Err(error), (now, end), launches),
+            };
+            match &mut launches {
+                None if steps.is_empty() => {}
+                None => {
+                    let (outcome, (_, finished)) = job(steps);
+                    end = finished;
+                    if outcome.is_err() {
+                        return (outcome, (now, end), None);
+                    }
+                }
+                Some(intervals) => {
+                    let mut steps = steps.into_iter();
+                    for launch in run.iter().flat_map(|call| call.0.launches) {
+                        if launch.is_none() {
+                            intervals.push(None);
+                            continue;
+                        }
+                        let step = steps.next().expect("every active launch forms a step");
+                        let (outcome, interval) = job(vec![step]);
+                        intervals.push(Some(interval));
+                        end = interval.1;
+                        if outcome.is_err() {
+                            return (outcome, (now, end), launches);
+                        }
+                    }
+                }
+            }
+            for operation in operations {
+                let TimelineKind::Cpu(timeline) = operation.timeline.kind() else {
+                    unreachable!("a run binds timelines of its own device");
+                };
+                match operation.action {
+                    TimelineAction::Wait => timeline.wait_unbounded(operation.value),
+                    TimelineAction::Signal => timeline.signal(operation.value),
+                }
+            }
+        }
+    }
+    (Ok(()), (now, end), launches)
 }
 
 /// One call of a submission: its dispatch, the range of its buffers in the
-/// address and weight tables, and its scalar-result storage.
+/// [`Tables`], and its scalar-result storage.
 type Call<'l> = (Dispatch<'l>, std::ops::Range<usize>, *mut u64);
 
-/// Every call of `list`, appending the calls' buffer addresses to `pointers`
-/// and their resolved weight components to `weights`.
+/// The per-buffer tables of a submission's calls.
+#[derive(Clone, Copy)]
+struct Tables<'a> {
+    pointers: &'a [*mut u8],
+    /// Each buffer's storage name (`registry::storage_of`): what the CPU
+    /// components and conversions read, the same for every operand recipe.
+    storages: &'a [&'static str],
+    weights: &'a [Option<WeightOperand>],
+}
+
+/// Every call of `list`, appending the calls' buffer addresses to
+/// `pointers`, their storage names to `storages` and their resolved weight
+/// components to `weights`.
 fn calls<'l>(
     list: &'l impl DispatchList,
     pointers: &mut Vec<*mut u8>,
-    weights: &mut Vec<Option<&'static WeightKernels>>,
+    storages: &mut Vec<&'static str>,
+    weights: &mut Vec<Option<WeightOperand>>,
 ) -> Vec<Call<'l>> {
     type Cpu = seismic_cpu::Cpu;
     type Executor = seismic_cpu::Executor;
@@ -235,12 +371,22 @@ fn calls<'l>(
             // allocations (checked when the views were formed).
             unsafe { base.add(*offset as usize) }
         }));
-        weights.extend(dispatch.representations.iter().map(|representation| {
-            seismic_native_cpu::components::resolve(route.tier, representation)
-        }));
-        let scalars = typed_buffer::<Cpu, Executor>(&dispatch.kernel.scalars)
-            .data_pointer()
-            .cast::<u64>();
+        for representation in dispatch.representations {
+            // Scratch (`"bytes"`) is no registered element.
+            let element = seismic_lang::registry::representation(representation);
+            let storage = element.map_or(*representation, |element| {
+                seismic_lang::registry::representation_info(
+                    seismic_lang::registry::storage_of(element),
+                )
+                .name
+            });
+            storages.push(storage);
+            weights.push(element.and_then(|element| WeightOperand::of(route.tier, element)));
+        }
+        // An entry without scalar results is passed no slots.
+        let scalars = dispatch.kernel.scalar_slots().map_or(std::ptr::null_mut(), |slots| {
+            typed_buffer::<Cpu, Executor>(slots).data_pointer().cast::<u64>()
+        });
         calls.push((dispatch, first..pointers.len(), scalars));
     }
     calls
@@ -249,8 +395,7 @@ fn calls<'l>(
 /// The active launches of `calls` on a pool of `participants`.
 fn steps<'a>(
     calls: &'a [Call<'_>],
-    pointers: &'a [*mut u8],
-    weights: &'a [Option<&'static WeightKernels>],
+    tables: Tables<'a>,
     participants: usize,
 ) -> Result<Vec<Step<'a>>, ExecutionError> {
     let mut steps = Vec::new();
@@ -274,9 +419,9 @@ fn steps<'a>(
             steps.push(Step {
                 function: *function,
                 invocation: CpuInvocation {
-                    buffers: &pointers[range.clone()],
-                    representations: dispatch.representations,
-                    weights: &weights[range.clone()],
+                    buffers: &tables.pointers[range.clone()],
+                    representations: &tables.storages[range.clone()],
+                    weights: &tables.weights[range.clone()],
                     words: dispatch.words,
                     params: &route.params,
                     scalar_results: *scalars,
@@ -284,6 +429,9 @@ fn steps<'a>(
                     threads: launch.threads,
                 },
                 items,
+                grid: launch.grid.map(|buffer| {
+                    tables.pointers[range.start + dispatch.kernel.argument(buffer)].cast_const().cast()
+                }),
                 shared_bytes: launch.shared_bytes,
                 workers: if *workers == 0 {
                     participants

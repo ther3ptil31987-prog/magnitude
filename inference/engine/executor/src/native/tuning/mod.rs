@@ -1,20 +1,34 @@
-//! Tuning at program preparation (route spec NR12, program spec E6, tuning
-//! spec `specs/26-09-24/native-tuning-search-and-caching.md`).
+//! Tuning at program preparation.
 //!
 //! Every native entry whose implementation declares tuning parameters is
-//! tuned on the opened device on the first load for each tuning key. A count
-//! walk finds the units that will search and a census walk measures their
-//! defaults; the units then share [`TUNING_TIME`] ([`allocation`]): every
-//! unit's defaults and form starts are measured before any unit's declared
-//! domain is searched further, the rest of the time goes to the units by
-//! the step time each still takes, and each unit keeps the best
-//! configuration it confirmed.
-//! A unit builds each point's inputs only when Seismic admits the point, and
-//! forms only what it is about to measure. With a [`KernelCache`], the
-//! result of each unit that was started is stored under a key over what it
-//! is valid for (tuning version,
-//! device and toolchain identity, unit, implementation digest, precision
-//! policy and served shapes). Nothing is shipped.
+//! tuned on the opened device once for each tuning key, by a search
+//! (`AttestedPrograms::search_draft`) that runs in a process of its own and
+//! ends before the model is loaded. A load never searches: its one walk
+//! ([`Tuner::serve`]) reads each unit's stored record and, at a unit without
+//! one, stops and reports it or prepares the unit at its canonical default
+//! ([`UnpreparedUnits`]). "First load" below names the search that precedes
+//! it. A count walk finds the units without a stored choice. Their mandatory phase then
+//! forms each one's canonical artifact, hands it to serving and publishes
+//! the unit's record: from there every unit serves a legal published choice.
+//! What is left of the first-load tuning budget ([`TuningSettings`]) is
+//! spent on optional work by value ([`allocation`]): only work whose whole
+//! price fits what remains is started, work begun runs to its end, and a
+//! challenger that measured faster replaces a unit's choice only once it is
+//! confirmed and covered. Time past the budget is reported, never a failure.
+//! A unit builds each point's inputs only when its work reaches the point,
+//! and forms only what it is about to measure. With a [`KernelCache`], every
+//! unit's record is stored provisional from its mandatory phase on, replaced
+//! when its served choice changes, and settled once, with everything it
+//! measured, when the optional work stops, including explicit unmeasured
+//! scope. A search abandoned before then (a Prepare preempted by a load,
+//! a killed process) leaves no settled record: the next search of the unit
+//! searches it again, and a load meets it as a unit without a record.
+//! Later loads only reuse a settled record, under a key over what its
+//! measurements are valid for (tuning version, tuning budget,
+//! device and toolchain identity, unit, implementation digest, the
+//! comparison its measurements come from and served shapes), choosing from
+//! it again when their α differs. A fresh preparation ([`TuningSettings::fresh`])
+//! reads no stored result and replaces them. Nothing is shipped.
 //! The engine supplies what only it knows, per entry, through an
 //! [`EntryTuning`] case:
 //!
@@ -22,8 +36,10 @@
 //! - tuning points over the shape classes the entry serves (§5.3), with
 //!   weights;
 //! - rotations built from real resident weights of up to
-//!   [`ROTATION_LAYERS`] distinct layers, so repeated calls stream from
-//!   memory as a real step does;
+//!   [`ROTATION_LAYERS`] distinct layers, whose values a real step reads;
+//!   where the device reports its last-level cache, Seismic times copies of
+//!   a rotation whose bytes the cache could hold beside it, so that
+//!   repeated calls stream from memory as a real step does;
 //! - control tables built as the batch builder builds them
 //!   ([`TuningInputs::batch`]);
 //! - scratch state, KV history and routing tables owned by each case. An
@@ -31,7 +47,11 @@
 //!   restored before each reference and validated invocation (Seismic's
 //!   `TuningPoint::initialize`); real state is never bound.
 //!
-//! Each entry uses the compiler precision policy with explicit floating result/state limits.
+//! Every candidate is held to the caller's numerical profile against its
+//! unit's default: each floating result and written state within α rounding
+//! steps ([`NumericalProfile`]), everything else bit for bit. A unit's
+//! measurements do not depend on α: a stored record is served under any
+//! profile by choosing again among the choices its search served.
 //!
 //! Adding an entry: implement [`EntryTuning`] for a case type in the module of
 //! its block family, and prepare the entry through `Specializer::tuned` at
@@ -48,61 +68,28 @@
 /// entry's element bindings built from it.
 macro_rules! generated_entry {
     ($module:ident, $this:ident => $elements:expr) => {
-        fn precision(&self) -> Result<seismic::PrecisionPolicy, seismic::TuneError> {
-            let $this = self;
-            super::precision::policy($module::native_numerical_subjects($elements)?)
-        }
-
-        generated_entry!(@bound $module, $this => $elements);
-    };
-    // An entry whose results are a residual plus a value it rounds to the
-    // element `$rounded` first, or F32 values computed from such a value.
-    ($module:ident, $this:ident => $elements:expr, rounded to $rounded:expr) => {
-        fn precision(&self) -> Result<seismic::PrecisionPolicy, seismic::TuneError> {
-            let $this = self;
-            super::precision::rounded_policy(
-                $module::native_numerical_subjects($elements)?,
-                $rounded,
-            )
-        }
-
-        generated_entry!(@bound $module, $this => $elements);
-    };
-    (@bound $module:ident, $this:ident => $elements:expr) => {
         #[cfg(feature = "tuning-survey")]
         fn tune(
             &self,
             device: &seismic::Device,
             statics: &seismic::NativeSpecialization,
             points: &mut dyn seismic::PointSource<'_, Self::Entry>,
-            validation: seismic::TuningPrecision,
+            validation: seismic::NumericalRequirement,
             strategy: seismic::Strategy,
         ) -> Result<seismic::TuningResult, seismic::TuneError> {
             let $this = self;
-            $module::native_tune_with(
-                device,
-                $elements,
-                statics,
-                points,
-                validation,
-                strategy,
-                seismic::TuningReference::NativeDefault,
-            )
+            $module::native_tune_with(device, $elements, statics, points, validation, strategy)
         }
 
         fn open(
             &self,
             device: &seismic::Device,
             statics: &seismic::NativeSpecialization,
-            validation: seismic::TuningPrecision,
+            validation: seismic::NumericalRequirement,
         ) -> Result<Box<dyn super::EntrySearch<Self::Entry>>, seismic::TuneError> {
             let $this = self;
             Ok(Box::new($module::native_search_with(
-                device,
-                $elements,
-                statics,
-                validation,
-                seismic::TuningReference::NativeDefault,
+                device, $elements, statics, validation,
             )?))
         }
 
@@ -121,40 +108,26 @@ macro_rules! generated_entry {
         }
     };
     ($module:ident) => {
-        fn precision(&self) -> Result<seismic::PrecisionPolicy, seismic::TuneError> {
-            super::precision::policy($module::native_numerical_subjects()?)
-        }
-
         #[cfg(feature = "tuning-survey")]
         fn tune(
             &self,
             device: &seismic::Device,
             statics: &seismic::NativeSpecialization,
             points: &mut dyn seismic::PointSource<'_, Self::Entry>,
-            validation: seismic::TuningPrecision,
+            validation: seismic::NumericalRequirement,
             strategy: seismic::Strategy,
         ) -> Result<seismic::TuningResult, seismic::TuneError> {
-            $module::native_tune(
-                device,
-                statics,
-                points,
-                validation,
-                strategy,
-                seismic::TuningReference::NativeDefault,
-            )
+            $module::native_tune(device, statics, points, validation, strategy)
         }
 
         fn open(
             &self,
             device: &seismic::Device,
             statics: &seismic::NativeSpecialization,
-            validation: seismic::TuningPrecision,
+            validation: seismic::NumericalRequirement,
         ) -> Result<Box<dyn super::EntrySearch<Self::Entry>>, seismic::TuneError> {
             Ok(Box::new($module::native_search(
-                device,
-                statics,
-                validation,
-                seismic::TuningReference::NativeDefault,
+                device, statics, validation,
             )?))
         }
 
@@ -177,53 +150,71 @@ pub(crate) mod attention;
 pub(crate) mod cases;
 pub(crate) mod general_routed;
 pub(crate) mod per_layer;
-#[cfg(feature = "pinned-tuning")]
 pub mod pinned;
 pub(crate) mod post_norm;
 mod precision;
+pub(crate) mod ranged;
 pub(crate) mod readout;
+mod record;
 pub(crate) mod recurrent;
 pub(crate) mod routed;
 pub(crate) mod short_conv;
 pub(crate) mod state_space;
+pub(crate) mod streams;
 #[cfg(feature = "tuning-survey")]
 pub mod survey;
+mod trace;
 mod weights;
+pub(crate) mod workload;
 
-pub(crate) use weights::TuningWeights;
-pub use precision::{AdmittedErrorClasses, NO_ERROR_CLASSES};
+pub use precision::{NumericalProfile, ResolvedNumericalProfile};
+#[cfg(test)]
+use record::ChosenEvidence;
+pub use record::Receipt;
+use record::StoredChoice;
+pub use trace::{TRACE_SCHEMA, TracedWork, TuningTrace};
 pub use weights::{TuningWeightSource, ZeroTuningWeights};
+pub(crate) use weights::{TuningWeights, decode_experts, experts_text, weight_plan};
 
 use super::CatalogFailure;
-use crate::kernel_cache::{KernelCache, TuningCacheKey};
+use super::specialization::{UntunedEntries, UntunedFormation};
 use crate::ModelLoadPlan;
+use crate::kernel_cache::{KernelCache, TuningCacheKey};
+use crate::operators::InputForm;
+use crate::programs::invocation_demand::Launch;
 use magnitude_batching::{ClassLimits, Demand, PackedRowTables, Row, RowHistory, Slot};
-use magnitude_family_contracts::{ModelDefinition, Operator, WeightKind, WeightScope};
-use seismic::{
-    CensusPlan, Configuration, DType, Device, Element, NativeImplementation, NativeSpecialization, ParameterValues, PrecisionPolicy, SearchSettings, SearchStop,
-    Standing, StartPlan, Tensor, TensorError, TuneError, TuningInitializer, TuningMethod,
-    TuningResult, TuningTime,
+use magnitude_family_contracts::{
+    InputNorm, ModelDefinition, Operator, OutputForm, ResidualForm, Sublayer, WeightKind,
+    WeightScope,
 };
 #[cfg(feature = "tuning-survey")]
 use seismic::Strategy;
-use std::cell::RefCell;
+use seismic::{
+    BuildError, Configuration, DType, Device, Element, NativeImplementation, NativeSpecialization,
+    ParameterValues, SearchSettings, SearchStop, Standing, Tensor, TensorError, TuneError,
+    TuningInitializer, TuningResult, TuningTime,
+};
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// The row counts whose shares of step time weigh the objective (§5.3).
+/// The row classes units are tuned at; a load's launches are represented at
+/// them ([`EntryTuning::invocation_rows`]).
 pub const TUNING_ROWS: [u64; 10] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512];
-/// History lengths of attention tuning points (§5.3).
-// An empty history exercises the fresh-only path, where the Gemma G8
-// defect reproduces. Longer histories plus their appended rows already
-// cover partially occupied groups.
+/// Numerical history witnesses, supplemented by each layer's longest
+/// retained history ([`with_contexts`]). Performance demand selects its
+/// representatives independently in [`apply_invocation_counts`].
 pub const TUNING_CONTEXTS: [u64; 5] = [0, 256, 4096, 16384, 65536];
 /// Distinct layers a decode-row rotation cycles through where the model has
-/// them. Decode rows stream every weight once per call, so repeated calls
-/// must not find the weights cache resident. A prefill chunk reuses each
-/// weight across its row tile and is compute bound, so one argument set
-/// measures it.
+/// them. Decode rows stream every weight once per call; that repeated calls
+/// do not find a rotation's bytes cache resident is Seismic's to ensure,
+/// whatever their size, by timing copies of a rotation the cache could
+/// hold beside it, where the device reports its cache. A prefill chunk
+/// reuses each weight across its row tile and is compute bound, so one
+/// argument set measures it.
 pub const ROTATION_LAYERS: usize = 4;
 /// The largest row count at which projections stream their weights (the K1
 /// GEMV bound); larger counts run tiled GEMMs. Every point of at most these
@@ -237,9 +228,9 @@ pub const STREAMING_ROWS: u64 = 8;
 /// makes every user retune every model.
 ///
 /// Do not bump it just because tuning changed. A stored result stays valid
-/// across changes to the search, its settings, the tuning time or the
-/// workload weights: it was validated on this device for this code and
-/// precision policy at these shapes, which the rest of the key covers. Bump
+/// across changes to the search, its settings or the workload weights: it
+/// was measured on this device for this code and comparison at these
+/// shapes under this tuning budget, which the rest of the key covers. Bump
 /// it only with the maintainers' approval, when tuning has improved enough
 /// that retuning every model for its better performance is worth the cost,
 /// or when a stored result can no longer be read.
@@ -264,68 +255,204 @@ pub const STREAMING_ROWS: u64 = 8;
 ///     validation of written state rows with one whole-state guard point.
 /// 16: tuning time instead of a configuration budget (results of 15 cannot be
 ///     read), and keys without the search's definition.
-pub const SEARCH_VERSION: u32 = 16;
-/// The time one preparation spends tuning, on any device.
-pub const TUNING_TIME: Duration = Duration::from_secs(60);
-/// A unit's search may take `1 / ADMISSION_SHARE` of its share of step
-/// time's part of [`TUNING_TIME`] to admit points beyond its census's,
-/// building them and measuring the defaults there: about as many evaluations
-/// of its points as this share.
-pub const ADMISSION_SHARE: u32 = 10;
-/// The time one unit refines its search before the tuning time left is
-/// dealt again among the units.
-pub const REFINEMENT_SLICE: Duration = Duration::from_millis(500);
-/// The search's constants (§D2).
-pub const SEARCH_SETTINGS: SearchSettings = SearchSettings {
-    improvement: 0.01,
-    restarts: 2,
-    confirmed: 3,
-    default_margin: 0.02,
-    samples: 3,
-    confirmation_samples: 7,
-};
+/// 28: production fidelity uses the exact associated portable computation;
+/// canonical formation is pre-clock, observations share the original minute.
+/// Earlier native self-comparison results are not valid under this identity.
+/// 27: complete checked numerical computations and caller-owned exact-recipe approvals
+/// replace error-class widening; reference identity binds the computation and actual elements.
+/// 26: numerical witnesses and performance rotations are distinct; zero-demand histories
+/// remain untimed witnesses, and expired validation is not a cached rejection.
+/// 25: admitted optional packets survive forecast-slice handoff under hard deadlines;
+/// affine served geometry includes codec planes and invalid terminal choices cannot reopen search.
+/// 23: runtime-owned admissible start portfolios are priced atomic packets;
+/// service-weighted coverage continues within the same first-load minute before descent.
+/// 22: incomplete required admission uses the allocated first-load slot;
+/// receipt-volume assembly/publication reserves bootstrap from actual census
+/// work, with every attempted execution phase charged on all outcomes.
+/// 21: launch boundaries use admissible local witnesses; partial census
+/// measurements retain their cost and evidence within the first-load minute.
+/// 31: candidates qualify on the device against the declaration's native
+/// default under the caller's comparison; no portable or host reference.
+/// 20: required canonical qualification precedes optimization;
+/// deadline-only optional absence retains the safe declared default.
+/// 19: one first-load deadline across admission and confirmation; corrected
+/// confirmation reserve, retained evidenced incumbents and dependent choices.
+/// 29: selected-artifact service receipts retain actual checked invocation
+/// geometry for load forecasting. Pre-schema records have a different terminal
+/// identity; they are neither reinterpreted nor reopened by this load.
+/// 32: a stored result of 31 can no longer be read: a measured point states
+/// its invocation geometry without repeating its entry and artifact, a
+/// method records no per-unit allowance, and coverage outcomes are passed
+/// or failed. A unit's record is published from its mandatory phase on and
+/// replaced as its first load measures and promotes.
+/// 33: a stored result of 32 can no longer be read: a searched unit's
+/// method is one shape, `Search { groups, candidates, complete }`, whether
+/// its launches are formed separately or its program whole (it was
+/// `Factored` with those fields for the one and `Search { settings, stop }`
+/// for the other), and recorded settings no longer carry `improvement`,
+/// `restarts` or `confirmed`. A program formed whole is searched in the
+/// order of the others: other forms first, a form's leader's neighbours
+/// after.
+/// 35: the objective's demand is the workload's launches at every row count:
+/// a third of the decode steps run at 2, 4 and 8 rows, which a result of 34
+/// was searched without (it weighed every decoded token at one row).
+/// 36: a searched configuration's record states how it was formed (the
+/// formation calls' seconds, the programs they formed, whether any compiler
+/// ran), and a piece's price includes the planning that follows it; a
+/// result of 35 records neither.
+/// 37: every recorded time is read at the device's sustained clock, both
+/// sides of a round with the same repetitions and each sample behind a lead
+/// of its own work (a result of 36 mixed readings taken at different device
+/// states, whose ratios do not compare), and a challenger that is timed
+/// before it is witnessed and does not stay ahead records no numerical
+/// observations.
+/// 38: what a search admits changed with what its pieces are quoted: a
+/// promoted choice owes its serving artifact only where the store lacks
+/// it, a witness after rounds not yet observed is priced by the unit's
+/// admissions witnessed first, and a unit's coverage checks not yet
+/// observed are one unknown. A result of 37 stopped with seconds of its
+/// budget unused and left measured leads unconverted.
+/// 39: a record is stored as its choice and, apart from it, its evidence
+/// ([`record`]); a result of 38 is one entry holding both, which a load
+/// decoded whole. And a challenger leads the served choice when the sign
+/// test of its matched rounds resolves that it is faster, by however
+/// little: no margin is asked of a round, of a nominal lead or of a
+/// promotion, and the search's settings hold the error rate alone (a
+/// result of 38 served only a challenger faster by more than 2%, and
+/// recorded that margin in its settings). And a search whose leading row
+/// band boundary moves off the default goes on to its groups' sweeps, and
+/// is recorded complete only when its domain is exhausted (in a result of
+/// 38 such a unit stopped after the new leader's coverage, its launches'
+/// mappings unrefined, and was recorded as exhausted). And a unit whose
+/// remaining pieces did not fit the memory room when its load's optional
+/// work stopped is stored with that stop ([`SearchStop::NoRoom`]; a
+/// result of 38 recorded it as expired, as if the budget had ended it).
+/// 40: optional runtime work observes the original load cutoff between
+/// submissions; interrupted witnesses and rounds never become rejections.
+/// 41: a record is settled only when its search's optional work stopped,
+/// and one published before then is stored provisional and searched again
+/// (a result of 40 stored the mandatory phase's canonical default as the
+/// unit's final choice, so a Prepare preempted mid-search left its units
+/// untuned for good).
+/// 42: a search admits a configuration whose program the store does not
+/// keep without an artifact price or a cold-compile bound, since every
+/// program has one owner that loads it or compiles it once (a result of 41
+/// priced promoting and confirming a choice by the artifact it would
+/// publish).
+/// 43: a unit whose work can never start again leaves the optional work,
+/// one still undiscovered leaving the objective, and the others' search
+/// goes on; and a unit's challengers whose bytes it has not observed are
+/// held to what its pieces' operations added beyond the inputs they kept
+/// resident (a result of 42 stopped every unit's search when one unit's
+/// discovery was refused for its bytes, its other units expired with one
+/// candidate each, and held a unit's first challengers to its own input
+/// build again: 21.66 GB for a piece needing about 2.4).
+/// 44: a case's picks name the rows its index-list source holds at the
+/// position its point stands for, in a plane of those rows (a result of 43
+/// timed every pick as none, of a plane of no rows).
+/// 45: a discovery piece is admitted at what it is ranked at, a unit's
+/// later points priced from its own earlier ones and what that leaves
+/// unpriced from the discovery the load has run (a result of 44 held every
+/// pending piece to two or three times the longest operation any unit
+/// completed, and stored the units that then left the objective with their
+/// defaults alone: 18 demanded units of a DeepSeek V4.1 load on Metal,
+/// attention_decode among them, behind routed_gate_up's 11.29 s build).
+pub const SEARCH_VERSION: u32 = 45;
+/// The tuning budget of a served load: the time one first-load preparation
+/// spends tuning, on any device.
+pub const STANDARD_TUNING_BUDGET: Duration = Duration::from_secs(60);
 
-/// CPU and Metal candidates are measured with one sample and their finalists
-/// confirmed with five: replays of 31 stored CPU searches and of Metal's
-/// recorded searches preserved every seven-sample winner at five, while
-/// three samples changed one CPU winner.
-pub(crate) fn search_settings(backend: seismic::BackendName) -> SearchSettings {
-    let mut settings = SEARCH_SETTINGS;
-    if matches!(
-        backend,
-        seismic::BackendName::Cpu | seismic::BackendName::Metal
-    ) {
-        settings.samples = 1;
-        settings.confirmation_samples = 5;
-    }
-    settings
+/// What a load does when it meets a tuning unit without a stored record
+/// (and without a development pin deciding it). The two are one walk that
+/// differs only at that moment; a load searches under neither.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum UnpreparedUnits {
+    /// Stop there, before anything of the model is placed, and report it
+    /// ([`CatalogFailure::Unprepared`]): the host has the search run in a
+    /// process of its own and loads again.
+    Report,
+    /// Prepare the unit at its canonical default and go on: the load is
+    /// total.
+    ServeDefaults,
 }
-/// The settings of a unit holding `share` of step time: a unit below
-/// [`MINOR_SHARE`] confirms its finalists with fewer samples.
-fn search_settings_for(share: f64, backend: seismic::BackendName) -> SearchSettings {
-    let mut settings = search_settings(backend);
-    if share < MINOR_SHARE {
-        settings.confirmation_samples = settings
-            .confirmation_samples
-            .min(MINOR_CONFIRMATION_SAMPLES);
-    }
-    settings
+
+/// How one preparation tunes, chosen by its host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TuningSettings {
+    /// The time the first-load preparation spends tuning. It is part of every
+    /// stored result's key: a result searched within one budget is never
+    /// read under another.
+    pub budget: Duration,
+    /// Search every unit again: stored tuning results are not read, and the
+    /// new results replace them. Formed programs are still reused. A load
+    /// never searches: one that reports units without a record reports
+    /// every unit under it, and one that serves defaults ignores it.
+    pub fresh: bool,
 }
-/// Minimum device time of one sample; device timestamps resolve
-/// microseconds.
+
+impl TuningSettings {
+    /// What a served load tunes with.
+    pub const STANDARD: Self = Self {
+        budget: STANDARD_TUNING_BUDGET,
+        fresh: false,
+    };
+}
+/// The search's constants (§D2), the same for every unit on every device.
+///
+/// `error_rate` is how often a resolved comparison of a challenger with the
+/// served choice is wrong ([`SearchSettings::error_rate`]): one in twenty of
+/// the comparisons of a configuration that is not faster than the served
+/// choice promote it, and one in twenty of those of a configuration that
+/// is not slower drop it. No margin is asked of a challenger beyond that:
+/// one that is faster by however little leads once its rounds resolve it.
+/// The rate is per comparison, and only a comparison given the rounds to
+/// resolve can go wrong the first way: a challenger whose first round is
+/// not ahead leaves after it, so those comparisons are a load's
+/// conversions (48 promotions on Metal for Qwen3.5-4B Q4 in the load
+/// recorded 2026-10-10, 42 with the 2% margin that was asked before). How many
+/// samples a decision takes follows from this rate and from how the rounds
+/// come out, nowhere from a count: a clear difference is settled in the
+/// fewest rounds there are (seven for a lead at 0.05), a slower challenger
+/// leaves after one, and neither depends on the device or on the unit's
+/// share (what a decision is worth is weighed where its piece is admitted,
+/// by the allocator).
+pub const SEARCH_SETTINGS: SearchSettings = SearchSettings { error_rate: 0.05 };
+
+/// Minimum device time of one sample: what makes the fixed device cost of
+/// a submission, which both sides of a comparison carry, a small part of
+/// what is timed (device timestamps resolve microseconds). No number of
+/// rounds stands in for it: rounds average a sample's noise, and this is a
+/// bias every round repeats.
 pub const MIN_SAMPLE_SECONDS: f64 = 0.0002;
 
-/// One workload an entry serves: its shape and its share of expected step
-/// time.
+/// One workload an entry serves: its shape and its invocation demand.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PointShape {
     pub label: String,
+    /// The point's weight in the unit's objective, once the load's graph
+    /// has supplied the unit's launches ([`apply_invocation_counts`]): for
+    /// each term of the load's objective, the term's weight times the
+    /// term's launches at the point over the term's time at the defaults
+    /// ([`Objective`]); as a case declares its points, their weights
+    /// relative to each other. The unit's objective is the sum over points
+    /// of this times the time measured there, so a point of no demand votes
+    /// for nothing.
     pub weight: f64,
+    /// The launches of each term of the load's objective at this point, by
+    /// the term's index: the point's part of the term's time.
+    pub terms: Vec<(usize, f64)>,
     pub rows: u64,
+    /// The sequences the point's rows belong to, each with a history of its
+    /// own: 1 for rows of one sequence (a prefill chunk, a drafter's
+    /// verification rows), the rows themselves for a decode step of that
+    /// many requests. Only a unit whose time depends on it declares points
+    /// of more than one ([`apply_invocation_counts`]).
+    pub sequences: u64,
     /// Visible history rows for attention points.
     pub context: Option<u64>,
-    /// The row point whose history lengths this point varies: points of one
-    /// class split its weight by real time (`seismic::TuningPoint::class`).
+    /// The row point whose history lengths this point varies: the physical
+    /// region the point belongs to, which normalizes nothing of its own
+    /// (`seismic::TuningPoint::class`).
     pub class: Option<String>,
 }
 
@@ -362,87 +489,31 @@ impl TuningLimits {
     }
 }
 
-/// Provisional share of expected step time per row count, for an engine
-/// whose largest launch has `limits.max_rows` rows and whose context is
-/// `limits.context_tokens`. Decode (1 row) dominates serving; verify and
-/// concurrency rows (2–8) come next; the short chunks (16 and 32 rows) and
-/// the prefill chunks share the rest. Weights of points beyond the engine's
-/// bounds are dropped and the remainder renormalized.
-///
-/// The prefill chunks divide their share by the prompts each row count
-/// serves ([`chunk_octaves`]): a prompt longer than the largest launch is
-/// prefilled in launches of that many rows, so the largest row count holds
-/// the share of every longer prompt up to the context, not one part in as
-/// many as there are chunk row counts.
-fn row_share(rows: u64, limits: TuningLimits) -> f64 {
-    match rows {
-        1 => 0.40,
-        2..=8 => 0.20 / 3.0,
-        16 | 32 => 0.05,
-        _ => {
-            let octaves = |rows: u64| chunk_octaves(rows, limits);
-            let served = TUNING_ROWS
-                .into_iter()
-                .filter(|rows| *rows > SHORT_CHUNK_ROWS)
-                .map(octaves)
-                .sum::<f64>();
-            0.30 * octaves(rows) / served
-        }
-    }
+/// `case`'s implementation as `device` offers it at the case's elements
+/// (`seismic::BoundEntry::offered`): the declaration preparation forms, its
+/// defaults the ones a pinned unit holds to.
+fn offered<T: EntryTuning>(case: &T, device: &Device) -> Result<seismic::OnDevice, String> {
+    case.entry()
+        .offered(device)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "the device offers no native implementation".to_owned())
 }
 
-/// The largest row count of the short chunks; larger row counts are the
-/// prefill chunks.
-const SHORT_CHUNK_ROWS: u64 = 32;
-
-/// The octaves of prompt length the prefill row count `rows` serves, prompt
-/// lengths being as likely in one octave as in another: its own (the prompts
-/// of more than half its rows up to its rows), and for the largest row count
-/// within the engine's row bound every octave from there to the context,
-/// whose prompts are prefilled in launches of that many rows. None for a row
-/// count beyond the bound.
-fn chunk_octaves(rows: u64, limits: TuningLimits) -> f64 {
-    let largest = TUNING_ROWS
-        .into_iter()
-        .filter(|rows| *rows <= limits.max_rows)
-        .max();
-    match largest {
-        Some(largest) if rows == largest => {
-            1. + (limits.context_tokens.max(largest) as f64 / largest as f64).log2()
-        }
-        Some(largest) if rows < largest => 1.,
-        _ => 0.,
-    }
-}
-
-/// The row classes one census point stands for. Each streaming row count is
-/// a class of its own (its points are required, and the census times them
-/// all). Beyond them the classes [`row_share`] weighs alike are one group,
-/// the short chunks and the prefill chunks: the census times a unit at the
-/// costliest point it serves in each group, and that point's time stands
-/// for the unit at every row count of the group it serves.
-fn census_group(rows: u64) -> u64 {
-    match rows {
-        0..=STREAMING_ROWS => rows,
-        16 | 32 => 32,
-        _ => u64::MAX,
-    }
-}
-
-/// Whether the census times each of `shapes`: every required point, and beyond the streaming rows the costliest point of
-/// each [`census_group`], the most rows and for attention the longest
-/// history. A prefill chunk's time is what a unit serving only chunks spends
-/// of a step, so its share of step time cannot be read from its cheapest
-/// point.
+/// Discover each unit at the points the load's objective weighs, and at an
+/// empty history beside each weighted history point, the cheapest point of
+/// its rows, which prices the longer ones before they are built. Complete
+/// numerical scope remains independent of these performance measurements.
 fn census_points(shapes: &[PointShape]) -> Vec<bool> {
     shapes
         .iter()
         .map(|shape| {
-            shape.rows <= STREAMING_ROWS
-                || shapes.iter().all(|other| {
-                    census_group(other.rows) != census_group(shape.rows)
-                        || other.cost() <= shape.cost()
-                })
+            shape.weight > 0.
+                || (shape.context == Some(0)
+                    && shapes.iter().any(|other| {
+                        other.rows == shape.rows
+                            && other.sequences == shape.sequences
+                            && other.weight > 0.
+                    }))
         })
         .collect()
 }
@@ -455,13 +526,235 @@ fn normalized(mut points: Vec<PointShape>) -> Vec<PointShape> {
     points
 }
 
+/// The declared workload and its measured baseline term times. Before
+/// discovery, unnormalized demand selects points only; no candidate is
+/// compared until the complete baseline supplies the normalization.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Objective {
+    pub terms: Vec<workload::Term>,
+    pub measured: Vec<f64>,
+}
+
+impl Objective {
+    pub fn new(terms: Vec<workload::Term>) -> Self {
+        let measured = vec![0.; terms.len()];
+        Self { terms, measured }
+    }
+
+    /// What `launches` launches of term `term` at a point weigh in a unit's
+    /// objective, per second they take: the term's weight over its time.
+    fn weight(&self, term: usize, launches: f64) -> f64 {
+        match self.measured.get(term) {
+            Some(time) if *time > 0. => self.terms[term].weight * launches / time,
+            _ => self.terms[term].weight * launches,
+        }
+    }
+}
+
+/// Retain every numerical point while replacing its performance demand with
+/// the launches the load's graph supplied for the unit ([`Objective`]).
+/// Launches of a row count go to the points of that row count whose
+/// sequences are the most declared that the launches have; a unit that
+/// declares only points of one sequence takes them all there. A launch's
+/// history is divided between the two timing representatives around it in
+/// proportion to its distance from each, so its time is interpolated
+/// between the neighbouring measured points only, and is held to the
+/// longest declared (a windowed layer reads no more).
+pub(crate) fn apply_invocation_counts(
+    points: &mut [PointShape],
+    counts: &crate::programs::invocation_demand::InvocationCounts,
+    objective: &Objective,
+) {
+    for point in points.iter_mut() {
+        point.weight = 0.;
+        point.terms.clear();
+    }
+    for (launch, count) in counts.launches() {
+        let declared = points
+            .iter()
+            .filter(|point| point.rows == launch.rows)
+            .map(|point| point.sequences)
+            .collect::<Vec<_>>();
+        let Some(sequences) = declared
+            .iter()
+            .copied()
+            .filter(|declared| *declared <= launch.sequences)
+            .max()
+            .or_else(|| declared.iter().copied().min())
+        else {
+            continue;
+        };
+        let at = points
+            .iter()
+            .enumerate()
+            .filter(|(_, point)| point.rows == launch.rows && point.sequences == sequences)
+            .map(|(index, point)| (index, point.context))
+            .collect::<Vec<_>>();
+        let mut contexts = at
+            .iter()
+            .filter_map(|(index, context)| context.map(|context| (context, *index)))
+            .collect::<Vec<_>>();
+        contexts.sort_unstable();
+        let parts = if contexts.is_empty() {
+            vec![(at[0].0, 1.)]
+        } else {
+            let longest = contexts.last().expect("a point").0;
+            // Keep all declared numerical witnesses, but time only the
+            // explicit empty, short and longest history representatives.
+            contexts.retain(|(context, _)| matches!(*context, 0 | 4096) || *context == longest);
+            let history = launch.history.min(longest);
+            let upper = contexts
+                .iter()
+                .position(|(context, _)| *context >= history)
+                .unwrap_or(contexts.len() - 1);
+            let lower = upper.saturating_sub(1);
+            let (low, high) = (contexts[lower].0 as f64, contexts[upper].0 as f64);
+            let high_share = if high > low {
+                ((history as f64 - low) / (high - low)).clamp(0., 1.)
+            } else {
+                1.
+            };
+            if lower == upper {
+                vec![(contexts[upper].1, 1.)]
+            } else {
+                vec![
+                    (contexts[lower].1, 1. - high_share),
+                    (contexts[upper].1, high_share),
+                ]
+            }
+        };
+        for (index, part) in parts {
+            if part > 0. {
+                let point = &mut points[index];
+                point.terms.push((launch.term, count * part));
+                point.weight += objective.weight(launch.term, count * part);
+            }
+        }
+    }
+}
+
 fn row_point(rows: u64, weight: f64) -> PointShape {
     PointShape {
         label: format!("m{rows}"),
         weight,
+        terms: Vec::new(),
         rows,
+        sequences: 1,
         context: None,
         class: None,
+    }
+}
+
+/// Where a point's histories lie ([`TuningInputs::batch`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HistoryPlacement {
+    /// Per sequence, its history's `[start, end)` row ranges in logical
+    /// order.
+    pub sequences: Vec<Vec<[i32; 2]>>,
+    /// One past the last row any history holds.
+    pub extent: u64,
+}
+
+/// Where `point`'s histories lie in layers keeping at most `window` rows
+/// (the whole context without one). One sequence's history is one span, as
+/// a store keeps a request that grows alone. Several sequences' lie where
+/// the target's store of those layers' history domain, of `codec`, places
+/// requests that arrive together ([`magnitude_state::fresh_history_ranges`]):
+/// apart from one another, so a kernel form that reads its rows' histories
+/// as one range is timed over what lies between them, as it is in service.
+pub(crate) fn history_placement(
+    model: &ModelInputs<'_>,
+    codec: magnitude_state::KvCodec,
+    window: Option<u64>,
+    point: &PointShape,
+) -> Result<HistoryPlacement, String> {
+    let context = point.context.unwrap_or(0);
+    let bound = |row: u64| i32::try_from(row).map_err(|_| "tuning history exceeds i32".to_owned());
+    if point.sequences == 1 {
+        // A history of no rows has no span.
+        let history = match context {
+            0 => Vec::new(),
+            context => vec![[0, bound(context)?]],
+        };
+        return Ok(HistoryPlacement {
+            sequences: vec![history],
+            extent: context,
+        });
+    }
+    let sequences = magnitude_state::fresh_history_ranges(
+        history_geometry(model, codec, window)?,
+        usize::try_from(point.sequences).map_err(|_| "sequences exceed usize")?,
+        usize::try_from(context).map_err(|_| "context exceeds usize")?,
+    )
+    .into_iter()
+    .map(|history| {
+        history
+            .into_iter()
+            .map(|(start, count)| Ok([bound(start as u64)?, bound((start + count) as u64)?]))
+            .collect::<Result<Vec<_>, String>>()
+    })
+    .collect::<Result<Vec<_>, String>>()?;
+    let extent = sequences
+        .iter()
+        .flatten()
+        .map(|range| range[1] as u64)
+        .max()
+        .unwrap_or(0);
+    Ok(HistoryPlacement { sequences, extent })
+}
+
+/// The history rows the listing classes of a layer keeping at most
+/// `window` rows (the whole context without one) hold for one request: its
+/// history's most spans of whole pages, as the target's store of `codec`
+/// places them (`HistoryStorePlan::launch_tiles`). A launch whose rows see
+/// at most these lists the tiles they see.
+pub(crate) fn request_history_rows(
+    model: &ModelInputs<'_>,
+    codec: magnitude_state::KvCodec,
+    window: Option<u64>,
+) -> Result<u64, String> {
+    let geometry = history_geometry(model, codec, window)?;
+    geometry
+        .span_limit
+        .checked_mul(geometry.page_rows)
+        .map(|rows| rows as u64)
+        .ok_or_else(|| "a request's history rows overflow".to_owned())
+}
+
+/// The geometry of the target's history store, of `codec`, for layers
+/// keeping at most `window` rows: its Token domain without a window, else
+/// the Window domain of exactly that many rows.
+fn history_geometry(
+    model: &ModelInputs<'_>,
+    codec: magnitude_state::KvCodec,
+    window: Option<u64>,
+) -> Result<magnitude_state::HistoryGeometry, String> {
+    let layout =
+        magnitude_state::ModelStateLayout::derive(&model.definition.decoder, &[], codec, 0)?;
+    let context = usize::try_from(model.limits.context_tokens).map_err(|_| "context exceeds usize")?;
+    let max_advance = usize::try_from(model.limits.max_rows).map_err(|_| "rows exceed usize")?;
+    let granule = crate::planning::state_granule(&layout, context, max_advance)?;
+    layout
+        .target_history
+        .iter()
+        .find(|domain| match (domain, window) {
+            (magnitude_state::HistoryDomainLayout::Token { .. }, None) => true,
+            (magnitude_state::HistoryDomainLayout::Window { rows, .. }, Some(window)) => {
+                *rows as u64 == window
+            }
+            _ => false,
+        })
+        .ok_or("the layers' history domain is not the target's")?
+        .geometry(&layout.target_history, context, max_advance, granule)
+        .map_err(|error| error.to_string())
+}
+
+/// `point`, a row point of one sequence, as `sequences` sequences' rows.
+pub(crate) fn across_sequences(point: &PointShape, sequences: u64) -> PointShape {
+    PointShape {
+        label: format!("{}s{sequences}", point.label),
+        sequences,
+        ..point.clone()
     }
 }
 
@@ -491,57 +784,47 @@ pub fn served_row_points(limits: TuningLimits, serves: impl Fn(u64) -> bool) -> 
             .map(|rows| row_point(rows, 1.0))
             .collect();
     }
-    normalized(
-        within
-            .into_iter()
-            .map(|rows| row_point(rows, row_share(rows, limits)))
-            .collect(),
-    )
+    normalized(within.into_iter().map(|rows| row_point(rows, 1.)).collect())
 }
 
 /// The longest history the engine serves to layers keeping at most `window`
 /// history rows: the window when it is shorter than the context, else the
 /// context.
 pub fn longest_history(limits: TuningLimits, window: Option<u64>) -> u64 {
-    window.map_or(limits.context_tokens, |window| window.min(limits.context_tokens))
+    window.map_or(limits.context_tokens, |window| {
+        window.min(limits.context_tokens)
+    })
 }
 
 /// `rows` crossed with the history lengths the engine serves to layers
 /// keeping at most `window` history rows (the whole context without one).
 ///
-/// A layer whose window is shorter than the context never sees a longer
-/// history and sees exactly its window in every prompt longer than it, so
-/// its lengths are the ladder's below the window and the window itself. A
-/// window that holds the whole context bounds nothing.
+/// Those are [`TUNING_CONTEXTS`] below the longest and the longest itself:
+/// the context, or for a layer whose window is shorter than the context
+/// the window, which it sees in every prompt longer than it and never
+/// exceeds. A window that holds the whole context bounds nothing.
 pub fn with_contexts(
     limits: TuningLimits,
     window: Option<u64>,
     rows: Vec<PointShape>,
 ) -> Vec<PointShape> {
     let longest = longest_history(limits, window);
-    let window = window.filter(|window| *window < limits.context_tokens);
     let mut contexts = TUNING_CONTEXTS
         .into_iter()
         .filter(|context| *context <= longest)
         .collect::<Vec<_>>();
-    if let Some(window) = window {
-        if !contexts.contains(&window) {
-            contexts.push(window);
-        }
-    }
-    let contexts = if contexts.is_empty() {
-        vec![limits.context_tokens]
-    } else {
-        contexts
-    };
-    let share = 1.0 / contexts.len() as f64;
+    contexts.push(longest);
+    contexts.sort_unstable();
+    contexts.dedup();
     normalized(
         rows.into_iter()
             .flat_map(|point| {
                 contexts.iter().map(move |&context| PointShape {
                     label: format!("{}-c{context}", point.label),
-                    weight: point.weight * share,
+                    weight: point.weight,
+                    terms: Vec::new(),
                     rows: point.rows,
+                    sequences: point.sequences,
                     context: Some(context),
                     class: Some(point.label.clone()),
                 })
@@ -561,8 +844,9 @@ pub fn attention_points(limits: TuningLimits) -> Vec<PointShape> {
 /// most points only those rows are restored before every reference and
 /// validated invocation and observed by validation; the rest is input the
 /// entry only reads. One point per unit ([`guard_point`]) restores and
-/// observes the complete storage, so a write outside the declared rows is
-/// rejected without paying for whole long histories everywhere.
+/// observes the complete storage: there the rows outside the declared ones
+/// must stay the default's bit for bit, so a write outside them is rejected
+/// without paying for whole long histories everywhere.
 pub(crate) struct CaseState {
     tensor: Tensor,
     written: Range<u64>,
@@ -611,6 +895,25 @@ impl CaseState {
 
 type Restorer = Box<dyn FnMut() -> Result<(), TensorError>>;
 
+/// A tuning case's binding of a slab port (`&slab`) it only reads
+/// ([`TuningInputs::slab_view`]).
+pub(crate) struct SlabView {
+    tensor: Tensor,
+    /// The rows of each of its slabs, the port's `slab_rows` scalar.
+    rows_per_slab: u32,
+    _slab: Option<Arc<seismic::SlabTensor>>,
+}
+
+impl SlabView {
+    pub fn tensor(&self) -> &Tensor {
+        &self.tensor
+    }
+
+    pub fn rows_per_slab(&self) -> u32 {
+        self.rows_per_slab
+    }
+}
+
 /// Restores every writable state in every argument rotation of a point:
 /// completely at the guard point, their written rows elsewhere.
 fn initializer(
@@ -635,65 +938,137 @@ fn initializer(
     })))
 }
 
-/// One unit's search on the device, advanced in steps
-/// ([`seismic::NativeSearch`]): a census of the defaults at the points
-/// every candidate must pass, a start that measures the defaults and every
-/// form's start, refinements, and a conclusion.
+/// One unit's tuning on the device, advanced one piece of work at a time
+/// ([`seismic::NativeSearch`]). From its mandatory work on, the unit holds
+/// a legal served choice and a complete record of it; every later piece is
+/// optional and can only replace that choice with a better one.
 pub(crate) trait EntrySearch<E: seismic::Entry> {
-    fn census(
+    /// The compile of the mandatory work, the unit's canonical program,
+    /// to run on any thread; none when the unit has none to run there.
+    fn grounding(
         &mut self,
         points: &mut dyn seismic::PointSource<'static, E>,
-        plan: CensusPlan,
-    ) -> Result<TuningResult, TuneError>;
-    fn start(
+    ) -> Result<Option<seismic::Grounding>, TuneError>;
+    /// The end of the mandatory work: take what the compile formed and
+    /// hand the canonical program to serving.
+    fn grounded(&mut self, grounded: Option<seismic::Grounded>) -> Result<(), TuneError>;
+    fn plan(&mut self, plan: seismic::UnitPlan);
+    /// The unit's complete record as it stands.
+    fn terminal(&self) -> Result<TuningResult, TuneError>;
+    /// The next piece of optional work, priced in full; none when the unit
+    /// has none left.
+    fn next(&self) -> Option<seismic::Work>;
+    /// The compile of the next piece, to run on any thread ahead of it;
+    /// none when the piece compiles nothing ahead.
+    fn forming(&self) -> Option<seismic::Forming>;
+    /// Hold what the next piece's compile formed. Returns what the compile
+    /// took.
+    fn formed(&mut self, formed: seismic::Formed) -> Result<Duration, TuneError>;
+    /// Run the next piece of work to its end.
+    fn perform(
         &mut self,
         points: &mut dyn seismic::PointSource<'static, E>,
-        plan: StartPlan,
-        until: Instant,
-    ) -> Result<Standing, TuneError>;
-    fn refine(&mut self, slice: Instant, until: Instant) -> Result<Standing, TuneError>;
-    fn reserve(&self) -> Duration;
-    fn conclude(
-        self: Box<Self>,
-        points: &mut dyn seismic::PointSource<'static, E>,
-        until: Instant,
-        allowance: Duration,
-    ) -> Result<TuningResult, TuneError>;
+        before: Option<Instant>,
+    ) -> Result<seismic::Performed, TuneError>;
+    /// Give up what only running work needs: the points' built inputs,
+    /// and with no work left the held programs.
+    fn release(&mut self, points: &mut dyn seismic::PointSource<'static, E>);
+    /// Offer the next piece with one challenger fewer; false when it has
+    /// no fewer to offer.
+    fn narrow(&mut self) -> bool;
+    /// The allocations the unit's resident inputs bind, each its identity
+    /// and bytes; none when it holds no inputs.
+    fn bound(&self) -> Option<Vec<(u64, u64)>>;
+    /// The bytes of the formed programs the unit's search holds.
+    fn programs(&self) -> u64;
+    /// Give up the formed programs the unit's search holds.
+    fn give_up_programs(&mut self);
+    /// The most a single piece of the unit's work has added to the bytes
+    /// held; none until a piece of it has been measured.
+    fn largest_footprint(&self) -> Option<u64>;
+    /// The longest single operation the unit has completed.
+    fn longest_operation(&self) -> Duration;
+    /// What building the inputs the unit holds took.
+    fn inputs_built(&self) -> seismic::Quote;
+    fn service_measurements(&self) -> Vec<seismic::PointMeasurement>;
+    /// Weigh the points by `weights` before anything of the search is
+    /// measured against its first weights; false once it has.
+    fn reweigh(&mut self, weights: &[f64]) -> bool;
+    /// Whether the defaults are measured at every discovery point.
+    fn discovered(&self) -> bool;
+    fn standing(&self) -> Standing;
 }
 
 impl<E: seismic::Entry> EntrySearch<E> for seismic::NativeSearch<'static, E> {
-    fn census(
+    fn grounding(
         &mut self,
         points: &mut dyn seismic::PointSource<'static, E>,
-        plan: CensusPlan,
-    ) -> Result<TuningResult, TuneError> {
-        seismic::NativeSearch::census(self, points, plan)
+    ) -> Result<Option<seismic::Grounding>, TuneError> {
+        seismic::NativeSearch::grounding(self, points)
     }
-
-    fn start(
+    fn grounded(&mut self, grounded: Option<seismic::Grounded>) -> Result<(), TuneError> {
+        match grounded {
+            Some(grounded) => seismic::NativeSearch::grounded(self, grounded),
+            None => Ok(()),
+        }
+    }
+    fn plan(&mut self, plan: seismic::UnitPlan) {
+        seismic::NativeSearch::plan(self, plan)
+    }
+    fn terminal(&self) -> Result<TuningResult, TuneError> {
+        seismic::NativeSearch::terminal(self)
+    }
+    fn next(&self) -> Option<seismic::Work> {
+        seismic::NativeSearch::next(self)
+    }
+    fn forming(&self) -> Option<seismic::Forming> {
+        seismic::NativeSearch::forming(self)
+    }
+    fn formed(&mut self, formed: seismic::Formed) -> Result<Duration, TuneError> {
+        seismic::NativeSearch::formed(self, formed)
+    }
+    fn perform(
         &mut self,
         points: &mut dyn seismic::PointSource<'static, E>,
-        plan: StartPlan,
-        until: Instant,
-    ) -> Result<Standing, TuneError> {
-        seismic::NativeSearch::start(self, points, plan, until)
+        before: Option<Instant>,
+    ) -> Result<seismic::Performed, TuneError> {
+        seismic::NativeSearch::perform(self, points, before)
     }
-
-    fn refine(&mut self, slice: Instant, until: Instant) -> Result<Standing, TuneError> {
-        seismic::NativeSearch::refine(self, slice, until)
+    fn release(&mut self, points: &mut dyn seismic::PointSource<'static, E>) {
+        seismic::NativeSearch::release(self, points)
     }
-
-    fn reserve(&self) -> Duration {
-        seismic::NativeSearch::reserve(self)
+    fn narrow(&mut self) -> bool {
+        seismic::NativeSearch::narrow(self)
     }
-
-    fn conclude(
-        self: Box<Self>,
-        points: &mut dyn seismic::PointSource<'static, E>,
-        until: Instant,
-        allowance: Duration,
-    ) -> Result<TuningResult, TuneError> {
-        seismic::NativeSearch::conclude(*self, points, until, allowance)
+    fn bound(&self) -> Option<Vec<(u64, u64)>> {
+        seismic::NativeSearch::bound_allocations(self)
+    }
+    fn programs(&self) -> u64 {
+        seismic::NativeSearch::held_programs(self)
+    }
+    fn give_up_programs(&mut self) {
+        seismic::NativeSearch::give_up_programs(self)
+    }
+    fn largest_footprint(&self) -> Option<u64> {
+        seismic::NativeSearch::largest_footprint(self)
+    }
+    fn longest_operation(&self) -> Duration {
+        seismic::NativeSearch::longest_operation(self)
+    }
+    fn inputs_built(&self) -> seismic::Quote {
+        seismic::NativeSearch::inputs_built(self)
+    }
+    fn service_measurements(&self) -> Vec<seismic::PointMeasurement> {
+        seismic::NativeSearch::service_measurements(self)
+    }
+    fn reweigh(&mut self, weights: &[f64]) -> bool {
+        seismic::NativeSearch::reweigh(self, weights)
+    }
+    fn discovered(&self) -> bool {
+        seismic::NativeSearch::discovered(self)
+    }
+    fn standing(&self) -> Standing {
+        seismic::NativeSearch::standing(self)
     }
 }
 
@@ -702,7 +1077,6 @@ impl<E: seismic::Entry> EntrySearch<E> for seismic::NativeSearch<'static, E> {
 /// from its census to its conclusion.
 pub(crate) trait EntryTuning: Clone + 'static {
     type Entry: seismic::Entry;
-    fn precision(&self) -> Result<PrecisionPolicy, TuneError>;
     /// One argument set: every tensor its arguments borrow, owned, including
     /// the [`CaseState`]s its `&mut` parameters bind. Kept from a unit's
     /// census for its search.
@@ -716,24 +1090,67 @@ pub(crate) trait EntryTuning: Clone + 'static {
     /// The value of every dimension the model fixes.
     fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String>;
     fn points(&self, limits: TuningLimits) -> Vec<PointShape>;
+
+    /// The rows of `launch` this entry's call takes, which its points' rows
+    /// stand for and its kernel is bound by: the step's rows, or a readout's
+    /// projected rows.
+    fn launch_rows(&self, launch: &Launch) -> u64 {
+        launch.rows
+    }
+    /// Project a logical graph launch onto this entry's performance
+    /// representative: the rows of the point that times it, none where the
+    /// unit's kernel does not serve it (another kernel for the same layers
+    /// does). Numerical support remains `points`/served dimensions.
+    fn invocation_rows(&self, launch: &Launch, representatives: &[u64]) -> Option<u64> {
+        let rows = self.launch_rows(launch);
+        (rows > 0)
+            .then(|| {
+                representatives
+                    .iter()
+                    .copied()
+                    .filter(|at| *at >= rows)
+                    .min()
+            })
+            .flatten()
+    }
+    /// The dimensions of the calls the unit serves at shapes the inputs of
+    /// its points `shapes` do not take (`seismic::PointSource::served`):
+    /// none, unless a launch's requirements grow with a dimension every
+    /// point holds at one value. A candidate that cannot launch at one of
+    /// them is excluded as it is formed, and a stored choice that cannot is
+    /// tuned again.
+    fn served_dimensions(&self, _shapes: &[PointShape]) -> Vec<BTreeMap<String, u64>> {
+        Vec::new()
+    }
     /// Workload-informed admissible configurations to measure at the start
-    /// of a search. A hint in another structural form replaces that form's
-    /// usual nearest-default start within the same budget slot.
+    /// of a search of the unit serving `rows` of the case's rows
+    /// ([`ranged::Ranged`]; [`ranged::EVERY_ROW`] for a case tuned whole).
+    /// A hint in another structural form replaces that form's usual
+    /// nearest-default start within the same budget slot.
     fn search_starts(
         &self,
+        _rows: &Range<u64>,
         _device: &Device,
-        _implementation: &NativeImplementation,
+        _implementation: &seismic::OnDevice,
         _statics: &NativeSpecialization,
         _limits: TuningLimits,
     ) -> Vec<ParameterValues> {
         Vec::new()
     }
-    /// The argument sets of one point, cycling distinct layers.
+    /// Numerical witnesses may include adversarial cases; only genuine served
+    /// invocations belong to the performance workload. Real-weight rotations
+    /// retain every layer by default.
+    fn workload(&self, _cases: usize) -> seismic::WorkloadRotation {
+        seismic::WorkloadRotation::All
+    }
+    /// The argument sets of one point, cycling distinct layers. An
+    /// allocation the device refuses is [`BuildError::Refused`], which
+    /// prices the point at its demand rather than failing the unit.
     fn rotation(
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String>;
+    ) -> Result<Vec<Self::Case>, BuildError>;
     fn args<'a>(case: &'a mut Self::Case) -> <Self::Entry as seismic::Entry>::Args<'a>;
     /// The states `case` lends through `&mut` parameters, by parameter name;
     /// none for an entry without them. Seismic rejects a point that binds a
@@ -749,7 +1166,7 @@ pub(crate) trait EntryTuning: Clone + 'static {
         device: &Device,
         statics: &NativeSpecialization,
         points: &mut dyn seismic::PointSource<'_, Self::Entry>,
-        validation: seismic::TuningPrecision,
+        validation: seismic::NumericalRequirement,
         strategy: Strategy,
     ) -> Result<TuningResult, TuneError>;
     /// Open the search of the unit at `statics`: the entry's generated
@@ -758,31 +1175,15 @@ pub(crate) trait EntryTuning: Clone + 'static {
         &self,
         device: &Device,
         statics: &NativeSpecialization,
-        validation: seismic::TuningPrecision,
+        validation: seismic::NumericalRequirement,
     ) -> Result<Box<dyn EntrySearch<Self::Entry>>, TuneError>;
-    /// The envelopes of the classes among `admitted` that the entry's
-    /// implementation for `device` declares: what its tuning admits, and
-    /// what its stored results are keyed by.
-    fn admitted(
-        &self,
-        device: &Device,
-        admitted: &AdmittedErrorClasses,
-    ) -> BTreeMap<String, seismic::ErrorEnvelope> {
-        let declared =
-            seismic::generated::native_error_classes::<Self::Entry>(device).unwrap_or_default();
-        admitted
-            .envelopes()
-            .iter()
-            .filter(|(class, _)| declared.contains(class))
-            .map(|(class, envelope)| (class.clone(), *envelope))
-            .collect()
-    }
     /// The entry's generated `native_digest[_with]`.
     fn digest(&self, device: &Device, statics: &NativeSpecialization) -> Result<String, TuneError>;
     /// Check a stored choice against the same device-augmented declaration
     /// that native preparation uses.
     fn stored_valid(&self, device: &Device, specialization: &NativeSpecialization) -> bool {
-        seismic::generated::native_specialization_valid::<Self::Entry>(device, specialization)
+        self.entry()
+            .specialization_valid(device, specialization)
             .unwrap_or(false)
     }
     /// The entry bound to the case's elements (its generated
@@ -793,65 +1194,784 @@ pub(crate) trait EntryTuning: Clone + 'static {
 /// Progress of tuning at load, for readiness reporting.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TuningEvent {
-    /// Milliseconds of tuning time spent so far, of [`TUNING_TIME`].
+    /// Milliseconds of tuning time spent so far, of the tuning budget.
     /// Reported when the search walk begins and after each unit it
     /// searches; nothing is reported when every unit is stored.
-    Progress {
-        completed: usize,
-        total: usize,
+    Progress { completed: usize, total: usize },
+    /// The selected device work starts, including resumed and composed units.
+    WorkStarted {
+        entry: &'static str,
+        stage: seismic::Stage,
     },
-    /// A unit's search starts. How many configurations it can reach is
-    /// reported with its result ([`SearchProgress`]): counting the declared
-    /// domain here would enumerate it.
+    /// A unit's first optional work starts. How many configurations it can reach
+    /// is reported with its result ([`SearchProgress`]): counting the
+    /// declared domain here would enumerate it.
     Started {
         entry: &'static str,
         bindings: String,
         points: usize,
     },
+    /// A development survey of a unit (feature `tuning-survey`) came this
+    /// far through its configurations: reported once they are counted,
+    /// before any is formed, and as each batch is formed and measured.
+    Surveyed {
+        entry: &'static str,
+        bindings: String,
+        progress: seismic::SurveyProgress,
+    },
+    /// A unit's mandatory work is done: when the units' canonical compiles
+    /// began on the tuning clock (what the count walk took), what forming
+    /// its canonical artifact took (its own compile, which ran beside the
+    /// other units', and handing it to serving), and what publishing its
+    /// record took.
+    Mandatory {
+        entry: &'static str,
+        bindings: String,
+        began_seconds: f64,
+        forming_seconds: f64,
+        publishing_seconds: f64,
+    },
+    /// The mandatory phase formed the entries without tuning parameters
+    /// that the load after the search prepares, beside the units'
+    /// canonical programs: how many, and what forming them took in all.
+    Untuned {
+        programs: usize,
+        forming_seconds: f64,
+    },
+    /// A piece of a unit's optional work ran to its end: its forecast and
+    /// what it took.
+    Stage(StageRecord),
+    /// The optional work stopped and a unit whose record had changed since
+    /// it was published published it: what the publication was priced at
+    /// (none while its class was unobserved), when it began on the tuning
+    /// clock and what it took.
+    Published {
+        entry: &'static str,
+        bindings: String,
+        forecast_seconds: Option<f64>,
+        began_seconds: f64,
+        actual_seconds: f64,
+    },
+    /// A unit's complete record: once per unit, when its work at this load
+    /// is over.
     Finished(TunedEntry),
-    /// The units were searched: how the tuning time was planned among them
-    /// and what the plan's steps took.
-    Planned(TuningPlan),
+    /// The load's optional work is over: what became of its budget.
+    Budget(BudgetReport),
+    /// A load found no stored record for a unit and prepared it at its
+    /// canonical default. Nothing is published for it.
+    Unprepared {
+        entry: &'static str,
+        bindings: String,
+        statics: BTreeMap<String, u64>,
+    },
+    /// A development tuning pin (`pinned`, installed only by the harness) fixed a unit's
+    /// configuration: the unit was not tuned. `configuration` is what the
+    /// unit runs.
+    Pinned {
+        entry: &'static str,
+        bindings: String,
+        statics: BTreeMap<String, u64>,
+        choice: PinnedChoice,
+        configuration: Configuration,
+    },
 }
 
-/// How one preparation's tuning time was planned among its units, and what
-/// happened. Times are seconds since the tuning time began.
-#[derive(Clone, Debug, PartialEq)]
-pub struct TuningPlan {
-    /// The units' starts, in the order planned: largest share first.
-    pub starts: Vec<PlannedStart>,
-    /// When the starts, the refinement and the last conclusion ended.
-    pub started_seconds: f64,
-    pub refined_seconds: f64,
-    pub concluded_seconds: f64,
-    /// What the plan held back for conclusions when refinement ended.
-    pub reserved_seconds: f64,
-    /// Refinement slices dealt.
-    pub slices: usize,
-    /// Steps that ended after the instant they were given: the unit, the
-    /// step and by how much. A failure of the plan.
-    pub overruns: Vec<(String, &'static str, f64)>,
+/// Where a pinned unit's configuration came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PinnedChoice {
+    /// The configuration recorded for the unit.
+    Replayed,
+    /// Every unit runs its declared default (`TuningPin::Defaults`).
+    Defaults,
+    /// The recording has no configuration for the unit (a shape first
+    /// prepared in this run): its declared default runs, untuned.
+    NotReplayed,
 }
 
-/// What the plan gave one unit's start.
+/// Fresh counters from the current search, excluding stored records.
 #[derive(Clone, Debug, PartialEq)]
-pub struct PlannedStart {
+pub struct TuningCounts {
+    pub measured: usize,
+    pub programs: usize,
+}
+
+/// One completed piece of optional work and its current-run counters.
+/// Times are seconds; `began_seconds` is since tuning began.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StageRecord {
     pub entry: &'static str,
     pub bindings: String,
+    /// The unit's statics: with its entry and bindings, which unit.
+    pub statics: BTreeMap<String, u64>,
+    /// The unit's share of step time when the piece was started.
     pub share: f64,
-    /// Whether the start measured the form starts besides the defaults;
-    /// none when neither start fit and the unit kept its defaults.
-    pub forms: Option<bool>,
-    /// What the plan expected the start it gave to take, what a start with
-    /// the form starts would have, and the time it had for this start and
-    /// everything after it.
-    pub estimated_seconds: f64,
-    pub with_forms_seconds: f64,
-    pub available_seconds: f64,
+    pub stage: seismic::Stage,
+    pub counts: Option<TuningCounts>,
+    /// The piece's whole price when it was started: the sum of its
+    /// operations' class prices, and how many of its operations belonged
+    /// to a class this load had not observed. A piece with an unpriced
+    /// operation has no forecast.
+    pub priced_seconds: f64,
+    pub unpriced: usize,
+    pub forecast_seconds: Option<f64>,
+    pub began_seconds: f64,
     pub actual_seconds: f64,
-    /// The start reached its hard limit before its planned work was done:
-    /// a failure of the plan.
-    pub cut: bool,
+    /// The part of `actual_seconds` the unit's search performed; the rest
+    /// is the tuner's own work around it.
+    pub searching_seconds: f64,
+    pub interrupted: bool,
+    /// The piece's compile, when it ran ahead on a worker while the device
+    /// did other work: its price when the piece was started, and what it
+    /// took. The piece's price and time above are then of the rest of it,
+    /// on the device.
+    pub formed: Option<FormedAhead>,
+    /// Where the piece's time went by operation class, and what publishing
+    /// the unit's record after it took.
+    pub spent: seismic::Spent,
+    /// What each raise of the device's clock did within the piece, and
+    /// each establishment of its gauge, in order.
+    pub raises: Vec<seismic::measure::Raise>,
+    pub publishing_seconds: f64,
+    /// The unit's served choice changed.
+    pub promoted: bool,
+}
+
+/// What the engine may still claim in each memory domain, as read at one
+/// moment ([`TuningRoom::now`]): what the device's store ledgers leave free
+/// less the speed guarantee, with everything held then, the search's own
+/// holdings among it, already taken. It is the platform's own bound on any
+/// engine claim and not the load's plan: a search holds its units' weights
+/// and its working memory together, which on a small model is more than
+/// the load will hold, and it has ended before the load begins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RoomNow {
+    /// What may still be charged in device storage's store.
+    pub device_bytes: u64,
+    /// What may still be claimed of host RAM, including compilation.
+    pub host_bytes: u64,
+    /// Device storage lies in host RAM, so the device's charges and the
+    /// host's growth share its room.
+    pub host_shared: bool,
+}
+
+/// The room a search is held to, asked at every decision: the load's
+/// ledgers' at the reading the load holds ([`crate::LoadRoom`]), every
+/// holding since counted, so what the search and its neighbours in the
+/// process hold takes its room from the search's next admission, and the
+/// search's room is the room the load was planned against.
+pub trait TuningRoom {
+    fn now(&self, device: &Device) -> RoomNow;
+    /// The rate the machine frees memory at, a generic figure of it
+    /// (`platform::ReleaseRate`): what giving a unit's
+    /// inputs up is priced by before a give-up is observed.
+    fn release(&self) -> crate::platform::ReleaseRate;
+}
+
+/// What a search held, against the ceiling it is held to.
+///
+/// The search runs in a process of its own, before the served model's
+/// weights are loaded: everything it holds is its own. It may hold what the
+/// platform lets the engine claim ([`TuningRoom`], read as it runs). A tuner given no room
+/// has no ceiling. Work is admitted on what Seismic's ledgers count:
+/// its charges on the device ([`seismic::DeviceLedgerView::charged`]) and the
+/// host bytes of reference observations. Tuning's whole footprint, which
+/// also holds host buffers, compiles and records, is read as each piece
+/// ends and reported against its ceiling. The whole footprint is the
+/// process's and, where the device's allocations lie outside it
+/// (`device_separate`), the device's charges beside it, so that ceiling,
+/// peak and margin count the same bytes on every backend.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TuningMemory {
+    /// The most tuning's charges on the device may reach, as last read:
+    /// what it held then and the device's room then ([`RoomNow::device_bytes`]);
+    /// none when the tuner was given no room.
+    pub ceiling_bytes: Option<u64>,
+    /// The most tuning held as its ledgers count it: the device's
+    /// high-water mark within any piece, with the host bytes of that
+    /// piece's reference observations, since tuning began.
+    pub held_peak_bytes: u64,
+    /// The ceiling less that peak: negative when the invariant was broken.
+    pub margin_bytes: Option<i64>,
+    /// The process's footprint when the search's tuner was made, before it
+    /// counted its units (what every growth of the process is counted
+    /// from), the most it was when a piece ended, and what it was when the
+    /// last one ended; none where the system reports none.
+    pub process_began_bytes: Option<u64>,
+    pub process_peak_footprint_bytes: Option<u64>,
+    pub process_ended_bytes: Option<u64>,
+    /// The runtime reports that the device's allocations lie outside the
+    /// process's footprint: tuning's whole footprint is then the process's
+    /// and the device's charges together. Elsewhere the process's footprint
+    /// already counts them.
+    pub device_separate: bool,
+    /// What tuning's whole footprint may grow by, where the device's memory
+    /// is the host's and the two are one domain, as last read: what it had
+    /// grown by then and host RAM's room then. None where the device's
+    /// memory is apart.
+    pub footprint_ceiling_bytes: Option<u64>,
+    /// The most tuning's whole footprint grew since it began, as read when
+    /// each piece ended: the growth of the process's footprint, with what
+    /// tuning held on a separate device at most within that piece.
+    pub footprint_peak_bytes: Option<u64>,
+    /// That ceiling less that growth: negative when tuning's whole
+    /// footprint passed it.
+    pub footprint_margin_bytes: Option<i64>,
+    /// Host RAM the platform lets the engine claim, including compiles and
+    /// process growth, as last read: what the process had grown by then and
+    /// host RAM's room then, where host RAM is a domain apart from the
+    /// device's memory. Where they are one, none: `footprint_ceiling_bytes`
+    /// holds all of it, and one room owns it.
+    pub host_ceiling_bytes: Option<u64>,
+    /// The most the process's footprint had grown since tuning began: the
+    /// peak of the footprint ([`seismic::ProcessMemory::footprint_peak`])
+    /// less the footprint tuning began at (`process_began_bytes`).
+    pub host_peak_bytes: Option<u64>,
+    /// That peak is the most of the readings tuning took of the footprint
+    /// (around every piece, at the end of every worker thread's job, and
+    /// where a compile holds its program and what it formed), not a mark
+    /// the system keeps: what the footprint was between two readings is
+    /// not in it ([`seismic::ProcessMemory::PEAK_IS_SAMPLED`]).
+    pub host_peak_sampled: bool,
+    /// What the process's footprint had grown by when the optional work
+    /// began, the pages the mandatory phase freed returned: the canonical
+    /// programs and what forming them left. The optional work has the
+    /// host ceiling less this.
+    pub host_mandatory_bytes: Option<u64>,
+    /// Every piece and burst of compiles that added more to the host than
+    /// it was priced at, in order: each raised its price to what it added.
+    pub mispriced: Vec<Mispricing>,
+    /// The first piece refused for its bytes for good (its unit left the
+    /// optional work for them, or waited for them when the ending began),
+    /// as the room stood then; none when nothing was.
+    pub no_room: Option<NoRoom>,
+    /// The host ceiling less that growth: negative when tuning's host
+    /// working set passed the load's planned host peak.
+    pub host_margin_bytes: Option<i64>,
+    /// The most one piece of each unit's work added to the process's
+    /// footprint, apart for pieces with the unit's inputs resident and
+    /// pieces that build them: what the unit's next piece is taken to add
+    /// to the host ([`allocation::Unit::host_footprint`]).
+    pub host_added_by_unit: Vec<HostAdded>,
+    /// The host bytes one thread of a compile holds while it runs: the
+    /// most the host's room fell over compiles that ran at once
+    /// ([`compile_wave_price`]), for each thread that compiled, wherever
+    /// the compiles' memory lies. What a compile started ahead of its piece
+    /// is admitted on ([`allocation::Unit::compile_host`]).
+    pub compile_host_bytes: u64,
+    /// Device charges when the mandatory phase began and when it ended.
+    pub began_bytes: u64,
+    pub mandatory_bytes: u64,
+    /// The device's high-water mark over the optional work, within pieces
+    /// included, and what was charged when the optional work ended.
+    pub peak_bytes: u64,
+    pub ended_bytes: u64,
+    /// What the pieces of each class left held, in sum: discovery leaves a
+    /// unit's built inputs and its defaults' observations, measurement its
+    /// challengers' programs, kernels and observations.
+    pub held_by_class: Vec<(seismic::Stage, i64)>,
+    /// What each unit's pieces left held, in sum.
+    pub held_by_unit: Vec<(String, i64)>,
+    /// The process's peak resident set when the optional work ended, as
+    /// the operating system counts it (`getrusage`): everything the
+    /// process held, on the device or not, within pieces included.
+    pub process_peak_bytes: Option<u64>,
+    /// The process's memory by what holds it ([`seismic::ProcessMemory`]):
+    /// when tuning began, when a piece ended at the most footprint, when
+    /// the optional work ended, and once the pages tuning freed were
+    /// returned to the system ([`seismic::return_freed_pages`]).
+    pub breakdown_began: seismic::ProcessMemory,
+    pub breakdown_peak: seismic::ProcessMemory,
+    pub breakdown_ended: seismic::ProcessMemory,
+    pub breakdown_returned: seismic::ProcessMemory,
+    /// What returning freed pages took the footprint down by over the
+    /// search, and what the returning took. The search's process exits
+    /// when it ends and no load runs in it, so what the search leaves in
+    /// its process is carried by nothing and is not reported.
+    pub returned_bytes: u64,
+    pub returning_seconds: f64,
+}
+
+/// The most one piece of a unit's work added to the process's footprint:
+/// with the unit's inputs `resident`, beyond them, as Seismic prices a
+/// piece's device bytes beyond the inputs it keeps
+/// ([`seismic::NativeSearch::largest_footprint`]); otherwise building them
+/// as well. A unit's first piece built its inputs and was priced so, and a
+/// DeepSeek V4.1 routed_experts unit was held to that 4.9 GB for a 4.2 MB
+/// second point while its inputs stayed resident.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostAdded {
+    pub unit: String,
+    pub resident: bool,
+    pub bytes: u64,
+}
+
+/// Work that added more to the host than it was priced at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Mispricing {
+    /// A unit, for one of its pieces; `"compile"` for one thread of a
+    /// burst of compiles.
+    pub kind: String,
+    /// What it was admitted on, and what it added.
+    pub priced_bytes: u64,
+    pub added_bytes: u64,
+}
+
+/// A piece refused for its bytes for good: with nothing in flight and the
+/// pages tuning freed returned, it did not fit what was free with
+/// everything another unit could give up for it, or needed more than the
+/// optional work may ever hold. It is neither the budget running out nor a
+/// unit's domain exhausted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NoRoom {
+    /// The domains the piece was refused in, each as it stood then.
+    pub domains: Vec<Room>,
+    /// What a load holds on the host that the host ceiling has no term for
+    /// ([`crate::planning::HostPeak::UNPLANNED`]): each would raise the
+    /// ceiling by what a load really holds of it, were it planned.
+    pub unplanned_holders: &'static [&'static str],
+}
+
+/// One memory domain at a stop for bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Room {
+    /// `"device"`: the device's charges under what the platform lets the
+    /// engine claim on it; `"footprint"`: where the device's memory is the
+    /// host's, everything the process holds under that same ceiling;
+    /// `"host"`: where it is apart, the process's footprint under what the
+    /// platform lets the engine claim of host RAM.
+    pub domain: &'static str,
+    pub ceiling_bytes: u64,
+    /// What tuning held in the domain, as measured, at the refusal.
+    pub held_bytes: u64,
+    /// What the refused piece was taken to add to the domain.
+    pub footprint_bytes: u64,
+    /// What the domain lacked for that piece.
+    pub lacking_bytes: u64,
+}
+
+/// The process's peak resident set so far.
+fn process_peak_bytes() -> Option<u64> {
+    #[cfg(unix)]
+    {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        // SAFETY: `getrusage` writes a whole `rusage` to the pointer it is
+        // given when it returns zero.
+        let usage = unsafe {
+            (libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) == 0)
+                .then(|| usage.assume_init())
+        }?;
+        let peak = u64::try_from(usage.ru_maxrss).ok()?;
+        // Bytes on macOS, kibibytes elsewhere.
+        Some(if cfg!(target_os = "macos") {
+            peak
+        } else {
+            peak.saturating_mul(1024)
+        })
+    }
+    #[cfg(not(unix))]
+    None
+}
+
+/// Whether the device's allocations are held by its driver beside the
+/// process's footprint rather than in it
+/// ([`Device::allocations_in_process_footprint`]: CPU and Metal allocations
+/// and a host-memory CUDA device's are in it, other CUDA and Vulkan driver
+/// memory is not). It decides whether
+/// tuning's whole footprint adds the device's charges to the process's,
+/// whatever store the executor places on: what the footprint reading
+/// already counts is a fact of the runtime, not of the placement.
+fn device_separate(device: &Device) -> bool {
+    !device.allocations_in_process_footprint()
+}
+
+/// What the ledger counts the device store holding, the driver's memory
+/// brought up to date first.
+fn allocated(device: &Device) -> u64 {
+    device.reconcile_driver_memory();
+    device.allocated()
+}
+
+/// The most [`allocated`] has been since the device's high water was last
+/// restarted, the driver's memory brought up to date first.
+fn high_water(device: &Device) -> u64 {
+    device.reconcile_driver_memory();
+    device.high_water()
+}
+
+impl TuningMemory {
+    /// What tuning holds now, as admission counts it: Seismic's charges on
+    /// the device since tuning began.
+    fn held(&self, device: &Device) -> u64 {
+        allocated(device).saturating_sub(self.began_bytes)
+    }
+
+    /// What tuning holds now in all: what the process's footprint has
+    /// grown by since it began (heap, compiles and whatever a toolchain or
+    /// framework keeps, which no ledger counts) and, where the device's
+    /// allocations lie outside the process (`device_separate`), its charges
+    /// on the device beside it. A CPU or Metal device's allocations are in
+    /// the footprint. None where the system reports no footprint.
+    fn held_whole(&self, device: &Device) -> Option<u64> {
+        let grown = seismic::ProcessMemory::footprint_now()?
+            .saturating_sub(self.breakdown_began.footprint_bytes?);
+        Some(if self.device_separate {
+            self.held(device) + grown
+        } else {
+            grown
+        })
+    }
+
+    /// The bytes tuning may still take in the domain the device allocates
+    /// in, as `room` reads it now; none without a room. Where that domain
+    /// is the host's, what is free is the lesser of the device's room and
+    /// host RAM's, which everything tuning holds, the host's growth
+    /// included, has already taken. Where the device's memory is apart,
+    /// this is the device's room alone and the host has its own
+    /// ([`TuningMemory::host_free`]). Either is held to what the runtime
+    /// lets device storage still take ([`Device::room`]: its placement's
+    /// paths, grants and stores, and its limit, which the reading bounds
+    /// anew), so a piece the runtime would refuse is not admitted.
+    fn free(&self, device: &Device, room: Option<RoomNow>) -> Option<u64> {
+        let room = room?;
+        let free = match room.host_shared {
+            true => room.device_bytes.min(room.host_bytes),
+            false => room.device_bytes,
+        };
+        Some(free.min(device.room(seismic::Contract::DeviceOnly)))
+    }
+
+    /// Whether tuning's device charges and its host growth share host
+    /// RAM's ceiling: device storage's placement includes host RAM
+    /// (`RoomNow::host_shared`, spec §2.8), and [`Self::free`] holds the
+    /// whole footprint to it (`footprint_ceiling_bytes`). There host work
+    /// no piece prices takes of [`Self::free`] beside the pieces
+    /// ([`allocation::Unit::shared_host`]); elsewhere host RAM is a domain
+    /// apart ([`Self::host_free`]).
+    ///
+    /// A piece's own host bytes are never among that work: Seismic prices
+    /// a piece by everything it adds to what is held, the process's
+    /// footprint with the device's charges where they lie outside it
+    /// ([`seismic::PieceMemory`]), so its footprint already counts them.
+    /// Counting them again, at the unit's host price
+    /// ([`Self::host_added`]), which keeps the inputs its first piece built
+    /// and its unit has held resident since, refused a DeepSeek V4.1
+    /// routed_experts discovery point of 4.2 MB under 3.8 GB free on Metal
+    /// for its first point's 4.9 GB, and made every other unit give its
+    /// inputs up for it.
+    fn shares_host_ceiling(&self) -> bool {
+        self.footprint_ceiling_bytes.is_some()
+    }
+
+    /// What the process's footprint has grown by since tuning began: its
+    /// host working set, where the device's memory is apart. The footprint
+    /// is the one quantity on every system (anonymous and shared resident
+    /// memory on Linux, the physical footprint on macOS): resident pages
+    /// of mapped files, a compiler's own among them, are in neither, here
+    /// or in the load this is held to.
+    fn host_grown(&self) -> Option<u64> {
+        Some(seismic::ProcessMemory::footprint_now()?.saturating_sub(self.process_began_bytes?))
+    }
+
+    /// The host bytes tuning may still take of host RAM where it is a
+    /// domain apart, as `room` reads it now: everything held then, heap
+    /// freed and not yet returned among it, already taken. Exceeded where
+    /// none is left above the reserve. Unbounded without a room, and where
+    /// the device's memory is the host's: there [`Self::free`] holds
+    /// everything tuning holds to the one room, which owns all of it, and
+    /// no second host room prices the same bytes again.
+    fn host_free(&self, room: Option<RoomNow>) -> allocation::HostRoom {
+        match room {
+            None | Some(RoomNow { host_shared: true, .. }) => allocation::HostRoom::Unbounded,
+            Some(RoomNow { host_bytes: 0, .. }) => allocation::HostRoom::Exceeded,
+            Some(room) => allocation::HostRoom::Free(room.host_bytes),
+        }
+    }
+
+    /// The most a piece of `unit`'s work has added to the process's
+    /// footprint with its inputs `resident`, or building them
+    /// ([`HostAdded`]); none before such a piece has run.
+    fn host_added(&self, unit: &str, resident: bool) -> Option<u64> {
+        self.host_added_by_unit
+            .iter()
+            .find(|added| added.unit == unit && added.resident == resident)
+            .map(|added| added.bytes)
+    }
+
+    /// Record what a piece of `unit`'s work added to the process's
+    /// footprint with its inputs `resident`, or building them: the price
+    /// is the most one has added, and a piece that added more than the
+    /// price it was admitted on is kept as a mispricing.
+    fn host_piece(&mut self, unit: &str, resident: bool, added: u64) {
+        match self
+            .host_added_by_unit
+            .iter_mut()
+            .find(|price| price.unit == unit && price.resident == resident)
+        {
+            Some(price) if added > price.bytes => {
+                self.mispriced.push(Mispricing {
+                    kind: unit.to_owned(),
+                    priced_bytes: price.bytes,
+                    added_bytes: added,
+                });
+                price.bytes = added;
+            }
+            Some(_) => {}
+            None => self.host_added_by_unit.push(HostAdded {
+                unit: unit.to_owned(),
+                resident,
+                bytes: added,
+            }),
+        }
+    }
+
+    /// The bytes free when the optional work holds nothing, as `room`
+    /// reads it now: what is free, and what the optional work holds beyond
+    /// what the mandatory phase left held, the canonical programs serving
+    /// takes. None without a room.
+    fn capacity(&self, device: &Device, room: Option<RoomNow>) -> Option<u64> {
+        let optional = self.held(device).saturating_sub(self.mandatory_bytes.saturating_sub(self.began_bytes));
+        room.map(|room| room.device_bytes.saturating_add(optional))
+    }
+
+    /// Read `room` into the ceilings the report states: in each domain,
+    /// what tuning holds there now and what is left of it now. Where the
+    /// device's memory is the host's, the two are one domain, whose ceiling
+    /// is the whole footprint's, and host RAM has none of its own.
+    fn read_room(&mut self, device: &Device, room: RoomNow) {
+        self.ceiling_bytes = Some(self.held(device).saturating_add(room.device_bytes));
+        self.host_ceiling_bytes =
+            (!room.host_shared).then(|| self.host_grown().unwrap_or(0).saturating_add(room.host_bytes));
+        self.footprint_ceiling_bytes =
+            room.host_shared.then(|| self.held_whole(device).unwrap_or(0).saturating_add(room.host_bytes));
+    }
+
+    /// Record what was held at most: `within`, a piece's own high-water
+    /// mark, and what is held now that it ended.
+    fn observe(&mut self, device: &Device, within: u64, room: Option<RoomNow>) {
+        if let Some(room) = room {
+            self.read_room(device, room);
+        }
+        let footprint = seismic::ProcessMemory::footprint_now();
+        if footprint > self.process_peak_footprint_bytes {
+            self.breakdown_peak = seismic::ProcessMemory::read();
+        }
+        self.process_peak_footprint_bytes = self.process_peak_footprint_bytes.max(footprint);
+        self.peak_bytes = self.peak_bytes.max(
+            high_water(device),
+        );
+        self.held_peak_bytes = self
+            .held_peak_bytes
+            .max(within.saturating_sub(self.began_bytes))
+            .max(self.held(device));
+        self.margin_bytes = self
+            .ceiling_bytes
+            .map(|ceiling| ceiling as i64 - self.held_peak_bytes as i64);
+        self.process_ended_bytes = footprint;
+        let held_within = within
+            .saturating_sub(self.began_bytes)
+            .max(self.held(device));
+        let grown = footprint.zip(self.process_began_bytes).map(|(now, began)| {
+            now.saturating_sub(began) + if self.device_separate { held_within } else { 0 }
+        });
+        self.footprint_peak_bytes = self.footprint_peak_bytes.max(grown);
+        self.footprint_margin_bytes = self
+            .footprint_ceiling_bytes
+            .zip(self.footprint_peak_bytes)
+            .map(|(ceiling, peak)| ceiling as i64 - peak as i64);
+        // The footprint's high-water mark: the system's own where it keeps
+        // one, and what the process held between two readings is then in
+        // it; elsewhere the most of the readings taken.
+        self.host_peak_sampled = seismic::ProcessMemory::PEAK_IS_SAMPLED;
+        self.host_peak_bytes = self.host_peak_bytes.max(
+            seismic::ProcessMemory::footprint_peak()
+                .zip(self.process_began_bytes)
+                .map(|(peak, began)| peak.saturating_sub(began)),
+        );
+        self.host_margin_bytes = self
+            .host_ceiling_bytes
+            .zip(self.host_peak_bytes)
+            .map(|(ceiling, peak)| ceiling as i64 - peak as i64);
+    }
+
+    /// The threads the host's room affords compiles that run at once, each
+    /// at the price a thread's compile was observed to hold
+    /// (`compile_host_bytes`): within host RAM's own room, and within the
+    /// device's room where they share it ([`Self::shares_host_ceiling`]);
+    /// none where neither bounds them. Before a compile has been observed
+    /// no room can be divided by its price, and compiles run one at a time.
+    /// Owed work is not refused, so it is afforded one thread at the
+    /// least.
+    fn compile_threads(&self, device: &Device, room: Option<RoomNow>) -> Option<usize> {
+        let price = self.compile_host_bytes;
+        // Compiles are host work of no device bytes: where host RAM's
+        // ceiling is shared, their bytes take of the device's room
+        // ([`allocation::shared_host`]).
+        let shared = self
+            .free(device, room)
+            .filter(|_| allocation::shared_host(self.shares_host_ceiling(), price) > 0);
+        let host = match (self.host_free(room), shared) {
+            (allocation::HostRoom::Free(host), Some(shared)) => {
+                allocation::HostRoom::Free(host.min(shared))
+            }
+            (allocation::HostRoom::Unbounded, Some(shared)) => allocation::HostRoom::Free(shared),
+            (host, _) => host,
+        };
+        match host {
+            allocation::HostRoom::Unbounded => None,
+            _ if price == 0 => Some(1),
+            allocation::HostRoom::Free(free) => Some((free / price) as usize),
+            allocation::HostRoom::Exceeded => Some(0),
+        }
+    }
+
+    /// A compile wave held `held` bytes on each of its threads: the price
+    /// the next is admitted on rises to it, a rise past a price already
+    /// set kept as a mispricing.
+    fn price_compiles(&mut self, held: u64) {
+        let priced = self.compile_host_bytes;
+        if held > priced {
+            if priced > 0 {
+                self.mispriced.push(Mispricing {
+                    kind: "compile".into(),
+                    priced_bytes: priced,
+                    added_bytes: held,
+                });
+            }
+            self.compile_host_bytes = held;
+        }
+    }
+
+    /// Return the pages tuning freed to the system, and count what that
+    /// took the footprint down by.
+    fn return_freed_pages(&mut self) {
+        let began = Instant::now();
+        self.returned_bytes += seismic::return_freed_pages();
+        self.returning_seconds += began.elapsed().as_secs_f64();
+    }
+
+    fn piece(&mut self, unit: String, stage: seismic::Stage, before: u64, after: u64) {
+        let held = after as i64 - before as i64;
+        match self
+            .held_by_class
+            .iter_mut()
+            .find(|(class, _)| *class == stage)
+        {
+            Some((_, sum)) => *sum += held,
+            None => self.held_by_class.push((stage, held)),
+        }
+        match self.held_by_unit.iter_mut().find(|(name, _)| *name == unit) {
+            Some((_, sum)) => *sum += held,
+            None => self.held_by_unit.push((unit, held)),
+        }
+    }
+}
+
+/// A piece's compile that ran ahead of it: its price and what it took.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
+pub struct FormedAhead {
+    pub priced_seconds: f64,
+    pub unpriced_operations: usize,
+    pub actual_seconds: f64,
+}
+
+/// What became of one load's tuning budget. Times are seconds.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BudgetReport {
+    pub budget_seconds: f64,
+    /// Tuning time when the optional work ended, the records its units
+    /// owed published.
+    pub used_seconds: f64,
+    /// What publishing those records took, part of `used_seconds`.
+    pub settling_seconds: f64,
+    /// Budget left then: no work remained whose price fit it.
+    pub unused_seconds: f64,
+    /// Time past the budget then: what work in flight when the budget
+    /// ended ran beyond it, a piece performed or an abandoned compile.
+    /// Recorded, never a failure.
+    pub overrun_seconds: f64,
+    /// Pieces of work started.
+    pub stages: usize,
+    /// The work still offered when the allocator stopped, none of which
+    /// fit.
+    pub refused: Vec<RefusedOffer>,
+    /// The pieces in flight when the allocator's ending began, never
+    /// measured ([`allocation::Abandoned`]).
+    pub abandoned: Vec<AbandonedPiece>,
+    /// Every unit that gave its inputs up, in order
+    /// ([`allocation::Released`]).
+    pub released: Vec<ReleasedInputs>,
+    /// The allocator's own work between the last piece and its stop.
+    pub ending: EndingReport,
+    pub memory: TuningMemory,
+}
+
+/// The allocator's own work from the end of the last piece performed to
+/// its stop, beside the publications settled there
+/// ([`allocation::Ending`]). Times are seconds.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct EndingReport {
+    /// Tuning time when the last piece performed ended.
+    pub began_seconds: f64,
+    /// What the start of that piece held back for the allocator's own
+    /// ending.
+    pub held_seconds: f64,
+    /// The allocator's passes since and what deciding in them took.
+    pub passes: usize,
+    pub deciding_seconds: f64,
+    /// The pieces narrowed since and what narrowing them took.
+    pub narrowed: usize,
+    pub narrowing_seconds: f64,
+    /// The units that gave their inputs up since and what that took.
+    pub released: usize,
+    pub releasing_seconds: f64,
+    /// Waiting, once everything owed was settled, for the compiles of
+    /// abandoned pieces to end.
+    pub draining_seconds: f64,
+}
+
+/// A piece admitted whose measurement never ran: the allocator's ending
+/// began first. Its price, when it was started and what its compile took.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AbandonedPiece {
+    pub unit: String,
+    pub stage: seismic::Stage,
+    pub priced_seconds: f64,
+    pub unpriced_operations: usize,
+    pub began_seconds: f64,
+    pub formed_seconds: f64,
+}
+
+/// A piece of work still offered when the allocator stopped, its price in
+/// seconds and in bytes, and which of the two it did not fit.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RefusedOffer {
+    pub unit: String,
+    pub stage: seismic::Stage,
+    pub priced_seconds: f64,
+    pub unpriced_operations: usize,
+    pub footprint_bytes: u64,
+    pub unpriced_footprints: usize,
+    /// `"seconds"`: what remained of the budget; `"bytes"`: what was free
+    /// under the ceiling with every other unit's inputs given up.
+    pub reason: &'static str,
+    /// What each unpriced footprint was held to.
+    pub largest_bytes: Option<u64>,
+    /// When its bytes last found nothing to give up for them: what was
+    /// free, and what giving up everything other units held would have
+    /// returned ([`allocation::Starved`]).
+    pub free_bytes: Option<u64>,
+    pub given_up_bytes: Option<u64>,
+}
+
+/// A unit that gave its inputs up: when, what giving them up was taken to
+/// return, and what was free under the ceiling before and after.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReleasedInputs {
+    pub unit: String,
+    pub began_seconds: f64,
+    pub claimed_bytes: u64,
+    pub free_before_bytes: Option<u64>,
+    pub free_after_bytes: Option<u64>,
 }
 
 /// Where a tuning unit's choice came from.
@@ -868,10 +1988,25 @@ pub enum TuningOrigin {
 pub struct TunedEntry {
     pub entry: &'static str,
     pub bindings: String,
+    /// The original receipt, shared with observers without copying candidate
+    /// measurements. Cached loads retain the same evidence as the first load:
+    /// a stored unit's is named where the store keeps it and read by the
+    /// observer that states it, not by the load.
+    pub receipt: Receipt,
     pub overall: Configuration,
+    /// Exact static domain of this unit, fixed by the same cache key.
+    pub statics: BTreeMap<String, u64>,
     pub origin: TuningOrigin,
-    /// The time the search was given and why it stopped (a searched unit).
-    pub search: Option<(Duration, SearchStop)>,
+    /// Whether the chosen configuration was numerically qualified against its
+    /// reference. `false` is the explicit canonical fallback: the declaration
+    /// default, kept because the first-load allowance could not qualify a
+    /// candidate or every candidate was rejected.
+    pub qualified: bool,
+    /// Whether the result's search reached its own end, read from the
+    /// result itself, so a stored result reports what its first load did.
+    pub stop: Option<SearchStop>,
+    /// The coverage checks of the unit's leaders, from the result itself.
+    pub coverage: Option<seismic::CoverageCheck>,
     /// How far a searched unit's search got at this load. Reported, not
     /// stored: nothing reads it to tune a unit again.
     pub progress: Option<SearchProgress>,
@@ -895,14 +2030,12 @@ pub struct TunedEntry {
 pub struct SearchProgress {
     /// The unit's share of expected step time at its defaults.
     pub share: f64,
-    /// The start, if the tuning time reached the unit: its wall time and
-    /// the programs formed by its end (the defaults' and every form
-    /// start's).
-    pub start: Option<(f64, usize)>,
-    /// Where the search stood when it was concluded: whether it ran to its
-    /// own end, the configurations measured of those it can reach, and the
-    /// programs formed. None for a unit the tuning time never reached.
-    pub standing: Option<Standing>,
+    /// Pieces of optional work the unit was given.
+    pub stages: usize,
+    /// Where the unit stood when the load's optional work ended: its served
+    /// cost, the configurations measured of those it can reach, and the
+    /// programs formed.
+    pub standing: Standing,
 }
 
 pub trait TuningObserver {
@@ -923,12 +2056,12 @@ pub struct TuningContext<'a> {
     pub definition: &'a ModelDefinition,
     pub weights: &'a dyn TuningWeightSource,
     pub observer: &'a dyn TuningObserver,
-    /// Where tuning results are stored between loads; `None` tunes every
-    /// unit at every load.
+    /// Where final first-load choices are retained. `None` is an isolated
+    /// preparation without durable reuse, not a continuation mechanism.
     pub cache: Option<&'a KernelCache>,
-    /// The error classes the model's qualification admits. A configuration
-    /// of any other class is never formed.
-    pub error_classes: &'a AdmittedErrorClasses,
+    /// The caller's numerical requirement: α.
+    pub numerical_profile: &'a ResolvedNumericalProfile,
+    pub settings: TuningSettings,
 }
 
 /// Inputs a case builds its argument sets from. Every tensor it returns is
@@ -940,6 +2073,11 @@ pub struct TuningContext<'a> {
 pub(crate) struct Noise(std::cell::RefCell<HashMap<DType, Vec<u8>>>);
 
 impl Noise {
+    /// The bytes the pool holds.
+    fn bytes(&self) -> u64 {
+        self.0.borrow().values().map(|pool| pool.capacity() as u64).sum()
+    }
+
     /// `count` encoded values of `dtype` at the window `seed` places.
     fn window(&self, dtype: DType, count: usize, seed: u64) -> Result<Vec<u8>, String> {
         let (size, encode): (usize, fn(f32, &mut Vec<u8>)) = match dtype {
@@ -950,12 +2088,12 @@ impl Noise {
                 bytes.extend_from_slice(&((value.to_bits() >> 16) as u16).to_le_bytes())
             }),
             DType::F16 => (2, |value, bytes| {
-                bytes.extend_from_slice(&f16_bits(value).to_le_bytes())
+                bytes.extend_from_slice(&seismic::f16_bits(value).to_le_bytes())
             }),
             other => {
                 return Err(format!(
                     "tuning activations support f32, bf16 and f16, not {other:?}"
-                ))
+                ));
             }
         };
         let mut pools = self.0.borrow_mut();
@@ -1023,8 +2161,13 @@ impl ModelInputs<'_> {
                 self.definition
                     .head
                     .as_ref()
-                    .and_then(|head| head.blocks.get(index.block as usize))
-                    .map(|block| &block.block.sublayers),
+                    .and_then(|head| {
+                        head.blocks
+                            .iter()
+                            .flat_map(|block| &block.blocks)
+                            .nth(index.block as usize)
+                    })
+                    .map(|block| &block.sublayers),
                 index,
             ),
             WeightScope::DraftSublayer(index) => (
@@ -1043,6 +2186,118 @@ impl ModelInputs<'_> {
             .ok_or_else(|| format!("{scope:?} names no sublayer of the model"))
     }
 
+    /// The sublayer and residual form named by the first tuning scope.
+    fn sublayer(
+        &self,
+        scopes: &[WeightScope],
+    ) -> Result<Option<(&Sublayer, &ResidualForm)>, String> {
+        let scope = *scopes
+            .first()
+            .ok_or("a tuning case needs at least one layer")?;
+        let (block, index, residual) = match scope {
+            WeightScope::TargetSublayer(index) => (
+                self.definition.decoder.blocks.get(index.block as usize),
+                index,
+                &self.definition.decoder.residual,
+            ),
+            WeightScope::HeadSublayer(index) => {
+                let (head, block) = self
+                    .definition
+                    .head
+                    .as_ref()
+                    .and_then(|head| {
+                        head.blocks
+                            .iter()
+                            .flat_map(|head| head.blocks.iter().map(move |block| (head, block)))
+                            .nth(index.block as usize)
+                    })
+                    .ok_or("head tuning scope has no block")?;
+                (Some(block), index, &head.residual)
+            }
+            _ => return Ok(None),
+        };
+        block
+            .and_then(|block| block.sublayers.get(index.sublayer as usize))
+            .map(|sublayer| Some((sublayer, residual)))
+            .ok_or_else(|| format!("{scope:?} names no sublayer of the model"))
+    }
+
+    fn streams(residual: &ResidualForm) -> Result<u64, String> {
+        match residual {
+            ResidualForm::HyperConnections(form) => Ok(form.streams),
+            ResidualForm::Single => Err("the sublayer has a single residual stream".into()),
+        }
+    }
+
+    /// The residual join of the sublayers `scopes` name (`scatter`): its
+    /// streams `SN` and join width `IN` (`StreamsGeometry::join_width`) for
+    /// a scatter into the hyper-connection streams, else (1, 0).
+    pub fn join(&self, scopes: &[WeightScope]) -> Result<(u64, u64), String> {
+        match self.sublayer(scopes)? {
+            Some((
+                Sublayer {
+                    output: OutputForm::Scatter,
+                    ..
+                },
+                residual,
+            )) => {
+                let geometry = crate::operators::streams::StreamsGeometry::from_residual(self.definition.decoder.hidden, residual)
+                    .map_err(|error| error.to_string())?
+                    .ok_or("the sublayer has a single residual stream")?;
+                Ok((geometry.streams, geometry.join_width()))
+            }
+            _ => Ok((1, 0)),
+        }
+    }
+
+    /// The input form of the sublayers `scopes` name (`form_input`,
+    /// `SublayerSource::form`): its parts `PT` and norm extent `NM`, a
+    /// low-rank site's S partials without a norm, else one row normalized
+    /// by a norm of `width` (a Sinkhorn site's input among them).
+    pub fn input_form(&self, scopes: &[WeightScope], width: u64) -> Result<(u64, u64), String> {
+        match self.sublayer(scopes)? {
+            Some((
+                Sublayer {
+                    input: input @ InputNorm::HyperConnectionMix(_),
+                    ..
+                },
+                residual,
+            )) => {
+                let source = crate::operators::sublayer_source(input).map_err(|error| error.to_string())?;
+                let [(_, parts), (_, norm)] = source.form(Self::streams(residual)?).dimensions(width);
+                Ok((parts, norm))
+            }
+            _ => Ok((1, width)),
+        }
+    }
+
+    /// The input form of a readout normalized by the norm of `scope`: the
+    /// decoder exit site's S partials without a norm, or the final row
+    /// normalized by a norm of `width`.
+    pub fn readout_form(&self, scope: WeightScope, width: u64) -> Result<(u64, u64), String> {
+        let form = match scope {
+            WeightScope::Target => InputForm::exit(&self.definition.decoder),
+            WeightScope::HeadBlock(index) => {
+                let block = self
+                    .definition
+                    .head
+                    .as_ref()
+                    .and_then(|head| head.blocks.get(index as usize))
+                    .ok_or("head readout scope is absent")?;
+                match &block.residual {
+                    magnitude_family_contracts::ResidualForm::HyperConnections(form) => InputForm {
+                        parts: form.streams,
+                        normalized: false,
+                    },
+                    _ => InputForm::SINGLE,
+                }
+            }
+            _ => InputForm::SINGLE,
+        };
+        let [(_, parts), (_, norm)] = form.dimensions(width);
+        Ok((parts, norm))
+    }
+
     /// The planned shape of one weight role.
     pub fn weight_shape(&self, scope: WeightScope, kind: WeightKind) -> Result<Vec<u64>, String> {
         Ok(weights::weight_plan(self.load, scope, kind)?.shape.clone())
@@ -1052,6 +2307,12 @@ impl ModelInputs<'_> {
     /// without a second-level scale).
     pub fn scale_extent(&self, scope: WeightScope, kind: WeightKind) -> Result<u64, String> {
         Ok(weights::weight_plan(self.load, scope, kind)?.scale_extent())
+    }
+
+    /// The planned packing bound of one weight role: its port's extent (0
+    /// without a bound).
+    pub fn packing(&self, scope: WeightScope, kind: WeightKind) -> Result<u64, String> {
+        Ok(weights::weight_plan(self.load, scope, kind)?.bound)
     }
 }
 
@@ -1063,9 +2324,6 @@ pub(crate) struct TuningInputs<'w, 'a> {
     /// Tensors shared by the units of one tuning, by a name that identifies
     /// their contents.
     shared: &'w mut HashMap<String, Tensor>,
-    /// What the point being built may take; a weight import or activation
-    /// predicted not to fit is refused.
-    building: &'w RefCell<BuildBudget>,
 }
 
 impl<'a> std::ops::Deref for TuningInputs<'_, 'a> {
@@ -1073,6 +2331,15 @@ impl<'a> std::ops::Deref for TuningInputs<'_, 'a> {
 
     fn deref(&self) -> &ModelInputs<'a> {
         &self.model
+    }
+}
+
+impl TuningInputs<'_, '_> {
+    /// Drop every weight and shared tensor no built input binds any more.
+    fn release_unheld(&mut self) {
+        self.weights.release_unheld();
+        self.shared
+            .retain(|_, tensor| weights::held_elsewhere(tensor));
     }
 }
 
@@ -1096,23 +2363,46 @@ impl TuningInputs<'_, '_> {
 
     /// The resident weight of one role, imported from the artifact into the
     /// resident representation and layout.
-    pub fn weight(&mut self, scope: WeightScope, kind: WeightKind) -> Result<Tensor, String> {
-        if self.weights.resident(scope, kind) {
-            return self.weights.weight(scope, kind);
+    pub fn weight(&mut self, scope: WeightScope, kind: WeightKind) -> Result<Tensor, BuildError> {
+        self.weights.weight(scope, kind)
+    }
+
+    /// The resident weight of one role as a decode launch of `scope` reads
+    /// it ([`TuningWeights::decode_weight`]): a banked layer's stack of the
+    /// bank's slots.
+    pub fn decode_weight(&mut self, scope: WeightScope, kind: WeightKind) -> Result<Tensor, BuildError> {
+        self.weights.decode_weight(scope, kind)
+    }
+
+    /// A weight's packing bound operand, as loading binds it: its bound, or
+    /// an absent one (zero extent).
+    pub fn bound(&mut self, scope: WeightScope, kind: WeightKind) -> Result<Tensor, BuildError> {
+        match self.weights.bound(scope, kind)? {
+            Some(bound) => Ok(bound),
+            None => self.unit_scale(0),
         }
-        let bytes = self.weights.bytes(scope, kind)?;
-        self.building.borrow_mut().admit(Building::Import, bytes)?;
-        let started = Instant::now();
-        let weight = self.weights.weight(scope, kind)?;
-        self.building
-            .borrow_mut()
-            .record(Building::Import, bytes, started.elapsed().as_secs_f64());
-        Ok(weight)
+    }
+
+    /// A consumer entry's norm port of `extent` (`NM`): the resident norm
+    /// `kind`, or an empty `element` port when the input is a mix site's
+    /// partials.
+    pub fn input_norm(
+        &mut self,
+        scope: WeightScope,
+        kind: WeightKind,
+        element: Element,
+        extent: u64,
+    ) -> Result<Tensor, BuildError> {
+        if extent == 0 {
+            self.scratch(element, &[0])
+        } else {
+            self.weight(scope, kind)
+        }
     }
 
     /// A unit accumulator-scale port of `extent` (absent at 0): the scale's
     /// value does not bear on a configuration's timing or agreement.
-    pub fn unit_scale(&self, extent: u64) -> Result<Tensor, String> {
+    pub fn unit_scale(&self, extent: u64) -> Result<Tensor, BuildError> {
         let count = usize::try_from(extent).map_err(|_| "scale extent exceeds usize")?;
         self.f32s(&[extent], &vec![1.0; count])
     }
@@ -1123,7 +2413,7 @@ impl TuningInputs<'_, '_> {
         element: Element,
         extents: &[u64],
         seed: u64,
-    ) -> Result<Tensor, String> {
+    ) -> Result<Tensor, BuildError> {
         let dtype = element
             .dtype()
             .ok_or_else(|| format!("tuning activations are not {}", element.name()))?;
@@ -1133,85 +2423,84 @@ impl TuningInputs<'_, '_> {
     }
 
     /// A tensor of `element` at `extents` whose bytes `generate` makes from
-    /// its element count. Generating it is refused when predicted not to fit
-    /// the point's time, and measured.
+    /// its element count.
     pub fn generated(
         &self,
         element: Element,
         extents: &[u64],
         generate: impl FnOnce(usize) -> Result<Vec<u8>, String>,
-    ) -> Result<Tensor, String> {
+    ) -> Result<Tensor, BuildError> {
         let count = element_count(extents)?;
-        let width = element
-            .dtype()
-            .ok_or_else(|| format!("generated tuning tensors are not {}", element.name()))?
-            .bytes();
-        let size = (count as u64).saturating_mul(u64::from(width));
-        self.building
-            .borrow_mut()
-            .admit(Building::Generation, size)?;
-        let started = Instant::now();
+        if element.dtype().is_none() {
+            return Err(BuildError::Failed(format!(
+                "generated tuning tensors are not {}",
+                element.name()
+            )));
+        }
         let bytes = generate(count)?;
-        let tensor = Tensor::from_host(self.device, element, extents, &bytes)
-            .map_err(|error| error.to_string())?;
-        self.building.borrow_mut().record(
-            Building::Generation,
-            size,
-            started.elapsed().as_secs_f64(),
-        );
-        Ok(tensor)
+        Ok(Tensor::from_host(self.device, element, extents, &bytes)?)
     }
 
     /// An `i32` tensor of `values`.
-    pub fn i32s(&self, extents: &[u64], values: &[i32]) -> Result<Tensor, String> {
+    pub fn i32s(&self, extents: &[u64], values: &[i32]) -> Result<Tensor, BuildError> {
         let bytes = values
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect::<Vec<_>>();
-        Tensor::from_host(self.device, Element::i32(), extents, &bytes)
-            .map_err(|error| error.to_string())
+        Ok(Tensor::from_host(
+            self.device,
+            Element::i32(),
+            extents,
+            &bytes,
+        )?)
     }
 
     /// A `u32` tensor of `values`.
-    pub fn u32s(&self, extents: &[u64], values: &[u32]) -> Result<Tensor, String> {
+    pub fn u32s(&self, extents: &[u64], values: &[u32]) -> Result<Tensor, BuildError> {
         let bytes = values
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect::<Vec<_>>();
-        Tensor::from_host(self.device, Element::u32(), extents, &bytes)
-            .map_err(|error| error.to_string())
+        Ok(Tensor::from_host(
+            self.device,
+            Element::u32(),
+            extents,
+            &bytes,
+        )?)
     }
 
     /// An `f32` tensor of `values`.
-    pub fn f32s(&self, extents: &[u64], values: &[f32]) -> Result<Tensor, String> {
+    pub fn f32s(&self, extents: &[u64], values: &[f32]) -> Result<Tensor, BuildError> {
         let bytes = values
             .iter()
             .flat_map(|value| value.to_le_bytes())
             .collect::<Vec<_>>();
-        Tensor::from_host(self.device, Element::f32(), extents, &bytes)
-            .map_err(|error| error.to_string())
+        Ok(Tensor::from_host(
+            self.device,
+            Element::f32(),
+            extents,
+            &bytes,
+        )?)
     }
 
     /// The `out_rows` gather selecting every one of `rows` rows in order.
-    pub fn every_row(&self, rows: u64) -> Result<Tensor, String> {
+    pub fn every_row(&self, rows: u64) -> Result<Tensor, BuildError> {
         let count = i32::try_from(rows).map_err(|_| "tuning rows exceed i32")?;
         self.i32s(&[rows], &(0..count).collect::<Vec<_>>())
     }
 
     /// A zeroed tensor owned by the case: outputs and tables the entry
     /// overwrites.
-    pub fn scratch(&self, element: Element, extents: &[u64]) -> Result<Tensor, String> {
-        Tensor::zeros(self.device, element, extents).map_err(|error| error.to_string())
+    pub fn scratch(&self, element: Element, extents: &[u64]) -> Result<Tensor, BuildError> {
+        Ok(Tensor::zeros(self.device, element, extents)?)
     }
 
     /// `tensor` lent to a `&mut` parameter that writes leading-axis rows
     /// `written`; their current contents are what every validated invocation
     /// starts from.
-    pub fn state(&self, tensor: Tensor, written: Range<u64>) -> Result<CaseState, String> {
-        let region = tensor
-            .slice_leading(written.start, written.end)
-            .map_err(|error| error.to_string())?;
-        let initial = region.read_to_host().map_err(|error| error.to_string())?;
+    pub fn state(&self, tensor: Tensor, written: Range<u64>) -> Result<CaseState, BuildError> {
+        let region = tensor.slice_leading(written.start, written.end)?;
+        let initial = region.read_to_host()?;
         Ok(CaseState {
             backing: tensor.clone(),
             tensor,
@@ -1230,49 +2519,61 @@ impl TuningInputs<'_, '_> {
         source: Tensor,
         view: u64,
         written: Range<u64>,
-    ) -> Result<CaseState, String> {
-        let extents = source.extents();
-        let rows = *extents.first().ok_or("slab tuning state has no row axis")?;
-        if view == 0 || view > rows || written.start >= written.end || written.end > view {
+    ) -> Result<CaseState, BuildError> {
+        if written.start >= written.end || written.end > view {
             return Err("slab tuning state has invalid row bounds".into());
         }
-        let mut slab = seismic::SlabTensor::new(
-            self.device,
-            view,
-            view,
-            vec![seismic::SlabRegion {
-                element: source.element(),
-                row_shape: extents[1..].to_vec(),
-            }],
-        )
-        .map_err(|error| error.to_string())?;
-        slab.add_slab().map_err(|error| error.to_string())?;
-        let bytes = source
-            .slice_leading(0, view)
-            .map_err(|error| error.to_string())?
-            .read_to_host()
-            .map_err(|error| error.to_string())?;
-        slab.region_rows(0, 0, view)
-            .map_err(|error| error.to_string())?
-            .write_from_host(&bytes)
-            .map_err(|error| error.to_string())?;
-        let region = slab
-            .region_rows(0, written.start, written.end - written.start)
-            .map_err(|error| error.to_string())?;
-        let tensor = slab.logical_region(0).map_err(|error| error.to_string())?;
+        let slab = self.slab(&source, view)?;
+        let region = slab.region_rows(0, written.start, written.end - written.start)?;
+        let tensor = slab.logical_region(0)?;
         Ok(CaseState {
             tensor,
             written,
-            initial: region
-                .read_to_host()
-                .map_err(|error| error.to_string())?
-                .into(),
+            initial: region.read_to_host()?.into(),
             region,
-            backing: slab
-                .region_rows(0, 0, view)
-                .map_err(|error| error.to_string())?,
+            backing: slab.region_rows(0, 0, view)?,
             _slab: Some(Arc::new(slab)),
         })
+    }
+
+    /// A slab port's binding of `source` (`&slab`), which the entry only
+    /// reads: one slab of its rows, or `source` itself when it has none,
+    /// which a slab port takes as any tensor.
+    pub fn slab_view(&self, source: Tensor) -> Result<SlabView, BuildError> {
+        let rows = *source.extents().first().ok_or("slab tuning input has no row axis")?;
+        if source.extents().contains(&0) {
+            return Ok(SlabView { tensor: source, rows_per_slab: 1, _slab: None });
+        }
+        let slab = self.slab(&source, rows)?;
+        Ok(SlabView {
+            tensor: slab.logical_region(0)?,
+            rows_per_slab: u32::try_from(rows).map_err(|_| "slab tuning input rows exceed u32")?,
+            _slab: Some(Arc::new(slab)),
+        })
+    }
+
+    /// One slab holding the first `rows` rows of `source`.
+    fn slab(&self, source: &Tensor, rows: u64) -> Result<seismic::SlabTensor, BuildError> {
+        let extents = source.extents();
+        if rows == 0 || extents.first().is_none_or(|&held| rows > held) {
+            return Err("a tuning slab has invalid row bounds".into());
+        }
+        let slab = crate::experts::pooled_slabs(
+            self.device,
+            seismic::Contract::DeviceOnly,
+            rows,
+            rows,
+            &[seismic::SlabRegion {
+                element: source.element(),
+                row_shape: extents[1..].to_vec(),
+            }],
+            1,
+        )?;
+        // Every row is written before the entry reads any.
+        slab.add_slab(seismic::SlabFill::Unwritten)?;
+        let bytes = source.slice_leading(0, rows)?.read_to_host()?;
+        slab.region_rows(0, 0, rows)?.write_from_host(&bytes)?;
+        Ok(slab)
     }
 
     /// The tensor `name` shared by the points of the entry being tuned,
@@ -1280,8 +2581,8 @@ impl TuningInputs<'_, '_> {
     pub fn shared(
         &mut self,
         name: String,
-        build: impl FnOnce(&Self) -> Result<Tensor, String>,
-    ) -> Result<Tensor, String> {
+        build: impl FnOnce(&Self) -> Result<Tensor, BuildError>,
+    ) -> Result<Tensor, BuildError> {
         if let Some(tensor) = self.shared.get(&name) {
             return Ok(tensor.clone());
         }
@@ -1290,30 +2591,32 @@ impl TuningInputs<'_, '_> {
         Ok(tensor)
     }
 
-    /// Row tables for `rows` rows over `slots` requests, each with `context`
-    /// accepted history rows, packed by the batch builder. Slot `s` sees
-    /// history rows `[s·context, (s+1)·context)`; batch row `i` appends at
-    /// history row `appends + i`, past every row any point reads, so no
-    /// point's appends change another point's inputs.
+    /// Row tables for `rows` rows over one request for each of `histories`,
+    /// each with `context` accepted history rows in the ranges its entry
+    /// names ([`history_placement`]), packed by the batch builder. Batch
+    /// row `i` appends at history row `appends + i`, past every row any
+    /// point reads, so no point's appends change another point's inputs.
     pub fn batch(
         &self,
         rows: u64,
         context: u64,
-        slots: u64,
+        histories: &[Vec<[i32; 2]>],
         appends: u64,
     ) -> Result<PackedRowTables, String> {
         let rows = usize::try_from(rows).map_err(|_| "tuning rows exceed usize")?;
-        let slots = usize::try_from(slots.max(1)).map_err(|_| "tuning slots exceed usize")?;
+        let slots = histories.len();
         let context = i32::try_from(context).map_err(|_| "tuning context exceeds i32")?;
         let appends = i32::try_from(appends).map_err(|_| "tuning history exceeds i32")?;
-        if slots > rows {
+        if slots == 0 || slots > rows {
             return Err(format!("{slots} slots cannot share {rows} rows"));
         }
+        let spans = histories.iter().map(Vec::len).max().unwrap_or(0);
         let mut row_index = 0i32;
-        let packed = (0..slots)
-            .map(|slot| {
+        let packed = histories
+            .iter()
+            .enumerate()
+            .map(|(slot, visible)| {
                 let count = rows / slots + usize::from(slot < rows % slots);
-                let base = slot as i32 * context;
                 Slot {
                     rows: (0..count)
                         .map(|offset| {
@@ -1325,11 +2628,7 @@ impl TuningInputs<'_, '_> {
                                 coordinates: [position, position, position, 0],
                                 // One Token history domain.
                                 histories: vec![RowHistory {
-                                    visible: if context == 0 {
-                                        Vec::new()
-                                    } else {
-                                        vec![[base, base + context]]
-                                    },
+                                    visible: visible.clone(),
                                     fresh_start: 0,
                                     bidirectional_end: None,
                                     destination,
@@ -1348,36 +2647,100 @@ impl TuningInputs<'_, '_> {
             .collect::<Vec<_>>();
         let vocabulary = usize::try_from(self.definition.decoder.vocabulary)
             .map_err(|_| "vocabulary exceeds usize")?;
-        // Each row sees at most one history span.
-        let limits = ClassLimits { rows, segments: 1 };
+        // The span class a store seals for the most spans a row sees.
+        let limits = ClassLimits {
+            rows,
+            segments: spans.max(1).next_power_of_two(),
+        };
         PackedRowTables::pack(&packed, vocabulary, limits).map_err(|error| error.to_string())
     }
 }
 
 fn element_count(extents: &[u64]) -> Result<usize, String> {
-    extents
-        .iter()
-        .try_fold(1u64, |count, extent| count.checked_mul(*extent))
+    crate::planning::elements(extents)
         .and_then(|count| usize::try_from(count).ok())
         .ok_or_else(|| "tuning tensor size overflows".to_owned())
 }
 
-fn f16_bits(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exponent = ((bits >> 23) & 0xff) as i32 - 127 + 15;
-    let mantissa = bits & 0x7f_ffff;
-    if exponent <= 0 {
-        // |value| < 2^-14 in [-1, 1): flush to signed zero.
-        return sign;
-    }
-    let rounded = (mantissa + 0x1000) >> 13;
-    sign | (((exponent as u32) << 10) + rounded) as u16
+/// An entry, its element bindings and the values it is fixed at
+/// ([`FixedValues`]): what one tuning result applies to (a tuning unit).
+pub(super) type TuningKey = (&'static str, String, FixedValues);
+
+/// An entry, its element bindings and its static values: what a demand
+/// walk collects a unit's launches by, whatever parameters the unit is
+/// fixed at (it reads no choice).
+pub(super) type DemandKey = (&'static str, String, BTreeMap<String, u64>);
+
+/// The values a unit is fixed at, each kind apart: its statics, and each
+/// parameter its call site fixes (a dependant's arithmetic,
+/// [`Tuner::following`]). A declaration names a dimension static or a
+/// parameter, never both.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(super) struct FixedValues {
+    pub statics: BTreeMap<String, u64>,
+    pub params: BTreeMap<String, u64>,
 }
 
-/// An entry, its element bindings and its static values: what one tuning
-/// result applies to (a tuning unit).
-type TuningKey = (&'static str, String, BTreeMap<String, u64>);
+impl FixedValues {
+    pub(super) fn of(fixed: &NativeSpecialization) -> Self {
+        Self {
+            statics: fixed.statics().clone(),
+            params: fixed.params().clone(),
+        }
+    }
+
+    /// The specialization they fix: each static a static, each parameter
+    /// a parameter.
+    pub(super) fn specialization(&self) -> NativeSpecialization {
+        let statics = self
+            .statics
+            .iter()
+            .fold(NativeSpecialization::new(), |spec, (name, value)| spec.with_static(name.clone(), *value));
+        self.params
+            .iter()
+            .fold(statics, |spec, (name, value)| spec.with_param(name.clone(), *value))
+    }
+
+    /// Their text in a stored result's key: the statics, then the fixed
+    /// parameters where the call site fixes any.
+    fn key_text(&self) -> String {
+        match self.params.is_empty() {
+            true => format!("{:?}", self.statics),
+            false => format!("{:?}\nfixed {:?}", self.statics, self.params),
+        }
+    }
+}
+
+/// The unit of `entry` at `bindings` and the values `fixed` holds.
+pub(super) fn unit_key(
+    entry: &'static str,
+    bindings: String,
+    fixed: &NativeSpecialization,
+) -> TuningKey {
+    (entry, bindings, FixedValues::of(fixed))
+}
+
+/// Each arithmetic parameter of `implementation` (`NativeParameter::
+/// arithmetic`: one that changes the order of a result's arithmetic) at its
+/// value in `choice`: what a dependant of the unit that chose `choice` is
+/// fixed at ([`Tuner::following`]). Fails with the name of one `choice`
+/// does not hold.
+pub(super) fn arithmetic_of(
+    implementation: &NativeImplementation,
+    choice: &NativeSpecialization,
+) -> Result<Vec<(String, u64)>, String> {
+    implementation
+        .params
+        .iter()
+        .filter(|parameter| parameter.arithmetic)
+        .map(|parameter| {
+            choice
+                .param(&parameter.name)
+                .map(|value| (parameter.name.clone(), value))
+                .ok_or_else(|| parameter.name.clone())
+        })
+        .collect()
+}
 
 /// Where a preparation's tuning is. One [`Tuner`] walks the program once per
 /// phase.
@@ -1387,95 +2750,386 @@ enum Phase<'a> {
     Count {
         launches: HashMap<TuningKey, usize>,
         searching: Vec<TuningKey>,
+        /// Each unit whose search the count opened, at the canonical
+        /// default the mandatory phase publishes for it: its choice as it
+        /// stands until its search promotes another.
+        canonical: HashMap<TuningKey, NativeSpecialization>,
     },
-    /// Measuring each searching unit's defaults at the points every
-    /// candidate must pass within the tuning time left, and keeping the
-    /// unit's opened search, in preparation order.
+    /// Every searching unit's mandatory work is done: it serves its
+    /// published canonical default. The walk collects the units with
+    /// optional work, in preparation order; nothing is formed or measured.
     Census {
         launches: HashMap<TuningKey, usize>,
+        canonical: HashMap<TuningKey, NativeSpecialization>,
         units: Vec<Box<dyn SearchedUnit<'a> + 'a>>,
     },
-    /// Every censused unit was searched ([`allocation`]): the walk reads
-    /// the choices and prepares them.
-    Prepare,
+    /// Every censused unit was searched ([`allocation`]) and its record is
+    /// published: the end of a search. Nothing walks after it; a unit's
+    /// published choice can still be read.
+    Searched,
+    /// A load's only phase: one walk reads each unit's stored record and
+    /// prepares its choice. At a unit without a record the walk stops and
+    /// reports it, or prepares the unit at its canonical default, as its
+    /// host asked. Nothing is searched, measured or published.
+    Serve(UnpreparedUnits),
 }
 
-/// One searching unit between its census and its conclusion, whatever its
-/// entry: its opened search, its case and the inputs built for it.
+/// One unit with optional work, whatever its entry: its opened search, its
+/// case and the inputs built for it. It serves a published legal choice
+/// throughout.
 trait SearchedUnit<'a> {
+    fn dependency_keys(&self) -> Vec<TuningKey> {
+        Vec::new()
+    }
+    fn set_prerequisites(&mut self, _: Vec<usize>) {}
+    fn prerequisites(&self) -> Vec<usize> {
+        Vec::new()
+    }
     fn key(&self) -> &TuningKey;
-    /// The unit's step time as its census measured it: its launches per
-    /// step, the points it serves, its timed points and its defaults' time
-    /// at each.
-    fn time(&self) -> (usize, Vec<PointShape>, Vec<PointShape>, Vec<f64>);
+    /// The unit's time in each of the objective's `terms` at its defaults,
+    /// as its census measured it ([`term_times`]).
+    fn times(&self, terms: usize) -> Vec<f64>;
+    /// Weigh the unit's points again under `objective`, whose terms' times
+    /// now stand on measurements, once its discovery is complete and
+    /// before anything of its search is measured against those weights.
+    fn reweigh(&mut self, _objective: &Objective) {}
+    /// Whether the unit's defaults are measured at every discovery point,
+    /// so its times ([`SearchedUnit::times`]) are whole.
+    fn discovered(&self) -> bool;
     fn share(&self) -> f64;
     fn set_share(&mut self, share: f64);
-    /// What the unit's start and conclusion will cost, from its census.
-    fn estimate(&self) -> allocation::Estimate;
-    fn start(
+    /// The unit's next piece of optional work, priced in full.
+    fn next(&self) -> Option<seismic::Work>;
+    /// The compile of that piece, to run on a worker ahead of it.
+    fn forming(&self) -> Option<seismic::Forming>;
+    /// Hold what that compile formed, which took `took`.
+    fn formed(
+        &mut self,
+        formed: seismic::Formed,
+        took: Duration,
+        tuner: &mut Tuner<'a>,
+    ) -> Result<(), CatalogFailure>;
+    /// Run that piece to its end; when it changed the unit's served choice,
+    /// publish the unit's record with it. Returns the longest single
+    /// operation the unit has completed.
+    fn perform(
         &mut self,
         tuner: &mut Tuner<'a>,
-        depth: allocation::Depth,
-        until: Instant,
-    ) -> Result<allocation::Started, CatalogFailure>;
-    fn refine(
-        &mut self,
-        slice: Instant,
-        until: Instant,
-    ) -> Result<allocation::Progress, CatalogFailure>;
-    fn reserve(&self) -> Duration;
-    /// Conclude the search, store its result and record the unit's choice.
-    fn conclude(&mut self, tuner: &mut Tuner<'a>, until: Instant) -> Result<(), CatalogFailure>;
+        before: Duration,
+    ) -> Result<Duration, CatalogFailure>;
+    /// The process's footprint once the last piece's inputs were built or
+    /// restored; none before a piece, or where the system reports none.
+    fn resident_footprint(&self) -> Option<u64> {
+        None
+    }
+    /// What the unit owes when the optional work stops, priced
+    /// ([`allocation::Unit::owed`]).
+    fn owed(&self, _worked: bool) -> seismic::Quote {
+        seismic::Quote::default()
+    }
+    /// Publish the unit's record if its work changed it since it was
+    /// published: the optional work has stopped.
+    fn settle(&mut self, _: &mut Tuner<'a>) -> Result<(), CatalogFailure> {
+        Ok(())
+    }
+    /// The allocations the unit's resident inputs bind, each its identity
+    /// and bytes; none when it holds no inputs.
+    fn bound(&self) -> Option<Vec<(u64, u64)>> {
+        None
+    }
+    /// What building the inputs the unit holds took
+    /// ([`allocation::Unit::built`]).
+    fn built(&self) -> seismic::Quote {
+        seismic::Quote::default()
+    }
+    /// Give up the inputs the unit holds.
+    fn release(&mut self, _: &mut Tuner<'a>) {}
+    /// The bytes of the formed programs the unit holds; zero when it holds
+    /// none.
+    fn programs(&self) -> u64 {
+        0
+    }
+    /// Give up the formed programs the unit holds.
+    fn give_up(&mut self) {}
+    /// Offer the next piece with one challenger fewer; false when it has
+    /// no fewer to offer (a piece that is one whole thing never has).
+    fn narrow(&mut self) -> bool {
+        false
+    }
+    /// The unit's next piece was refused for its bytes for good
+    /// ([`allocation::Unit::refused_for_bytes`]).
+    fn refused_for_bytes(&mut self, _: &mut Tuner<'a>) {}
+    /// The most a single piece of the unit's operations has added to the
+    /// bytes held beyond the inputs it kept resident; none until a piece
+    /// of it has been measured.
+    fn largest_footprint(&self) -> Option<u64> {
+        None
+    }
+    /// The load's optional work is over: report the unit's record.
+    fn finish(&mut self, tuner: &mut Tuner<'a>) -> Result<(), CatalogFailure>;
 }
 
 impl<'a> allocation::Unit for Box<dyn SearchedUnit<'a> + 'a> {
+    fn discovered(&self) -> bool {
+        (**self).discovered()
+    }
+
+    /// Freeze the objective over its units once each has measured its
+    /// baseline. A unit that left the objective undiscovered is not in it:
+    /// missing measurements never become zero-cost service.
+    fn refresh(units: &mut [Self], members: &[bool], tuner: &mut Tuner<'a>) {
+        assert!(
+            units
+                .iter()
+                .zip(members)
+                .all(|(unit, member)| !member || unit.discovered()),
+            "the objective is refreshed only once its units are discovered"
+        );
+        let objective = &mut tuner.invocations.objective;
+        let terms = objective.terms.len();
+        let times = units
+            .iter()
+            .zip(members)
+            .filter(|(_, member)| **member)
+            .map(|(unit, _)| unit.times(terms))
+            .collect::<Vec<_>>();
+        let weights = objective
+            .terms
+            .iter()
+            .map(|term| term.weight)
+            .collect::<Vec<_>>();
+        objective.measured = (0..terms)
+            .map(|term| times.iter().map(|unit| unit[term]).sum())
+            .collect();
+        let units = units
+            .iter_mut()
+            .zip(members)
+            .filter(|(_, member)| **member)
+            .map(|(unit, _)| unit);
+        for (unit, share) in units.zip(shares(&times, &weights)) {
+            unit.set_share(share);
+            unit.reweigh(objective);
+        }
+    }
+    fn prerequisites(&self) -> Vec<usize> {
+        (**self).prerequisites()
+    }
     type Context = Tuner<'a>;
     type Failure = CatalogFailure;
+    type Forming = seismic::Forming;
+    type Formed = seismic::Formed;
 
     fn share(&self) -> f64 {
         (**self).share()
     }
 
-    fn estimate(&self) -> allocation::Estimate {
-        (**self).estimate()
+    fn next(&self) -> Option<seismic::Work> {
+        (**self).next()
     }
 
-    fn start(
-        &mut self,
-        tuner: &mut Tuner<'a>,
-        depth: allocation::Depth,
-        until: Duration,
-    ) -> Result<allocation::Started, CatalogFailure> {
-        let until = tuner.started + until;
-        (**self).start(tuner, depth, until)
+    /// Units of one entry check the same untimed points.
+    fn kind(&self) -> &'static str {
+        self.key().0
     }
 
-    fn refine(
+    fn forming(&self) -> Option<seismic::Forming> {
+        (**self).forming()
+    }
+
+    fn formed(
+        &mut self,
+        formed: seismic::Formed,
+        took: Duration,
+        tuner: &mut Tuner<'a>,
+    ) -> Result<(), CatalogFailure> {
+        (**self).formed(formed, took, tuner)
+    }
+
+    fn perform(
         &mut self,
         tuner: &mut Tuner<'a>,
-        slice: Duration,
-        until: Duration,
-    ) -> Result<allocation::Progress, CatalogFailure> {
-        let progress = (**self).refine(tuner.started + slice, tuner.started + until)?;
+        before: Duration,
+    ) -> Result<Duration, CatalogFailure> {
+        let stage = (**self)
+            .next()
+            .expect("a unit performs the work it named")
+            .stage;
+        let device = tuner.device;
+        let charged_before = allocated(device);
+        let resident = <Self as allocation::Unit>::holding(self) > 0;
+        let host_before = seismic::ProcessMemory::footprint_now();
+        let peak_before = seismic::ProcessMemory::footprint_peak();
+        device.restart_high_water();
+        tuner.context.observer.event(&TuningEvent::WorkStarted {
+            entry: (**self).key().0,
+            stage,
+        });
+        let longest = (**self).perform(tuner, before)?;
+        let unit = unit_name((**self).key());
+        // What the piece added at its most: where the footprint's peak
+        // rose while it ran, the peak over where it began (with what the
+        // compiles in flight took meanwhile, which only prices it higher);
+        // otherwise what it left added when it ended. A piece that began
+        // with its unit's inputs resident prices the pieces that will; one
+        // that built them prices building them again, and what it added
+        // beyond them once built prices the pieces that keep them.
+        if let Some((before, after)) = host_before.zip(seismic::ProcessMemory::footprint_now()) {
+            let most = peak_before
+                .zip(seismic::ProcessMemory::footprint_peak())
+                .filter(|(before, peak)| peak > before)
+                .map_or(after, |(_, peak)| peak.max(after));
+            if resident {
+                tuner.memory.host_piece(&unit, true, most.saturating_sub(before));
+            } else {
+                tuner.memory.host_piece(&unit, false, most.saturating_sub(before));
+                let built = (**self).resident_footprint().map_or(before, |built| built.max(before));
+                tuner.memory.host_piece(&unit, true, most.saturating_sub(built));
+            }
+        }
+        tuner
+            .memory
+            .piece(unit, stage, charged_before, allocated(device));
+        let within = high_water(device);
+        let room = tuner.room_now();
+        tuner.memory.observe(device, within, room);
         tuner.report_progress();
-        Ok(progress)
+        Ok(longest)
     }
 
-    fn reserve(&self) -> Duration {
-        (**self).reserve()
+    /// Every allocation the unit's inputs bind; inputs held that bind no
+    /// bytes are still held.
+    fn holding(&self) -> u64 {
+        (**self).bound().map_or(0, |bound| {
+            bound
+                .iter()
+                .map(|(_, bytes)| bytes)
+                .sum::<u64>()
+                .max(1)
+        })
     }
 
-    fn conclude(&mut self, tuner: &mut Tuner<'a>, until: Duration) -> Result<(), CatalogFailure> {
-        let until = tuner.started + until;
-        (**self).conclude(tuner, until)
+    /// The allocations the givers' inputs bind that no other unit's inputs
+    /// bind, by the units' own bindings: the weights and shared planes the
+    /// tuner keeps leave once no built input binds them (`release_unheld`),
+    /// so an allocation returns when its last binder gives it up.
+    fn returned(units: &[Self], givers: &[usize]) -> u64 {
+        // Each allocation's bytes, and whether a unit not giving up binds it.
+        let mut allocations = HashMap::<u64, (u64, bool)>::new();
+        for (index, unit) in units.iter().enumerate() {
+            let giving = givers.contains(&index);
+            for (identity, bytes) in unit.bound().into_iter().flatten() {
+                allocations.entry(identity).or_insert((bytes, false)).1 |= !giving;
+            }
+        }
+        allocations
+            .values()
+            .filter(|(_, kept)| !kept)
+            .map(|(bytes, _)| bytes)
+            .sum()
+    }
+
+    fn built(&self) -> seismic::Quote {
+        (**self).built()
+    }
+
+    fn release(&mut self, tuner: &mut Tuner<'a>) {
+        // What the unit gives up is freed; its pages are returned when a
+        // piece needs the room ([`allocation::Unit::reclaim`]) and when
+        // tuning ends. Returning them at every release took 2.6 s of one
+        // load's 47 s of tuning.
+        (**self).release(tuner);
+    }
+
+    fn reclaim(tuner: &mut Tuner<'a>) {
+        tuner.memory.return_freed_pages();
+    }
+
+    /// The pool of activation noise, twice the largest activation built,
+    /// where the host's growth counts against the device's room (the one
+    /// rule, [`allocation::Unit::shared_host`]). It is generated again when
+    /// a point is next built; its values are pseudo-random either way, and
+    /// a point built again is observed again.
+    fn spare(tuner: &Tuner<'a>) -> u64 {
+        Self::shared_host(tuner, tuner.noise.bytes())
+    }
+
+    fn drop_spare(tuner: &mut Tuner<'a>) {
+        tuner.noise = Noise::default();
+        tuner.memory.return_freed_pages();
+    }
+
+    fn programs(&self) -> u64 {
+        (**self).programs()
+    }
+
+    fn give_up(&mut self, _: &mut Tuner<'a>) {
+        (**self).give_up();
+    }
+
+    fn narrow(&mut self, _: &mut Tuner<'a>) -> bool {
+        (**self).narrow()
+    }
+
+    /// The first refusal for bytes is stated as the room stood when it
+    /// was made.
+    fn refused_for_bytes(&mut self, tuner: &mut Tuner<'a>) {
+        if tuner.memory.no_room.is_none() {
+            if let Some(room) = tuner.room_now() {
+                tuner.memory.read_room(tuner.device, room);
+            }
+            tuner.memory.no_room = Some(tuner.no_room(self));
+        }
+        (**self).refused_for_bytes(tuner);
+    }
+
+    fn largest_footprint(&self) -> Option<u64> {
+        (**self).largest_footprint()
+    }
+
+    fn owed(&self, worked: bool) -> seismic::Quote {
+        (**self).owed(worked)
+    }
+
+    fn settle(&mut self, tuner: &mut Tuner<'a>) -> Result<(), CatalogFailure> {
+        (**self).settle(tuner)
+    }
+
+    fn free(tuner: &Tuner<'a>) -> Option<u64> {
+        tuner.memory.free(tuner.device, tuner.room_now())
+    }
+
+    fn host_free(tuner: &Tuner<'a>) -> allocation::HostRoom {
+        tuner.memory.host_free(tuner.room_now())
+    }
+
+    fn shares_host(tuner: &Tuner<'a>) -> bool {
+        tuner.memory.shares_host_ceiling()
+    }
+
+    fn release_rate(tuner: &Tuner<'a>) -> Option<f64> {
+        tuner.room.map(|room| room.release().bytes_per_second())
+    }
+
+    fn host_footprint(&self, tuner: &Tuner<'a>) -> Option<u64> {
+        tuner.memory.host_added(
+            &unit_name((**self).key()),
+            <Self as allocation::Unit>::holding(self) > 0,
+        )
+    }
+
+    fn compile_host(tuner: &Tuner<'a>) -> u64 {
+        tuner.memory.compile_host_bytes
+    }
+
+    fn capacity(tuner: &Tuner<'a>) -> Option<u64> {
+        tuner.memory.capacity(tuner.device, tuner.room_now())
     }
 }
 
-/// A unit whose share of step time is below this confirms its finalists
-/// with [`MINOR_CONFIRMATION_SAMPLES`]: the samples a decision gets follow
-/// what the decision is worth.
-const MINOR_SHARE: f64 = 0.05;
-const MINOR_CONFIRMATION_SAMPLES: usize = 3;
+/// A unit as the memory report names it.
+fn unit_name(key: &TuningKey) -> String {
+    format!("{} [{}]", key.0, key.1)
+}
 
 /// The tuning time since `0` began.
 struct Elapsed(Instant);
@@ -1490,36 +3144,40 @@ impl allocation::Clock for Elapsed {
 struct CaseUnit<'a, T: EntryTuning> {
     case: T,
     key: TuningKey,
-    implementation: NativeImplementation,
+    /// Its implementation as the device offers it ([`offered`]).
+    implementation: seismic::OnDevice,
     statics: NativeSpecialization,
     /// The unit's points, ascending in cost.
     shapes: Vec<PointShape>,
-    launches: usize,
-    /// The inputs built so far, kept until the conclusion.
+    /// Its points were weighed again once its discovery was complete
+    /// ([`SearchedUnit::reweigh`]).
+    reweighed: bool,
+    /// The inputs built so far, kept for the unit's later work.
     cases: UnitCases<T::Case>,
-    /// The unit's search, until it is concluded.
-    search: Option<Box<dyn EntrySearch<T::Entry>>>,
-    census: TuningResult,
-    /// Where the unit's result is stored.
-    slot: Option<(&'a KernelCache, TuningCacheKey)>,
+    search: Box<dyn EntrySearch<T::Entry>>,
     share: f64,
-    /// The wall time of the unit's steps so far.
+    /// The wall time of the unit's work so far, its mandatory work
+    /// included.
     spent: Duration,
-    /// The wall time of the unit's census.
-    censused: Duration,
-    backend: seismic::BackendName,
-    start: Option<(f64, usize)>,
-    standing: Option<Standing>,
-}
-
-impl<T: EntryTuning> CaseUnit<'_, T> {
-    /// Where the unit's search stands, as the allocation reads it.
-    fn progress(&self, standing: Standing) -> allocation::Progress {
-        allocation::Progress {
-            finished: standing.finished,
-            cost: standing.cost,
-        }
-    }
+    /// Pieces of optional work performed.
+    stages: usize,
+    /// The process's footprint once the last piece's inputs were resident
+    /// ([`seismic::PieceMemory::resident_footprint`]).
+    resident_footprint: Option<u64>,
+    /// The next piece's compile, which ran ahead of it, and its price when
+    /// it was started.
+    formed: Option<FormedAhead>,
+    forming_quote: Cell<Option<seismic::Quote>>,
+    /// What publishing a unit's record has taken in this load: its class,
+    /// the price of a conversion's publication and of the one the unit
+    /// owes when the optional work stops.
+    publishing: Rc<Cell<seismic::Observed>>,
+    /// The unit's settled record is still owed: everything it published
+    /// before the optional work stopped is provisional.
+    unpublished: bool,
+    /// The record as it was published when the optional work stopped.
+    settled: Option<TuningResult>,
+    marker: std::marker::PhantomData<&'a ()>,
 }
 
 /// The failure of tuning the unit `key` with `error`.
@@ -1532,13 +3190,46 @@ fn unit_failure(key: &TuningKey, error: impl ToString) -> CatalogFailure {
 }
 
 impl<'a, T: EntryTuning> SearchedUnit<'a> for CaseUnit<'a, T> {
+    fn resident_footprint(&self) -> Option<u64> {
+        self.resident_footprint
+    }
+
     fn key(&self) -> &TuningKey {
         &self.key
     }
 
-    fn time(&self) -> (usize, Vec<PointShape>, Vec<PointShape>, Vec<f64>) {
-        let (shapes, seconds) = censused_times(&self.shapes, &self.census);
-        (self.launches, self.shapes.clone(), shapes, seconds)
+    fn times(&self, terms: usize) -> Vec<f64> {
+        let measured = self.search.service_measurements();
+        term_times(&self.shapes, terms, |shape| {
+            measured
+                .iter()
+                .find(|point| point.point == shape.label)
+                .map(|point| point.median_seconds)
+        })
+    }
+
+    /// Freeze this unit's objective after the load's complete baseline
+    /// census and before measuring any challenger.
+    fn reweigh(&mut self, objective: &Objective) {
+        if self.reweighed || !self.search.discovered() {
+            return;
+        }
+        for point in &mut self.shapes {
+            point.weight = point
+                .terms
+                .iter()
+                .map(|(term, launches)| objective.weight(*term, *launches))
+                .sum();
+        }
+        let weights = point_specs(&self.shapes)
+            .into_iter()
+            .map(|spec| spec.weight)
+            .collect::<Vec<_>>();
+        self.reweighed = self.search.reweigh(&weights);
+    }
+
+    fn discovered(&self) -> bool {
+        self.search.discovered()
     }
 
     fn share(&self) -> f64 {
@@ -1549,308 +3240,282 @@ impl<'a, T: EntryTuning> SearchedUnit<'a> for CaseUnit<'a, T> {
         self.share = share;
     }
 
-    /// The census timed the defaults at the required points and the census
-    /// points ([`census_points`]); the start admits further points within the unit's admission, plans the search
-    /// and measures the defaults at every timed point, then one
-    /// configuration per form start. These are estimates of the right
-    /// size, not predictions: the plan scales them by what the starts
-    /// before this one took against theirs.
-    fn estimate(&self) -> allocation::Estimate {
-        let census = &self.census.time;
-        // One pass of the defaults over the points the census timed: their
-        // reference and their measurement.
-        let pass = census.reference_seconds + census.measuring_seconds;
-        // Admitting the further points costs up to the admission, and no
-        // more than the census's time at each of them.
-        let further = self.shapes.len() - censused_times(&self.shapes, &self.census).0.len();
-        let admission = (TUNING_TIME.mul_f64(self.share.min(1.)) / ADMISSION_SHARE)
-            .min(self.censused * further as u32);
-        // A configuration is validated and sampled at every timed point:
-        // the census's pass, and as much again per point admitted since.
-        let configuration = Duration::from_secs_f64(pass) + admission / 2;
-        // The starts: every other value of the form parameters, and for a
-        // launch-scoped implementation of the other entry parameters too,
-        // which choose which launch serves which rows (each such value's
-        // base is measured before any launch is refined).
-        let scoped = self.implementation.launch_scoped();
-        let forms = self
-            .implementation
-            .params
-            .iter()
-            .filter(|parameter| parameter.form || scoped)
-            .map(|parameter| parameter.values.len() - 1)
-            .sum::<usize>();
-        let launches = self.implementation.launches.len().max(1);
-        let settings = search_settings_for(self.share, self.backend);
-        allocation::Estimate {
-            defaults: admission + configuration,
-            forms: configuration * forms as u32,
-            default_programs: launches,
-            form_programs: forms * launches,
-            conclusion: started_conclusion(censused_sample(&self.census), forms, scoped, &settings)
-                + admission,
+    /// The runtime prices the piece. A conversion that promotes publishes
+    /// the unit's record with the choice: the adapter's one more operation,
+    /// of a class this load observed when it published the unit's
+    /// canonical default. The choice's program is the artifact the search
+    /// compiled and stored, which any later load reads: nothing more is
+    /// formed for it.
+    fn next(&self) -> Option<seismic::Work> {
+        let mut work = self.search.next()?;
+        if matches!(
+            work.stage,
+            seismic::Stage::Promote | seismic::Stage::Confirm
+        ) {
+            work.quote.add(self.publishing.get().price(), 1);
         }
+        Some(work)
     }
 
-    fn start(
-        &mut self,
-        tuner: &mut Tuner<'a>,
-        depth: allocation::Depth,
-        until: Instant,
-    ) -> Result<allocation::Started, CatalogFailure> {
+    /// A unit owes its settled record when the optional work stops, until
+    /// it has published it.
+    fn owed(&self, worked: bool) -> seismic::Quote {
+        let mut owed = seismic::Quote::default();
+        if self.unpublished || worked {
+            owed.add(self.publishing.get().price(), 1);
+        }
+        owed
+    }
+
+    /// The optional work has stopped: the unit's record is published as it
+    /// stands.
+    fn settle(&mut self, tuner: &mut Tuner<'a>) -> Result<(), CatalogFailure> {
+        if !self.unpublished {
+            return Ok(());
+        }
         let began = Instant::now();
-        tuner.context.observer.event(&TuningEvent::Started {
+        let began_seconds = tuner.started.elapsed().as_secs_f64();
+        let owed = self.owed(false);
+        let result = tuner
+            .publish(&self.key, true, || self.search.terminal())
+            .map_err(|error| unit_failure(&self.key, error))?;
+        self.unpublished = false;
+        self.settled = Some(result);
+        self.spent += began.elapsed();
+        tuner.context.observer.event(&TuningEvent::Published {
             entry: self.key.0,
             bindings: self.key.1.clone(),
-            points: self.shapes.len(),
+            forecast_seconds: owed.forecast().map(|forecast| forecast.as_secs_f64()),
+            began_seconds,
+            actual_seconds: began.elapsed().as_secs_f64(),
         });
-        let plan = StartPlan {
-            // The census admitted the required points.
-            required: Duration::ZERO,
-            admission: TUNING_TIME.mul_f64(self.share.min(1.)) / ADMISSION_SHARE,
-            settings: search_settings_for(self.share, tuner.device.backend()),
-            min_sample_seconds: MIN_SAMPLE_SECONDS,
-            start: self.case.search_starts(
-                tuner.device,
-                &self.implementation,
-                &self.statics,
-                tuner.limits,
-            ),
-            forms: depth == allocation::Depth::Forms,
-        };
-        let standing = self
-            .search
-            .as_mut()
-            .expect("a unit starts before it is concluded")
-            .start(
-                &mut UnitPoints {
-                    case: &self.case,
-                    shapes: &self.shapes,
-                    inputs: tuner.inputs(),
-                    cases: &mut self.cases,
-                },
-                plan,
-                until,
-            )
-            .map_err(|error| unit_failure(&self.key, error))?;
-        tuner.weights.release();
-        self.spent += began.elapsed();
-        self.start = Some((began.elapsed().as_secs_f64(), standing.programs));
-        self.standing = Some(standing);
-        tuner.report_progress();
-        Ok(allocation::Started {
-            progress: self.progress(standing),
-            programs: standing.programs,
-            forming: Duration::from_secs_f64(standing.forming_seconds),
-            cut: standing.cut,
-        })
+        Ok(())
     }
 
-    fn refine(
+    fn forming(&self) -> Option<seismic::Forming> {
+        let forming = self.search.forming()?;
+        self.forming_quote
+            .set(self.search.next().map(|work| work.forming));
+        Some(forming)
+    }
+
+    fn formed(
         &mut self,
-        slice: Instant,
-        until: Instant,
-    ) -> Result<allocation::Progress, CatalogFailure> {
-        let began = Instant::now();
-        let standing = self
-            .search
-            .as_mut()
-            .expect("a unit is refined before it is concluded")
-            .refine(slice, until)
-            .map_err(|error| unit_failure(&self.key, error))?;
-        self.spent += began.elapsed();
-        self.standing = Some(standing);
-        Ok(self.progress(standing))
-    }
-
-    fn reserve(&self) -> Duration {
-        self.search
-            .as_ref()
-            .map_or(Duration::ZERO, |search| search.reserve())
-    }
-
-    fn conclude(&mut self, tuner: &mut Tuner<'a>, until: Instant) -> Result<(), CatalogFailure> {
-        let began = Instant::now();
-        let search = self
-            .search
+        formed: seismic::Formed,
+        took: Duration,
+        _: &mut Tuner<'a>,
+    ) -> Result<(), CatalogFailure> {
+        // The compile's price as the piece was started with it: priced now,
+        // it would read the programs it formed as live.
+        let quote = self
+            .forming_quote
             .take()
-            .expect("a unit is concluded once");
-        // The time the unit was given: its steps, and what was left for its
-        // conclusion.
-        let allowance = self.spent + until.saturating_duration_since(began);
-        let result = search
-            .conclude(
+            .expect("a compile ran ahead of the unit's next piece");
+        self.search
+            .formed(formed)
+            .map_err(|error| unit_failure(&self.key, error))?;
+        self.spent += took;
+        self.formed = Some(FormedAhead {
+            priced_seconds: quote.priced.as_secs_f64(),
+            unpriced_operations: quote.unpriced,
+            actual_seconds: took.as_secs_f64(),
+        });
+        Ok(())
+    }
+
+    fn perform(
+        &mut self,
+        tuner: &mut Tuner<'a>,
+        before: Duration,
+    ) -> Result<Duration, CatalogFailure> {
+        let work = self.next().expect("a unit performs the work it named");
+        let began = Instant::now();
+        let began_seconds = tuner.started.elapsed().as_secs_f64();
+        if self.stages == 0 {
+            tuner.context.observer.event(&TuningEvent::Started {
+                entry: self.key.0,
+                bindings: self.key.1.clone(),
+                points: self.shapes.len(),
+            });
+        }
+        self.search.plan(seismic::UnitPlan {
+            settings: SEARCH_SETTINGS,
+            min_sample_seconds: MIN_SAMPLE_SECONDS,
+            start: self
+                .case
+                .search_starts(&ranged::EVERY_ROW, tuner.device, &self.implementation, &self.statics, tuner.limits),
+        });
+        let cutoff = tuner.started + before;
+        let searching = Instant::now();
+        let performed = self
+            .search
+            .perform(
                 &mut UnitPoints {
                     case: &self.case,
                     shapes: &self.shapes,
                     inputs: tuner.inputs(),
                     cases: &mut self.cases,
                 },
-                until,
-                allowance,
+                Some(cutoff),
             )
             .map_err(|error| unit_failure(&self.key, error))?;
-        tuner.weights.release();
-        self.spent += began.elapsed();
-        // A unit never started was not searched: its result is its census,
-        // the defaults unmeasured against anything. It is not stored, so
-        // the next preparation searches the unit instead of reading those
-        // defaults as its result ever after.
-        if let Some((cache, key)) = self.slot.as_ref().filter(|_| self.start.is_some()) {
-            cache.store_tuning(key, &result);
+        let searched = searching.elapsed();
+        // A weight no built input binds leaves; one that a point of any
+        // unit still binds stays shared.
+        tuner.inputs().release_unheld();
+        let room = tuner.room_now();
+        tuner
+            .memory
+            .observe(tuner.device, performed.memory.ledger_peak_bytes, room);
+        self.resident_footprint = performed.memory.resident_footprint;
+        // A promotion is published with the unit's record as it stands,
+        // served from that instant. What a piece measures or
+        // judges besides is the unit's in memory and published once, when
+        // the optional work stops ([`SearchedUnit::settle`]): a search
+        // abandoned before then leaves only provisional records, and the
+        // next search of the unit searches it again.
+        let publishing = Instant::now();
+        if performed.promoted {
+            tuner
+                .publish(&self.key, false, || self.search.terminal())
+                .map_err(|error| unit_failure(&self.key, error))?;
         }
-        let mut tuned = tuned_entry(
-            self.key.0,
-            self.key.1.clone(),
-            &result,
-            TuningOrigin::Searched,
-            began,
-        );
+        let published = publishing.elapsed();
+        self.spent += began.elapsed();
+        self.stages += 1;
+        tuner
+            .context
+            .observer
+            .event(&TuningEvent::Stage(StageRecord {
+                entry: self.key.0,
+                bindings: self.key.1.clone(),
+                statics: self.key.2.statics.clone(),
+                share: self.share,
+                stage: performed.stage,
+                counts: Some(TuningCounts {
+                    measured: self.search.standing().measured,
+                    programs: self.search.standing().programs,
+                }),
+                priced_seconds: work.quote.priced.as_secs_f64(),
+                unpriced: work.quote.unpriced,
+                forecast_seconds: work.quote.forecast().map(|forecast| forecast.as_secs_f64()),
+                began_seconds,
+                actual_seconds: began.elapsed().as_secs_f64(),
+                searching_seconds: searched.as_secs_f64(),
+                interrupted: performed.interrupted,
+                formed: self.formed.take(),
+                spent: performed.spent,
+                raises: performed.raises,
+                publishing_seconds: published.as_secs_f64(),
+                promoted: performed.promoted,
+            }));
+        Ok(self.search.longest_operation().max(published))
+    }
+
+    fn bound(&self) -> Option<Vec<(u64, u64)>> {
+        self.search.bound()
+    }
+
+    fn built(&self) -> seismic::Quote {
+        self.search.inputs_built()
+    }
+
+    /// The unit's inputs leave: the search's points give theirs up, the
+    /// cases built for them are dropped, and the weights and shared planes
+    /// nothing else binds leave with them.
+    fn release(&mut self, tuner: &mut Tuner<'a>) {
+        self.search.release(&mut UnitPoints {
+            case: &self.case,
+            shapes: &self.shapes,
+            inputs: tuner.inputs(),
+            cases: &mut self.cases,
+        });
+    }
+
+    fn programs(&self) -> u64 {
+        self.search.programs()
+    }
+
+    fn give_up(&mut self) {
+        self.search.give_up_programs();
+    }
+
+    fn narrow(&mut self) -> bool {
+        self.search.narrow()
+    }
+
+    /// What stopped the unit's search is the memory room: the tuner is
+    /// told, so that the record settled when the optional work stops says
+    /// so.
+    fn refused_for_bytes(&mut self, tuner: &mut Tuner<'a>) {
+        tuner.without_room.insert(self.key.clone());
+    }
+
+    fn largest_footprint(&self) -> Option<u64> {
+        self.search.largest_footprint()
+    }
+
+    fn finish(&mut self, tuner: &mut Tuner<'a>) -> Result<(), CatalogFailure> {
+        // The record published when the optional work stopped; for a unit
+        // that owed no publication then, its record as it stands.
+        let result = match self.settled.take() {
+            Some(result) => result,
+            None => self
+                .search
+                .terminal()
+                .map_err(|error| unit_failure(&self.key, error))?,
+        };
+        let mut tuned = searched_entry(self.key.0, self.key.1.clone(), result, tuner.budget(), Instant::now());
+        if tuner.without_room.contains(&self.key) {
+            tuned.stop = Some(SearchStop::NoRoom);
+        }
         tuned.seconds = self.spent.as_secs_f64();
         tuned.progress = Some(SearchProgress {
             share: self.share,
-            start: self.start,
-            standing: self.standing,
+            stages: self.stages,
+            standing: self.search.standing(),
         });
         tuner.finish(self.key.clone(), tuned);
-        tuner.report_progress();
         Ok(())
     }
 }
 
-/// One tuning unit's step time as its census measured it: its launches per
-/// step, the points it serves, its timed points and its defaults' time at
-/// each.
-#[derive(Clone, Copy)]
-struct UnitTime<'u> {
-    launches: usize,
-    served: &'u [PointShape],
-    shapes: &'u [PointShape],
-    seconds: &'u [f64],
+/// A unit's time in each of the objective's `terms` at its defaults: at
+/// every point whose time `seconds` gives, the point's launches of the term
+/// times that time. A point not yet timed counts for nothing.
+fn term_times(
+    points: &[PointShape],
+    terms: usize,
+    seconds: impl Fn(&PointShape) -> Option<f64>,
+) -> Vec<f64> {
+    let mut times = vec![0.; terms];
+    for point in points {
+        if let Some(seconds) = seconds(point) {
+            for (term, launches) in &point.terms {
+                times[*term] += launches * seconds;
+            }
+        }
+    }
+    times
 }
 
-/// Each unit's share of expected step time (§D3). Every row class holds its
-/// share of step time ([`row_share`]), split among the units serving it by
-/// their time there: launches per step times the defaults' mean time over
-/// the timed points that stand for the class ([`census_group`]: the class's
-/// own points where the census timed them, else the costliest timed points
-/// of its group). The prefill classes so weigh on the units that serve
-/// them, and a unit serving only chunks holds its part of them. The
-/// defaults' time is also what tuning can recover: a unit far from its best
-/// spends more of the step and gets more of the time.
-fn step_shares(units: &[UnitTime<'_>], limits: TuningLimits) -> Vec<f64> {
-    let time = |unit: &UnitTime<'_>, rows: u64| {
-        if !unit.served.iter().any(|shape| shape.rows == rows) {
-            return 0.0;
-        }
-        let timed = |at: u64| {
-            unit.shapes
-                .iter()
-                .zip(unit.seconds)
-                .filter(|(shape, _)| shape.rows == at)
-                .map(|(_, seconds)| *seconds)
-                .collect::<Vec<_>>()
-        };
-        let mut class = timed(rows);
-        if class.is_empty() {
-            let stands = unit
-                .shapes
-                .iter()
-                .filter(|shape| census_group(shape.rows) == census_group(rows))
-                .map(|shape| shape.rows)
-                .max();
-            class = stands.map(timed).unwrap_or_default();
-        }
-        if class.is_empty() {
-            0.0
-        } else {
-            unit.launches as f64 * class.iter().sum::<f64>() / class.len() as f64
-        }
-    };
-    let class_time = TUNING_ROWS
-        .iter()
-        .map(|rows| units.iter().map(|unit| time(unit, *rows)).sum::<f64>())
+/// Each unit's measured baseline contribution to the relative-time
+/// objective ([`workload`]): the weighted
+/// mean over terms of the unit's fraction of the term's time at the
+/// defaults, each unit's time in each term given (`times`).
+fn shares(times: &[Vec<f64>], weights: &[f64]) -> Vec<f64> {
+    let totals = (0..weights.len())
+        .map(|term| times.iter().map(|unit| unit[term]).sum::<f64>())
         .collect::<Vec<_>>();
-    units
+    times
         .iter()
         .map(|unit| {
-            TUNING_ROWS
-                .iter()
-                .zip(&class_time)
-                .filter(|(_, total)| **total > 0.0)
-                .map(|(rows, total)| row_share(*rows, limits) * time(unit, *rows) / total)
+            (0..weights.len())
+                .filter(|term| totals[*term] > 0.)
+                .map(|term| weights[term] * unit[term] / totals[term])
                 .sum()
         })
         .collect()
-}
-
-/// The defaults' measurements at the points a census timed; none when its
-/// required points did not fit.
-fn censused_defaults(census: &TuningResult) -> &[seismic::PointMeasurement] {
-    census
-        .configurations
-        .iter()
-        .find(|record| record.configuration == census.overall)
-        .and_then(|record| match &record.outcome {
-            seismic::Outcome::Measured { points, .. } => Some(points.as_slice()),
-            seismic::Outcome::Excluded(_) => None,
-        })
-        .unwrap_or_default()
-}
-
-/// The defaults' time a census measured at each of its timed points, with
-/// those points' shapes.
-fn censused_times(shapes: &[PointShape], census: &TuningResult) -> (Vec<PointShape>, Vec<f64>) {
-    let measured = censused_defaults(census);
-    shapes
-        .iter()
-        .filter_map(|shape| {
-            measured
-                .iter()
-                .find(|point| point.point == shape.label)
-                .map(|point| (shape.clone(), point.median_seconds))
-        })
-        .unzip()
-}
-
-/// What one sample of the defaults over the points a census timed takes:
-/// each point's invocation as measured, times its repetitions. A search
-/// prices a confirmation sample of a configuration the same way.
-fn censused_sample(census: &TuningResult) -> Duration {
-    Duration::from_secs_f64(
-        censused_defaults(census)
-            .iter()
-            .map(|point| point.median_seconds * point.repetitions as f64)
-            .sum(),
-    )
-}
-
-/// What concluding a unit takes when its start is done, estimated before it
-/// starts: confirming the finalists the start leaves, each sampled as the
-/// confirmation samples it (after a calibrating pass) at the defaults'
-/// `sample`. The finalists are the defaults and the rivals the start
-/// measures: its `forms` form starts, at most the settings' confirmed
-/// finalists (a unit without form starts meets its first rival in its first
-/// refinement). A launch-scoped search reserves the settings' finalists
-/// whatever it has measured.
-///
-/// The rivals a refinement finds later take no part: once a unit has started
-/// its search states its own reserve from what it measured, and is not
-/// refined past it. Pricing them here at the defaults' sample would refuse
-/// the start of a unit whose defaults are slow, which is the unit a search
-/// recovers the most for, and whose rivals are the faster for it.
-fn started_conclusion(
-    sample: Duration,
-    forms: usize,
-    scoped: bool,
-    settings: &SearchSettings,
-) -> Duration {
-    let finalists = if scoped {
-        settings.confirmed + 1
-    } else {
-        1 + forms.max(1).min(settings.confirmed)
-    };
-    sample * (finalists * (settings.confirmation_samples + 1)) as u32
 }
 
 /// One unit's built cases by point, kept from its census for its search,
@@ -1861,73 +3526,668 @@ struct UnitCases<C> {
     guard: Option<usize>,
 }
 
+/// A counted unit can form its canonical artifact without constructing inputs.
+/// Type erasure keeps the prerequisite phase independent of another model walk;
+/// the census recovers the original entry-specific search and cases afterward.
+trait CanonicalUnit: std::any::Any {
+    /// The compile of the unit's mandatory work, its canonical artifact,
+    /// to run on any thread: units' canonical artifacts form concurrently.
+    fn grounding(&mut self) -> Result<Option<seismic::Grounding>, TuneError>;
+    /// The end of the unit's mandatory work: take what the compile formed
+    /// and hand the canonical artifact to serving. The unit's record is
+    /// legal from here on. Returns the longest operation it took.
+    fn grounded(&mut self, grounded: Option<seismic::Grounded>) -> Result<Duration, TuneError>;
+    /// The unit's record as it stands.
+    fn record(&self) -> Result<TuningResult, TuneError>;
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any>;
+}
+
+struct PreparedUnit<T: EntryTuning> {
+    case: T,
+    shapes: Vec<PointShape>,
+    search: Box<dyn EntrySearch<T::Entry>>,
+    cases: UnitCases<T::Case>,
+    /// What the unit's mandatory work took.
+    mandatory: Duration,
+}
+
+impl<T: EntryTuning> CanonicalUnit for PreparedUnit<T> {
+    fn grounding(&mut self) -> Result<Option<seismic::Grounding>, TuneError> {
+        self.search.grounding(&mut CanonicalPoints {
+            case: &self.case,
+            shapes: &self.shapes,
+        })
+    }
+
+    fn grounded(&mut self, grounded: Option<seismic::Grounded>) -> Result<Duration, TuneError> {
+        let began = Instant::now();
+        let formed = grounded
+            .as_ref()
+            .map_or(Duration::ZERO, seismic::Grounded::elapsed);
+        self.search.grounded(grounded)?;
+        self.mandatory = formed + began.elapsed();
+        Ok(self.search.longest_operation())
+    }
+
+    fn record(&self) -> Result<TuningResult, TuneError> {
+        self.search.terminal()
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
+    }
+}
+
+/// What one native implementation on a device is a function of: its entry,
+/// the entry's element bindings and its static values.
+type ImplementationKey = (
+    &'static str,
+    Vec<(&'static str, Element)>,
+    NativeSpecialization,
+);
+
 /// A unit's slot in the kernel cache: the cache, the unit's key, and the
-/// valid result stored under it.
-type StoredSlot<'c> = (&'c KernelCache, TuningCacheKey, Option<TuningResult>);
+/// valid choice stored under it with its evidence.
+type StoredSlot<'c> = (
+    &'c KernelCache,
+    TuningCacheKey,
+    Option<(StoredChoice, Receipt)>,
+);
 
 /// Resolves every native entry's specialization for the opened device:
-/// static values, tuned parameters, and missing implementations. Tuning
-/// spends about [`TUNING_TIME`] from the start of the census. The census
-/// measures each unit's defaults at the points every candidate must pass
-/// and at the costliest point of each further row class it serves, within the tuning time left (a unit whose required points do not fit
-/// keeps its defaults). The time left is then divided among the units
-/// ([`allocation`]): every unit's defaults and form starts are measured
-/// before any unit is searched further, the rest goes to the units by the
-/// step time each still takes, and every unit is concluded within the
-/// tuning time with the best configuration it confirmed.
+/// static values, tuned parameters, and missing implementations. A first
+/// load's tuning has a mandatory phase and an optional one. The mandatory
+/// phase forms every searching unit's canonical artifact, hands it to
+/// serving and publishes the unit's record with it: from then on every unit
+/// serves a legal published choice, and a failure there is the only
+/// preparation failure of tuning. The optional phase spends what is left of
+/// the tuning budget by value ([`allocation`]): it starts only work whose
+/// whole price fits what remains, runs it to its end, publishes a unit's
+/// record when its served choice changes, and stops when nothing that fits
+/// is left, publishing once more each record that changed since.
 pub(crate) struct Tuner<'a> {
     device: &'a Device,
     context: TuningContext<'a>,
     limits: TuningLimits,
     weights: TuningWeights<'a>,
+    invocations: super::specialization::InvocationDemand,
     noise: Noise,
     /// Tensors shared by the units of this tuning (history planes).
     shared: HashMap<String, Tensor>,
-    /// What building inputs costs on this machine, as measured so far.
-    building: RefCell<BuildBudget>,
     phase: Phase<'a>,
-    /// When the census began: the start of the tuning time.
+    /// When counting began: the tuning clock. Metadata, canonical
+    /// formation and all optional work are measured on it; the budget is
+    /// counted from it. Counting forms nothing.
     started: Instant,
+    /// This preparation has uncached units: it reports what became of its
+    /// budget.
+    first_load_search: bool,
+    /// Units a load found no stored record for and prepared at their
+    /// canonical defaults.
+    unprepared: usize,
     tuned: Vec<TunedEntry>,
+    /// Every unit's served choice as it stands: its canonical default from
+    /// the mandatory phase, replaced when a challenger is promoted.
     chosen: HashMap<TuningKey, NativeSpecialization>,
+    /// The arithmetic values dependants were counted at from a choice this
+    /// round's search may replace: the prerequisite, the parameter and its
+    /// value ([`Self::following`], [`Self::stale`]).
+    provisional: std::collections::HashSet<(TuningKey, String, u64)>,
+    /// The digest of each native implementation a unit's key was formed
+    /// with, by its entry, element bindings and static values
+    /// ([`Self::implementation_digest`]).
+    digests: std::cell::RefCell<HashMap<ImplementationKey, String>>,
+    /// What publishing a unit's record (deriving it and storing it) has
+    /// taken in this load: the class a promotion's publication and each
+    /// publication owed when the optional work stops are priced by.
+    publishing: Rc<Cell<seismic::Observed>>,
+    /// The longest single operation the load has completed: what an
+    /// unpriced operation is held to ([`seismic::Quote::fits`]).
+    longest: Duration,
+    /// What the load's tuning has held on the device, for its report.
+    memory: TuningMemory,
+    /// The units whose next piece was refused for its bytes for good: their
+    /// records state that stop ([`SearchStop::NoRoom`]).
+    without_room: std::collections::HashSet<TuningKey>,
+    /// What the platform lets the engine claim, read live: the bound of
+    /// what the search holds. None for a tuner given no room, which bounds
+    /// nothing.
+    room: Option<&'a dyn TuningRoom>,
+    /// Where each uncached unit's record is published.
+    slots: HashMap<TuningKey, TuningCacheKey>,
+    prepared: HashMap<TuningKey, Box<dyn CanonicalUnit>>,
+    /// The threads everything of this preparation runs on off the device's
+    /// thread.
+    /// None once the search has ended: the walk that follows it compiles
+    /// nothing a stored record does not serve, and holds no thread.
+    staff: Option<Staff<'a>>,
+}
+
+/// One preparation's worker threads, lent to its device for as long as the
+/// preparation's tuner lives: the canonical compiles of the mandatory
+/// phase, the optional work's compiles and every source the device forms
+/// run on these threads and no others. The tuner owns the concurrency of
+/// the load's formation; the device and its toolchain start no thread per
+/// compile. The threads are joined when the tuner is done.
+struct Staff<'a> {
+    device: &'a Device,
+    workers: Arc<seismic::Workers>,
+}
+
+/// One compile of the mandatory phase: a unit's canonical program (none
+/// once formed), or an entry without tuning parameters that the load after
+/// the search prepares.
+enum Mandatory<'a> {
+    Canonical(Option<seismic::Grounding>),
+    Untuned(UntunedFormation<'a>),
+}
+
+/// What one compile of the mandatory phase formed: a unit's canonical
+/// program, or what forming an untuned entry took.
+enum MandatoryFormed {
+    Canonical(Option<seismic::Grounded>),
+    Untuned(Result<Duration, CatalogFailure>),
+}
+
+impl<'a> Staff<'a> {
+    fn of(device: &'a Device) -> Self {
+        let workers = Arc::new(seismic::Workers::of_the_host());
+        device.staff(Some(workers.clone()));
+        Self { device, workers }
+    }
+}
+
+impl Drop for Staff<'_> {
+    fn drop(&mut self) {
+        self.device.staff(None);
+    }
 }
 
 impl<'a> Tuner<'a> {
-    /// A tuner that counts the units of a walk: the first phase.
+    /// `fixed` with each arithmetic parameter of `implementation`
+    /// (`NativeParameter::arithmetic`) at its value in the choice of the
+    /// unit `prerequisite` as it stands: a dependant whose results carry its
+    /// prerequisite's bits (a streamed layer's route, its resident route's)
+    /// is fixed at the parameters that set them and searches the others,
+    /// which its declaration holds to bit-identical results. A choice a
+    /// search of this round may still replace (a count's or census's of a
+    /// unit it searches) is recorded: if the search replaces it, another
+    /// round counts the dependant at the replacement ([`Self::stale`]).
+    pub(super) fn following(
+        &mut self,
+        prerequisite: &TuningKey,
+        implementation: &NativeImplementation,
+        fixed: NativeSpecialization,
+    ) -> Result<NativeSpecialization, String> {
+        let (choice, provisional) = match &self.phase {
+            // A count or census holds the choices of the units it settled
+            // (stored, pinned or mandatory) and earlier rounds decided; each
+            // unit not yet chosen (counted, or deferred to a development
+            // survey) stands at its canonical default.
+            Phase::Count { canonical, .. } | Phase::Census { canonical, .. } => {
+                match self.chosen.get(prerequisite) {
+                    Some(choice) => (
+                        Some(choice),
+                        matches!(&self.phase, Phase::Census { launches, .. } if launches.contains_key(prerequisite)),
+                    ),
+                    None => (canonical.get(prerequisite), true),
+                }
+            }
+            Phase::Searched | Phase::Serve(_) => (self.chosen.get(prerequisite), false),
+        };
+        let choice = choice.ok_or_else(|| {
+            format!(
+                "its prerequisite {} [{}] was not tuned before it",
+                prerequisite.0, prerequisite.1
+            )
+        })?;
+        let arithmetic = arithmetic_of(implementation, choice)
+            .map_err(|name| format!("its prerequisite {} has no parameter `{name}`", prerequisite.0))?;
+        if provisional {
+            self.provisional.extend(
+                arithmetic
+                    .iter()
+                    .map(|(name, value)| (prerequisite.clone(), name.clone(), *value)),
+            );
+        }
+        Ok(arithmetic
+            .into_iter()
+            .fold(fixed, |fixed, (name, value)| fixed.with_param(name, value)))
+    }
+
+    /// Whether this round's search replaced a choice a dependant was
+    /// counted at ([`Self::following`]): the dependant is then a unit at
+    /// the replacement's values, which another round forms and searches
+    /// ([`Self::recount`]).
+    pub fn stale(&self) -> bool {
+        self.provisional.iter().any(|(prerequisite, name, value)| {
+            self.chosen
+                .get(prerequisite)
+                .and_then(|choice| choice.param(name))
+                != Some(*value)
+        })
+    }
+
+    /// Another round of the search, after a search that left a dependant
+    /// stale ([`Self::stale`]): on the same tuning clock and budget, a count
+    /// that opens only the units no round has decided, with every choice
+    /// published so far.
+    pub fn recount(mut self) -> Self {
+        let Phase::Searched = self.phase else {
+            unreachable!("a round follows a search");
+        };
+        self.phase = Phase::Count {
+            launches: HashMap::new(),
+            searching: Vec::new(),
+            canonical: HashMap::new(),
+        };
+        self.provisional.clear();
+        self.staff = Some(Staff::of(self.device));
+        self
+    }
+    pub(super) fn device(&self) -> &'a Device {
+        self.device
+    }
+    fn budget(&self) -> Duration {
+        self.context.settings.budget
+    }
+    /// The room `unit`'s next piece was refused for its bytes for good in,
+    /// as it stands now: when the refusal is made, with nothing in flight,
+    /// the pages tuning freed returned, and nothing left that another unit
+    /// could give up for the piece, or at the ending. Each bounded domain
+    /// is stated with what the piece was taken to add to it.
+    fn no_room(&self, unit: &Box<dyn SearchedUnit<'a> + 'a>) -> NoRoom {
+        use allocation::Unit as _;
+        let room = |domain, ceiling: Option<u64>, held: Option<u64>, footprint: u64| {
+            let (ceiling, held) = ceiling.zip(held)?;
+            Some(Room {
+                domain,
+                ceiling_bytes: ceiling,
+                held_bytes: held,
+                footprint_bytes: footprint,
+                lacking_bytes: held.saturating_add(footprint).saturating_sub(ceiling),
+            })
+        };
+        // What the piece is taken to add where the device allocates: its
+        // footprint, an unpriced part at the most a piece of its unit's
+        // operations has added.
+        let charged = unit
+            .next()
+            .expect("a unit refused for its bytes offers a piece")
+            .footprint
+            .forecast(unit.largest_footprint());
+        // And on the host: the most a piece of its unit has added, with
+        // what its compile holds on each of its threads. The footprint's
+        // room is bounded only where host RAM's ceiling is shared, so all of
+        // that compile takes of it beside the piece's footprint, which
+        // already counts its host bytes.
+        let compile = unit.forming().map_or(0, |forming| {
+            self.memory
+                .compile_host_bytes
+                .saturating_mul(seismic::Forming::threads(&forming) as u64)
+        });
+        let host = unit
+            .host_footprint(self)
+            .unwrap_or(0)
+            .saturating_add(compile);
+        let domains = [
+            room(
+                "device",
+                self.memory.ceiling_bytes,
+                Some(self.memory.held(self.device)),
+                charged,
+            ),
+            room(
+                "footprint",
+                self.memory.footprint_ceiling_bytes,
+                self.memory.held_whole(self.device),
+                charged.saturating_add(compile),
+            ),
+            room(
+                "host",
+                self.memory.host_ceiling_bytes,
+                self.memory.host_grown(),
+                host,
+            ),
+        ];
+        NoRoom {
+            domains: domains.into_iter().flatten().collect(),
+            unplanned_holders: crate::planning::HostPeak::UNPLANNED,
+        }
+    }
+
+    /// The preparation's worker threads, which it has until its search
+    /// ends.
+    fn workers(&self) -> Arc<seismic::Workers> {
+        self.staff
+            .as_ref()
+            .expect("the mandatory phase and the search run before the tuner's threads are joined")
+            .workers
+            .clone()
+    }
+
+    /// A tuner that counts the units of a walk: the first phase of a
+    /// search.
     pub fn count(
         device: &'a Device,
         context: TuningContext<'a>,
         limits: TuningLimits,
         weights: TuningWeights<'a>,
+        invocations: super::specialization::InvocationDemand,
+    ) -> Self {
+        Self::in_phase(
+            device,
+            context,
+            limits,
+            weights,
+            invocations,
+            Phase::Count {
+                launches: HashMap::new(),
+                searching: Vec::new(),
+                canonical: HashMap::new(),
+            },
+        )
+    }
+
+    /// A load's tuner: its one walk reads the stored records and prepares
+    /// their choices. `unprepared` is what it does at a unit without a
+    /// record. Under fresh tuning ([`TuningSettings::fresh`]) a load that
+    /// reports reads no stored record, so every unit is one without: the
+    /// search its host then runs replaces them all. The load that serves
+    /// defaults reads whatever is stored: it comes after that search.
+    pub fn serve(
+        device: &'a Device,
+        context: TuningContext<'a>,
+        limits: TuningLimits,
+        weights: TuningWeights<'a>,
+        invocations: super::specialization::InvocationDemand,
+        unprepared: UnpreparedUnits,
+    ) -> Self {
+        Self::in_phase(
+            device,
+            TuningContext {
+                settings: TuningSettings {
+                    fresh: context.settings.fresh && unprepared == UnpreparedUnits::Report,
+                    ..context.settings
+                },
+                ..context
+            },
+            limits,
+            weights,
+            invocations,
+            Phase::Serve(unprepared),
+        )
+    }
+
+    fn in_phase(
+        device: &'a Device,
+        context: TuningContext<'a>,
+        limits: TuningLimits,
+        weights: TuningWeights<'a>,
+        invocations: super::specialization::InvocationDemand,
+        phase: Phase<'a>,
     ) -> Self {
         Self {
             device,
             context,
             limits,
             weights,
+            invocations,
             noise: Noise::default(),
             shared: HashMap::new(),
-            building: RefCell::new(BuildBudget::default()),
-            phase: Phase::Count {
-                launches: HashMap::new(),
-                searching: Vec::new(),
-            },
+            unprepared: 0,
             started: Instant::now(),
+            first_load_search: false,
             tuned: Vec::new(),
             chosen: HashMap::new(),
+            provisional: std::collections::HashSet::new(),
+            digests: std::cell::RefCell::new(HashMap::new()),
+            publishing: Rc::new(Cell::new(seismic::Observed::default())),
+            longest: Duration::ZERO,
+            // What a search's process holds is counted from here, where
+            // its tuner is made, not from its mandatory phase: counting
+            // the units and opening their searches grows the process too
+            // (116 MB before the mandatory phase of one Gemma 4 E2B search
+            // on CUDA), and the room it is held to was observed at the
+            // same place, its device just opened.
+            memory: match &phase {
+                Phase::Serve(_) => TuningMemory::default(),
+                Phase::Count { .. } | Phase::Census { .. } | Phase::Searched => {
+                    let began = seismic::ProcessMemory::read();
+                    TuningMemory {
+                        process_began_bytes: began.footprint_bytes,
+                        breakdown_began: began,
+                        breakdown_peak: began,
+                        ..TuningMemory::default()
+                    }
+                }
+            },
+            without_room: std::collections::HashSet::new(),
+            room: None,
+            slots: HashMap::new(),
+            prepared: HashMap::new(),
+            // A search's compiles run on its own threads. A load's walk
+            // forms its chosen kernels as it always has, after a search's
+            // threads were joined: on none.
+            staff: match phase {
+                Phase::Serve(_) => None,
+                Phase::Count { .. } | Phase::Census { .. } | Phase::Searched => {
+                    Some(Staff::of(device))
+                }
+            },
+            phase,
         }
     }
 
-    /// Begin the census of the counted units that will search: the tuning
-    /// time starts.
-    pub fn census(mut self) -> Self {
+    /// Units this load found no stored record for and prepared at their
+    /// canonical defaults.
+    pub fn unprepared(&self) -> usize {
+        self.unprepared
+    }
+
+    /// Hold the search to `room`.
+    pub fn held_to(mut self, room: Option<&'a dyn TuningRoom>) -> Self {
+        self.room = room;
+        self
+    }
+
+    /// The room the search is held to, read now; none without a room.
+    fn room_now(&self) -> Option<RoomNow> {
+        self.room.map(|room| room.now(self.device))
+    }
+
+    /// Publish a unit's record as it stands: derive it (`record`), store it
+    /// where a later load reads it, and serve its choice. The whole is one
+    /// observation of the publication class. Returns the record. A record
+    /// published before the unit's optional work stopped is stored
+    /// provisional: a search abandoned then leaves nothing a later search
+    /// takes for the unit's choice, so that search searches the unit again.
+    fn publish(
+        &mut self,
+        key: &TuningKey,
+        settled: bool,
+        record: impl FnOnce() -> Result<TuningResult, TuneError>,
+    ) -> Result<TuningResult, TuneError> {
+        let began = Instant::now();
+        let result = record()?;
+        if let (Some(cache), Some(slot)) = (self.context.cache, self.slots.get(key)) {
+            let choice = StoredChoice::of(&result, self.budget());
+            let choice = if self.without_room.contains(key) {
+                choice.without_room()
+            } else {
+                choice
+            };
+            let choice = if settled { choice } else { choice.provisional() };
+            cache.store_tuning(slot, &choice, &result);
+        }
+        self.chosen
+            .insert(key.clone(), result.overall.specialization());
+        let elapsed = began.elapsed();
+        let mut publishing = self.publishing.get();
+        publishing.observe(elapsed.as_secs_f64());
+        self.publishing.set(publishing);
+        self.longest = self.longest.max(elapsed);
+        Ok(result)
+    }
+
+    /// The mandatory phase: form every searching unit's canonical
+    /// artifact, hand it to serving and publish the unit's record with it,
+    /// before any input is built or anything optional is started, and form
+    /// the count's entries without tuning parameters (`untuned`) beside
+    /// them, for the load that follows. From here every unit serves a legal
+    /// published choice; a failure here is the only preparation failure of
+    /// tuning.
+    pub fn census(mut self, untuned: UntunedEntries<'a>) -> Result<Self, CatalogFailure> {
         let Phase::Count {
             launches,
             searching,
-        } = self.phase
+            canonical,
+        } = std::mem::replace(&mut self.phase, Phase::Searched)
         else {
             unreachable!("a census follows the count");
         };
+        self.memory.began_bytes = allocated(self.device);
+        self.memory.device_separate = device_separate(self.device);
+        // The search holds no more than the platform lets the engine claim
+        // ([`TuningRoom`]). Where the device's memory is the host's, its
+        // charges and the process's footprint are one domain under one
+        // ceiling; where it is apart, host RAM is a second domain with the
+        // platform's own room.
+        if let Some(room) = self.room_now() {
+            self.memory.read_room(self.device, room);
+        }
+        // The units' canonical programs and the untuned entries compile
+        // together on the load's worker threads: a compile needs nothing of
+        // another or of the device's queue. The canonical compiles come
+        // first, in the order of `searching`.
+        let began = self.started.elapsed();
+        let untuned_programs = untuned.len();
+        let groundings = searching
+            .iter()
+            .map(|key| {
+                self.prepared
+                    .get_mut(key)
+                    .expect("counted unit has its opened search")
+                    .grounding()
+                    .map(|grounding| std::sync::Mutex::new(Some(Mandatory::Canonical(grounding))))
+                    .map_err(|error| unit_failure(key, error))
+            })
+            .chain(
+                untuned.into_formations().into_iter().map(|formation| {
+                    Ok(std::sync::Mutex::new(Some(Mandatory::Untuned(formation))))
+                }),
+            )
+            .collect::<Result<Vec<_>, _>>()?;
+        let workers = self.workers();
+        let ground = |compile: &std::sync::Mutex<Option<Mandatory<'a>>>| match compile
+            .lock()
+            .expect("a mandatory compile is taken once")
+            .take()
+            .expect("a mandatory compile is formed once")
+        {
+            Mandatory::Canonical(grounding) => {
+                MandatoryFormed::Canonical(grounding.map(seismic::Grounding::run))
+            }
+            Mandatory::Untuned(formation) => {
+                let began = Instant::now();
+                let formed = formation();
+                MandatoryFormed::Untuned(formed.map(|()| began.elapsed()))
+            }
+        };
+        // Without a host ceiling the canonical compiles all run at once.
+        // Where the host has a ceiling of its own they run in waves. A
+        // compile's memory is not known before one has run, and one unit's
+        // compile says little of another's (the first of one Qwen3.5-4B
+        // search held 10 MB, and the twenty-two threads then run at once
+        // on that price held 25 MB each and took the process 104 MB past
+        // its ceiling): so a wave runs at once as many as the host's room
+        // affords at the most a thread's compile has been seen to hold,
+        // and never more than have been observed so far. One runs alone,
+        // then as many as have run, and the price each wave is admitted on
+        // is the most seen over at least as many compiles as it starts.
+        // What a wave freed is returned before the next reads its room, so
+        // that room is what its compiles left held, as measured.
+        let mut grounded = Vec::with_capacity(groundings.len());
+        if self.room.is_none() {
+            grounded.extend(workers.each(&groundings, ground));
+        }
+        while grounded.len() < groundings.len() {
+            let observed = grounded.len();
+            let threads = self
+                .memory
+                .compile_threads(self.device, self.room_now())
+                .map_or(1, |threads| threads.max(1))
+                .min(observed.max(1))
+                .min(groundings.len() - observed);
+            let narrowed = workers.narrowed(threads);
+            // The host's room as the wave began, and its lowest as each of
+            // the wave's compiles ended: what the compiles held wherever it
+            // lies, a toolchain's compiler service apart from this process
+            // among it.
+            let before = host_room();
+            let lowest = std::sync::atomic::AtomicU64::new(u64::MAX);
+            let ground = |compile: &std::sync::Mutex<Option<Mandatory<'a>>>| {
+                let formed = ground(compile);
+                lowest.fetch_min(host_room(), std::sync::atomic::Ordering::Relaxed);
+                formed
+            };
+            grounded.extend(workers.each(&groundings[observed..observed + threads], ground));
+            drop(narrowed);
+            let lowest = Some(lowest.into_inner()).filter(|lowest| *lowest != u64::MAX);
+            if let Some(held) = compile_wave_price(before, lowest, threads) {
+                self.memory.price_compiles(held);
+            }
+            self.memory.return_freed_pages();
+        }
+        // What the optional work is admitted against is what is held, as
+        // measured, and what the mandatory phase left is stated.
+        if self.room.is_some() {
+            self.memory.host_mandatory_bytes = self.memory.host_grown();
+        }
+        let untuned = grounded.split_off(searching.len());
+        let mut untuned_forming = Duration::ZERO;
+        for formed in untuned {
+            let MandatoryFormed::Untuned(formed) = formed else {
+                unreachable!("the untuned compiles follow the canonical ones");
+            };
+            untuned_forming += formed?;
+        }
+        if untuned_programs > 0 {
+            self.context.observer.event(&TuningEvent::Untuned {
+                programs: untuned_programs,
+                forming_seconds: untuned_forming.as_secs_f64(),
+            });
+        }
+        for (key, grounded) in searching.iter().zip(grounded) {
+            let MandatoryFormed::Canonical(grounded) = grounded else {
+                unreachable!("the canonical compiles come first");
+            };
+            let forming = Instant::now();
+            let formed = grounded
+                .as_ref()
+                .map_or(Duration::ZERO, seismic::Grounded::elapsed);
+            let mut unit = self
+                .prepared
+                .remove(key)
+                .expect("counted unit has its opened search");
+            let longest = unit
+                .grounded(grounded)
+                .map_err(|error| unit_failure(key, error))?;
+            let forming = formed + forming.elapsed();
+            self.longest = self.longest.max(longest);
+            let publishing = Instant::now();
+            self.publish(key, false, || unit.record())
+                .map_err(|error| unit_failure(key, error))?;
+            let publishing = publishing.elapsed();
+            self.prepared.insert(key.clone(), unit);
+            self.context.observer.event(&TuningEvent::Mandatory {
+                entry: key.0,
+                bindings: key.1.clone(),
+                began_seconds: began.as_secs_f64(),
+                forming_seconds: forming.as_secs_f64(),
+                publishing_seconds: publishing.as_secs_f64(),
+            });
+        }
         let launches = searching
             .into_iter()
             .map(|key| {
@@ -1935,93 +4195,208 @@ impl<'a> Tuner<'a> {
                 (key, count)
             })
             .collect::<HashMap<_, _>>();
+        self.memory.mandatory_bytes = allocated(self.device);
+        self.memory.peak_bytes = self.memory.mandatory_bytes;
         let searches = !launches.is_empty();
+        self.first_load_search = searches;
         self.phase = Phase::Census {
             launches,
+            canonical,
             units: Vec::new(),
         };
-        self.started = Instant::now();
         if searches {
             self.report_progress();
         }
-        self
+        Ok(self)
     }
 
-    /// Search the censused units within the tuning time left
-    /// ([`allocation`]), each unit's share of step time as its census
-    /// measured it. The walk that follows prepares their choices.
+    /// The optional phase: spend what is left of the tuning budget on the
+    /// units' work by value ([`allocation`]), then report every unit's
+    /// record and what became of the budget. Nothing walks after it: the
+    /// records are published, and a load reads them.
     pub fn search(mut self) -> Result<Self, CatalogFailure> {
-        let Phase::Census { mut units, .. } = std::mem::replace(&mut self.phase, Phase::Prepare)
+        let Phase::Census { mut units, .. } = std::mem::replace(&mut self.phase, Phase::Searched)
         else {
             unreachable!("a search follows the census");
         };
-        let times = units.iter().map(|unit| unit.time()).collect::<Vec<_>>();
-        let shares = step_shares(
-            &times
-                .iter()
-                .map(|(launches, served, shapes, seconds)| UnitTime {
-                    launches: *launches,
-                    served,
-                    shapes,
-                    seconds,
-                })
-                .collect::<Vec<_>>(),
-            self.limits,
-        );
-        // Shares among the units searching: a row class no unit was timed
-        // at takes no part.
-        let measured = shares.iter().sum::<f64>();
-        for (unit, share) in units.iter_mut().zip(shares) {
-            unit.set_share(if measured > 0. { share / measured } else { 0. });
-        }
-        if units.is_empty() {
-            return Ok(self);
-        }
         let clock = Elapsed(self.started);
-        let report =
-            allocation::allocate(&mut units, &mut self, &clock, TUNING_TIME, REFINEMENT_SLICE)?;
-        let name = |unit: usize| (units[unit].key().0, units[unit].key().1.clone());
-        self.context
-            .observer
-            .event(&TuningEvent::Planned(TuningPlan {
-                starts: report
-                    .starts
+        let budget = self.budget();
+        let indices = units
+            .iter()
+            .enumerate()
+            .map(|(index, unit)| (unit.key().clone(), index))
+            .collect::<HashMap<_, _>>();
+        for unit in &mut units {
+            let mut prerequisites = Vec::new();
+            for key in unit.dependency_keys() {
+                match indices.get(&key) {
+                    Some(index) => prerequisites.push(*index),
+                    // A prerequisite without optional work: its choice is
+                    // final already.
+                    None if self.chosen.contains_key(&key) => {}
+                    None => {
+                        return Err(unit_failure(
+                            unit.key(),
+                            format!("missing canonical prerequisite {} [{}]", key.0, key.1),
+                        ));
+                    }
+                }
+            }
+            unit.set_prerequisites(prerequisites);
+        }
+        // A finite prerequisite graph must be acyclic before any unit seals.
+        let mut pending = (0..units.len()).collect::<std::collections::HashSet<_>>();
+        loop {
+            let ready = pending
+                .iter()
+                .copied()
+                .filter(|index| {
+                    units[*index]
+                        .prerequisites()
+                        .iter()
+                        .all(|dependency| !pending.contains(dependency))
+                })
+                .collect::<Vec<_>>();
+            if ready.is_empty() {
+                break;
+            }
+            for index in ready {
+                pending.remove(&index);
+            }
+        }
+        if let Some(&index) = pending.iter().min() {
+            return Err(unit_failure(
+                units[index].key(),
+                "cyclic canonical prerequisites",
+            ));
+        }
+        let longest = self.longest;
+        // The pieces' compiles run on the load's worker threads while the
+        // device measures; each started runs to its end.
+        let mut threads = allocation::Threads::new(
+            self.workers(),
+            seismic::Forming::run,
+            seismic::Forming::threads,
+            self.memory.compile_host_bytes,
+        );
+        let (report, outcome) =
+            allocation::allocate(&mut units, &mut self, &clock, &mut threads, budget, longest);
+        self.memory.compile_host_bytes = self
+            .memory
+            .compile_host_bytes
+            .max(allocation::Workers::compile_host(&threads));
+        self.memory
+            .mispriced
+            .extend(
+                threads
+                    .mispriced()
                     .iter()
-                    .map(|start| {
-                        let (entry, bindings) = name(start.unit);
-                        PlannedStart {
-                            entry,
-                            bindings,
-                            share: units[start.unit].share(),
-                            forms: start
-                                .depth
-                                .map(|depth| depth == allocation::Depth::Forms),
-                            estimated_seconds: start.estimated.as_secs_f64(),
-                            with_forms_seconds: start.with_forms.as_secs_f64(),
-                            available_seconds: start.available.as_secs_f64(),
-                            actual_seconds: start.actual.as_secs_f64(),
-                            cut: start.cut,
-                        }
-                    })
-                    .collect(),
-                started_seconds: report.started.as_secs_f64(),
-                refined_seconds: report.refined.as_secs_f64(),
-                concluded_seconds: report.concluded.as_secs_f64(),
-                reserved_seconds: report.reserved.as_secs_f64(),
-                slices: report.slices,
-                overruns: report
-                    .overruns
-                    .iter()
-                    .map(|overrun| {
-                        let (entry, bindings) = name(overrun.unit);
-                        (
-                            format!("{entry} [{bindings}]"),
-                            overrun.step,
-                            overrun.by.as_secs_f64(),
-                        )
-                    })
-                    .collect(),
-            }));
+                    .map(|(priced, added)| Mispricing {
+                        kind: "compile".into(),
+                        priced_bytes: *priced,
+                        added_bytes: *added,
+                    }),
+            );
+        drop(threads);
+        self.memory.ended_bytes = allocated(self.device);
+        let ended = self.memory.ended_bytes;
+        let room = self.room_now();
+        self.memory.observe(self.device, ended, room);
+        self.memory.process_peak_bytes = process_peak_bytes();
+        // Every unit reports its record as the allocator left it published,
+        // whatever became of the work: each has served a published legal
+        // choice throughout.
+        let reported = units.iter_mut().try_for_each(|unit| unit.finish(&mut self));
+        let refused = report
+            .refused
+            .iter()
+            .map(|refused| {
+                let key = units[refused.unit].key();
+                RefusedOffer {
+                    unit: format!("{} [{}]", key.0, key.1),
+                    stage: refused.stage,
+                    priced_seconds: refused.quote.priced.as_secs_f64(),
+                    unpriced_operations: refused.quote.unpriced,
+                    footprint_bytes: refused.footprint.priced,
+                    unpriced_footprints: refused.footprint.unpriced,
+                    reason: match refused.refusal {
+                        allocation::Refusal::Seconds => "seconds",
+                        allocation::Refusal::Bytes => "bytes",
+                    },
+                    largest_bytes: refused.largest,
+                    free_bytes: refused.starved.and_then(|starved| starved.free),
+                    given_up_bytes: refused.starved.map(|starved| starved.given_up),
+                }
+            })
+            .collect();
+        let released = report
+            .released
+            .iter()
+            .map(|released| ReleasedInputs {
+                unit: unit_name(units[released.unit].key()),
+                began_seconds: released.began.as_secs_f64(),
+                claimed_bytes: released.claimed,
+                free_before_bytes: released.free.map(|(before, _)| before),
+                free_after_bytes: released.free.map(|(_, after)| after),
+            })
+            .collect();
+        let abandoned = report
+            .abandoned
+            .iter()
+            .map(|abandoned| AbandonedPiece {
+                unit: unit_name(units[abandoned.unit].key()),
+                stage: abandoned.stage,
+                priced_seconds: abandoned.quote.priced.as_secs_f64(),
+                unpriced_operations: abandoned.quote.unpriced,
+                began_seconds: abandoned.began.as_secs_f64(),
+                formed_seconds: abandoned.formed.as_secs_f64(),
+            })
+            .collect();
+        // Tuning is over: what its units still hold is released and the
+        // pages it freed are returned, and the report that follows states
+        // the process's memory before and after.
+        self.memory.breakdown_ended = seismic::ProcessMemory::read();
+        drop(units);
+        // What the tuner itself held for its units' work goes with them:
+        // the opened search of a unit no walk reached, the weights and
+        // shared planes no input binds any more, and the activation pools
+        // the inputs were windows of.
+        self.prepared.clear();
+        self.inputs().release_unheld();
+        self.noise = Noise::default();
+        // Its threads go too, joined: what a thread freed is the
+        // allocator's to keep for that thread while it lives.
+        self.staff = None;
+        self.memory.return_freed_pages();
+        self.memory.breakdown_returned = seismic::ProcessMemory::read();
+        if self.first_load_search {
+            self.context
+                .observer
+                .event(&TuningEvent::Budget(BudgetReport {
+                    budget_seconds: budget.as_secs_f64(),
+                    used_seconds: report.ended.as_secs_f64(),
+                    settling_seconds: report.settling.as_secs_f64(),
+                    unused_seconds: report.unused().as_secs_f64(),
+                    overrun_seconds: report.overrun().as_secs_f64(),
+                    stages: report.admitted.len(),
+                    refused,
+                    abandoned,
+                    released,
+                    ending: EndingReport {
+                        began_seconds: report.ending.began.as_secs_f64(),
+                        held_seconds: report.ending.held.as_secs_f64(),
+                        passes: report.ending.passes,
+                        deciding_seconds: report.ending.deciding.as_secs_f64(),
+                        narrowed: report.ending.narrowed,
+                        narrowing_seconds: report.ending.narrowing.as_secs_f64(),
+                        released: report.ending.released,
+                        releasing_seconds: report.ending.releasing.as_secs_f64(),
+                        draining_seconds: report.ending.draining.as_secs_f64(),
+                    },
+                    memory: self.memory.clone(),
+                }));
+        }
+        outcome.and(reported)?;
         Ok(self)
     }
 
@@ -2033,28 +4408,45 @@ impl<'a> Tuner<'a> {
             weights: &mut self.weights,
             noise: &self.noise,
             shared: &mut self.shared,
-            building: &self.building,
         }
     }
 
-    /// Report the tuning time spent so far, of [`TUNING_TIME`].
+    /// Report the tuning time spent so far, of the tuning budget.
     fn report_progress(&self) {
-        let total = TUNING_TIME.as_millis() as usize;
+        let total = self.budget().as_millis() as usize;
         self.context.observer.event(&TuningEvent::Progress {
             completed: (self.started.elapsed().as_millis() as usize).min(total),
             total,
         });
     }
 
-    pub fn tuned(self) -> Vec<TunedEntry> {
-        self.tuned
+    /// The walk or the search is over: its units' outcomes, with nothing
+    /// else of the tuner left in the process. A search ends its process, so
+    /// what it freed needs no returning here; a load's walk searched
+    /// nothing.
+    pub fn conclude(mut self) -> Vec<TunedEntry> {
+        std::mem::take(&mut self.tuned)
     }
 
     /// The unit's tuning points, ascending in cost.
-    fn shapes<T: EntryTuning>(&self, case: &T) -> Vec<PointShape> {
+    fn shapes<T: EntryTuning>(
+        &self,
+        case: &T,
+        key: &TuningKey,
+        statics: &NativeSpecialization,
+    ) -> Result<Vec<PointShape>, CatalogFailure> {
         let mut shapes = case.points(self.limits);
+        // A unit's launches are its entry's at its static values, whatever
+        // parameters it is fixed at: the demand walk, which reads no
+        // choice, collects them so.
+        let supplied = self
+            .invocations
+            .units
+            .get(&(key.0, key.1.clone(), statics.statics().clone()))
+            .ok_or_else(|| unit_failure(key, "graph invocation demand is missing"))?;
+        apply_invocation_counts(&mut shapes, supplied, &self.invocations.objective);
         shapes.sort_by(|left, right| left.cost().total_cmp(&right.cost()));
-        shapes
+        Ok(shapes)
     }
 
     /// Tune `case` over its implementation's declared domain at `statics`
@@ -2070,37 +4462,52 @@ impl<'a> Tuner<'a> {
     ) -> Result<NativeSpecialization, CatalogFailure> {
         let entry = <T::Entry as seismic::Entry>::NAME;
         let bindings = case.bindings();
-        let key = (entry, bindings.clone(), statics.statics().clone());
+        let key = unit_key(entry, bindings.clone(), statics);
         let failure = |outcome: String| CatalogFailure::Tuning {
             entry,
             bindings: bindings.clone(),
             outcome,
         };
-        let defaults = implementation
-            .default_specialization(statics)
+        // The statics lie inside the declaration's domain.
+        implementation
+            .admits(statics)
             .map_err(|error| failure(error.to_string()))?;
-        let shapes = self.shapes(case);
+        // The implementation as the device offers it, bound once for the
+        // unit, and its canonical default, as a stored fallback holds it.
+        let offered = offered(case, self.device).map_err(failure)?;
+        let defaults = offered
+            .default_specialization(statics)
+            .map_err(|error| failure(format!("the device offers no default at these statics: {error}")))?;
+        let shapes = self.shapes(case, &key, statics)?;
         if shapes.is_empty() {
             return Err(failure("the engine's bounds admit no tuning point".into()));
         }
         match self.phase {
-            Phase::Count { .. } => self.count_unit(case, implementation, statics, key, &shapes),
-            Phase::Census { .. } => self.census_unit(case, implementation, statics, key, shapes),
-            Phase::Prepare => self
-                .searched_unit(case, implementation, statics, key, shapes)
+            Phase::Count { .. } => {
+                self.count_unit(case, &offered, statics, key, &shapes, &defaults)
+            }
+            Phase::Census { .. } => self.census_unit(case, offered, statics, key, shapes),
+            // The search is over: the unit's published choice is read, and
+            // nothing is prepared.
+            Phase::Searched => self.searched_unit(case, statics, key, shapes),
+            Phase::Serve(_) => self
+                .served_unit(case, &offered, statics, key, shapes, &defaults)
                 .map(Some),
         }
         .map(|chosen| chosen.unwrap_or(defaults))
     }
 
     /// Count one unit: its launches per step, and whether it will search.
+    /// `offered` is its implementation as the device offers it
+    /// ([`offered`]), `defaults` that implementation's default.
     fn count_unit<T: EntryTuning>(
         &mut self,
         case: &T,
-        implementation: &NativeImplementation,
+        offered: &seismic::OnDevice,
         statics: &NativeSpecialization,
         key: TuningKey,
         shapes: &[PointShape],
+        defaults: &NativeSpecialization,
     ) -> Result<Option<NativeSpecialization>, CatalogFailure> {
         let failure = |outcome: String| CatalogFailure::Tuning {
             entry: key.0,
@@ -2115,18 +4522,91 @@ impl<'a> Tuner<'a> {
             return Ok(None);
         }
         launches.insert(key.clone(), case.launches());
-        #[cfg(feature = "pinned-tuning")]
-        if let pinned::Pinned::Chosen(_) = pinned::lookup(&key, implementation).map_err(failure)? {
+        // An earlier round of this search decided the unit.
+        if self.chosen.contains_key(&key) {
             return Ok(None);
         }
-        #[cfg(not(feature = "pinned-tuning"))]
-        let _ = implementation;
-        let stored = matches!(
-            self.stored(case, statics, shapes).map_err(failure)?,
-            Some((_, _, Some(_)))
-        );
-        // A surveyed unit is surveyed when the last walk reaches it.
-        if !stored && survey_plan(key.0).is_none() {
+        // A pinned unit's choice is final here, as a stored one is: it is
+        // the unit's choice from the count on, so whatever depends on the
+        // unit (a composed recipe's qualification) finds it in every phase.
+        if let pinned::Pinned::Chosen(chosen, choice) =
+            pinned::lookup(&key, offered).map_err(failure)?
+        {
+            self.context.observer.event(&TuningEvent::Pinned {
+                entry: key.0,
+                bindings: key.1.clone(),
+                statics: key.2.statics.clone(),
+                choice,
+                configuration: Configuration::of(&chosen),
+            });
+            self.chosen.insert(key, chosen);
+            return Ok(None);
+        }
+        // A valid cached final choice is never searched again. The first
+        // preparation alone owns the fixed tuning allowance.
+        let began = Instant::now();
+        let cached = self.stored(case, statics, shapes).map_err(failure)?;
+        let slot = cached.as_ref().map(|(_, slot, _)| slot.clone());
+        let settled = if let Some((_, _, Some((choice, receipt)))) = cached {
+            // A later load is metadata only: the walk that prepares the
+            // choice forms what it serves, once. A stored fallback is the
+            // declared default or a violated contract.
+            if matches!(
+                choice.disposition,
+                seismic::TuningDisposition::CanonicalFallback { .. }
+            ) && choice.overall.specialization() != *defaults
+            {
+                return Err(failure(
+                    "terminal fallback: choice is not the declared canonical default; search cannot reopen"
+                        .into(),
+                ));
+            }
+            let tuned = tuned_entry(
+                key.0,
+                key.1.clone(),
+                choice,
+                receipt,
+                TuningOrigin::Stored,
+                TuningTime::default(),
+                began,
+            );
+            self.finish(key.clone(), tuned);
+            true
+        } else {
+            // Counting opens searches without formation. The mandatory
+            // phase forms every canonical artifact together; a surveyed unit
+            // is opened by its survey after the search.
+            if survey_plan(key.0).is_none() {
+                let requirement = self.context.numerical_profile.requirement(&case.entry());
+                let search = case
+                    .open(self.device, statics, requirement)
+                    .map_err(|error| failure(error.to_string()))?;
+                let cases: UnitCases<T::Case> = UnitCases {
+                    points: shapes.iter().map(|_| None).collect(),
+                    guard: None,
+                };
+                self.prepared.insert(
+                    key.clone(),
+                    Box::new(PreparedUnit {
+                        case: case.clone(),
+                        shapes: shapes.to_vec(),
+                        search,
+                        cases,
+                        mandatory: Duration::ZERO,
+                    }),
+                );
+            }
+            if let Some(slot) = slot {
+                self.slots.insert(key.clone(), slot);
+            }
+            let Phase::Count { canonical, .. } = &mut self.phase else {
+                unreachable!("the phase is the count");
+            };
+            canonical.insert(key.clone(), defaults.clone());
+            false
+        };
+        // A surveyed unit is surveyed by the walk after the search.
+        if !settled && survey_plan(key.0).is_none() {
             let Phase::Count { searching, .. } = &mut self.phase else {
                 unreachable!("the phase is the count");
             };
@@ -2141,7 +4621,7 @@ impl<'a> Tuner<'a> {
     fn census_unit<T: EntryTuning>(
         &mut self,
         case: &T,
-        implementation: &NativeImplementation,
+        offered: seismic::OnDevice,
         statics: &NativeSpecialization,
         key: TuningKey,
         shapes: Vec<PointShape>,
@@ -2151,84 +4631,164 @@ impl<'a> Tuner<'a> {
             bindings: key.1.clone(),
             outcome,
         };
-        let Phase::Census { launches, units } = &self.phase else {
+        let Phase::Census { launches, units, .. } = &self.phase else {
             unreachable!("the phase is the census");
         };
-        let Some(&count) = launches.get(&key) else {
+        if !launches.contains_key(&key) {
             return Ok(None);
-        };
+        }
         if units.iter().any(|unit| *unit.key() == key) {
             return Ok(None);
         }
-        let plan = CensusPlan {
-            limit: TUNING_TIME.saturating_sub(self.started.elapsed()),
-            min_sample_seconds: MIN_SAMPLE_SECONDS,
+        let prepared = self
+            .prepared
+            .remove(&key)
+            .ok_or_else(|| failure("canonical preparation missing".into()))?;
+        let PreparedUnit {
+            search,
+            cases,
+            mandatory,
+            ..
+        } = *prepared
+            .into_any()
+            .downcast::<PreparedUnit<T>>()
+            .map_err(|_| failure("canonical preparation case mismatch".into()))?;
+        let mut unit = CaseUnit {
+            case: case.clone(),
+            key: key.clone(),
+            implementation: offered,
+            statics: statics.clone(),
+            shapes,
+            reweighed: false,
+            cases,
+            search,
+            share: 0.,
+            spent: mandatory,
+            stages: 0,
+            resident_footprint: None,
+            formed: None,
+            forming_quote: Cell::new(None),
+            publishing: self.publishing.clone(),
+            unpublished: true,
+            settled: None,
+            marker: std::marker::PhantomData,
         };
-        let began = Instant::now();
-        let slot = self
-            .stored(case, statics, &shapes)
-            .map_err(failure)?
-            .map(|(cache, key, _)| (cache, key));
-        let precision = seismic::TuningPrecision {
-            policy: case
-                .precision()
-                .map_err(|error| failure(error.to_string()))?,
-            admitted: case.admitted(self.device, self.context.error_classes),
-        };
-        let mut search = case
-            .open(self.device, statics, precision)
-            .map_err(|error| failure(error.to_string()))?;
-        let mut cases = UnitCases {
-            points: shapes.iter().map(|_| None).collect(),
-            guard: None,
-        };
-        let census = search
-            .census(
-                &mut UnitPoints {
-                    case,
-                    shapes: &shapes,
-                    inputs: self.inputs(),
-                    cases: &mut cases,
-                },
-                plan,
-            )
-            .map_err(|error| failure(error.to_string()))?;
-        self.weights.release();
+        if unit.shapes.iter().all(|shape| shape.weight == 0.) {
+            // A unit without serving demand has no optional work: nothing
+            // could be ranked. Its canonical default is its record, settled
+            // now and stating it was made without demand
+            // ([`StoredChoice::demanded`]): a later load without demand
+            // reads it, and one that serves the unit searches it.
+            unit.settle(self)?;
+            unit.finish(self)?;
+            let Phase::Census { launches, .. } = &mut self.phase else {
+                unreachable!("the phase is the census");
+            };
+            launches.remove(&key);
+            return Ok(None);
+        }
         let Phase::Census { units, .. } = &mut self.phase else {
             unreachable!("the phase is the census");
         };
-        units.push(Box::new(CaseUnit {
-            case: case.clone(),
-            key,
-            implementation: implementation.clone(),
-            statics: statics.clone(),
-            shapes,
-            launches: count,
-            cases,
-            search: Some(search),
-            census,
-            slot,
-            share: 0.,
-            spent: began.elapsed(),
-            censused: began.elapsed(),
-            backend: self.device.backend(),
-            start: None,
-            standing: None,
-        }));
-        self.report_progress();
+        units.push(Box::new(unit));
         Ok(None)
     }
 
-    /// The choice of one unit at the walk that prepares it: the choice its
-    /// search concluded with, a pinned choice, or a stored result's; a
-    /// surveyed unit is surveyed here.
+    /// A load met a unit without a stored record: stop and report it, or
+    /// count it as served at its canonical default, as the load's host
+    /// asked. Nothing is published for it: only a search publishes, so a
+    /// later search still finds the unit unsearched.
+    fn unprepared_unit(
+        &mut self,
+        entry: &'static str,
+        bindings: String,
+        statics: BTreeMap<String, u64>,
+    ) -> Result<(), CatalogFailure> {
+        match self.phase {
+            Phase::Serve(UnpreparedUnits::Report) => {
+                Err(CatalogFailure::Unprepared { entry, bindings })
+            }
+            Phase::Serve(UnpreparedUnits::ServeDefaults) => {
+                self.unprepared += 1;
+                self.context.observer.event(&TuningEvent::Unprepared {
+                    entry,
+                    bindings,
+                    statics,
+                });
+                Ok(())
+            }
+            Phase::Count { .. } | Phase::Census { .. } | Phase::Searched => {
+                unreachable!("only a load meets a unit without a record")
+            }
+        }
+    }
+
+    /// A unit's choice once the search is over: the one its record was
+    /// published with, read without preparing anything. A unit a
+    /// development survey owns (feature `tuning-survey`) took no part in
+    /// the search and is surveyed here, in the search's process.
     fn searched_unit<T: EntryTuning>(
         &mut self,
         case: &T,
-        implementation: &NativeImplementation,
         statics: &NativeSpecialization,
         key: TuningKey,
         shapes: Vec<PointShape>,
+    ) -> Result<Option<NativeSpecialization>, CatalogFailure> {
+        if let Some(chosen) = self.chosen.get(&key) {
+            return Ok(Some(chosen.clone()));
+        }
+        #[cfg(feature = "tuning-survey")]
+        if let Some(plan) = survey::plan(key.0) {
+            let (entry, bindings) = (key.0, key.1.clone());
+            let failure = |outcome: String| CatalogFailure::Tuning {
+                entry,
+                bindings: bindings.clone(),
+                outcome,
+            };
+            let began = Instant::now();
+            self.context.observer.event(&TuningEvent::Started {
+                entry,
+                bindings: bindings.clone(),
+                points: shapes.len(),
+            });
+            let result = self
+                .survey(case, entry, &bindings, statics, &shapes, plan)
+                .map_err(failure)?;
+            // A surveyed unit takes no part in the division of the tuning
+            // time: the most a search of it could be given is all of it.
+            survey::record(&key, self.budget(), &result).map_err(failure)?;
+            let result = self
+                .publish(&key, true, || Ok(result))
+                .map_err(|error| unit_failure(&key, error))?;
+            let tuned = searched_entry(entry, bindings, result, self.budget(), began);
+            return Ok(Some(self.finish(key, tuned)));
+        }
+        #[cfg(feature = "tuning-survey")]
+        if survey::installed() && self.stale() {
+            // An earlier surveyed prerequisite replaced its default; the next
+            // round counts and searches this dependant at the replacement.
+            return Ok(None);
+        }
+        #[cfg(not(feature = "tuning-survey"))]
+        let _ = (case, statics, shapes);
+        Err(unit_failure(
+            &key,
+            "the search published no choice for this unit",
+        ))
+    }
+
+    /// The choice a load prepares one unit with: a pinned choice, its
+    /// stored record's, or, for a unit without a record, its canonical
+    /// default (`defaults`) when the load serves defaults
+    /// ([`Self::unprepared_unit`]).
+    fn served_unit<T: EntryTuning>(
+        &mut self,
+        case: &T,
+        offered: &seismic::OnDevice,
+        statics: &NativeSpecialization,
+        key: TuningKey,
+        shapes: Vec<PointShape>,
+        defaults: &NativeSpecialization,
     ) -> Result<NativeSpecialization, CatalogFailure> {
         let entry = key.0;
         let bindings = key.1.clone();
@@ -2240,40 +4800,62 @@ impl<'a> Tuner<'a> {
         if let Some(chosen) = self.chosen.get(&key) {
             return Ok(chosen.clone());
         }
-        #[cfg(feature = "pinned-tuning")]
-        if let pinned::Pinned::Chosen(chosen) =
-            pinned::lookup(&key, implementation).map_err(failure)?
+        if let pinned::Pinned::Chosen(chosen, choice) =
+            pinned::lookup(&key, offered).map_err(failure)?
         {
+            self.context.observer.event(&TuningEvent::Pinned {
+                entry,
+                bindings: bindings.clone(),
+                statics: key.2.statics.clone(),
+                choice,
+                configuration: Configuration::of(&chosen),
+            });
             self.chosen.insert(key, chosen.clone());
             return Ok(chosen);
         }
-        #[cfg(not(feature = "pinned-tuning"))]
-        let _ = implementation;
         let began = Instant::now();
-        #[cfg(feature = "tuning-survey")]
-        if let Some(plan) = survey::plan(entry) {
-            self.context.observer.event(&TuningEvent::Started {
-                entry,
-                bindings: bindings.clone(),
-                points: shapes.len(),
-            });
-            let result = self
-                .survey(case, statics, &shapes, plan)
-                .map_err(failure)?;
-            // A surveyed unit takes no part in the division of the tuning
-            // time: the most a search of it could be given is all of it.
-            survey::record(&key, TUNING_TIME, &result).map_err(failure)?;
-            let tuned = tuned_entry(entry, bindings, &result, TuningOrigin::Searched, began);
-            return Ok(self.finish(key, tuned));
-        }
         let stored = self.stored(case, statics, &shapes).map_err(failure)?;
-        let Some((_, _, Some(result))) = &stored else {
-            return Err(failure(
-                "the tuning census did not measure this unit".into(),
-            ));
+        let Some((_, _, Some((choice, receipt)))) = stored else {
+            self.unprepared_unit(entry, bindings, key.2.statics.clone())?;
+            self.chosen.insert(key, defaults.clone());
+            return Ok(defaults.clone());
         };
-        let tuned = tuned_entry(entry, bindings, result, TuningOrigin::Stored, began);
+        let tuned = tuned_entry(
+            entry,
+            bindings,
+            choice,
+            receipt,
+            TuningOrigin::Stored,
+            TuningTime::default(),
+            began,
+        );
         Ok(self.finish(key, tuned))
+    }
+
+    /// The digest of the native implementation `case` is tuned on at
+    /// `statics`, computed once for each implementation. Computing it
+    /// renders the implementation's source, and units that differ only in
+    /// what they are measured at share one implementation: an attention
+    /// decode unit per span class rendered the same source once each, 5 ms
+    /// a time (GB10 and M4 Pro, 2026-10-10).
+    fn implementation_digest<T: EntryTuning>(
+        &self,
+        case: &T,
+        statics: &NativeSpecialization,
+    ) -> Result<String, String> {
+        let key = (
+            <T::Entry as seismic::Entry>::NAME,
+            case.entry().elements().to_vec(),
+            statics.clone(),
+        );
+        if let Some(digest) = self.digests.borrow().get(&key) {
+            return Ok(digest.clone());
+        }
+        let digest = case
+            .digest(self.device, statics)
+            .map_err(|error| error.to_string())?;
+        self.digests.borrow_mut().insert(key, digest.clone());
+        Ok(digest)
     }
 
     /// The cache slot of the unit `case` is at `statics` and the valid result
@@ -2289,23 +4871,79 @@ impl<'a> Tuner<'a> {
         let Some(cache) = self.context.cache.filter(|_| survey_plan(entry).is_none()) else {
             return Ok(None);
         };
-        let digest = case
-            .digest(self.device, statics)
-            .map_err(|error| error.to_string())?;
-        let policy = case.precision().map_err(|error| error.to_string())?;
+        let digest = self.implementation_digest(case, statics)?;
+        let requirement = self.context.numerical_profile.requirement(&case.entry());
         let key = TuningCacheKey::of(&tuning_key_material(
             self.device,
             entry,
             &case.bindings(),
             statics,
             &digest,
-            &policy,
-            &case.admitted(self.device, self.context.error_classes),
+            requirement.activation(),
             shapes,
         ));
-        let hit = cache
-            .tuning(&key)
-            .filter(|result| case.stored_valid(self.device, &result.overall.specialization()));
+        // A fresh preparation searches again and replaces the stored record.
+        // Any other serves the stored record under this load's requirement.
+        // Under the requirement it was searched under, that is its stored
+        // choice, and its evidence stays unread in the store. Its
+        // measurements are the same facts under every α, so under another
+        // the evidence is read and chosen from again, with nothing formed
+        // or measured. The store keeps a choice and its evidence together,
+        // so evidence that cannot be read is a broken store, not a miss.
+        let stored = match self.context.settings.fresh {
+            true => None,
+            false => cache.tuning::<StoredChoice>(&key),
+        };
+        // A provisional record is what a search abandoned before its optional
+        // work stopped left: the unit has no choice yet, and is searched
+        // again as if nothing were stored. A record made without demand is
+        // the unit's choice only for a load without demand for it: one that
+        // serves the unit searches it. The store's key holds no demand.
+        let demanded = shapes.iter().any(|shape| shape.weight > 0.);
+        let hit = match stored.filter(|(choice, _)| {
+            choice.settled && (choice.demanded || !demanded) && choice.searched_within(self.budget())
+        }) {
+            None => None,
+            Some((choice, evidence)) if choice.requirement == requirement => {
+                Some((choice, Receipt::Stored(evidence)))
+            }
+            Some((stored, evidence)) => {
+                let mut result = evidence.read()?;
+                seismic::reselect(&mut result, &requirement);
+                // What stopped the record's search is the stored choice's
+                // to say: the evidence knows only whether it was complete.
+                let choice = StoredChoice {
+                    stop: stored.stop,
+                    settled: stored.settled,
+                    ..StoredChoice::of(&result, Duration::from_millis(stored.budget_ms))
+                };
+                Some((choice, Receipt::Held(Arc::new(result))))
+            }
+        };
+        if let Some((choice, _)) = &hit {
+            // Reading a stored choice is metadata only. Its key binds the
+            // implementation, the device and the served shapes it was
+            // formed and checked for; the walk that prepares it forms what
+            // it serves, once.
+            let chosen = choice.overall.specialization();
+            if !case.stored_valid(self.device, &chosen) {
+                return Err(format!(
+                    "terminal tuning choice for {entry} fails its served contract; search cannot reopen"
+                ));
+            }
+            match &choice.disposition {
+                seismic::TuningDisposition::CanonicalFallback { .. } => {
+                    choice.chosen.usable_fallback()?;
+                }
+                seismic::TuningDisposition::QualifiedCandidate => {
+                    if shapes.iter().any(|shape| shape.weight > 0.) {
+                        choice.chosen.qualified_at(shapes).map_err(|detail| {
+                            format!("terminal tuning choice for {entry} lacks matching numerical evidence: {detail}; search cannot reopen")
+                        })?;
+                    }
+                }
+            }
+        }
         Ok(Some((cache, key, hit)))
     }
 
@@ -2315,44 +4953,51 @@ impl<'a> Tuner<'a> {
     fn survey<T: EntryTuning>(
         &mut self,
         case: &T,
+        entry: &'static str,
+        bindings: &str,
         statics: &NativeSpecialization,
         shapes: &[PointShape],
         plan: seismic::SurveyPlan,
     ) -> Result<TuningResult, String> {
-        let precision = seismic::TuningPrecision {
-            policy: case.precision().map_err(|error| error.to_string())?,
-            admitted: case.admitted(self.device, self.context.error_classes),
-        };
+        let requirement = self.context.numerical_profile.requirement(&case.entry());
         let mut cases = UnitCases {
             points: shapes.iter().map(|_| None).collect(),
             guard: None,
         };
         let device = self.device;
+        let observer = self.context.observer;
         let result = case
             .tune(
                 device,
                 statics,
-                &mut UnitPoints {
-                    case,
-                    shapes,
-                    inputs: self.inputs(),
-                    cases: &mut cases,
+                &mut SurveyedPoints {
+                    points: UnitPoints {
+                        case,
+                        shapes,
+                        inputs: self.inputs(),
+                        cases: &mut cases,
+                    },
+                    observer,
+                    entry,
+                    bindings,
                 },
-                precision,
+                requirement,
                 Strategy::Survey(plan),
             )
             .map_err(|error| error.to_string());
-        self.weights.release();
+        // The survey's cases are gone: nothing binds what it imported.
+        drop(cases);
+        self.inputs().release_unheld();
         result
     }
 
     /// Record a unit's outcome and report it.
-    fn finish(&mut self, key: TuningKey, tuned: TunedEntry) -> NativeSpecialization {
+    fn finish(&mut self, key: TuningKey, mut tuned: TunedEntry) -> NativeSpecialization {
+        tuned.statics = key.2.statics.clone();
         self.context
             .observer
             .event(&TuningEvent::Finished(tuned.clone()));
         let chosen = tuned.overall.specialization();
-        #[cfg(feature = "pinned-tuning")]
         pinned::record(&key, &chosen);
         self.tuned.push(tuned);
         self.chosen.insert(key, chosen.clone());
@@ -2369,6 +5014,76 @@ impl<'a> Tuner<'a> {
     }
 }
 
+/// A surveyed unit's points, which report the survey's progress to the
+/// tuning's observer ([`TuningEvent::Surveyed`]).
+#[cfg(feature = "tuning-survey")]
+struct SurveyedPoints<'s, P> {
+    points: P,
+    observer: &'s dyn TuningObserver,
+    entry: &'static str,
+    bindings: &'s str,
+}
+
+#[cfg(feature = "tuning-survey")]
+impl<E: seismic::Entry, P: seismic::PointSource<'static, E>> seismic::PointSource<'static, E>
+    for SurveyedPoints<'_, P>
+{
+    fn release(&mut self, point: usize) {
+        self.points.release(point);
+    }
+
+    fn points(&self) -> Vec<seismic::PointSpec> {
+        self.points.points()
+    }
+
+    fn served(&self) -> Vec<BTreeMap<String, u64>> {
+        self.points.served()
+    }
+
+    fn build(&mut self, point: usize) -> Result<seismic::PointInputs<'static>, BuildError> {
+        self.points.build(point)
+    }
+
+    fn surveyed(&mut self, progress: seismic::SurveyProgress) {
+        self.observer.event(&TuningEvent::Surveyed {
+            entry: self.entry,
+            bindings: self.bindings.to_owned(),
+            progress,
+        });
+    }
+}
+
+/// Canonical formation uses only served geometry. Input construction and
+/// observations are unavailable during prerequisites and cache verification.
+struct CanonicalPoints<'a, T> {
+    case: &'a T,
+    shapes: &'a [PointShape],
+}
+impl<T: EntryTuning> seismic::PointSource<'static, T::Entry> for CanonicalPoints<'_, T> {
+    fn points(&self) -> Vec<seismic::PointSpec> {
+        point_specs(self.shapes)
+    }
+    fn served(&self) -> Vec<BTreeMap<String, u64>> {
+        self.case.served_dimensions(self.shapes)
+    }
+    fn build(&mut self, _: usize) -> Result<seismic::PointInputs<'static>, BuildError> {
+        Err("canonical formation cannot construct numerical observations".into())
+    }
+}
+fn point_specs(shapes: &[PointShape]) -> Vec<seismic::PointSpec> {
+    shapes
+        .iter()
+        .zip(census_points(shapes))
+        .map(|(shape, census)| seismic::PointSpec {
+            label: shape.label.clone(),
+            weight: shape.weight,
+            class: shape.class.clone(),
+            cost: shape.cost(),
+            census,
+        })
+        .collect()
+}
+
 /// One unit's points, whose inputs are built when Seismic admits them, once
 /// for the unit's census and search.
 struct UnitPoints<'u, 'w, 'a, T: EntryTuning> {
@@ -2379,37 +5094,22 @@ struct UnitPoints<'u, 'w, 'a, T: EntryTuning> {
 }
 
 impl<T: EntryTuning> seismic::PointSource<'static, T::Entry> for UnitPoints<'_, '_, '_, T> {
-    fn points(&self) -> Vec<seismic::PointSpec> {
-        self.shapes
-            .iter()
-            .zip(census_points(self.shapes))
-            .map(|(shape, census)| seismic::PointSpec {
-                label: shape.label.clone(),
-                weight: shape.weight,
-                class: shape.class.clone(),
-                cost: shape.cost(),
-                required: shape.rows <= STREAMING_ROWS,
-                census,
-            })
-            .collect()
+    fn release(&mut self, point: usize) {
+        self.cases.points[point] = None;
+        self.inputs.release_unheld();
     }
 
-    fn build(
-        &mut self,
-        point: usize,
-        limit: Duration,
-    ) -> Result<seismic::PointInputs<'static>, seismic::PointUnavailable> {
+    fn points(&self) -> Vec<seismic::PointSpec> {
+        point_specs(self.shapes)
+    }
+
+    fn served(&self) -> Vec<BTreeMap<String, u64>> {
+        self.case.served_dimensions(self.shapes)
+    }
+
+    fn build(&mut self, point: usize) -> Result<seismic::PointInputs<'static>, BuildError> {
         if self.cases.points[point].is_none() {
-            self.inputs.building.borrow_mut().limit(limit);
-            let built = self.case.rotation(&mut self.inputs, &self.shapes[point]);
-            let refused = self.inputs.building.borrow().refused();
-            let built = built.map_err(|error| {
-                if refused {
-                    seismic::PointUnavailable::Unaffordable
-                } else {
-                    seismic::PointUnavailable::Failed(error)
-                }
-            })?;
+            let built = self.case.rotation(&mut self.inputs, &self.shapes[point])?;
             if self.cases.guard.is_none()
                 && built.first().is_some_and(|case| {
                     T::state(case)
@@ -2432,98 +5132,31 @@ impl<T: EntryTuning> seismic::PointSource<'static, T::Entry> for UnitPoints<'_, 
                 .map(|(_, state)| state)
                 .collect(),
             guard,
-        )
-        .map_err(seismic::PointUnavailable::Failed)?;
-        // Every argument set of a point writes the same rows; the guard
-        // declares none, so its states are observed whole.
+        )?;
+        // Every argument set of a point writes the same rows. The guard
+        // observes its states' other rows too: a candidate may leave no
+        // mark there, whatever error its written rows are allowed.
         let written = cases
             .iter()
             .take(1)
-            .filter(|_| !guard)
             .flat_map(T::state)
-            .map(|(name, state)| (name.to_owned(), state.written.clone()))
+            .map(|(name, state)| {
+                (
+                    name.to_owned(),
+                    seismic::WrittenRows {
+                        rows: state.written.clone(),
+                        observe_rest: guard,
+                    },
+                )
+            })
             .collect();
+        let workload = self.case.workload(cases.len());
         Ok(seismic::point_inputs::<T::Entry>(
             cases.iter_mut().map(T::args).collect(),
+            workload,
             initialize,
             written,
         ))
-    }
-}
-
-/// What building a point's inputs may take, and what building costs on
-/// this machine: seconds per byte of importing weights and of generating
-/// activations, measured as tuning goes.
-#[derive(Default)]
-pub(crate) struct BuildBudget {
-    deadline: Option<Instant>,
-    refused: bool,
-    import: Rate,
-    generation: Rate,
-}
-
-/// Seconds per byte of one kind of building, as measured so far.
-#[derive(Clone, Copy, Default)]
-struct Rate {
-    seconds: f64,
-    bytes: f64,
-}
-
-impl Rate {
-    /// The time of `bytes`, once anything was measured.
-    fn predict(self, bytes: u64) -> Option<f64> {
-        (self.bytes > 0.).then(|| self.seconds * bytes as f64 / self.bytes)
-    }
-}
-
-/// The kinds of building whose cost is predicted.
-#[derive(Clone, Copy)]
-enum Building {
-    Import,
-    Generation,
-}
-
-impl BuildBudget {
-    /// Allow the next point's building `limit`.
-    fn limit(&mut self, limit: Duration) {
-        self.deadline = Instant::now().checked_add(limit);
-        self.refused = false;
-    }
-
-    /// Whether the last building was refused for its predicted time.
-    fn refused(&self) -> bool {
-        self.refused
-    }
-
-    fn rate(&mut self, kind: Building) -> &mut Rate {
-        match kind {
-            Building::Import => &mut self.import,
-            Building::Generation => &mut self.generation,
-        }
-    }
-
-    /// Admit building `bytes` of `kind` when its predicted time fits.
-    fn admit(&mut self, kind: Building, bytes: u64) -> Result<(), String> {
-        let predicted = self.rate(kind).predict(bytes);
-        let fits = match (self.deadline, predicted) {
-            (Some(deadline), Some(seconds)) => {
-                Instant::now() + Duration::from_secs_f64(seconds) <= deadline
-            }
-            _ => true,
-        };
-        if fits {
-            Ok(())
-        } else {
-            self.refused = true;
-            Err("building the point's inputs would not fit its time".into())
-        }
-    }
-
-    /// Record that building `bytes` of `kind` took `seconds`.
-    fn record(&mut self, kind: Building, bytes: u64, seconds: f64) {
-        let rate = self.rate(kind);
-        rate.seconds += seconds;
-        rate.bytes += bytes as f64;
     }
 }
 
@@ -2540,19 +5173,26 @@ fn survey_plan(_entry: &str) -> Option<seismic::SurveyPlan> {
 }
 
 /// What a stored tuning result is valid for (§C2), rendered canonically: the
-/// tuning version, the device with its toolchain and driver, the unit, the
-/// implementation's digest, the precision policy its choice passed, and the
-/// shapes it was validated at. How it was searched (settings, tuning time,
-/// workload weights, the points timed) is not: a better search never
-/// invalidates a result that is still correct; see [`SEARCH_VERSION`].
+/// tuning version, the device with its toolchain and driver, the
+/// unit, the implementation's digest, the definition of its measurements
+/// against the default (the comparison's version and the activation type
+/// subjects are measured against, `activation`), and the shapes it was
+/// measured at. The budget bounds how far the search could reach, so the
+/// record states the one it was searched within and serves any load whose
+/// budget is no larger ([`StoredChoice::searched_within`]), not part of the
+/// key. How it was
+/// otherwise searched (settings, workload weights, the points timed) is not:
+/// a better search never invalidates a result that is still correct; see
+/// [`SEARCH_VERSION`]. Neither is the caller's α: it judges the stored
+/// measurements and changes none, so a load under another α reads the same
+/// record and chooses from it again ([`seismic::reselect`]).
 fn tuning_key_material(
     device: &Device,
     entry: &str,
     bindings: &str,
     statics: &NativeSpecialization,
     digest: &str,
-    policy: &PrecisionPolicy,
-    admitted: &BTreeMap<String, seismic::ErrorEnvelope>,
+    activation: Option<DType>,
     shapes: &[PointShape],
 ) -> String {
     let mut shapes = shapes
@@ -2560,85 +5200,86 @@ fn tuning_key_material(
         .map(|shape| shape.label.as_str())
         .collect::<Vec<_>>();
     shapes.sort_unstable();
-    let mut material = format!(
-        "tuning {SEARCH_VERSION}\ndevice {}\nentry {entry}\nbindings {bindings}\nstatics {:?}\n\
-         implementation {digest}\npolicy {:?}\nshapes {}",
+    format!(
+        "tuning {SEARCH_VERSION}\ndevice {}\nentry {entry}\nbindings {bindings}\n\
+         statics {}\nimplementation {digest}\ncomparison {} steps {activation:?}\nshapes {}",
         device.tuning_identity(),
-        statics.statics(),
-        seismic::precision::PolicyIdentity::of(policy).0,
+        FixedValues::of(statics).key_text(),
+        seismic::COMPARISON_VERSION,
         shapes.join(","),
-    );
-    // The admitted error classes the entry declares, with their envelopes:
-    // a choice searched with a class admitted may be of that class. A unit
-    // that admits none keeps the key its results were stored under.
-    if !admitted.is_empty() {
-        material.push_str(&format!(
-            "\nerror comparison {}\nerror classes {admitted:?}",
-            seismic::ErrorEnvelope::COMPARISON_VERSION,
-        ));
-    }
-    material
+    )
 }
 
+/// The outcome of a unit whose search just produced `result`.
+fn searched_entry(
+    entry: &'static str,
+    bindings: String,
+    result: TuningResult,
+    budget: Duration,
+    began: Instant,
+) -> TunedEntry {
+    let choice = StoredChoice::of(&result, budget);
+    let time = result.time.clone();
+    tuned_entry(
+        entry,
+        bindings,
+        choice,
+        Receipt::Held(Arc::new(result)),
+        TuningOrigin::Searched,
+        time,
+        began,
+    )
+}
+
+/// The outcome of a unit that serves `choice`, whose evidence is `receipt`.
 fn tuned_entry(
     entry: &'static str,
     bindings: String,
-    result: &TuningResult,
+    choice: StoredChoice,
+    receipt: Receipt,
     origin: TuningOrigin,
+    time: TuningTime,
     began: Instant,
 ) -> TunedEntry {
-    let measured = result
-        .configurations
-        .iter()
-        .filter(|record| matches!(record.outcome, seismic::Outcome::Measured { .. }))
-        .count();
-    let (time, search) = match origin {
-        TuningOrigin::Stored => (TuningTime::default(), None),
-        TuningOrigin::Searched => (
-            result.time.clone(),
-            match &result.method {
-                TuningMethod::Search {
-                    allowance_seconds,
-                    stop,
-                    ..
-                } => Some((Duration::from_secs_f64(*allowance_seconds), *stop)),
-                TuningMethod::Factored {
-                    allowance_seconds,
-                    complete,
-                    ..
-                } => Some((
-                    Duration::from_secs_f64(*allowance_seconds),
-                    if *complete {
-                        SearchStop::Exhausted
-                    } else {
-                        SearchStop::Expired
-                    },
-                )),
-                TuningMethod::Survey { .. } | TuningMethod::Census => None,
-            },
-        ),
-    };
     TunedEntry {
         entry,
         bindings,
-        overall: result.overall.clone(),
+        overall: choice.overall,
+        statics: BTreeMap::new(),
         origin,
-        search,
+        qualified: matches!(
+            choice.disposition,
+            seismic::TuningDisposition::QualifiedCandidate
+        ),
+        stop: choice.stop,
+        coverage: choice.coverage,
         progress: None,
-        measured,
-        excluded: result.configurations.len() - measured,
-        rejections: result.rejections().count(),
-        first_rejection: result
-            .rejections()
-            .find_map(|record| match &record.outcome {
-                seismic::Outcome::Excluded(exclusion) => {
-                    Some(format!("{:?}: {exclusion:?}", record.configuration.params))
-                }
-                seismic::Outcome::Measured { .. } => None,
-            }),
+        measured: choice.measured,
+        excluded: choice.excluded,
+        rejections: choice.rejections,
+        first_rejection: choice.first_rejection,
         seconds: began.elapsed().as_secs_f64(),
         time,
+        receipt,
     }
+}
+
+/// Host RAM the OS can give a taker now ([`seismic::Supply::total`] of a
+/// [`seismic::host_sample`]): a compile burst's price is how far it falls.
+pub(super) fn host_room() -> u64 {
+    seismic::host_sample().supply.total()
+}
+
+/// What one thread of a wave of `threads` compiles held: how far the host's
+/// room fell from `before`, its reading as the wave began, to `lowest`, its
+/// least as any of the wave's compiles ended, for each thread. The fall
+/// counts the compiles' memory in any process, a toolchain's compiler
+/// service as well as this one, which the process's footprint does not.
+/// None where no compile ended (`lowest` is missing) or the room did not
+/// fall.
+pub(super) fn compile_wave_price(before: u64, lowest: Option<u64>, threads: usize) -> Option<u64> {
+    let fell = before.checked_sub(lowest?).filter(|fell| *fell > 0)?;
+    Some(fell / threads.max(1) as u64)
 }
 
 #[cfg(test)]

@@ -1,7 +1,14 @@
-import { Data, Effect } from "effect"
+import { Cause, Data, Effect, Option, Schema, type ParseResult } from "effect"
 import stringWidth from "string-width"
+import { drafterNotUsableMessage, modelVersionNotRunnableMessage } from "@magnitudedev/client-common"
+import { DrafterNotUsable, HuggingFaceAccessRequired, ModelVersionNotRunnable } from "@magnitudedev/sdk"
+import { huggingFaceAccessText } from "./hugging-face-access"
 
+/** A failure's product message; refusals the service states as facts are worded here, as on the desktop. */
 const messageOf = (error: unknown): string => {
+  if (error instanceof ModelVersionNotRunnable) return modelVersionNotRunnableMessage(error)
+  if (error instanceof DrafterNotUsable) return drafterNotUsableMessage(error)
+  if (error instanceof HuggingFaceAccessRequired) return huggingFaceAccessText(error.access, Option.some(error.repository))
   if (typeof error === "object" && error !== null) {
     const candidate = error as { readonly message?: unknown; readonly reason?: unknown }
     if (Object.hasOwn(candidate, "message") && typeof candidate.message === "string") return candidate.message
@@ -11,24 +18,68 @@ const messageOf = (error: unknown): string => {
   return String(error)
 }
 
+/** A stable machine code for a failure: the product code it carries, else its tag in snake case. */
+export const errorCode = (error: unknown): string => {
+  if (typeof error === "object" && error !== null) {
+    const candidate = error as { readonly code?: unknown; readonly _tag?: unknown }
+    if (typeof candidate.code === "string" && candidate.code.length > 0) return candidate.code
+    if (typeof candidate._tag === "string" && candidate._tag.length > 0) {
+      return candidate._tag.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase()
+    }
+  }
+  return "command_failed"
+}
+
+/** What a failed command writes to stderr: its product message, or under `--json` one error document. */
+export const renderCommandError = (error: unknown, json: boolean): string => json
+  ? `${JSON.stringify({ error: { message: messageOf(error), code: errorCode(error) } }, null, 2)}\n`
+  : `${messageOf(error)}\n`
+
 class CommandOutputFailed extends Data.TaggedError("CommandOutputFailed")<{
   readonly message: string
 }> {}
 
-export const runCommand = <A>(options: {
+/** How a command's result becomes the one machine-readable document `--json` prints. */
+export interface JsonDocument<A> {
+  readonly encode: (result: A) => Effect.Effect<unknown, ParseResult.ParseError>
+}
+
+export const jsonDocument = <A, J, I>(
+  schema: Schema.Schema<J, I, never>,
+  project: (result: A) => J,
+): JsonDocument<A> => ({ encode: (result) => Schema.encode(schema)(project(result)) })
+
+export interface JsonOption {
+  readonly json?: boolean
+}
+
+/** The document to print when `--json` was given, or nothing for text output. */
+export const asJson = <A>(options: JsonOption, document: JsonDocument<A>): JsonDocument<A> | undefined =>
+  options.json === true ? document : undefined
+
+export interface CommandOptions<A> {
   readonly effect: Effect.Effect<A, unknown, never>
   readonly render: (result: A) => string
-}): Promise<void> => Effect.runPromise(options.effect.pipe(
-  Effect.tap((result) => Effect.try({
-    try: () => process.stdout.write(options.render(result)),
+  readonly json?: JsonDocument<A>
+}
+
+/** A command as one Effect: run it, print its text or JSON document, or print its error and set a nonzero exit. */
+export const commandEffect = <A>(options: CommandOptions<A>): Effect.Effect<void> => options.effect.pipe(
+  Effect.flatMap((result) => options.json === undefined
+    ? Effect.succeed(options.render(result))
+    : options.json.encode(result).pipe(Effect.map((document) => `${JSON.stringify(document, null, 2)}\n`))),
+  Effect.flatMap((output) => Effect.try({
+    try: () => process.stdout.write(output),
     catch: (error) => new CommandOutputFailed({ message: messageOf(error) }),
   })),
-  Effect.catchAll((error) => Effect.sync(() => {
-    process.stderr.write(`${messageOf(error)}\n`)
+  Effect.catchAllCause((cause) => Effect.sync(() => {
+    process.stderr.write(renderCommandError(Cause.squash(cause), options.json !== undefined))
     process.exitCode = 1
   })),
   Effect.asVoid,
-))
+)
+
+export const runCommand = <A>(options: CommandOptions<A>): Promise<void> => Effect.runPromise(commandEffect(options))
 
 export const ensureTrailingNewline = (value: string): string =>
   `${value.replace(/\n+$/, "")}\n`

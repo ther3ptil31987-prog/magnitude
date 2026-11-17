@@ -6,18 +6,44 @@
     "asOfDate": "2026-09-29",
     "url": "https://artificialanalysis.ai/models/claude-opus-5-5"
   },
+  "labs": [
+    { "id": "alibaba", "name": "Alibaba", "country": "CN", "huggingFaceOrganizations": ["Qwen"] },
+    { "id": "google", "name": "Google", "country": "US", "huggingFaceOrganizations": ["google"] },
+    { "id": "liquid", "name": "Liquid AI", "country": "US", "huggingFaceOrganizations": ["LiquidAI"] },
+    { "id": "nvidia", "name": "NVIDIA", "country": "US", "huggingFaceOrganizations": ["nvidia"] },
+    { "id": "meta", "name": "Meta", "country": "US", "huggingFaceOrganizations": ["meta-llama", "facebook", "meta-models"] },
+    { "id": "deepseek", "name": "DeepSeek", "country": "CN", "huggingFaceOrganizations": ["deepseek-ai"] },
+    { "id": "poolside", "name": "Poolside", "country": "US", "huggingFaceOrganizations": ["poolside"] },
+    { "id": "zai", "name": "Z.ai", "country": "CN", "huggingFaceOrganizations": ["zai-org"] },
+    { "id": "prismml", "name": "PrismML", "country": "US", "huggingFaceOrganizations": ["prism-ml"] }
+  ],
+  "families": [
+    { "name": "Qwen 3.5–3.8", "lab": "alibaba", "architectures": ["qwen35", "qwen35moe", "qwen4exp"], "status": "supported" },
+    { "name": "Gemma 4", "lab": "google", "architectures": ["gemma4"], "status": "supported" },
+    { "name": "LFM 2.5 and 3", "lab": "liquid", "architectures": ["lfm2", "lfm2moe", "lfm3"], "status": "supported" },
+    { "name": "Nemotron 3 and 3.5", "lab": "nvidia", "architectures": ["nemotron_h_moe"], "status": "supported" },
+    { "name": "Muse Glimmer", "lab": "meta", "architectures": ["muse-glimmer"], "status": "supported" },
+    { "name": "DeepSeek V4.1", "lab": "deepseek", "architectures": ["deepseek41"], "status": "comingSoon" },
+    { "name": "GLM-5.3 Flash", "lab": "zai", "architectures": ["glm5-next"], "status": "comingSoon" }
+  ],
   "models": [
     {
       "id": "qwen3.5-4b",
       "displayName": "Qwen3.5 4B",
+      "lab": "alibaba",
       "description": "Compact dense model for machines where responsiveness and footprint matter most.",
       "releaseDate": "2026-03-02",
       "parameterization": { "architecture": "dense", "totalParameters": 4000000000 },
       "support": { "level": "supported" },
-      "repository": "unsloth/Qwen3.5-4B-MTP-GGUF",
-      "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "UD-Q5_K_XL", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
-      "projector": { "path": "mmproj-BF16.gguf" },
-      "license": "apache-2.0",
+      "sources": [
+        {
+          "repository": "unsloth/Qwen3.5-4B-MTP-GGUF",
+          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q5", "format": "UD-Q5_K_XL", "variantLabel": "Q5", "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "quantizationAware": false}],
+          "projector": { "path": "mmproj-BF16.gguf" },
+          "license": "apache-2.0"
+        }
+      ],
+      "speculativeDecoding": { "method": "dflash", "draft": { "type": "file", "repository": "magnitudedev/Qwen3.5-4B-DFlash-GGUF", "path": "Qwen3.5-4B-DFlash-Q8_0.gguf" } },
       "artificialAnalysis": {
         "score": 13.1,
         "provenance": {
@@ -35,14 +61,20 @@
     {
       "id": "qwen3.5-9b",
       "displayName": "Qwen3.5 9B",
+      "lab": "alibaba",
       "description": "Small dense model with a substantial capability gain over the 4B tier.",
       "releaseDate": "2026-03-02",
       "parameterization": { "architecture": "dense", "totalParameters": 9000000000 },
       "support": { "level": "supported" },
-      "repository": "unsloth/Qwen3.5-9B-MTP-GGUF",
-      "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "UD-Q5_K_XL", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
-      "projector": { "path": "mmproj-BF16.gguf" },
-      "license": "apache-2.0",
+      "sources": [
+        {
+          "repository": "unsloth/Qwen3.5-9B-MTP-GGUF",
+          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "quantizationAware": false}],
+          "projector": { "path": "mmproj-BF16.gguf" },
+          "license": "apache-2.0"
+        }
+      ],
+      "speculativeDecoding": { "method": "dflash", "draft": { "type": "file", "repository": "magnitudedev/Qwen3.5-9B-DFlash-GGUF", "path": "Qwen3.5-9B-DFlash-Q8_0.gguf" } },
       "artificialAnalysis": {
         "score": 11.2,
         "provenance": {
@@ -56,15 +88,20 @@
     {
       "id": "qwen3.8-27b",
       "displayName": "Qwen3.8 27B",
+      "lab": "alibaba",
       "description": "Large dense multimodal model with frontier-class agentic coding capability for its size.",
       "releaseDate": "2026-08-13",
       "parameterization": { "architecture": "dense", "totalParameters": 27000000000 },
       "support": { "level": "supported" },
-      "repository": "unsloth/Qwen3.8-27B-GGUF",
-      "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
-      "projector": { "path": "mmproj-BF16.gguf" },
+      "sources": [
+        {
+          "repository": "unsloth/Qwen3.8-27B-GGUF",
+          "variants": [{"variantId": "gguf:iq3", "format": "UD-IQ3_XXS", "variantLabel": "IQ3", "quantizationAware": false}, {"variantId": "gguf:q3", "format": "UD-Q3_K_XL", "variantLabel": "Q3", "quantizationAware": false}, {"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "quantizationAware": false}],
+          "projector": { "path": "mmproj-BF16.gguf" },
+          "license": "apache-2.0"
+        }
+      ],
       "speculativeDecoding": { "method": "dflash2", "draft": { "type": "file", "repository": "magnitudedev/Qwen3.8-27B-DFlash2-GGUF", "path": "Qwen3.8-27B-DFlash2-Q8_0.gguf" } },
-      "license": "apache-2.0",
       "artificialAnalysis": {
         "score": 33.7,
         "provenance": {
@@ -78,14 +115,28 @@
     {
       "id": "qwen3.8-flash-next",
       "displayName": "Qwen3.8 Flash Next",
+      "lab": "alibaba",
       "description": "Large multimodal MoE preview of Qwen's next-generation architecture with strong agentic reasoning and low active compute.",
       "releaseDate": "2026-08-26",
       "parameterization": { "architecture": "mixtureOfExperts", "totalParameters": 180000000000, "activeParameters": 6000000000 },
-      "support": { "level": "disabled", "reason": "Qwen4exp hyper-connections and QSA attention are not implemented yet." },
-      "repository": "unsloth/Qwen3.8-Flash-Next-GGUF",
-      "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
-      "projector": { "path": "mmproj-BF16.gguf" },
-      "license": "qwen-community-1.0",
+      "support": { "level": "supported" },
+      "sources": [
+        {
+          "repository": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+          "variants": [{"variantId": "gguf:q2", "format": "Q2_0", "variantLabel": "Q2", "quantizationAware": false}, {"variantId": "gguf:iq3", "format": "IQ3_S", "variantLabel": "IQ3", "quantizationAware": false}],
+          "license": "apache-2.0"
+        },
+        {
+          "repository": "unsloth/Qwen3.8-Flash-Next-GGUF",
+          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "quantizationAware": false}],
+          "projector": { "path": "mmproj-BF16.gguf" },
+          "license": "qwen-community-1.0"
+        }
+      ],
+      "speculativeDecoding": {
+        "method": "mtp",
+        "draft": { "type": "file", "repository": "unsloth/Qwen3.8-Flash-Next-GGUF", "path": "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf" }
+      },
       "artificialAnalysis": {
         "score": 39.8,
         "provenance": {
@@ -99,13 +150,19 @@
     {
       "id": "qwen3.6-35b-a3b",
       "displayName": "Qwen3.6 35B-A3B",
+      "lab": "alibaba",
       "description": "Efficient MoE coding model with a large knowledge footprint and low active compute.",
       "releaseDate": "2026-04-15",
       "parameterization": { "architecture": "mixtureOfExperts", "totalParameters": 35000000000, "activeParameters": 3000000000 },
       "support": { "level": "supported" },
-      "repository": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
-      "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "UD-Q5_K_XL", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
-      "projector": { "path": "mmproj-BF16.gguf" },
+      "sources": [
+        {
+          "repository": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
+          "variants": [{"variantId": "gguf:q2", "format": "UD-Q2_K_XL", "variantLabel": "Q2", "quantizationAware": false}, {"variantId": "gguf:q3", "format": "UD-Q3_K_XL", "variantLabel": "Q3", "quantizationAware": false}, {"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "quantizationAware": false}],
+          "projector": { "path": "mmproj-BF16.gguf" },
+          "license": "apache-2.0"
+        }
+      ],
       "speculativeDecoding": {
         "method": "dflash",
         "draft": {
@@ -114,7 +171,6 @@
           "path": "Qwen3.6-35B-A3B-DFlash-Q8_0.gguf"
         }
       },
-      "license": "apache-2.0",
       "artificialAnalysis": {
         "score": 18.2,
         "provenance": {
@@ -128,15 +184,20 @@
     {
       "id": "muse-glimmer-30b",
       "displayName": "Muse Glimmer 30B",
+      "lab": "meta",
       "description": "Dense multimodal model purpose-built for autonomous agentic tasks on consumer hardware.",
       "releaseDate": "2026-08-10",
       "parameterization": { "architecture": "dense", "totalParameters": 29600000000 },
       "support": { "level": "supported" },
-      "repository": "unsloth/Muse-Glimmer-30B-GGUF",
-      "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "UD-Q5_K_XL", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
-      "projector": { "path": "mmproj-Muse-Glimmer-30B-Q8_0.gguf" },
+      "sources": [
+        {
+          "repository": "unsloth/Muse-Glimmer-30B-GGUF",
+          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q5", "format": "UD-Q5_K_XL", "variantLabel": "Q5", "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "quantizationAware": false}],
+          "projector": { "path": "mmproj-Muse-Glimmer-30B-Q8_0.gguf" },
+          "license": "apache-2.0"
+        }
+      ],
       "speculativeDecoding": { "method": "dflash", "draft": { "type": "file", "repository": "magnitudedev/Muse-Glimmer-30B-DFlash-GGUF", "path": "dflash-kquant.gguf" } },
-      "license": "apache-2.0",
       "artificialAnalysis": {
         "score": 17.5,
         "provenance": {
@@ -148,41 +209,29 @@
       }
     },
     {
-      "id": "gemma-4-e2b-it-qat",
-      "displayName": "Gemma 4 E2B",
-      "description": "Very small dense model with per-layer embeddings optimized for on-device use.",
-      "releaseDate": "2026-04-02",
-      "parameterization": { "architecture": "dense", "totalParameters": 5100000000 },
-      "support": { "level": "supported" },
-      "repository": "unsloth/gemma-4-E2B-it-qat-GGUF",
-      "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4 QAT", "fidelityRank": 58, "quantizationAware": true}],
-      "projector": { "path": "mmproj-BF16.gguf" },
-      "license": "apache-2.0",
-      "artificialAnalysis": {
-        "score": 7.8,
-        "provenance": {
-          "kind": "estimate",
-          "target": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.3.2",
-          "asOfDate": "2026-09-29",
-          "methodology": "Artificial Analysis published this score as its own estimate rather than a fully measured result.",
-          "evidenceUrls": [
-            "https://artificialanalysis.ai/models/gemma-4-e2b"
-          ]
-        }
-      }
-    },
-    {
       "id": "gemma-4-e4b-it-qat",
       "displayName": "Gemma 4 E4B",
+      "lab": "google",
       "description": "Small dense model with per-layer embeddings that materially improves capability over the E2B tier while remaining practical on memory-constrained machines.",
       "releaseDate": "2026-04-02",
       "parameterization": { "architecture": "dense", "totalParameters": 8000000000 },
       "support": { "level": "supported" },
-      "repository": "unsloth/gemma-4-E4B-it-qat-GGUF",
-      "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4 QAT", "fidelityRank": 58, "quantizationAware": true}],
-      "projector": { "path": "mmproj-BF16.gguf" },
-      "license": "apache-2.0",
+      "sources": [
+        {
+          "repository": "unsloth/gemma-4-E4B-it-qat-GGUF",
+          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4 QAT", "quantizationAware": true}],
+          "projector": { "path": "mmproj-BF16.gguf" },
+          "license": "apache-2.0"
+        }
+      ],
+      "speculativeDecoding": {
+        "method": "mtp",
+        "draft": {
+          "type": "file",
+          "repository": "magnitudedev/gemma-4-E4B-it-qat-MTP-GGUF",
+          "path": "gemma-4-E4B-it-qat-MTP-Q4_0.gguf"
+        }
+      },
       "artificialAnalysis": {
         "score": 8.9,
         "provenance": {
@@ -198,117 +247,77 @@
       }
     },
     {
-      "id": "lfm2.5-2.6b",
-      "displayName": "Liquid LFM2.5 2.6B",
-      "description": "Compact dense Liquid model tuned for fast on-device tool use and coding workflows.",
-      "releaseDate": "2026-08-04",
-      "parameterization": { "architecture": "dense", "totalParameters": 2600000000 },
-      "support": { "level": "supported" },
-      "repository": "LiquidAI/LFM2.5-2.6B-GGUF",
-      "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "Q5_K_M", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "Q6_K", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
-      "speculativeDecoding": {
-        "method": "dspark",
-        "draft": {
-          "type": "file",
-          "repository": "magnitudedev/LFM2.5-2.6B-DSpark-GGUF",
-          "path": "LFM2.5-2.6B-DSpark-Q8_0.gguf"
-        }
+      "id": "lfm2.5-24b-a2b",
+      "displayName": "Liquid LFM2.5 24B-A2B",
+      "lab": "liquid",
+      "description": "Reasoning MoE for fast on-device agents, coding, and tool use.",
+      "releaseDate": "2026-10-13",
+      "parameterization": {
+        "architecture": "mixtureOfExperts",
+        "totalParameters": 23971585280,
+        "activeParameters": 2450000000
       },
-      "license": "lfm1.0",
-      "artificialAnalysis": {
-        "score": 8.4,
-        "provenance": {
-          "kind": "estimate",
-          "target": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.3.2",
-          "asOfDate": "2026-09-29",
-          "methodology": "Artificial Analysis published this score as its own estimate rather than a fully measured result.",
-          "evidenceUrls": [
-            "https://artificialanalysis.ai/models/lfm2-5-2-6b"
-          ]
-        }
-      }
-    },
-    {
-      "id": "lfm2.5-8b-a1b",
-      "displayName": "Liquid LFM2.5 8B-A1B",
-      "description": "Low-active-parameter Liquid MoE optimized for fast local reasoning and tool use.",
-      "releaseDate": "2026-05-28",
-      "parameterization": { "architecture": "mixtureOfExperts", "totalParameters": 8300000000, "activeParameters": 1500000000 },
-      "support": { "level": "supported" },
-      "repository": "LiquidAI/LFM2.5-8B-A1B-GGUF",
-      "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "Q5_K_M", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "Q6_K", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
-      "speculativeDecoding": {
-        "method": "dspark",
-        "draft": {
-          "type": "file",
-          "repository": "magnitudedev/LFM2.5-8B-A1B-DSpark-GGUF",
-          "path": "LFM2.5-8B-A1B-DSpark-Q8_0.gguf"
-        }
+      "support": {
+        "level": "supported"
       },
-      "license": "lfm1.0",
+      "sources": [
+        {
+          "repository": "LiquidAI/LFM2.5-24B-A2B-GGUF",
+          "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q6", "format": "Q6_K", "variantLabel": "Q6", "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "quantizationAware": false}],
+          "license": "lfm1.0"
+        }
+      ],
       "artificialAnalysis": {
-        "score": 7.2,
+        "score": 15.6,
         "provenance": {
           "kind": "estimate",
           "target": "artificialAnalysisIntelligenceIndex",
           "methodologyVersion": "4.3.2",
-          "asOfDate": "2026-09-29",
-          "methodology": "Artificial Analysis published this score as its own estimate rather than a fully measured result.",
+          "asOfDate": "2026-10-13",
+          "methodology": "Scaled two measured anchors, Qwen3.6 35B-A3B (18.2) and Nemotron 3.5 Lightning (12.9), by the geometric mean of LFM2.5 24B-A2B benchmark ratios against each on GPQA Diamond, HLE, IFBench, SciCode, tau3-Bench Banking and SWE-Bench Verified (OpenCode), from Liquid AI's release comparison. The scaled estimates are approximately 17.2 and 14.2; their geometric mean rounds to 15.6. This is an estimated Intelligence Index, not a measured score.",
           "evidenceUrls": [
-            "https://artificialanalysis.ai/models/lfm2-5-8b-a1b"
+            "https://www.liquid.ai/blog/lfm2-5-24b-a2b",
+            "https://artificialanalysis.ai/models/qwen3-6-35b-a3b",
+            "https://artificialanalysis.ai/models/nemotron-3-5-lightning"
           ]
         }
       }
     },
     {
-      "id": "minicpm5-1b",
-      "displayName": "MiniCPM5 1B",
-      "description": "Compact dense model for on-device reasoning and tool use.",
-      "releaseDate": "2026-05-21",
-      "parameterization": { "architecture": "dense", "totalParameters": 1080632832 },
+      "id": "lfm3-1.7b",
+      "displayName": "Liquid LFM3 1.7B",
+      "lab": "liquid",
+      "description": "Compact hybrid Liquid model for fast on-device agents and tool use, with a quantization-aware distilled (QAD) Q4.",
+      "releaseDate": "2026-10-27",
+      "parameterization": { "architecture": "dense", "totalParameters": 1728801536 },
       "support": { "level": "supported" },
-      "repository": "openbmb/MiniCPM5-1B-GGUF",
-      "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
-      "license": "apache-2.0",
+      "sources": [
+        {
+          "repository": "LiquidAI/LFM3-1.7B-GGUF",
+          "variants": [{"variantId": "gguf:q4-qat", "format": "QAD-Q4_0", "variantLabel": "Q4 QAT", "quantizationAware": true}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "quantizationAware": false}],
+          "license": "lfm1.0"
+        }
+      ],
       "artificialAnalysis": {
-        "score": 8.8,
+        "score": 14.0,
         "provenance": {
           "kind": "estimate",
           "target": "artificialAnalysisIntelligenceIndex",
           "methodologyVersion": "4.3.2",
-          "asOfDate": "2026-09-29",
-          "methodology": "Artificial Analysis published this score as its own estimate rather than a fully measured result.",
+          "asOfDate": "2026-10-27",
+          "methodology": "Scaled two measured anchors, MiniCPM5 2B (12.5) and Qwen3.5 9B (11.2), by the geometric mean of LFM3 1.7B benchmark ratios against each on the Intelligence Index components in Liquid AI's release comparison: AutomationBench, Terminal-Bench 2.1, SciCode, Humanity's Last Exam (no tools), AA-Omniscience accuracy and non-hallucination, and AA-LCR. The scaled estimates are approximately 18.7 and 10.5; their geometric mean rounds to 14.0. The anchors disagree widely, mostly on AutomationBench and Terminal-Bench, so this is a loose estimate. This is an estimated Intelligence Index, not a measured score.",
           "evidenceUrls": [
-            "https://artificialanalysis.ai/models/minicpm5-1b"
+            "https://huggingface.co/LiquidAI/LFM3-1.7B",
+            "https://artificialanalysis.ai/models/minicpm5-2b",
+            "https://artificialanalysis.ai/models/qwen3-5-9b"
           ]
-        }
-      }
-    },
-    {
-      "id": "minicpm5-2b",
-      "displayName": "MiniCPM5 2B",
-      "description": "Compact dense model with native long context, tool use, and reasoning for on-device work.",
-      "releaseDate": "2026-09-07",
-      "parameterization": { "architecture": "dense", "totalParameters": 2516756480 },
-      "support": { "level": "supported" },
-      "repository": "openbmb/MiniCPM5-2B-GGUF",
-      "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
-      "speculativeDecoding": { "method": "dspark", "draft": { "type": "file", "repository": "magnitudedev/MiniCPM5-2B-DSpark-GGUF", "path": "MiniCPM5-2.6B-DSpark.gguf" } },
-      "license": "apache-2.0",
-      "artificialAnalysis": {
-        "score": 12.5,
-        "provenance": {
-          "kind": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.3.2",
-          "asOfDate": "2026-09-29",
-          "url": "https://artificialanalysis.ai/models/minicpm5-2b"
         }
       }
     },
     {
       "id": "bonsai-8b-q1",
       "displayName": "Bonsai 8B 1-bit",
+      "lab": "prismml",
       "description": "Extremely compact 1-bit model for machines that cannot fit conventional small-model quantizations.",
       "releaseDate": "2026-03-31",
       "parameterization": { "architecture": "dense", "totalParameters": 8190000000 },
@@ -318,9 +327,13 @@
         "replacement": "qwen3.5-4b:gguf:q4",
         "reason": "Superseded by the supported Qwen3.5 4B Q4 compact configuration."
       },
-      "repository": "prism-ml/Bonsai-8B-gguf",
-      "variants": [{"variantId": "gguf:q1-qat", "format": "Q1_0", "variantLabel": "Q1 QAT", "fidelityRank": 20, "quantizationAware": true}],
-      "license": "apache-2.0",
+      "sources": [
+        {
+          "repository": "prism-ml/Bonsai-8B-gguf",
+          "variants": [{"variantId": "gguf:q1-qat", "format": "Q1_0", "variantLabel": "Q1 QAT", "quantizationAware": true}],
+          "license": "apache-2.0"
+        }
+      ],
       "artificialAnalysis": {
         "score": 6.4,
         "provenance": {
@@ -339,14 +352,27 @@
     {
       "id": "gemma-4-12b-it-qat",
       "displayName": "Gemma 4 12B",
+      "lab": "google",
       "description": "Mid-size dense model with native tool use, reasoning, and multimodal capability.",
       "releaseDate": "2026-06-03",
       "parameterization": { "architecture": "dense", "totalParameters": 11950000000 },
       "support": { "level": "supported" },
-      "repository": "unsloth/gemma-4-12B-it-qat-GGUF",
-      "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4 QAT", "fidelityRank": 58, "quantizationAware": true}],
-      "projector": { "path": "mmproj-BF16.gguf" },
-      "license": "apache-2.0",
+      "sources": [
+        {
+          "repository": "unsloth/gemma-4-12B-it-qat-GGUF",
+          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4 QAT", "quantizationAware": true}],
+          "projector": { "path": "mmproj-BF16.gguf" },
+          "license": "apache-2.0"
+        }
+      ],
+      "speculativeDecoding": {
+        "method": "mtp",
+        "draft": {
+          "type": "file",
+          "repository": "magnitudedev/gemma-4-12B-it-qat-MTP-GGUF",
+          "path": "gemma-4-12B-it-qat-MTP-Q4_0.gguf"
+        }
+      },
       "artificialAnalysis": {
         "score": 14.2,
         "provenance": {
@@ -364,14 +390,27 @@
     {
       "id": "gemma-4-26b-a4b-it-qat",
       "displayName": "Gemma 4 26B-A4B",
+      "lab": "google",
       "description": "Mid-size MoE model balancing a substantial weight footprint with low active compute.",
       "releaseDate": "2026-04-02",
       "parameterization": { "architecture": "mixtureOfExperts", "totalParameters": 25200000000, "activeParameters": 3800000000 },
       "support": { "level": "supported" },
-      "repository": "unsloth/gemma-4-26B-A4B-it-qat-GGUF",
-      "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4 QAT", "fidelityRank": 58, "quantizationAware": true}],
-      "projector": { "path": "mmproj-BF16.gguf" },
-      "license": "apache-2.0",
+      "sources": [
+        {
+          "repository": "unsloth/gemma-4-26B-A4B-it-qat-GGUF",
+          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4 QAT", "quantizationAware": true}],
+          "projector": { "path": "mmproj-BF16.gguf" },
+          "license": "apache-2.0"
+        }
+      ],
+      "speculativeDecoding": {
+        "method": "mtp",
+        "draft": {
+          "type": "file",
+          "repository": "magnitudedev/gemma-4-26B-A4B-it-qat-MTP-GGUF",
+          "path": "gemma-4-26B-A4B-it-qat-MTP-Q4_0.gguf"
+        }
+      },
       "artificialAnalysis": {
         "score": 16.7,
         "provenance": {
@@ -389,14 +428,27 @@
     {
       "id": "gemma-4-31b-it-qat",
       "displayName": "Gemma 4 31B",
+      "lab": "google",
       "description": "Large dense Gemma model with the strongest measured coding score in its family.",
       "releaseDate": "2026-04-02",
       "parameterization": { "architecture": "dense", "totalParameters": 30700000000 },
       "support": { "level": "supported" },
-      "repository": "unsloth/gemma-4-31B-it-qat-GGUF",
-      "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4 QAT", "fidelityRank": 58, "quantizationAware": true}],
-      "projector": { "path": "mmproj-BF16.gguf" },
-      "license": "apache-2.0",
+      "sources": [
+        {
+          "repository": "unsloth/gemma-4-31B-it-qat-GGUF",
+          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4 QAT", "quantizationAware": true}],
+          "projector": { "path": "mmproj-BF16.gguf" },
+          "license": "apache-2.0"
+        }
+      ],
+      "speculativeDecoding": {
+        "method": "mtp",
+        "draft": {
+          "type": "file",
+          "repository": "magnitudedev/gemma-4-31B-it-qat-MTP-GGUF",
+          "path": "gemma-4-31B-it-qat-MTP-Q4_0.gguf"
+        }
+      },
       "artificialAnalysis": {
         "score": 19.0,
         "provenance": {
@@ -414,39 +466,35 @@
     {
       "id": "laguna-s-2.1",
       "displayName": "Laguna S 2.1 118B-A8B",
+      "lab": "poolside",
       "description": "High-capability MoE model designed for agentic coding and long-horizon software work.",
       "releaseDate": "2026-07-21",
       "parameterization": { "architecture": "mixtureOfExperts", "totalParameters": 117600000000, "activeParameters": 8500000000 },
       "support": { "level": "disabled", "reason": "Laguna full-model support is not implemented yet." },
-      "repository": "unsloth/Laguna-S-2.1-GGUF",
-      "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
-      "license": "openmdw-1.1",
-      "artificialAnalysis": {
-        "score": 0.0,
-        "provenance": {
-          "kind": "estimate",
-          "target": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.3.2",
-          "asOfDate": "2026-09-29",
-          "methodology": "No Intelligence Index result or usable estimate; placeholder score for a disabled model.",
-          "evidenceUrls": [
-            "https://huggingface.co/poolside/Laguna-S-2.1",
-            "https://poolside.ai/blog/introducing-laguna-s-2-1"
-          ]
+      "sources": [
+        {
+          "repository": "unsloth/Laguna-S-2.1-GGUF",
+          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "quantizationAware": false}],
+          "license": "openmdw-1.1"
         }
-      }
+      ]
     },
     {
       "id": "qwen3.5-122b-a10b",
       "displayName": "Qwen3.5 122B-A10B",
+      "lab": "alibaba",
       "description": "Workstation-class MoE model with a large knowledge footprint and moderate active compute.",
       "releaseDate": "2026-02-24",
       "parameterization": { "architecture": "mixtureOfExperts", "totalParameters": 122000000000, "activeParameters": 10000000000 },
       "support": { "level": "disabled", "reason": "The 122B MoE model's full serving path is unfinished." },
-      "repository": "unsloth/Qwen3.5-122B-A10B-MTP-GGUF",
-      "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "UD-Q5_K_XL", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
-      "projector": { "path": "mmproj-BF16.gguf" },
-      "license": "apache-2.0",
+      "sources": [
+        {
+          "repository": "unsloth/Qwen3.5-122B-A10B-MTP-GGUF",
+          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q5", "format": "UD-Q5_K_XL", "variantLabel": "Q5", "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "quantizationAware": false}],
+          "projector": { "path": "mmproj-BF16.gguf" },
+          "license": "apache-2.0"
+        }
+      ],
       "artificialAnalysis": {
         "score": 15.6,
         "provenance": {
@@ -460,13 +508,18 @@
     {
       "id": "nemotron-3-super-120b-a12b",
       "displayName": "NVIDIA Nemotron 3 Super 120B-A12B",
+      "lab": "nvidia",
       "description": "Workstation-class hybrid MoE model designed for agentic workflows.",
       "releaseDate": "2026-03-11",
       "parameterization": { "architecture": "mixtureOfExperts", "totalParameters": 120000000000, "activeParameters": 12000000000 },
       "support": { "level": "disabled", "reason": "The 120B Super model's full serving path is unfinished." },
-      "repository": "unsloth/NVIDIA-Nemotron-3-Super-120B-A12B-GGUF",
-      "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4 QAT", "fidelityRank": 58, "quantizationAware": true}, {"variantId": "gguf:mxfp4", "format": "MXFP4_MOE", "variantLabel": "MXFP4 QAT", "fidelityRank": 58, "quantizationAware": true}],
-      "license": "nvidia-nemotron-open-model-license",
+      "sources": [
+        {
+          "repository": "unsloth/NVIDIA-Nemotron-3-Super-120B-A12B-GGUF",
+          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4 QAT", "quantizationAware": true}, {"variantId": "gguf:mxfp4", "format": "MXFP4_MOE", "variantLabel": "MXFP4 QAT", "quantizationAware": true}],
+          "license": "nvidia-nemotron-open-model-license"
+        }
+      ],
       "artificialAnalysis": {
         "score": 12.8,
         "provenance": {
@@ -478,64 +531,128 @@
       }
     },
     {
-      "id": "nemotron-3.5-lightning-30b-a3b",
-      "displayName": "Nemotron 3.5 Lightning 30B-A3B",
-      "description": "Efficient hybrid MoE model for local reasoning, coding, and agentic workflows.",
-      "releaseDate": "2026-08-11",
-      "parameterization": { "architecture": "mixtureOfExperts", "totalParameters": 30000000000, "activeParameters": 3000000000 },
+      "id": "nemotron-3.5-bolt-74b-a9b",
+      "displayName": "Nemotron 3.5 Bolt 74B-A9B",
+      "lab": "nvidia",
+      "description": "Compressed hybrid MoE vision model with 2-bit expert weights, sized for 24GB machines.",
+      "releaseDate": "2026-10-15",
+      "parameterization": { "architecture": "mixtureOfExperts", "totalParameters": 74000000000, "activeParameters": 9000000000 },
       "support": { "level": "supported" },
-      "repository": "ggml-org/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF",
-      "variants": [{"variantId": "gguf:nvfp4-qat", "format": "NVFP4", "variantLabel": "NVFP4 QAT", "fidelityRank": 60, "quantizationAware": true}, {"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
+      "sources": [
+        {
+          "repository": "nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF",
+          "variants": [{"variantId": "gguf:iq2-qat", "format": "IQ2_XXS", "path": "NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf", "variantLabel": "IQ2 QAT", "quantizationAware": true}],
+          "projector": { "path": "mmproj-NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf" },
+          "license": "openmdw-1.1"
+        }
+      ],
       "speculativeDecoding": {
-        "method": "dflash",
+        "method": "lilicorr",
         "draft": {
           "type": "file",
-          "repository": "magnitudedev/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash-GGUF",
-          "path": "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash.gguf"
+          "repository": "magnitudedev/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr-GGUF",
+          "path": "NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr.gguf"
         }
       },
-      "license": "openmdw-1.1",
       "artificialAnalysis": {
-        "score": 12.9,
+        "score": 19.0,
         "provenance": {
-          "kind": "artificialAnalysisIntelligenceIndex",
+          "kind": "estimate",
+          "target": "artificialAnalysisIntelligenceIndex",
           "methodologyVersion": "4.3.2",
-          "asOfDate": "2026-09-29",
-          "url": "https://artificialanalysis.ai/models/nemotron-3-5-lightning"
+          "asOfDate": "2026-10-15",
+          "methodology": "Scaled two measured anchors, Qwen3.6 35B-A3B (18.2) and Nemotron 3.5 Lightning (12.9), by the geometric mean of Nemotron 3.5 Bolt 74B-A9B 24GB benchmark ratios against each on the Intelligence Index components in NVIDIA's release comparison: GDPval-AA, Terminal-Bench, Humanity's Last Exam, AA-Omniscience accuracy and non-hallucination, SciCode and AA-LCR. The scaled estimates are approximately 19.5 and 18.5; their geometric mean rounds to 19.0. This is an estimated Intelligence Index, not a measured score.",
+          "evidenceUrls": [
+            "https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF",
+            "https://artificialanalysis.ai/models/qwen3-6-35b-a3b",
+            "https://artificialanalysis.ai/models/nemotron-3-5-lightning"
+          ]
         }
       }
     },
     {
-      "id": "deepseek-v4-flash",
-      "displayName": "DeepSeek V4 Flash 284B-A13B",
-      "description": "Frontier MoE model with a very large weight footprint and low active compute.",
-      "releaseDate": "2026-07-31",
-      "parameterization": { "architecture": "mixtureOfExperts", "totalParameters": 284000000000, "activeParameters": 13000000000 },
-      "support": { "level": "disabled", "reason": "DeepSeek V4 Flash hyper-connections and compressed attention are not implemented yet." },
-      "repository": "unsloth/DeepSeek-V4-Flash-0731-GGUF",
-      "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
-      "speculativeDecoding": { "method": "dspark", "draft": { "type": "file", "path": "dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf" } },
-      "license": "mit",
+      "id": "nemotron-3.5-super-vl-120b-a12b",
+      "displayName": "Nemotron 3.5 Super VL 120B-A12B",
+      "lab": "nvidia",
+      "description": "Workstation-class hybrid MoE vision model for reasoning, coding, and agentic workflows.",
+      "releaseDate": "2026-10-15",
+      "parameterization": { "architecture": "mixtureOfExperts", "totalParameters": 120000000000, "activeParameters": 12000000000 },
+      "support": { "level": "supported" },
+      "sources": [
+        {
+          "repository": "unsloth/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GGUF",
+          "variants": [{"variantId": "gguf:q2", "format": "UD-Q2_K_XL", "variantLabel": "Q2", "quantizationAware": false}, {"variantId": "gguf:q3", "format": "UD-Q3_K_XL", "variantLabel": "Q3", "quantizationAware": false}, {"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "quantizationAware": false}],
+          "projector": { "path": "mmproj-BF16.gguf" },
+          "license": "openmdw-1.1"
+        }
+      ],
+      "speculativeDecoding": {
+        "method": "lilicorr",
+        "draft": {
+          "type": "file",
+          "repository": "magnitudedev/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4-LiLiCorr-GGUF",
+          "path": "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4-LiLiCorr.gguf"
+        }
+      },
       "artificialAnalysis": {
-        "score": 34.3,
+        "score": 26.5,
         "provenance": {
           "kind": "artificialAnalysisIntelligenceIndex",
           "methodologyVersion": "4.3.2",
-          "asOfDate": "2026-09-29",
-          "url": "https://artificialanalysis.ai/models/deepseek-v4-flash"
+          "asOfDate": "2026-10-15",
+          "url": "https://artificialanalysis.ai/models/nemotron-3-5-super-vl"
         }
       }
+    },
+    {
+      "id": "deepseek-v4.1-flash",
+      "displayName": "DeepSeek V4.1 Flash 552B-A16B",
+      "lab": "deepseek",
+      "description": "Multimodal MoE model with a causal encoder-decoder, Engram memory and low active compute.",
+      "releaseDate": "2026-10-17",
+      "parameterization": { "architecture": "mixtureOfExperts", "totalParameters": 552000000000, "activeParameters": 16000000000 },
+      "support": { "level": "disabled", "reason": "DeepSeek V4.1 Flash is withheld: its output diverges from the reference on long non-repeating text (an unresolved precision defect)" },
+      "sources": [
+        {
+          "repository": "magnitudedev/DeepSeek-V4.1-Flash-1017-GGUF",
+          "variants": [{"variantId": "gguf:mxfp4", "format": "MXFP4_MOE", "variantLabel": "MXFP4 QAT", "quantizationAware": true}],
+          "license": "mit"
+        }
+      ],
+      "speculativeDecoding": { "method": "dspark", "draft": { "type": "file", "repository": "magnitudedev/DeepSeek-V4.1-Flash-1017-GGUF", "path": "DeepSeek-V4.1-Flash-1017-DSpark.gguf" } }
+    },
+    {
+      "id": "glm-5.3-flash",
+      "displayName": "GLM-5.3 Flash 321B-A18B",
+      "lab": "zai",
+      "description": "Multimodal MoE model with hybrid linear and latent attention, hyper-connections and low active compute.",
+      "releaseDate": "2026-08-25",
+      "parameterization": { "architecture": "mixtureOfExperts", "totalParameters": 321300000000, "activeParameters": 18000000000 },
+      "support": { "level": "disabled", "reason": "GLM-5.3 Flash is withheld until the whole model meets its bar: D11 on the full checkpoint, measured MTP acceptance and served throughput. It has no Artificial Analysis score yet." },
+      "sources": [
+        {
+          "repository": "magnitudedev/GLM-5.3-Flash-GGUF",
+          "variants": [{"variantId": "gguf:fp8", "format": "FP8", "variantLabel": "FP8", "quantizationAware": true}],
+          "projector": { "path": "mmproj-BF16.gguf" },
+          "license": "mit"
+        }
+      ]
     },
     {
       "id": "nemotron-3-ultra-550b-a55b",
       "displayName": "NVIDIA Nemotron 3 Ultra 550B-A55B",
+      "lab": "nvidia",
       "description": "Frontier workstation/server MoE model for exceptionally high-memory systems.",
       "releaseDate": "2026-06-04",
       "parameterization": { "architecture": "mixtureOfExperts", "totalParameters": 550000000000, "activeParameters": 55000000000 },
       "support": { "level": "disabled", "reason": "The 550B Ultra MXFP4 MoE serving path is unfinished." },
-      "repository": "unsloth/NVIDIA-Nemotron-3-Ultra-550B-A55B-GGUF",
-      "variants": [{"variantId": "gguf:mxfp4", "format": "MXFP4_MOE", "variantLabel": "MXFP4 QAT", "fidelityRank": 58, "quantizationAware": true}],
-      "license": "openmdw-1.1",
+      "sources": [
+        {
+          "repository": "unsloth/NVIDIA-Nemotron-3-Ultra-550B-A55B-GGUF",
+          "variants": [{"variantId": "gguf:mxfp4", "format": "MXFP4_MOE", "variantLabel": "MXFP4 QAT", "quantizationAware": true}],
+          "license": "openmdw-1.1"
+        }
+      ],
       "artificialAnalysis": {
         "score": 22.9,
         "provenance": {
@@ -549,14 +666,19 @@
     {
       "id": "glm-5.2",
       "displayName": "GLM 5.2 753B-A40B",
+      "lab": "zai",
       "description": "Largest catalog tier, intended only for exceptionally high-memory systems.",
       "releaseDate": "2026-06-16",
       "parameterization": { "architecture": "mixtureOfExperts", "totalParameters": 753329940480, "activeParameters": 40000000000 },
       "support": { "level": "disabled", "reason": "GLM DSA attention and its indexer are not implemented yet." },
-      "repository": "unsloth/GLM-5.2-GGUF",
-      "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "UD-Q5_K_XL", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
+      "sources": [
+        {
+          "repository": "unsloth/GLM-5.2-GGUF",
+          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "quantizationAware": false}, {"variantId": "gguf:q5", "format": "UD-Q5_K_XL", "variantLabel": "Q5", "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "quantizationAware": false}],
+          "license": "mit"
+        }
+      ],
       "speculativeDecoding": { "method": "mtp", "draft": { "type": "embedded" } },
-      "license": "mit",
       "artificialAnalysis": {
         "score": 33.7,
         "provenance": {

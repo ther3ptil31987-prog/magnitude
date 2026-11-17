@@ -3,8 +3,8 @@
 //! projection (`attention_output` over one head of `channels`).
 //! `short_conv_rows` declares no parameters.
 
-use super::cases::projection_shape;
-use super::{row_points, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits};
+use super::cases::{packing_statics, projection_shape, scale_extent, scale_statics};
+use super::{EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points};
 use crate::ShortConvBinding;
 use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::{attention_output, short_conv_project};
@@ -25,8 +25,17 @@ pub(crate) struct ShortConvProjectCase {
     output_gate: Tensor,
     value: Tensor,
     epsilon: f32,
-    absent_scale: Tensor,
+    /// The input gate's, output gate's and value's scales.
+    scales: [Tensor; 3],
 }
+
+/// The short convolution's projections, in `short_conv_project`'s order (its
+/// B, C and X weights).
+const PROJECTIONS: [WeightKind; 3] = [
+    WeightKind::ShortConvInputGate,
+    WeightKind::ShortConvOutputGate,
+    WeightKind::ShortConvValue,
+];
 
 impl ShortConvProjectTuning {
     fn elements(&self) -> short_conv_project::Elements {
@@ -63,11 +72,7 @@ impl EntryTuning for ShortConvProjectTuning {
 
     fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let shape = self.binding.shape;
-        for kind in [
-            WeightKind::ShortConvInputGate,
-            WeightKind::ShortConvOutputGate,
-            WeightKind::ShortConvValue,
-        ] {
+        for kind in PROJECTIONS {
             if projection_shape(inputs, &self.scopes, kind)? != (shape.channels, shape.hidden) {
                 return Err(format!(
                     "the short convolution {kind:?} projection disagrees with the binding"
@@ -76,7 +81,12 @@ impl EntryTuning for ShortConvProjectTuning {
         }
         let [_, statics @ ..] = shape.project_dimensions(0);
         let mut statics = statics.to_vec();
-        statics.extend([("BS", 0), ("CS", 0), ("XS", 0)]);
+        let [b, c, x] = PROJECTIONS;
+        statics.extend(scale_statics(
+            inputs,
+            &self.scopes,
+            &[("BS", Some(b)), ("CS", Some(c)), ("XS", Some(x))],
+        )?);
         Ok(statics)
     }
 
@@ -88,7 +98,7 @@ impl EntryTuning for ShortConvProjectTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, seismic::BuildError> {
         let hidden = self.binding.shape.hidden;
         TuningInputs::rotation_scopes(&self.scopes, point)
             .into_iter()
@@ -105,7 +115,12 @@ impl EntryTuning for ShortConvProjectTuning {
                     output_gate: inputs.weight(scope, WeightKind::ShortConvOutputGate)?,
                     value: inputs.weight(scope, WeightKind::ShortConvValue)?,
                     epsilon: self.epsilon,
-                    absent_scale: inputs.activation(Element::f32(), &[0], 0)?,
+                    scales: {
+                        let scale =
+                            |kind| inputs.unit_scale(inputs.scale_extent(scope, kind)?);
+                        let [b, c, x] = PROJECTIONS;
+                        [scale(b)?, scale(c)?, scale(x)?]
+                    },
                 })
             })
             .collect()
@@ -119,9 +134,9 @@ impl EntryTuning for ShortConvProjectTuning {
             c_weight: &case.output_gate,
             x_weight: &case.value,
             eps: case.epsilon,
-            b_scale: &case.absent_scale,
-            c_scale: &case.absent_scale,
-            x_scale: &case.absent_scale,
+            b_scale: &case.scales[0],
+            c_scale: &case.scales[1],
+            x_scale: &case.scales[2],
         }
     }
 
@@ -138,8 +153,11 @@ pub(crate) struct ShortConvOutputTuning {
 
 pub(crate) struct ShortConvOutputCase {
     hidden: Tensor,
+    inject: Tensor,
     gated: Tensor,
     output: Tensor,
+    scale: Tensor,
+    bound: Tensor,
 }
 
 impl EntryTuning for ShortConvOutputTuning {
@@ -168,7 +186,17 @@ impl EntryTuning for ShortConvOutputTuning {
             );
         }
         let [_, statics @ ..] = shape.output_dimensions(0);
-        Ok(statics.to_vec())
+        let mut statics = statics.to_vec();
+        statics.push((
+            "OS",
+            scale_extent(inputs, &self.scopes, WeightKind::RecurrentOutput)?,
+        ));
+        statics.extend(packing_statics(
+            inputs,
+            &self.scopes,
+            &[("OB", Some(WeightKind::RecurrentOutput))],
+        )?);
+        Ok(statics)
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
@@ -179,7 +207,7 @@ impl EntryTuning for ShortConvOutputTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, seismic::BuildError> {
         let shape = self.binding.shape;
         TuningInputs::rotation_scopes(&self.scopes, point)
             .into_iter()
@@ -192,12 +220,16 @@ impl EntryTuning for ShortConvOutputTuning {
                         &[point.rows, shape.hidden],
                         seed + 1,
                     )?,
+                    inject: inputs.activation(Element::f32(), &[point.rows, 0], seed + 3)?,
                     gated: inputs.activation(
                         self.binding.activation,
                         &[point.rows, 1, shape.channels],
                         seed + 2,
                     )?,
                     output: inputs.weight(scope, WeightKind::RecurrentOutput)?,
+                    scale: inputs
+                        .unit_scale(inputs.scale_extent(scope, WeightKind::RecurrentOutput)?)?,
+                    bound: inputs.bound(scope, WeightKind::RecurrentOutput)?,
                 })
             })
             .collect()
@@ -206,13 +238,16 @@ impl EntryTuning for ShortConvOutputTuning {
     fn args<'a>(case: &'a mut Self::Case) -> attention_output::Args<'a> {
         attention_output::Args {
             hidden: &case.hidden,
+            inject: &case.inject,
             gated: &case.gated,
             output_weight: &case.output,
+            output_scale: &case.scale,
+            output_bound: &case.bound,
         }
     }
 
     generated_entry!(attention_output, this => attention_output::Elements {
         OW: this.binding.output,
         A: this.binding.activation,
-    }, rounded to this.binding.activation);
+    });
 }

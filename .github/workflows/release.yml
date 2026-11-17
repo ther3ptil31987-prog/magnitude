@@ -138,6 +138,7 @@ jobs:
       validate_candidate: false
       apple_distribution: true
       windows_distribution: true
+      docker_repository: magnitudedev/magnitude
     secrets: inherit
 
   publish:
@@ -161,7 +162,7 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
       - run: bun install --frozen-lockfile
-      - run: sudo apt-get update && sudo apt-get install -y binutils rpm xvfb dbus-x11 xfwm4 x11-utils xauth desktop-file-utils libglib2.0-bin
+      - run: sudo apt-get update && sudo apt-get install -y binutils rpm libarchive-tools xvfb dbus-x11 xfwm4 x11-utils xauth desktop-file-utils libglib2.0-bin
       - uses: actions/download-artifact@v4
         with:
           pattern: host-*
@@ -203,12 +204,6 @@ jobs:
           MAGNITUDE_RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
           MAGNITUDE_SOURCE_COMMIT: ${{ needs.preflight.outputs.source_commit }}
           MAGNITUDE_REQUIRE_RELEASE: "true"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: accepted-integrations
-          path: release/integration-candidate
-          if-no-files-found: ignore
-          overwrite: true
       - name: Verify the complete Apple distribution before any publication
         run: bun packages/release/scripts/apple/verify-receipts.ts release-artifacts release-candidate
         env:
@@ -227,6 +222,21 @@ jobs:
           DISTRIBUTION_PUBLISHER_DATABASE_URL: ${{ secrets.DISTRIBUTION_PUBLISHER_DATABASE_URL }}
           DISTRIBUTION_DATABASE_CA: ${{ secrets.DISTRIBUTION_DATABASE_CA }}
           GH_TOKEN: ${{ github.token }}
+  # The build pushed the candidate's image untagged and smoke-tested it before anything was
+  # published; tagging it is all that is left. If this fails, re-run this job.
+  docker:
+    permissions:
+      contents: read
+    needs: [preflight, publish]
+    if: needs.preflight.outputs.action == 'release'
+    uses: ./.github/workflows/docker-tags.yml
+    with:
+      version: ${{ needs.preflight.outputs.version }}
+      ref: ${{ needs.preflight.outputs.source_commit }}
+      repository: magnitudedev/magnitude
+      channel_tag: true
+    secrets:
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
   register-metadata:
     needs: preflight
     if: needs.preflight.outputs.action == 'register-metadata'

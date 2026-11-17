@@ -1,43 +1,102 @@
-use super::policy::{
-    fit_capacities, refresh_device_ceiling, DomainRole, MemoryPolicyError, MemoryReserves,
-};
-use super::selection::{select, DeviceRequest, SelectionError};
+use super::policy::{MemoryPolicyError, ReleaseRate};
+use super::selection::{DeviceRequest, SelectionError, select};
+use crate::planning::HostTier;
 use crate::{CatalogError, ExecutionPath};
 use seismic::{
-    ArtifactStore, Device, DeviceCatalog, DeviceInfo, DeviceOptions, DeviceSelector,
-    ObservationError, OpenError, ResolveError,
+    Device, DeviceOptions, Devices, Executor, ExecutorSelector, OpenError,
+    ResolveError, Contract,
 };
 use std::fmt;
-use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct PlatformConfig {
     pub path: ExecutionPath,
-    /// Where the device keeps formed kernels between loads.
-    pub artifacts: Option<Arc<dyn ArtifactStore>>,
-    /// The host's threshold policy the opened device's ceiling keeps.
-    pub reserves: MemoryReserves,
+    /// What its graphs hold, as the selection read it; none to measure it
+    /// on opening.
+    pub graph_cost: Option<seismic::GraphCost>,
 }
 
-/// The automatically selected device and its stable assessment capacity.
-/// Planning input only: it reserves nothing and guarantees no later load.
+/// The automatically selected device. Planning input only: it reserves
+/// nothing and guarantees no later load, and it sizes none: a load is sized
+/// from the ledger's reading, an assessment from its stable fit's room
+/// (`planning::StableRoom`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SelectedDevice {
-    pub info: DeviceInfo,
-    /// The allocation domain's stable fit capacity: its capacity, bounded
-    /// by process limits and working-set advice, less its planning reserve.
-    pub assessment_capacity_bytes: u64,
-    /// Whether the device forms Metal tensor operations
-    /// (`DeviceInfo::forms_tensor_operations`, the probe its opened device
-    /// runs): graphs are planned and assessed for the kernel forms that
-    /// exist only with them.
-    pub tensor_operations: bool,
+    /// The executor, whose reported capabilities graphs are planned and
+    /// assessed for (`Executor::forms_tensor_operations`).
+    pub info: Executor,
+    /// The executor's identity in the topology it was selected from, which
+    /// keys what is measured of it.
+    pub identity: seismic::Identity,
+    /// How an expert bank's host tier is held on this device, where it has
+    /// one ([`host_tier`]).
+    pub host_tier: Option<HostTier>,
+    /// What the selection's fit questions read, so the assessment asks `Fit`
+    /// of a demand again (`planning::StableRoom`).
+    pub reading: FitReading,
+    /// What a plan prices the executor's recorded graphs at
+    /// ([`GraphPricing`]).
+    pub graph_cost: GraphPricing,
+}
+
+/// What a selected executor's recorded graphs are priced at for their
+/// census: the device's own cost, or its backend's bound until that is
+/// measured. It serializes as which of the two it is and the cost, which is
+/// how it enters an identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "pricing", content = "cost", rename_all = "snake_case")]
+pub enum GraphPricing {
+    /// As its backend measured it (`seismic::Devices::graph_cost`), on
+    /// opening the device or by the measurement job
+    /// (`assessment::GraphMemory`).
+    Measured(seismic::GraphCost),
+    /// Its backend's bound (`seismic::unmeasured_graph_cost`), until the
+    /// measurement job stores the device's own: a load requests that of the
+    /// job (`assessment::PointRequest::GraphCost`), and later loads read it.
+    Bound(seismic::GraphCost),
+}
+
+impl GraphPricing {
+    /// The cost a plan charges its graphs at.
+    pub fn cost(self) -> seismic::GraphCost {
+        match self {
+            Self::Measured(cost) | Self::Bound(cost) => cost,
+        }
+    }
+}
+
+/// The stores and grants a fit question reads, as one reading
+/// of them found: `Fit`'s inputs, which alone interprets them, kept for a
+/// later question of the same reading.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FitReading {
+    pub topology: seismic::DeviceTopology,
+    pub status: seismic::Status,
+    pub release: ReleaseRate,
+}
+
+/// How an expert bank's host tier is held on `executor`: where its
+/// `Shared` storage lies in the store of its `DeviceOnly` storage (unified
+/// memory), the tier is the bank itself; elsewhere host RAM is a tier of
+/// its own across the link, a granule pool of `Shared` storage; none where
+/// the executor places no `Shared` storage.
+/// Every backend's decode entries read tier records in place; only a
+/// linked tier's are promoted ([`HostTier::Linked`]). The host lands and
+/// converts file misses into a linked tier's records in place; on unified
+/// memory the device converts them into the bank's, its parking the
+/// executor's backend's ([`crate::planning::Parking::of`]).
+pub fn host_tier(topology: &seismic::DeviceTopology, executor: &Executor) -> Option<HostTier> {
+    topology.first_store(executor, Contract::Shared)?;
+    Some(match topology.shared_ranges_lie_in_device_memory(executor) {
+        true => HostTier::Unified(crate::planning::Parking::of(executor.backend())),
+        false => HostTier::Linked,
+    })
 }
 
 /// The selected device, resolved and opened in the executing process,
 /// admitted against its fresh observations.
 pub struct OpenedPlatform {
-    selector: DeviceSelector,
+    selector: ExecutorSelector,
     device: Device,
 }
 
@@ -46,7 +105,7 @@ impl OpenedPlatform {
         &self.device
     }
 
-    pub fn selector(&self) -> DeviceSelector {
+    pub fn selector(&self) -> ExecutorSelector {
         self.selector
     }
 
@@ -58,7 +117,6 @@ impl OpenedPlatform {
 #[derive(Debug)]
 pub enum PlatformError {
     Selection(SelectionError),
-    Observation(ObservationError),
     Memory(MemoryPolicyError),
     Resolve(ResolveError),
     Open(OpenError),
@@ -67,13 +125,13 @@ pub enum PlatformError {
         outcome: String,
     },
     Qualification(CatalogError),
+    Records(crate::assessment::ExecutorCostsError),
 }
 
 impl fmt::Display for PlatformError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Selection(error) => write!(formatter, "{error}"),
-            Self::Observation(error) => write!(formatter, "{error}"),
             Self::Memory(error) => write!(formatter, "{error}"),
             Self::Resolve(error) => write!(formatter, "{error}"),
             Self::Open(error) => write!(formatter, "{error}"),
@@ -81,59 +139,118 @@ impl fmt::Display for PlatformError {
                 write!(formatter, "platform rejected path {path}: {outcome}")
             }
             Self::Qualification(error) => write!(formatter, "{error}"),
+            Self::Records(error) => write!(formatter, "{error}"),
         }
     }
 }
 
 impl std::error::Error for PlatformError {}
 
-/// Automatic selection and stable assessment against the current topology.
+/// Automatic selection and stable assessment against the current topology,
+/// its graph cost measured by opening the device: what a tool selects by. A
+/// load and an assessment select by [`select_recorded`], which measures
+/// nothing.
 pub fn select_device(
-    catalog: &DeviceCatalog,
+    catalog: &Devices,
     path: ExecutionPath,
     request: DeviceRequest,
-    reserves: &MemoryReserves,
+    release: &ReleaseRate,
 ) -> Result<SelectedDevice, PlatformError> {
     enforce_phase_one(path)?;
     let topology = catalog.topology();
     let info = select(&topology, path, request).map_err(PlatformError::Selection)?;
-    let host = catalog
-        .host_memory_status()
-        .map_err(PlatformError::Observation)?;
-    let assessment_capacity_bytes = fit_capacities(&topology, &info, &host, reserves)
-        .map_err(PlatformError::Memory)?
-        .into_iter()
-        .find(|(role, _)| *role == DomainRole::Allocation)
-        .expect("fit capacities include the allocation domain")
-        .1
-        .fit_bytes();
-    Ok(SelectedDevice {
-        tensor_operations: info.forms_tensor_operations(),
-        info,
-        assessment_capacity_bytes,
+    let status = catalog.status(&topology, info.id());
+    // Read after the status, whose fit the opening the measurement takes
+    // must not lower.
+    let graph_cost = catalog.graph_cost(info.id()).map_err(PlatformError::Open)?;
+    Ok(selected(&topology, &status, release, info, GraphPricing::Measured(graph_cost)))
+}
+
+/// [`select_device`] with no device opened and nothing measured, what a
+/// load and an assessment select by: its graph cost as the kernel cache at
+/// `root` records it (`assessment::GraphMemory`), or, without a cache or
+/// until the measurement job stored it there, its backend's bound
+/// (`seismic::unmeasured_graph_cost`), so a load always plans, charges and
+/// records its graphs.
+pub fn select_recorded(
+    catalog: &Devices,
+    path: ExecutionPath,
+    request: DeviceRequest,
+    release: &ReleaseRate,
+    root: Option<&std::path::Path>,
+) -> Result<SelectedDevice, PlatformError> {
+    enforce_phase_one(path)?;
+    let topology = catalog.topology();
+    let info = select(&topology, path, request).map_err(PlatformError::Selection)?;
+    let status = catalog.status(&topology, info.id());
+    let graph_cost = graph_pricing(&topology, &info, root)?;
+    Ok(selected(&topology, &status, release, info, graph_cost))
+}
+
+/// What `info`'s graphs are priced at from the kernel cache at `root`: the
+/// device's own cost once the measurement job recorded it there, its
+/// backend's bound until then and without a cache.
+pub fn graph_pricing(
+    topology: &seismic::DeviceTopology,
+    info: &Executor,
+    root: Option<&std::path::Path>,
+) -> Result<GraphPricing, PlatformError> {
+    let recorded = match root {
+        Some(root) => {
+            let records = crate::KernelCache::measurement_records(root);
+            crate::assessment::GraphMemory::stored(topology, info, &records).map_err(PlatformError::Records)?
+        }
+        None => None,
+    };
+    Ok(match recorded {
+        Some(recorded) => GraphPricing::Measured(recorded),
+        None => GraphPricing::Bound(seismic::unmeasured_graph_cost(info.backend())),
     })
 }
 
-/// Resolve the selected identity in this process's catalog, open it, set a
-/// ceiling from fresh scoped availability above the planning reserve, and
-/// enforce it in Seismic.
+/// `info`, of `topology`, as selected under `status` and `release`: its host
+/// tier, the reading its fit questions read, and its graph cost.
+pub fn selected(
+    topology: &seismic::DeviceTopology,
+    status: &seismic::Status,
+    release: &ReleaseRate,
+    info: Executor,
+    graph_cost: GraphPricing,
+) -> SelectedDevice {
+    SelectedDevice {
+        graph_cost,
+        host_tier: host_tier(topology, &info),
+        identity: topology
+            .executor_identity(info.id())
+            .expect("the selected executor is of the topology it was selected from"),
+        info,
+        reading: FitReading { topology: topology.clone(), status: status.clone(), release: *release },
+    }
+}
+
+/// Resolve the selected identity in this process's catalog and open it.
 /// Never substitutes another device.
 pub fn open_selected(
-    catalog: &DeviceCatalog,
-    selector: DeviceSelector,
+    catalog: &Devices,
+    selector: ExecutorSelector,
     config: PlatformConfig,
 ) -> Result<OpenedPlatform, PlatformError> {
     enforce_phase_one(config.path)?;
     let id = catalog.resolve(selector).map_err(PlatformError::Resolve)?;
+    // The device charges the process's ledger of each store it reaches.
+    let stores = crate::memory::ledger::Ledgers::process().stores(catalog.reached_stores(id));
     let device = catalog
-        .open_with(
+        .open_in(
             id,
+            // The device forms through the process's one store
+            // (`seismic::ProgramStore::user`).
             DeviceOptions {
-                artifacts: config.artifacts,
+                artifacts: None,
+                graph_cost: config.graph_cost,
             },
+            stores,
         )
         .map_err(PlatformError::Open)?;
-    refresh_device_ceiling(catalog, &device, &config.reserves).map_err(PlatformError::Memory)?;
     Ok(OpenedPlatform { selector, device })
 }
 
@@ -165,16 +282,15 @@ mod tests {
 
     #[test]
     fn opening_an_unknown_selector_never_substitutes_a_device() {
-        let catalog = DeviceCatalog::discover().unwrap();
-        let missing = DeviceSelector::Metal { registry_id: 0 };
+        let catalog = Devices::discover(&[]).unwrap();
+        let missing = ExecutorSelector::Metal { registry_id: 0 };
         assert!(matches!(
             open_selected(
                 &catalog,
                 missing,
                 PlatformConfig {
                     path: ExecutionPath::Native,
-                    artifacts: None,
-                    reserves: MemoryReserves::standard(),
+                    graph_cost: None,
                 },
             ),
             Err(PlatformError::Resolve(ResolveError::Missing(selector))) if selector == missing

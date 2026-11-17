@@ -4,15 +4,14 @@ use magnitude_artifacts::{
 };
 use magnitude_family_common::headers::{self, add_tensor, set as set_metadata};
 use magnitude_family_contracts::{
-    ActivationFunction, AttentionGate, FeedForwardUp, HeadNorm, HistoryDomain, ImportTransform,
-    InputNorm, KeyValue, ModelDefinition, ModelFamily, Operator, OutputForm, Rotary,
+    ActivationFunction, AttentionGate, FeedForwardUp, HeadNorm, HistoryReads, HistoryRows,
+    HistorySource, ImportTransform, InputNorm, ModelDefinition, ProjectedRows, RowProducer,
+    TokenDomain, ModelFamily, Operator, OutputForm, OutputProjection,
+    QueryProjection, Rotary,
 };
-use magnitude_family_llama::{inspect_components, recognize, Error, LlamaFamily};
-
-const VARIANTS: [&str; 2] = [
-    "minicpm5-2b__target-gguf_q4.json",
-    "minicpm5-2b__target-gguf_q8.json",
-];
+use magnitude_artifacts::UnsupportedReason;
+use magnitude_family_contracts::FamilyError;
+use magnitude_family_llama::{admit, inspect_components, Error, Feature, LlamaFamily};
 
 fn identity() -> PackageIdentity {
     PackageIdentity {
@@ -25,18 +24,14 @@ fn inspect(directory: &Directory) -> Result<ModelDefinition, Error> {
     inspect_components(directory, None, identity())
 }
 
+/// MiniCPM5 2B Q4_K_M, a pinned artifact: the catalog lists no llama target.
 fn minicpm5() -> Directory {
-    headers::directory(VARIANTS[0])
+    headers::artifact("minicpm5-2b-q4")
 }
 
 #[test]
-fn every_minicpm5_variant_binds_the_admitted_feature_set() {
-    let definitions = VARIANTS.map(|file| {
-        inspect(&headers::directory(file)).unwrap_or_else(|error| panic!("{file}: {error}"))
-    });
-    // Variants differ only in encodings, which the definition does not carry.
-    assert_eq!(definitions[0], definitions[1]);
-    let model = &definitions[0];
+fn minicpm5_binds_the_admitted_feature_set() {
+    let model = &inspect(&minicpm5()).unwrap();
     assert_eq!(model.family.0, "llama");
     assert!(model.deferred_forms().is_empty());
     assert!(model.head.is_none() && model.vision.is_none());
@@ -68,22 +63,29 @@ fn every_minicpm5_variant_binds_the_admitted_feature_set() {
         assert_eq!(attention.gate, AttentionGate::None);
         assert_eq!(attention.query_norm, HeadNorm::None);
         assert_eq!(attention.scale, 1.0 / 128f64.sqrt());
-        let KeyValue::Owned {
-            key,
-            key_norm,
-            domain,
-            ..
-        } = &attention.key_value
+        let [HistorySource {
+            rows:
+                HistoryRows::Own(RowProducer::Projected(ProjectedRows {
+                    key,
+                    key_norm,
+                    domain,
+                    ..
+                })),
+            reads: HistoryReads::Visible,
+        }] = &attention.history[..]
         else {
             panic!("every layer owns its history");
         };
         assert_eq!(*key_norm, HeadNorm::None);
-        assert_eq!(*domain, HistoryDomain::Token);
+        assert_eq!(*domain, TokenDomain::Token);
         assert_eq!(key.shape, [256, 2048]);
-        assert_eq!(attention.query.shape, [2048, 2048]);
+        let QueryProjection::Full(query) = &attention.query else {
+            panic!("the query is projected whole");
+        };
+        assert_eq!(query.shape, [2048, 2048]);
         // Query and key rows move from adjacent pairs to half-split pairs;
         // values and outputs are consumed as stored.
-        for descriptor in [&attention.query, key] {
+        for descriptor in [query, key] {
             let [ImportTransform::PermuteRows { order }] = descriptor.transforms.as_slice() else {
                 panic!("{} carries one row permutation", descriptor.name);
             };
@@ -95,7 +97,10 @@ fn every_minicpm5_variant_binds_the_admitted_feature_set() {
                 descriptor.shape
             );
         }
-        assert!(attention.output.transforms.is_empty());
+        assert!(matches!(
+            &attention.output,
+            OutputProjection::Full(output) if output.transforms.is_empty()
+        ));
         let Rotary::Table { pairs, .. } = &attention.rotary else {
             panic!("full-width rotary table");
         };
@@ -111,6 +116,7 @@ fn every_minicpm5_variant_binds_the_admitted_feature_set() {
             ffn.up,
             FeedForwardUp::Gated {
                 activation: ActivationFunction::Silu,
+                limit: None,
                 ..
             }
         ));
@@ -120,19 +126,19 @@ fn every_minicpm5_variant_binds_the_admitted_feature_set() {
 }
 
 #[test]
-fn claims_no_other_catalog_component() {
-    for (model, role, file) in headers::index() {
-        let expected = model == "minicpm5-2b" && role.starts_with("target-");
-        assert_eq!(
-            LlamaFamily.recognizes(&headers::directory(&file)),
-            expected,
-            "{file}"
+fn claims_no_catalog_component() {
+    for component in headers::index() {
+        assert!(
+            !LlamaFamily.recognizes(&headers::component(component)),
+            "{} {}",
+            component.model,
+            component.role
         );
     }
 }
 
 #[test]
-fn features_outside_the_admitted_set_are_not_recognized() {
+fn features_outside_the_admitted_set_are_each_refused_by_name() {
     let mut scaled = minicpm5();
     set_metadata(
         &mut scaled,
@@ -140,32 +146,34 @@ fn features_outside_the_admitted_set_are_not_recognized() {
         Value::Scalar(Scalar::String("yarn".into())),
     );
     assert_eq!(
-        recognize(&scaled),
-        Err(Error::UnknownMetadata("llama.rope.scaling.type".into()))
+        admit(&scaled),
+        Err(Error::Unadmitted(vec![Feature::RopeScaling("yarn".into())]))
     );
 
     let mut per_layer = minicpm5();
     set_metadata(
         &mut per_layer,
         "llama.attention.head_count_kv",
-        Value::Array(vec![Scalar::Unsigned(2); 42]),
+        Value::Array(vec![2_u64; 42].into()),
     );
     assert_eq!(
-        recognize(&per_layer),
-        Err(Error::PerLayerMetadata(
+        admit(&per_layer),
+        Err(Error::Unadmitted(vec![Feature::PerLayerMetadata(
             "llama.attention.head_count_kv".into()
-        ))
+        )]))
     );
 
-    let mut foreign = minicpm5();
+    let mut unknown = minicpm5();
     set_metadata(
-        &mut foreign,
-        "minicpm.scale_emb",
+        &mut unknown,
+        "llama.embedding_scale",
         Value::Scalar(Scalar::Float(12.0)),
     );
     assert_eq!(
-        recognize(&foreign),
-        Err(Error::UnknownMetadata("minicpm.scale_emb".into()))
+        admit(&unknown),
+        Err(Error::Unadmitted(vec![Feature::UnknownMetadata(
+            "llama.embedding_scale".into()
+        )]))
     );
 
     for role in [
@@ -176,12 +184,42 @@ fn features_outside_the_admitted_set_are_not_recognized() {
     ] {
         let mut extra = minicpm5();
         add_tensor(&mut extra, role, &[128]);
-        assert_eq!(recognize(&extra), Err(Error::UnboundWeight(role.into())));
+        assert_eq!(
+            admit(&extra),
+            Err(Error::Unadmitted(vec![Feature::Tensor(role.into())]))
+        );
     }
 
     let mut tied = minicpm5();
     tied.tensors.retain(|tensor| tensor.name != "output.weight");
-    assert_eq!(recognize(&tied), Err(Error::TiedOutput));
+    assert_eq!(admit(&tied), Err(Error::Unadmitted(vec![Feature::TiedOutput])));
+
+    // Every refused feature is named at once, and the family error carries
+    // each as a reason.
+    let mut several = minicpm5();
+    add_tensor(&mut several, "rope_freqs.weight", &[64]);
+    several.tensors.retain(|tensor| tensor.name != "output.weight");
+    set_metadata(
+        &mut several,
+        "llama.rope.scaling.type",
+        Value::Scalar(Scalar::String("llama3".into())),
+    );
+    let error = FamilyError::from(inspect(&several).unwrap_err());
+    assert_eq!(
+        error.reasons,
+        [
+            UnsupportedReason::RopeScaling {
+                kind: "llama3".into()
+            },
+            UnsupportedReason::UnrecognizedTensor {
+                name: "rope_freqs.weight".into()
+            },
+            UnsupportedReason::TiedOutputHead,
+        ]
+    );
+    // The family still claims the architecture, so the refusal names the
+    // features instead of disowning the file.
+    assert!(LlamaFamily.recognizes(&several));
 
     let mut other = minicpm5();
     set_metadata(
@@ -190,9 +228,28 @@ fn features_outside_the_admitted_set_are_not_recognized() {
         Value::Scalar(Scalar::String("mistral3".into())),
     );
     assert_eq!(
-        recognize(&other),
+        admit(&other),
         Err(Error::Architecture(Some("mistral3".into())))
     );
+}
+
+#[test]
+fn namespaces_that_configure_nothing_are_ignored() {
+    let mut stamped = minicpm5();
+    for key in [
+        "mradermacher.quantize_version",
+        "mradermacher.quantized_by",
+        "unsloth.version",
+        "imatrix.dataset",
+        "quantize.imatrix.file",
+        "split.count",
+        "general.quantized_by",
+        "minicpm.scale_emb",
+    ] {
+        set_metadata(&mut stamped, key, Value::Scalar(Scalar::String("x".into())));
+    }
+    assert_eq!(admit(&stamped), Ok(()));
+    assert_eq!(inspect(&stamped), inspect(&minicpm5()));
 }
 
 #[test]
@@ -226,7 +283,7 @@ fn recognized_packages_are_bound_strictly() {
     add_tensor(&mut beyond, "blk.42.attn_norm.weight", &[2048]);
     assert_eq!(
         inspect(&beyond),
-        Err(Error::UnboundWeight("blk.42.attn_norm.weight".into()))
+        Err(Error::UnboundWeights(vec!["blk.42.attn_norm.weight".into()]))
     );
 
     let mut unsized_vocabulary = minicpm5();
@@ -259,4 +316,23 @@ fn recognized_packages_are_bound_strictly() {
         inspect_components(&target, Some(&target), identity()),
         Err(Error::Projector)
     );
+}
+
+/// Absent head widths and rotary dimension read as llama.cpp reads them: the embedding width per
+/// head, and the whole head (Mistral 7B v0.3's GGUFs state none of them).
+#[test]
+fn absent_head_widths_are_the_embedding_width_per_head() {
+    let stated = inspect(&minicpm5()).unwrap();
+    let mut absent = minicpm5();
+    let hidden = absent.value("llama.embedding_length").and_then(Value::unsigned).unwrap();
+    let heads = absent.value("llama.attention.head_count").and_then(Value::unsigned).unwrap();
+    let width = absent.value("llama.attention.key_length").and_then(Value::unsigned).unwrap();
+    assert_eq!(hidden / heads, width, "this header's widths are the defaults");
+    absent.metadata.retain(|entry| {
+        !matches!(
+            entry.name.as_str(),
+            "llama.attention.key_length" | "llama.attention.value_length" | "llama.rope.dimension_count"
+        )
+    });
+    assert_eq!(inspect(&absent).unwrap(), stated);
 }

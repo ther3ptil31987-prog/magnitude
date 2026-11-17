@@ -8,15 +8,17 @@ use magnitude_executor::platform::{
     DeviceRequest, MemoryPolicyError, PlatformError, SelectionError,
 };
 use magnitude_executor::{CatalogError, CatalogFailure, GraphError, PlanError};
-use crate::census::MemoryDomain;
-use seismic::{DeviceSelector, ResolveError as SeismicResolveError};
+pub use magnitude_artifacts::{UnsupportedReason, WeightTypeCount};
+use magnitude_family_contracts::FamilyError;
+use seismic::ResolveError as SeismicResolveError;
+use seismic::StoreIdentity;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Why a loaded model stopped serving.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UnloadCause {
-    /// Headroom stayed at or below the planning reserve after every release
+    /// Headroom ran out after every release
     /// (engine memory policy): the engine unloaded itself.
     MemoryPressure,
     /// The host asked the worker to shut down.
@@ -70,52 +72,90 @@ impl fmt::Display for ArtifactError {
     }
 }
 
-/// Material this engine cannot execute here. Never retryable.
+/// Material this engine cannot execute here, with every cause the engine
+/// names and the developer text describing the refusal. `reasons` is never
+/// empty. Never retryable.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum UnsupportedModel {
-    /// No registered model family recognizes the target.
-    Family { reason: String },
-    /// The family recognizes it, but a representation, topology, tokenizer or
-    /// template is outside what the engine executes.
-    Representation { reason: String },
-    /// The selected backend cannot execute the model's program plan.
-    Backend { backend: String, reason: String },
-    /// A kernel call of the model's program has statics outside the
-    /// kernel's domain on the backend: no configuration executes them.
-    KernelDomain {
-        backend: String,
-        entry: String,
-        /// The call's static dimensions, by name.
-        statics: Vec<(String, u64)>,
-    },
+pub struct UnsupportedModel {
+    pub reasons: Vec<UnsupportedReason>,
+    pub detail: String,
+}
+
+impl UnsupportedModel {
+    pub fn new(reasons: Vec<UnsupportedReason>, detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        debug_assert!(!reasons.is_empty(), "a refusal names no reason: {detail}");
+        Self { reasons, detail }
+    }
+
+    pub fn reason(reason: UnsupportedReason, detail: impl Into<String>) -> Self {
+        Self::new(vec![reason], detail)
+    }
+
+    /// Material whose header does not describe a model the engine can
+    /// build.
+    pub fn unreadable(detail: impl Into<String>) -> Self {
+        Self::reason(UnsupportedReason::Unreadable, detail)
+    }
+
+    /// A drafter or projector that disagrees with the target it is bound
+    /// to.
+    pub fn mismatch(detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        Self::reason(
+            UnsupportedReason::TargetMismatch {
+                detail: detail.clone(),
+            },
+            detail,
+        )
+    }
+
+    /// The refusals of independent checks as one: every distinct reason in
+    /// order, and every detail. `None` when nothing was refused.
+    pub fn union(refusals: Vec<Self>) -> Option<Self> {
+        if refusals.is_empty() {
+            return None;
+        }
+        let mut reasons = Vec::new();
+        let mut details = Vec::with_capacity(refusals.len());
+        for refusal in refusals {
+            for reason in refusal.reasons {
+                if !reasons.contains(&reason) {
+                    reasons.push(reason);
+                }
+            }
+            details.push(refusal.detail);
+        }
+        Some(Self::new(reasons, details.join("; ")))
+    }
+}
+
+impl UnsupportedModel {
+    /// Chat templates the engine cannot read or render.
+    pub fn chat_template(detail: impl Into<String>) -> Self {
+        Self::reason(UnsupportedReason::ChatTemplate, detail)
+    }
+}
+
+impl From<magnitude_chat::TokenizerError> for UnsupportedModel {
+    fn from(error: magnitude_chat::TokenizerError) -> Self {
+        let detail = error.to_string();
+        match error {
+            magnitude_chat::TokenizerError::Unsupported(reasons) => Self::new(reasons, detail),
+            magnitude_chat::TokenizerError::Invalid(_) => Self::unreadable(detail),
+        }
+    }
+}
+
+impl From<FamilyError> for UnsupportedModel {
+    fn from(error: FamilyError) -> Self {
+        Self::new(error.reasons, error.detail)
+    }
 }
 
 impl fmt::Display for UnsupportedModel {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Family { reason } => write!(formatter, "unsupported model family: {reason}"),
-            Self::Representation { reason } => {
-                write!(formatter, "unsupported model representation: {reason}")
-            }
-            Self::Backend { backend, reason } => {
-                write!(formatter, "unsupported on the {backend} backend: {reason}")
-            }
-            Self::KernelDomain {
-                backend,
-                entry,
-                statics,
-            } => {
-                let statics = statics
-                    .iter()
-                    .map(|(name, value)| format!("{name}={value}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                write!(
-                    formatter,
-                    "`{entry}` has no admissible {backend} configuration at {statics}"
-                )
-            }
-        }
+        formatter.write_str(&self.detail)
     }
 }
 
@@ -128,12 +168,6 @@ pub enum DeviceSelectionError {
         request: DeviceRequest,
         evidence: Vec<String>,
     },
-    /// The exact selector resolved to several devices in this process's
-    /// catalog: the identity is stale and must be refreshed by the host.
-    Stale {
-        selector: DeviceSelector,
-        matches: usize,
-    },
 }
 
 impl fmt::Display for DeviceSelectionError {
@@ -143,10 +177,6 @@ impl fmt::Display for DeviceSelectionError {
                 formatter,
                 "no usable device matches `{request}`: {}",
                 evidence.join("; ")
-            ),
-            Self::Stale { selector, matches } => write!(
-                formatter,
-                "device {selector} resolves to {matches} devices; the selector is stale"
             ),
         }
     }
@@ -158,7 +188,6 @@ impl From<SelectionError> for DeviceSelectionError {
             SelectionError::NoCandidate { request, evidence, .. } => {
                 Self::Unavailable { request, evidence }
             }
-            SelectionError::Stale { selector, matches } => Self::Stale { selector, matches },
         }
     }
 }
@@ -170,9 +199,6 @@ impl From<SeismicResolveError> for DeviceSelectionError {
                 request: DeviceRequest::Selector(selector),
                 evidence: vec![format!("device {selector} is not present")],
             },
-            SeismicResolveError::Ambiguous { selector, matches } => {
-                Self::Stale { selector, matches }
-            }
         }
     }
 }
@@ -188,7 +214,7 @@ impl fmt::Display for InsufficientMemory {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "{} bytes are required but {} are available above the planning reserve",
+            "{} bytes are required but {} are available",
             self.required, self.available
         )
     }
@@ -218,6 +244,25 @@ impl fmt::Display for ResolveError {
 
 impl std::error::Error for ResolveError {}
 
+/// A weight bound (a cap or a device room) below what the load's weights need with its expert bank at its floor: a bound
+/// the caller set that no machine meets and no wait clears, so it is never retried, unlike a
+/// memory shortage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WeightBoundBelowWeights {
+    pub bound: magnitude_executor::WeightBound,
+    pub needed: u64,
+}
+
+impl fmt::Display for WeightBoundBelowWeights {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} is below the {} bytes the load's weights need with its expert bank at its floor",
+            self.bound, self.needed
+        )
+    }
+}
+
 /// `ResolvedEngineConfiguration::preview`: read-only planning.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PreviewError {
@@ -225,6 +270,11 @@ pub enum PreviewError {
     Device(DeviceSelectionError),
     /// A required memory observation failed (Blind). Retryable.
     MemoryObservationUnavailable { reason: String },
+    /// The weight bound is below the load's least weights. Never retryable.
+    WeightBound(WeightBoundBelowWeights),
+    /// The plan prices its holdings on this machine's standing figures, which the measurement
+    /// job has not stored yet ([`PlanOutcome::PricesPending`]). Retryable once it has.
+    PricesPending { reason: String },
     Internal { reason: String },
 }
 
@@ -233,9 +283,11 @@ impl fmt::Display for PreviewError {
         match self {
             Self::Unsupported(error) => error.fmt(formatter),
             Self::Device(error) => error.fmt(formatter),
+            Self::WeightBound(error) => error.fmt(formatter),
             Self::MemoryObservationUnavailable { reason } => {
                 write!(formatter, "memory observation unavailable: {reason}")
             }
+            Self::PricesPending { reason } => write!(formatter, "the plan's prices are pending: {reason}"),
             Self::Internal { reason } => write!(formatter, "internal preview failure: {reason}"),
         }
     }
@@ -250,26 +302,24 @@ pub enum LoadError {
     Artifact(ArtifactError),
     Unsupported(UnsupportedModel),
     Device(DeviceSelectionError),
-    /// A startup claim could not be satisfied in `domain` (the device's
-    /// allocation domain, or host RAM for a dedicated device's staged
-    /// uploads). Retryable once memory frees.
+    /// A startup allocation was not admitted in `store`, one of the stores
+    /// the executor's placement charges. Retryable once memory frees.
     InsufficientMemory {
         purpose: String,
-        domain: MemoryDomain,
+        store: StoreIdentity,
         memory: InsufficientMemory,
-    },
-    /// `domain` was in the Reclaim band when the load claimed from it or
-    /// while it imported weights: its headroom was at or below the planning
-    /// reserve, or its host was in distress. No byte count describes it.
-    /// Retryable once the domain recovers.
-    MemoryPressure {
-        purpose: String,
-        domain: MemoryDomain,
     },
     MemoryObservationUnavailable { reason: String },
     DeviceLost { reason: String },
     /// The worker ended, or broke the protocol, before it was ready.
     WorkerLost { reason: String },
+    /// A configuration control is malformed.
+    Configuration { reason: String },
+    /// The weight bound is below the load's least weights. Never retryable.
+    WeightBound(WeightBoundBelowWeights),
+    /// The plan prices its holdings on this machine's standing figures, which the measurement
+    /// job has not stored yet ([`PlanOutcome::PricesPending`]). Retryable once it has.
+    PricesPending { reason: String },
     Internal { reason: String },
 }
 
@@ -278,10 +328,10 @@ impl LoadError {
         matches!(
             self,
             Self::InsufficientMemory { .. }
-                | Self::MemoryPressure { .. }
                 | Self::MemoryObservationUnavailable { .. }
                 | Self::DeviceLost { .. }
                 | Self::WorkerLost { .. }
+                | Self::PricesPending { .. }
         )
     }
 }
@@ -294,17 +344,17 @@ impl fmt::Display for LoadError {
             Self::Device(error) => error.fmt(formatter),
             Self::InsufficientMemory {
                 purpose,
-                domain,
+                store,
                 memory,
-            } => write!(formatter, "{purpose} in {domain}: {memory}"),
-            Self::MemoryPressure { purpose, domain } => {
-                write!(formatter, "{purpose} in {domain}: memory pressure")
-            }
+            } => write!(formatter, "{purpose} in {store}: {memory}"),
             Self::MemoryObservationUnavailable { reason } => {
                 write!(formatter, "memory observation unavailable: {reason}")
             }
             Self::DeviceLost { reason } => write!(formatter, "device lost: {reason}"),
             Self::WorkerLost { reason } => write!(formatter, "worker lost during load: {reason}"),
+            Self::Configuration { reason } => write!(formatter, "invalid engine configuration: {reason}"),
+            Self::WeightBound(error) => error.fmt(formatter),
+            Self::PricesPending { reason } => write!(formatter, "the plan's prices are pending: {reason}"),
             Self::Internal { reason } => write!(formatter, "internal load failure: {reason}"),
         }
     }
@@ -315,7 +365,7 @@ impl std::error::Error for LoadError {}
 impl From<ResolveError> for LoadError {
     fn from(error: ResolveError) -> Self {
         match error {
-            ResolveError::InvalidConfiguration { reason } => Self::Internal { reason },
+            ResolveError::InvalidConfiguration { reason } => Self::Configuration { reason },
             ResolveError::Artifact(error) => Self::Artifact(error),
             ResolveError::Unsupported(error) => Self::Unsupported(error),
         }
@@ -332,17 +382,21 @@ pub enum RequestError {
     ContextLengthExceeded { required: u64, limit: u64 },
     /// A claim could not be satisfied after the release order. Retryable.
     InsufficientMemory(InsufficientMemory),
+    /// The request's context needs more memory than the loaded model can
+    /// ever give it, with nothing else left to free: not retryable as is.
+    ContextExceedsMemory(InsufficientMemory),
     /// A required memory observation failed (Blind). Retryable.
     MemoryObservationUnavailable { reason: String },
-    /// The engine is in the Reclaim band and pauses admission
-    /// (`memory_pressure`). Retryable.
-    MemoryReclaim,
     /// The model is no longer loaded.
     ModelUnloaded { cause: UnloadCause },
     /// The device cannot provision another request's numerical state. Retryable.
     Overloaded,
     /// The device or driver failed during execution.
     DeviceLost { reason: String },
+    /// Weights the request's steps read from the model file during
+    /// execution (a streamed table's rows) could not be read. Other
+    /// requests continue. Retryable.
+    WeightReadFailed { reason: String },
     /// The caller cancelled.
     Cancelled,
     /// The worker ended before the request's terminal outcome.
@@ -357,12 +411,12 @@ impl RequestError {
             self,
             Self::InsufficientMemory(_)
                 | Self::MemoryObservationUnavailable { .. }
-                | Self::MemoryReclaim
                 | Self::ModelUnloaded {
                     cause: UnloadCause::MemoryPressure
                 }
                 | Self::Overloaded
                 | Self::DeviceLost { .. }
+                | Self::WeightReadFailed { .. }
                 | Self::WorkerLost { .. }
         )
     }
@@ -383,15 +437,20 @@ impl fmt::Display for RequestError {
                 "the input requires {required} tokens but the loaded context is {limit}"
             ),
             Self::InsufficientMemory(memory) => memory.fmt(formatter),
+            Self::ContextExceedsMemory(memory) => write!(
+                formatter,
+                "the request's context needs {} bytes of memory, past the {} the loaded model can give it",
+                memory.required, memory.available
+            ),
             Self::MemoryObservationUnavailable { reason } => {
                 write!(formatter, "memory observation unavailable: {reason}")
             }
-            Self::MemoryReclaim => formatter.write_str(
-                "memory headroom is at or below the planning reserve; reclaiming memory",
-            ),
             Self::ModelUnloaded { cause } => write!(formatter, "model unloaded: {cause}"),
             Self::Overloaded => formatter.write_str("the engine's request capacity is exhausted"),
             Self::DeviceLost { reason } => write!(formatter, "device lost: {reason}"),
+            Self::WeightReadFailed { reason } => {
+                write!(formatter, "model weights could not be read: {reason}")
+            }
             Self::Cancelled => formatter.write_str("request cancelled"),
             Self::WorkerLost { reason } => write!(formatter, "worker lost: {reason}"),
             Self::Internal { reason } => write!(formatter, "internal engine failure: {reason}"),
@@ -405,10 +464,6 @@ impl From<magnitude_scheduler::owner::AdmissionError> for RequestError {
     fn from(error: magnitude_scheduler::owner::AdmissionError) -> Self {
         use magnitude_scheduler::{owner::AdmissionError, publication::ModelUnloadCause};
         match error {
-            AdmissionError::MemoryObservationUnavailable(reason) => {
-                Self::MemoryObservationUnavailable { reason }
-            }
-            AdmissionError::MemoryReclaim => Self::MemoryReclaim,
             AdmissionError::ModelUnloaded {
                 cause: ModelUnloadCause::MemoryPressure,
             } => Self::ModelUnloaded {
@@ -447,11 +502,17 @@ impl From<magnitude_scheduler::publication::RequestError> for RequestError {
                 | CapacityResource::RetainedMethodFeature
                 | CapacityResource::RetainedMediaFeature => Self::Overloaded,
             },
+            Scheduled::ContextExceedsMemory { required, available } => {
+                Self::ContextExceedsMemory(InsufficientMemory { required, available })
+            }
             Scheduled::Device(DeviceError::Lost(reason)) => Self::DeviceLost { reason },
             Scheduled::Device(error) => Self::DeviceLost {
                 reason: error.to_string(),
             },
             Scheduled::Invariant(error) => Self::internal(error.to_string()),
+            Scheduled::WeightRead(error) => Self::WeightReadFailed {
+                reason: error.detail,
+            },
             Scheduled::WorkerClosed => Self::WorkerLost {
                 reason: "the execution owner closed the request's stream".into(),
             },
@@ -495,26 +556,37 @@ impl From<magnitude_scheduler::worker::Panicked> for UnloadCause {
 }
 
 /// Planner rejections of a recognized, validated definition are properties
-/// of the material on this execution path; the others are arithmetic or
-/// resource failures of the engine itself.
+/// of the material on this execution path: a form, operator, scale or
+/// layout the backend's planner does not execute. The others are arithmetic
+/// or resource failures of the engine itself.
 pub(crate) fn classify_plan(error: PlanError, backend: seismic::BackendName) -> PlanOutcome {
+    let unsupported = |detail: &dyn fmt::Display| {
+        PlanOutcome::Unsupported(UnsupportedModel::reason(
+            UnsupportedReason::Backend {
+                backend: backend.as_str().to_owned(),
+            },
+            format!("unsupported on the {} backend: {detail}", backend.as_str()),
+        ))
+    };
     match error {
-        PlanError::Unsupported(reason) => PlanOutcome::Unsupported(UnsupportedModel::Backend {
-            backend: backend.as_str().to_owned(),
-            reason: reason.to_string(),
-        }),
+        PlanError::Unsupported(feature) => unsupported(&feature),
         error @ (PlanError::InvalidDefinition(_)
         | PlanError::Topology(_)
         | PlanError::UnsupportedOperator { .. }
         | PlanError::Deferred(_)
-        | PlanError::UnportedScale(_)) => {
-            PlanOutcome::Unsupported(UnsupportedModel::Representation {
-                reason: error.to_string(),
-            })
-        }
+        | PlanError::UnportedScale(_)
+        | PlanError::Unstreamed(_)) => unsupported(&error),
+        PlanError::WeightBound { bound, needed } => PlanOutcome::WeightBound(WeightBoundBelowWeights { bound, needed }),
+        PlanError::Unpriced { pending: true, reason } => PlanOutcome::PricesPending(reason),
+        PlanError::KernelDomain(violation) => PlanOutcome::Unsupported(kernel_domain(
+            violation.backend.as_str(),
+            violation.entry,
+            violation.statics,
+        )),
         error @ (PlanError::Arithmetic(_)
         | PlanError::ResourcePlanning(_)
-        | PlanError::Resource(_)) => PlanOutcome::Internal(error.to_string()),
+        | PlanError::Resource(_)
+        | PlanError::Unpriced { pending: false, .. }) => PlanOutcome::Internal(error.to_string()),
     }
 }
 
@@ -523,13 +595,11 @@ pub(crate) fn classify_plan(error: PlanError, backend: seismic::BackendName) -> 
 /// engine defect.
 pub(crate) fn classify_graph(error: GraphError) -> PlanOutcome {
     match error {
-        GraphError::KernelDomain(violation) => {
-            PlanOutcome::Unsupported(UnsupportedModel::KernelDomain {
-                backend: violation.backend.as_str().to_owned(),
-                entry: violation.entry.to_owned(),
-                statics: violation.statics,
-            })
-        }
+        GraphError::KernelDomain(violation) => PlanOutcome::Unsupported(kernel_domain(
+            violation.backend.as_str(),
+            violation.entry,
+            violation.statics,
+        )),
         GraphError::Invalid(reason) => PlanOutcome::Internal(reason),
     }
 }
@@ -539,20 +609,38 @@ pub(crate) fn classify_graph(error: GraphError) -> PlanOutcome {
 pub(crate) fn classify_catalog(error: CatalogError) -> PlanOutcome {
     match error.failure {
         CatalogFailure::KernelDomain { entry, statics } => {
-            PlanOutcome::Unsupported(UnsupportedModel::KernelDomain {
-                backend: error.backend.as_str().to_owned(),
-                entry: entry.to_owned(),
-                statics,
-            })
+            PlanOutcome::Unsupported(kernel_domain(error.backend.as_str(), entry, statics))
         }
+        // A load that stops unprepared is taken as its own outcome before
+        // any failure is classified; one that reaches here was not asked for.
         CatalogFailure::Preparation { .. }
         | CatalogFailure::Tuning { .. }
-        | CatalogFailure::Qualification { .. } => PlanOutcome::Internal(error.to_string()),
+        | CatalogFailure::Qualification { .. }
+        | CatalogFailure::Unprepared { .. } => PlanOutcome::Internal(error.to_string()),
     }
+}
+
+/// A kernel call of the model's program with statics outside the kernel's
+/// domain on the backend: no configuration executes them.
+fn kernel_domain(backend: &str, entry: &str, statics: Vec<(String, u64)>) -> UnsupportedModel {
+    let reason = UnsupportedReason::KernelDomain {
+        backend: backend.to_owned(),
+        entry: entry.to_owned(),
+        statics,
+    };
+    let detail = format!("no admissible configuration for {reason}");
+    UnsupportedModel::reason(reason, detail)
 }
 
 pub(crate) enum PlanOutcome {
     Unsupported(UnsupportedModel),
+    /// The caller's weight bound is below the load's least weights: no
+    /// property of the model or the backend.
+    WeightBound(WeightBoundBelowWeights),
+    /// The plan prices its holdings on the machine's standing figures, which the measurement
+    /// job has not stored yet: no property of the model or the engine. The engine never waits
+    /// for them; whoever holds the device for the load waits without it.
+    PricesPending(String),
     Internal(String),
 }
 
@@ -568,19 +656,21 @@ pub(crate) fn classify_platform(error: PlatformError) -> PlatformOutcome {
     match error {
         PlatformError::Selection(error) => PlatformOutcome::Device(error.into()),
         PlatformError::Resolve(error) => PlatformOutcome::Device(error.into()),
-        PlatformError::Observation(error)
-        | PlatformError::Memory(MemoryPolicyError::Observation(error)) => {
+        PlatformError::Memory(MemoryPolicyError::Observation(error)) => {
             PlatformOutcome::MemoryObservationUnavailable(error.to_string())
         }
         PlatformError::Policy { path, outcome } => {
-            PlatformOutcome::Unsupported(UnsupportedModel::Backend {
-                backend: path.to_string(),
-                reason: outcome,
-            })
+            PlatformOutcome::Unsupported(UnsupportedModel::reason(
+                UnsupportedReason::Backend {
+                    backend: path.to_string(),
+                },
+                format!("unsupported on the {path} backend: {outcome}"),
+            ))
         }
         error @ (PlatformError::Memory(_)
         | PlatformError::Open(_)
-        | PlatformError::Qualification(_)) => PlatformOutcome::Internal(error.to_string()),
+        | PlatformError::Qualification(_)
+        | PlatformError::Records(_)) => PlatformOutcome::Internal(error.to_string()),
     }
 }
 
@@ -614,6 +704,8 @@ impl From<PlanOutcome> for PreviewError {
     fn from(outcome: PlanOutcome) -> Self {
         match outcome {
             PlanOutcome::Unsupported(error) => Self::Unsupported(error),
+            PlanOutcome::WeightBound(error) => Self::WeightBound(error),
+            PlanOutcome::PricesPending(reason) => Self::PricesPending { reason },
             PlanOutcome::Internal(reason) => Self::Internal { reason },
         }
     }
@@ -623,6 +715,8 @@ impl From<PlanOutcome> for LoadError {
     fn from(outcome: PlanOutcome) -> Self {
         match outcome {
             PlanOutcome::Unsupported(error) => Self::Unsupported(error),
+            PlanOutcome::WeightBound(error) => Self::WeightBound(error),
+            PlanOutcome::PricesPending(reason) => Self::PricesPending { reason },
             PlanOutcome::Internal(reason) => Self::Internal { reason },
         }
     }
@@ -633,6 +727,20 @@ mod tests {
     use super::*;
     use magnitude_executor::{DeviceError, InvariantError};
     use magnitude_scheduler::{owner::AdmissionError, publication::RequestError as Scheduled};
+
+    /// A weight bound below the load's least weights reaches preview and load as the typed,
+    /// never-retried refusal it is, both numbers kept, not a memory shortage or a string.
+    #[test]
+    fn a_weight_cap_below_the_least_weights_stays_typed_and_unretried() {
+        let cap = || PlanError::WeightBound { bound: magnitude_executor::WeightBound::Cap(2_100_000_000), needed: 2_130_136_892 };
+        let typed = WeightBoundBelowWeights { bound: magnitude_executor::WeightBound::Cap(2_100_000_000), needed: 2_130_136_892 };
+        let preview = PreviewError::from(classify_plan(cap(), seismic::BackendName::Metal));
+        assert_eq!(preview, PreviewError::WeightBound(typed));
+        let load = LoadError::from(classify_plan(cap(), seismic::BackendName::Metal));
+        assert_eq!(load, LoadError::WeightBound(typed));
+        assert!(!load.retryable());
+        assert!(load.to_string().contains("2100000000") && load.to_string().contains("2130136892"));
+    }
 
     /// A failed execution owner keeps its classified failure: a device loss
     /// behind it unloads the model and refuses later admissions as device

@@ -7,15 +7,19 @@
 
 use super::protocol::{
     Admission, EngineBuild, ExecutionTimings, HostMessage, HostRequestId,
-    LoadProgress, MemoryObservation, RequestProgress, WorkerMessage,
+    LoadProgress, MemoryObservation, RequestProgress, RoomClaimId, WorkerMessage,
 };
 use super::transport::{HostTransport, MessageReceiver, MessageSender};
+use crate::census::AllocationCensus;
 use crate::error::{LoadError, RequestError};
+use crate::execution::LoadAttempt;
+use magnitude_executor::UnpreparedUnits;
 use crate::options::{ExecutionManifest, ReadyInfo};
 use magnitude_chat::ConstraintPlan;
 use magnitude_family_contracts::PreparedModelInput;
 use magnitude_generation::{DetailedUsage, FinishReason, Options, OutputToken};
 use magnitude_scheduler::prefix_cache::PrefixRetention;
+use magnitude_scheduler::protocol::RoomAnswer;
 use std::{
     collections::{HashMap, VecDeque},
     future::poll_fn,
@@ -56,7 +60,8 @@ impl RequestEvent {
 
 #[derive(Default)]
 struct RequestSlot {
-    /// `None` while admission is pending.
+    /// `None` while admission is pending: until the request began, or was
+    /// refused.
     admission: Option<Result<(), RequestError>>,
     events: VecDeque<RequestEvent>,
     terminal_received: bool,
@@ -95,11 +100,38 @@ struct State {
     next_id: u64,
     requests: HashMap<HostRequestId, RequestSlot>,
     observation: Option<Shared<MemoryObservation>>,
+    /// The measurement room's pending claim, and the identity the next
+    /// claim takes.
+    room: Option<(RoomClaimId, Shared<RoomAnswer>)>,
+    next_claim: u64,
     /// Why the connection ended; every later operation fails with it.
     closed: Option<RequestError>,
+    /// The census the worker pushed last, and how many it pushed
+    /// ([`EngineClient::census`]).
+    census: Option<AllocationCensus>,
+    censuses: u64,
+    /// Waiters on the connection's end or the census's next change
+    /// ([`EngineClient::closed`], [`EngineClient::census`]).
+    watchers: Vec<Waker>,
+    /// The host asked the worker to shut down ([`EngineClient::shutdown`]): a connection that
+    /// ends after that ends for the stop, however the worker's end came (its own unload, or
+    /// its kill once it overran its exit).
+    shutting_down: bool,
+    /// The worker itself answered that its model is unloaded: its process is ending by its own
+    /// choice, unlike a connection that merely closed.
+    unloaded: bool,
 }
 
 impl State {
+    /// Why a connection whose worker ended for `reason` ended: the host's stop, where the host
+    /// asked for one, so a stopped model's requests end alike whenever its worker ends.
+    fn lost(&self, reason: String) -> RequestError {
+        match self.shutting_down {
+            true => RequestError::ModelUnloaded { cause: crate::error::UnloadCause::Shutdown },
+            false => RequestError::WorkerLost { reason },
+        }
+    }
+
     fn close(&mut self, error: RequestError) {
         if self.closed.is_some() {
             return;
@@ -117,7 +149,33 @@ impl State {
         if let Some(reply) = self.observation.take() {
             reply.lock().unwrap().fulfill(Err(error.clone()));
         }
+        if let Some((_, reply)) = self.room.take() {
+            reply.lock().unwrap().fulfill(Err(error.clone()));
+        }
         self.closed = Some(error);
+        self.watchers.drain(..).for_each(Waker::wake);
+    }
+
+    /// The pending measurement room claim's reply, which a claim while one
+    /// is pending joins; with the identity of a new claim, which its host
+    /// sends.
+    fn claim_room(&mut self) -> (Shared<RoomAnswer>, Option<RoomClaimId>) {
+        if let Some((_, reply)) = &self.room {
+            return (reply.clone(), None);
+        }
+        let claim = RoomClaimId(self.next_claim);
+        self.next_claim += 1;
+        let reply = Arc::new(Mutex::new(SharedReply { value: None, wakers: Vec::new() }));
+        self.room = Some((claim, reply.clone()));
+        (reply, Some(claim))
+    }
+
+    /// Withdraw the pending measurement room claim: it is answered as
+    /// released.
+    fn release_room(&mut self) {
+        if let Some((_, reply)) = self.room.take() {
+            reply.lock().unwrap().fulfill(Ok(RoomAnswer::Released));
+        }
     }
 
     fn deliver(&mut self, message: WorkerMessage) -> Result<(), String> {
@@ -171,15 +229,34 @@ impl State {
                     .ok_or("observation reply without a query")?;
                 reply.lock().unwrap().fulfill(observation);
             }
+            WorkerMessage::Census { census } => {
+                self.census = Some(census);
+                self.censuses += 1;
+                self.watchers.drain(..).for_each(Waker::wake);
+            }
+            WorkerMessage::MeasurementRoom { claim, room } => {
+                // A claim released before its answer has no one waiting, and
+                // its answer answers no later claim.
+                if self.room.as_ref().is_some_and(|(pending, _)| *pending == claim) {
+                    let (_, reply) = self.room.take().expect("the pending claim");
+                    reply.lock().unwrap().fulfill(room);
+                }
+            }
             WorkerMessage::Unloaded { cause } => {
+                self.unloaded = true;
                 self.close(RequestError::ModelUnloaded { cause });
             }
             WorkerMessage::Hello { .. }
             | WorkerMessage::LoadProgress { .. }
             | WorkerMessage::Ready { .. }
             | WorkerMessage::Prepared
-            | WorkerMessage::LoadFailed { .. } => {
-                return Err("load message after readiness".into())
+            | WorkerMessage::Unprepared
+            | WorkerMessage::LoadFailed { .. } => return Err("load message after readiness".into()),
+            WorkerMessage::Attempting { .. }
+            | WorkerMessage::Opened
+            | WorkerMessage::Recorded { .. }
+            | WorkerMessage::MeasureFinished { .. } => {
+                return Err("measurement message from a serving worker".into())
             }
         }
         Ok(())
@@ -238,43 +315,30 @@ pub struct WorkerConnection {
 /// With `load`, this is a worker process that has not yet been told what to
 /// load: the host sends `Hello` and `Load`. Without it, the worker was given
 /// its manifest directly (in-process). Either way the worker's `Hello` must
-/// carry this build, and its `LoadProgress` events reach `progress` until `Ready`.
+/// carry this build, and its `LoadProgress` events reach `progress` until
+/// `Ready`, or until `Unprepared`: a worker asked to report tuning units
+/// without a stored record met one, placed nothing and is ending. Hosts
+/// reach this through [`super::load_prepared`].
 pub fn connect_worker(
     transport: impl HostTransport,
-    load: Option<ExecutionManifest>,
+    load: Option<(ExecutionManifest, UnpreparedUnits)>,
     mut progress: impl FnMut(LoadProgress),
-) -> Result<WorkerConnection, LoadError> {
+) -> Result<LoadAttempt<WorkerConnection>, LoadError> {
     let (mut receiver, mut sender) = transport.split();
-    let lost = |reason: String| LoadError::WorkerLost { reason };
-    let build = EngineBuild::current();
-    if let Some(manifest) = load {
-        sender
-            .send(HostMessage::Hello {
-                build: build.clone(),
-            })
-            .and_then(|()| sender.send(HostMessage::Load { manifest }))
-            .map_err(|error| lost(error.to_string()))?;
-    }
-    let mut next = || match receiver.receive() {
-        Ok(Some(message)) => Ok(message),
-        Ok(None) => Err(lost("the worker ended before it was ready".into())),
-        Err(error) => Err(lost(error.to_string())),
-    };
-    match next()? {
-        WorkerMessage::Hello { build: worker } if worker == build => {}
-        WorkerMessage::Hello { build: worker } => {
-            return Err(lost(format!(
-                "worker build {worker} differs from host build {build}"
-            )))
-        }
-        _ => return Err(lost("the worker did not greet the host".into())),
-    }
+    let lost = |lost: Lost| LoadError::WorkerLost { reason: lost.reason };
+    let ended = "it was ready";
+    let load = load.map(|(manifest, unprepared)| HostMessage::Load {
+        manifest,
+        unprepared,
+    });
+    handshake(&mut sender, &mut receiver, load, ended, lost)?;
     let ready = loop {
-        match next()? {
+        match receive(&mut receiver, ended, lost)? {
             WorkerMessage::LoadProgress { progress: current } => progress(current),
             WorkerMessage::Ready { ready } => break ready,
+            WorkerMessage::Unprepared => return Ok(LoadAttempt::Unprepared),
             WorkerMessage::LoadFailed { error } => return Err(error),
-            _ => return Err(lost("unexpected message during load".into())),
+            _ => return Err(lost(Lost::broke("unexpected message during load"))),
         }
     };
     let state = Arc::new(Mutex::new(State::default()));
@@ -299,65 +363,114 @@ pub fn connect_worker(
                 Ok(None) => "the worker ended".to_owned(),
                 Err(error) => error.to_string(),
             };
-            reading
-                .lock()
-                .unwrap()
-                .close(RequestError::WorkerLost { reason: failure });
+            let mut state = reading.lock().unwrap();
+            let lost = state.lost(failure);
+            state.close(lost);
             return;
         })
         .map_err(|error| LoadError::Internal {
             reason: error.to_string(),
         })?;
-    Ok(WorkerConnection {
+    Ok(LoadAttempt::Loaded(WorkerConnection {
         client: EngineClient { connection },
         ready,
-    })
+    }))
 }
 
-/// Ask a worker process to prepare `manifest`'s programs on its device and
-/// wait until it has, reporting its `LoadProgress` to `progress`. The worker
-/// exits once prepared; it never loads the model.
-pub fn prepare_worker(
+/// Ask a worker process for a Prepare of `manifest` and wait for its
+/// outcome, reporting its `LoadProgress` to `progress`. The worker exits once
+/// prepared; it never loads the model. Hosts reach this through
+/// [`super::load_prepared`] or [`super::prepare`], which also see the
+/// process ended. The outer error is a worker that reported no outcome (its
+/// stream ended, failed, or it broke the protocol); the inner result is the
+/// outcome a worker reported, after which it exits on its own.
+pub(super) fn prepare_worker(
     transport: impl HostTransport,
     manifest: ExecutionManifest,
     mut progress: impl FnMut(LoadProgress),
-) -> Result<(), LoadError> {
+) -> Result<Result<(), LoadError>, Lost> {
     let (mut receiver, mut sender) = transport.split();
-    let lost = |reason: String| LoadError::WorkerLost { reason };
-    let build = EngineBuild::current();
-    sender
-        .send(HostMessage::Hello {
-            build: build.clone(),
-        })
-        .and_then(|()| sender.send(HostMessage::Prepare { manifest }))
-        .map_err(|error| lost(error.to_string()))?;
-    let mut next = || match receiver.receive() {
-        Ok(Some(message)) => Ok(message),
-        Ok(None) => Err(lost("the worker ended before it was prepared".into())),
-        Err(error) => Err(lost(error.to_string())),
-    };
-    match next()? {
-        WorkerMessage::Hello { build: worker } if worker == build => {}
-        WorkerMessage::Hello { build: worker } => {
-            return Err(lost(format!(
-                "worker build {worker} differs from host build {build}"
-            )))
-        }
-        _ => return Err(lost("the worker did not greet the host".into())),
-    }
+    let lost = |lost: Lost| lost;
+    let ended = "it was prepared";
+    let prepare = HostMessage::Prepare { manifest };
+    handshake(&mut sender, &mut receiver, Some(prepare), ended, lost)?;
     loop {
-        match next()? {
+        match receive(&mut receiver, ended, lost)? {
             WorkerMessage::LoadProgress { progress: current } => progress(current),
-            WorkerMessage::Prepared => return Ok(()),
-            WorkerMessage::LoadFailed { error } => return Err(error),
-            _ => return Err(lost("unexpected message during preparation".into())),
+            WorkerMessage::Prepared => return Ok(Ok(())),
+            WorkerMessage::LoadFailed { error } => return Ok(Err(error)),
+            _ => return Err(Lost::broke("unexpected message during preparation")),
         }
+    }
+}
+
+/// How a host lost its worker: why, and whether the worker's stream ended,
+/// which a worker's ends only as its process ends, on its own.
+#[derive(Debug)]
+pub(super) struct Lost {
+    pub(super) reason: String,
+    pub(super) ended: bool,
+}
+
+impl Lost {
+    /// A worker whose stream failed or that broke the protocol: it may
+    /// still run.
+    fn broke(reason: impl Into<String>) -> Self {
+        Self { reason: reason.into(), ended: false }
+    }
+}
+
+/// Open an exchange with a worker: send it this build's `Hello` and then
+/// `first`, unless it was given its work directly (in-process, `None`), and
+/// require its own `Hello` to carry this build. Every failure is the worker
+/// lost, as `lost` names it; `ended` is what its stream ended before.
+pub(super) fn handshake<E>(
+    sender: &mut impl MessageSender<HostMessage>,
+    receiver: &mut impl MessageReceiver<WorkerMessage>,
+    first: Option<HostMessage>,
+    ended: &str,
+    lost: impl Fn(Lost) -> E,
+) -> Result<(), E> {
+    let build = EngineBuild::current();
+    if let Some(first) = first {
+        sender
+            .send(HostMessage::Hello {
+                build: build.clone(),
+            })
+            .and_then(|()| sender.send(first))
+            .map_err(|error| lost(Lost::broke(error.to_string())))?;
+    }
+    match receive(receiver, ended, &lost)? {
+        WorkerMessage::Hello { build: worker } if worker == build => Ok(()),
+        WorkerMessage::Hello { build: worker } => Err(lost(Lost::broke(format!(
+            "worker build {worker} differs from host build {build}"
+        )))),
+        _ => Err(lost(Lost::broke("the worker did not greet the host"))),
+    }
+}
+
+/// The worker's next message. Its stream ending, before `ended`, or
+/// failing is the worker lost, as `lost` names it.
+pub(super) fn receive<E>(
+    receiver: &mut impl MessageReceiver<WorkerMessage>,
+    ended: &str,
+    lost: impl Fn(Lost) -> E,
+) -> Result<WorkerMessage, E> {
+    match receiver.receive() {
+        Ok(Some(message)) => Ok(message),
+        Ok(None) => Err(lost(Lost { reason: format!("the worker ended before {ended}"), ended: true })),
+        Err(error) => Err(lost(Lost::broke(error.to_string()))),
     }
 }
 
 impl EngineClient {
     pub fn ready_info(&self) -> &ReadyInfo {
         &self.connection.ready
+    }
+
+    /// Whether the worker itself answered that its model is unloaded ([`State::unloaded`]).
+    pub fn unloaded(&self) -> bool {
+        self.connection.state.lock().unwrap().unloaded
     }
 
     /// `Ok` while the worker serves; otherwise why it stopped.
@@ -368,6 +481,47 @@ impl EngineClient {
         }
     }
 
+    /// Why the worker stopped, once it has: the connection's end, awaited
+    /// rather than polled.
+    pub async fn closed(&self) -> RequestError {
+        std::future::poll_fn(|context| {
+            let mut state = self.connection.state.lock().unwrap();
+            match &state.closed {
+                Some(error) => Poll::Ready(error.clone()),
+                None => {
+                    state.watchers.push(context.waker().clone());
+                    Poll::Pending
+                }
+            }
+        })
+        .await
+    }
+
+    /// The census once the worker pushed more than `seen` of them, with
+    /// how many it pushed: each is a change the worker counted, never a
+    /// sample. Why the worker stopped, once it has.
+    pub async fn census(&self, seen: u64) -> Result<(u64, AllocationCensus), RequestError> {
+        std::future::poll_fn(|context| {
+            let mut state = self.connection.state.lock().unwrap();
+            if state.censuses > seen {
+                let census = state.census.clone().expect("a pushed census is kept");
+                return Poll::Ready(Ok((state.censuses, census)));
+            }
+            match &state.closed {
+                Some(error) => Poll::Ready(Err(error.clone())),
+                None => {
+                    state.watchers.push(context.waker().clone());
+                    Poll::Pending
+                }
+            }
+        })
+        .await
+    }
+
+    /// Admit `request`: answered once it began (became resident), or
+    /// published before it did, or with why it was refused, which a request
+    /// that cannot begin (memory reclaimed until only the model's unload
+    /// could make its room) is, before anything of it is answered.
     pub async fn admit(&self, request: RequestOptions) -> Result<EngineRequest, RequestError> {
         if request.output_capacity == 0 {
             return Err(RequestError::InvalidRequest {
@@ -431,9 +585,58 @@ impl EngineClient {
         Self::wait(reply).await
     }
 
+    /// Make `bytes` of device memory free beside the model for the service's
+    /// measurement job: answered once the worker's expert bank has shrunk
+    /// to make it, with why it cannot, or released by
+    /// [`Self::release_measurement_room`] first. The bank grows nothing
+    /// until that release. One job claims at a time; a claim while one is
+    /// pending joins it.
+    pub async fn claim_measurement_room(&self, bytes: u64) -> Result<RoomAnswer, RequestError> {
+        let reply = {
+            let mut state = self.connection.state.lock().unwrap();
+            if let Some(error) = &state.closed {
+                return Err(error.clone());
+            }
+            let (reply, claim) = state.claim_room();
+            if let Some(claim) = claim {
+                // Sent under the state lock so the reply cannot arrive first.
+                self.connection.send(HostMessage::ClaimMeasurementRoom { claim, bytes })?;
+            }
+            reply
+        };
+        Self::wait(reply).await
+    }
+
+    /// The measurement job holding the room was started as `process`: the
+    /// worker credits its footprint against the room from now.
+    pub fn attach_measurement_process(&self, process: magnitude_executor::ProcessId) -> Result<(), RequestError> {
+        let state = self.connection.state.lock().unwrap();
+        if let Some(error) = &state.closed {
+            return Err(error.clone());
+        }
+        // Sent under the state lock, so it follows the claim it names.
+        self.connection.send(HostMessage::AttachMeasurementProcess { process })
+    }
+
+    /// The measurement job ended: the bank may grow into its room again. A
+    /// claim still pending is withdrawn.
+    pub fn release_measurement_room(&self) -> Result<(), RequestError> {
+        let mut state = self.connection.state.lock().unwrap();
+        state.release_room();
+        // Sent under the state lock, so a later claim follows it.
+        self.connection.send(HostMessage::ReleaseMeasurementRoom)
+    }
+
+    /// The measurement job stored new records: the worker prices its
+    /// experts again from what is stored.
+    pub fn reprice(&self) -> Result<(), RequestError> {
+        self.connection.send(HostMessage::Reprice)
+    }
+
     /// Ask the worker to unload and exit. Open requests fail with
     /// `ModelUnloaded { cause: Shutdown }`.
     pub fn shutdown(&self) -> Result<(), RequestError> {
+        self.connection.state.lock().unwrap().shutting_down = true;
         self.connection.send(HostMessage::Shutdown)
     }
 
@@ -599,5 +802,43 @@ impl Drop for EngineRequest {
                 request_id: self.id,
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use magnitude_scheduler::protocol::RoomRefusal;
+
+    /// The answer to a claim released before it arrived answers no later
+    /// claim: only the answer naming the pending claim fulfils it.
+    #[test]
+    fn a_released_claims_answer_does_not_answer_a_later_claim() {
+        let mut state = State::default();
+        let (first, Some(released)) = state.claim_room() else { panic!("a new claim") };
+        state.release_room();
+        assert_eq!(first.lock().unwrap().value, Some(Ok(RoomAnswer::Released)));
+        let (second, Some(claim)) = state.claim_room() else { panic!("a new claim") };
+        assert_ne!(claim, released);
+        state.deliver(WorkerMessage::MeasurementRoom { claim: released, room: Ok(RoomAnswer::Made) }).unwrap();
+        assert_eq!(second.lock().unwrap().value, None, "the released claim's answer");
+        let (joined, None) = state.claim_room() else { panic!("a claim while one is pending joins it") };
+        let short = Ok(RoomAnswer::Refused(RoomRefusal::Short { bytes: 1 }));
+        state.deliver(WorkerMessage::MeasurementRoom { claim, room: short.clone() }).unwrap();
+        assert_eq!(second.lock().unwrap().value, Some(short.clone()));
+        assert_eq!(joined.lock().unwrap().value, Some(short));
+    }
+
+    /// A worker that ends after the host asked it to shut down ended for the stop, whether it
+    /// unloaded or was killed for overrunning its exit; one the host never stopped was lost.
+    #[test]
+    fn a_stopped_workers_end_is_the_stop_however_it_ends() {
+        let mut state = State::default();
+        assert!(matches!(state.lost("the worker ended".into()), RequestError::WorkerLost { .. }));
+        state.shutting_down = true;
+        assert_eq!(
+            state.lost("the worker ended".into()),
+            RequestError::ModelUnloaded { cause: crate::error::UnloadCause::Shutdown }
+        );
     }
 }

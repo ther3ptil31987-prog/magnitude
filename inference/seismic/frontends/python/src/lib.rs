@@ -13,27 +13,66 @@ fn element(name: &str) -> PyResult<seismic::Element> {
     seismic::Element::named(name)
         .ok_or_else(|| pyo3::exceptions::PyValueError::new_err(format!("unknown element {name}")))
 }
-fn catalog() -> PyResult<&'static Mutex<seismic::DeviceCatalog>> {
-    static CATALOG: OnceLock<Mutex<seismic::DeviceCatalog>> = OnceLock::new();
-    if let Some(c) = CATALOG.get() {
+/// The process's devices, over the inventory discovered on first use.
+fn discovered() -> PyResult<&'static Mutex<seismic::Devices>> {
+    static DISCOVERED: OnceLock<Mutex<seismic::Devices>> = OnceLock::new();
+    if let Some(c) = DISCOVERED.get() {
         return Ok(c);
     }
-    let c =
-        seismic::DeviceCatalog::discover().map_err(|e| error(d::Error::new("TargetError", e)))?;
-    let _ = CATALOG.set(Mutex::new(c));
-    Ok(CATALOG.get().expect("catalog initialized"))
+    let c = seismic::Devices::discover(&[]).map_err(|e| error(d::Error::new("TargetError", e)))?;
+    let _ = DISCOVERED.set(Mutex::new(c));
+    Ok(DISCOVERED.get().expect("devices discovered"))
+}
+
+/// Each executor opened in the process, with the tallies of its stores
+/// ([`seismic::Devices::tallies`]) it was opened over.
+static TALLIES: Mutex<Vec<(seismic::ExecutorId, Vec<seismic::memory::Tally>)>> = Mutex::new(Vec::new());
+
+/// Executor `id` of `devices`, opened once in the process over tallies of
+/// its stores, and its device store's tally.
+fn open_tallied(devices: &seismic::Devices, id: seismic::ExecutorId) -> Result<(seismic::Device, seismic::memory::Tally), seismic::OpenError> {
+    let tallies = {
+        let mut held = TALLIES.lock().expect("tally list lock poisoned");
+        match held.iter().find(|(of, _)| *of == id) {
+            Some((_, tallies)) => tallies.clone(),
+            None => {
+                let tallies = devices.tallies(id);
+                held.push((id, tallies.clone()));
+                tallies
+            }
+        }
+    };
+    let stores = tallies.iter().map(|tally| std::sync::Arc::new(tally.clone()) as std::sync::Arc<dyn seismic::memory::Store>).collect();
+    let device = devices.open_in(id, Default::default(), stores)?;
+    let tally = device_tally(&device);
+    Ok((device, tally))
+}
+
+/// The tally of `device`'s own store, of those it was opened over
+/// ([`open_tallied`], the frontend's only open).
+fn device_tally(device: &seismic::Device) -> seismic::memory::Tally {
+    let identity = device.topology().store_identity(device.device_store()).expect("the device store is of its topology");
+    let held = TALLIES.lock().expect("tally list lock poisoned");
+    held.iter()
+        .find(|(of, _)| *of == device.info().id())
+        .and_then(|(_, tallies)| tallies.iter().find(|tally| seismic::memory::Store::identity(*tally) == &identity))
+        .cloned()
+        .expect("invariant violated: a device the frontend did not open over its tallies")
 }
 
 #[pyclass(name = "Device", frozen)]
 #[derive(Clone)]
 struct Device {
     inner: seismic::Device,
+    /// The tally of the device's own store, which counts and bounds what it
+    /// holds there: the frontend keeps no ledger of its own.
+    tally: seismic::memory::Tally,
 }
 #[pymethods]
 impl Device {
     #[getter]
     fn name(&self) -> String {
-        self.inner.info().name.clone()
+        self.inner.info().name().to_owned()
     }
     #[getter]
     fn backend(&self) -> String {
@@ -43,12 +82,11 @@ impl Device {
     fn capabilities(&self) -> Vec<String> {
         self.inner.capabilities().to_vec()
     }
-    fn memory_usage(&self) -> (u64, Option<u64>, u64) {
-        let m = self.inner.memory_usage();
-        (m.charged, m.limit, m.pool_charged)
+    fn device_ledger(&self) -> (u64, u64) {
+        (self.tally.held(), self.inner.high_water())
     }
-    fn set_memory_limit(&self, bytes: Option<u64>) -> PyResult<()> {
-        self.inner.set_memory_limit(bytes);
+    fn set_device_bound(&self, bytes: Option<u64>) -> PyResult<()> {
+        self.tally.bound(bytes.unwrap_or(u64::MAX));
         Ok(())
     }
     fn __repr__(&self) -> String {
@@ -57,15 +95,15 @@ impl Device {
 }
 #[pyfunction]
 fn devices() -> PyResult<Vec<(String, String, String)>> {
-    let c = catalog()?.lock().unwrap();
+    let c = discovered()?.lock().unwrap();
     Ok(c.topology()
-        .devices()
+        .executors()
         .iter()
         .map(|i| {
             (
-                i.selector.to_string(),
-                i.name.clone(),
-                i.backend.as_str().to_owned(),
+                i.selector().to_string(),
+                i.name().to_owned(),
+                i.backend().as_str().to_owned(),
             )
         })
         .collect())
@@ -76,17 +114,17 @@ fn devices() -> PyResult<Vec<(String, String, String)>> {
 fn device(py: Python<'_>, selector: &str) -> PyResult<Device> {
     let selector = selector.to_owned();
     py.detach(move || {
-        let c = catalog()?.lock().unwrap();
-        let id = match selector.parse::<seismic::DeviceSelector>() {
+        let c = discovered()?.lock().unwrap();
+        let id = match selector.parse::<seismic::ExecutorSelector>() {
             Ok(exact) => c
                 .resolve(exact)
                 .map_err(|e| error(d::Error::new("TargetError", e)))?,
             Err(_) => c
                 .topology()
-                .devices()
+                .executors()
                 .iter()
-                .find(|i| i.backend.as_str() == selector)
-                .map(|i| i.id)
+                .find(|i| i.backend().as_str() == selector)
+                .map(|i| i.id())
                 .ok_or_else(|| {
                     error(d::Error::new(
                         "TargetError",
@@ -94,11 +132,8 @@ fn device(py: Python<'_>, selector: &str) -> PyResult<Device> {
                     ))
                 })?,
         };
-        Ok(Device {
-            inner: c
-                .open(id)
-                .map_err(|e| error(d::Error::new("TargetError", e)))?,
-        })
+        let (inner, tally) = open_tallied(&c, id).map_err(|e| error(d::Error::new("TargetError", e)))?;
+        Ok(Device { inner, tally })
     })
 }
 
@@ -145,9 +180,9 @@ impl Tensor {
     }
     #[getter]
     fn device(&self) -> PyResult<Device> {
-        Ok(Device {
-            inner: self.inner.device().map_err(error)?,
-        })
+        let inner = self.inner.device().map_err(error)?;
+        let tally = device_tally(&inner);
+        Ok(Device { inner, tally })
     }
     #[getter]
     fn nbytes(&self) -> PyResult<u64> {
@@ -230,6 +265,7 @@ impl Scalar {
                 u32::try_from(word)
                     .map_err(|_| pyo3::exceptions::PyOverflowError::new_err("u32 word"))?,
             ),
+            "u64" => d::Scalar::U64(word),
             "bool" if word <= 1 => d::Scalar::Bool(word != 0),
             "index" => d::Scalar::Index(word.into()),
             "range" => d::Scalar::Range(word.into(), end.into()),
@@ -283,6 +319,7 @@ fn result(py: Python<'_>, v: d::Value) -> PyResult<Py<PyAny>> {
                 d::Scalar::BF16(v) => ("bf16", v as u64, 0),
                 d::Scalar::I32(v) => ("i32", v as u32 as u64, 0),
                 d::Scalar::U32(v) => ("u32", v as u64, 0),
+                d::Scalar::U64(v) => ("u64", v, 0),
                 d::Scalar::Bool(v) => ("bool", v as u64, 0),
                 d::Scalar::Index(v) => (
                     "index",
@@ -449,6 +486,7 @@ fn options(text: &str) -> PyResult<seismic::PreparationOptions> {
     Ok(seismic::PreparationOptions {
         precision,
         evaluation,
+        deadline: None,
     })
 }
 #[pymethods]

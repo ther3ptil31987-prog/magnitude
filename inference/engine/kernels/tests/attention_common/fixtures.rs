@@ -1,8 +1,9 @@
 // Shared fixtures of the gated-attention entry tests (`attention.rs`,
-// `cuda_attention.rs`, `attention_k8v4.rs`, `attention_segments.rs`), included
-// textually: cases of rows with their controls, projections, weights and dense
+// `cuda_attention.rs`, `attention_k8v4.rs`), included textually: cases of rows with their controls, projections, weights and dense
 // history, the host model of the portable body, the devices, device tensors
 // and the row builders.
+
+include!("vulkan_prefill.rs");
 
 fn bf16_bits(value: f32) -> u16 {
     let bits = value.to_bits();
@@ -60,6 +61,8 @@ struct Case {
     destinations: Vec<i32>,
     history_key: Vec<f32>,
     history_value: Vec<f32>,
+    /// Each query head's sink logit, or none (`SK = 0`).
+    sinks: Vec<f32>,
     epsilon: f32,
     scale: f32,
 }
@@ -145,9 +148,25 @@ impl Case {
             destinations: rows.iter().map(|row| row.destination).collect(),
             history_key,
             history_value,
+            sinks: Vec::new(),
             epsilon: 1.0e-6,
             scale: 1.0 / (w as f32).sqrt(),
         }
+    }
+
+    /// The case with a sink logit per query head, drawn around and above
+    /// the heads' scores so some sinks dominate their softmax.
+    fn with_sinks(mut self, seed: u64) -> Self {
+        let mut noise = Noise(seed);
+        self.sinks = (0..self.geometry.kv * self.geometry.g)
+            .map(|_| noise.next() * 6.0 + 2.0)
+            .collect();
+        self
+    }
+
+    /// The sinks' rows (`SK`).
+    fn sink_rows(&self) -> usize {
+        usize::from(!self.sinks.is_empty())
     }
 
     fn prepare(&self, raw: &[f32], norm: &[f32], row: usize) -> Vec<f32> {
@@ -179,6 +198,23 @@ impl Case {
 
     /// The portable body's result and final histories, computed on the host.
     fn expected(&self) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        self.expected_reading(&|_, _| true)
+    }
+
+    /// `expected` where row `row` reads its key `o` (spans in order, then
+    /// fresh rows) only when `reads(row, o)`: a WorkList prefill.
+    fn expected_reading(&self, reads: &dyn Fn(usize, usize) -> bool) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        self.expected_holding(reads, &|vector, _| vector.to_vec())
+    }
+
+    /// `expected_reading` over a history that holds a fresh row's prepared
+    /// key (`key`) or value as `held(vector, key)`, which is what every read
+    /// of the row attends; the histories returned hold the prepared rows.
+    fn expected_holding(
+        &self,
+        reads: &dyn Fn(usize, usize) -> bool,
+        held: &dyn Fn(&[f32], bool) -> Vec<f32>,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         let Geometry { kv, g, .. } = self.geometry;
         let w = self.geometry.w();
         let keys = (0..self.rows)
@@ -194,8 +230,21 @@ impl Case {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
+        let fresh = (0..self.rows)
+            .map(|row| {
+                (0..kv)
+                    .map(|head| {
+                        (
+                            held(&keys[row][head], true),
+                            held(&self.value[(row * kv + head) * w..][..w], false),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
         let mut gated = vec![0.0; self.rows * kv * g * w];
         for row in 0..self.rows {
+            seismic_native_tests::progress(format_args!("host model: row {row} of {}", self.rows));
             for head in 0..kv * g {
                 let kv_head = head / g;
                 let query = self.prepare(
@@ -214,11 +263,15 @@ impl Case {
                 }
                 for token in self.fresh[row * 2].max(0)..self.fresh[row * 2 + 1] {
                     let token = token as usize;
-                    entries.push((
-                        &keys[token][kv_head],
-                        &self.value[(token * kv + kv_head) * w..][..w],
-                    ));
+                    let (key, value) = &fresh[token][kv_head];
+                    entries.push((&key[..], &value[..]));
                 }
+                let entries = entries
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(ordinal, _)| reads(row, *ordinal))
+                    .map(|(_, entry)| entry)
+                    .collect::<Vec<_>>();
                 let scores = entries
                     .iter()
                     .map(|(key, _)| {
@@ -235,7 +288,12 @@ impl Case {
                     .iter()
                     .map(|score| (score - maximum).exp())
                     .collect::<Vec<_>>();
-                let denominator = weights.iter().sum::<f64>().max(1e-30);
+                // A sink's logit adds its weight to the denominator only.
+                let sink = self
+                    .sinks
+                    .get(head)
+                    .map_or(0.0, |sink| (f64::from(*sink) - maximum).exp());
+                let denominator = (weights.iter().sum::<f64>() + sink).max(1e-30);
                 for column in 0..w {
                     let attended = entries
                         .iter()
@@ -271,7 +329,7 @@ impl Case {
 /// decode/prefill contract with the same decode parameters), and the CPU
 /// device.
 fn devices() -> Vec<Device> {
-    let catalog = DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     let gpu = if cfg!(target_os = "macos") {
         Some(catalog.open_backend(BackendName::Metal).unwrap())
     } else {
@@ -286,6 +344,7 @@ fn is_cpu(device: &Device) -> bool {
     device.backend() == BackendName::Cpu
 }
 
+#[allow(dead_code)]
 fn bf16_tensor(device: &Device, shape: &[usize], values: &[f32]) -> Tensor {
     let shape = shape.iter().map(|x| *x as u64).collect::<Vec<_>>();
     let bytes = values
@@ -338,6 +397,75 @@ fn bf16_values(tensor: &Tensor) -> Vec<f32> {
         .collect()
 }
 
+/// A prefill specialization in the Visible form: no WorkList bitmap (`B`,
+/// a static of the GPU natives, is 0).
+fn visible_prefill(device: &Device, specialization: NativeSpecialization) -> NativeSpecialization {
+    if is_cpu(device) {
+        specialization
+    } else {
+        specialization.with_static("B", 0)
+    }
+}
+
+/// A prefill's absent WorkList bitmap: `rows` rows of no words.
+fn no_selection(device: &Device, rows: usize) -> Tensor {
+    Tensor::from_host(device, Element::u32(), &[rows as u64, 0], &[]).unwrap()
+}
+
+/// A prefill's WorkList block keys `keys` (`BR`), carried by the extent of
+/// an empty table: 1 for a read of every visible row.
+#[allow(dead_code)]
+fn block_slots(device: &Device, keys: usize) -> Tensor {
+    Tensor::from_host(device, Element::i32(), &[0, keys as u64], &[]).unwrap()
+}
+
+/// The mix entries' `form` (`RA`, `RT`, `RO`, `VK`), carried by the extents
+/// of an empty table: half-split pairs over the leading columns, no output
+/// rotary, values of their own.
+#[allow(dead_code)]
+fn half_split_layout(device: &Device) -> Tensor {
+    Tensor::from_host(device, Element::i32(), &[0, 0, 0, 0, 0], &[]).unwrap()
+}
+
+/// The appends' `form` (`RA`, `RT`, `VK`): half-split leading, values of
+/// their own.
+#[allow(dead_code)]
+fn half_split_append_layout(device: &Device) -> Tensor {
+    Tensor::from_host(device, Element::i32(), &[0, 0, 0, 0], &[]).unwrap()
+}
+
+/// The dense entries' `form` (`RA`, `RT`, `RO`, `VK`, `KR`, `AB`): half-split
+/// leading, no output rotary, values of their own, no key rounding, no
+/// absorbed latent read.
+#[allow(dead_code)]
+fn dense_layout(device: &Device) -> Tensor {
+    Tensor::from_host(device, Element::i32(), &[0, 0, 0, 0, 0, 0, 0], &[]).unwrap()
+}
+
+/// The dense append's `form` (`RA`, `RT`, `VK`, `KR`): half-split leading,
+/// values of their own, no key rounding.
+#[allow(dead_code)]
+fn dense_append_layout(device: &Device) -> Tensor {
+    Tensor::from_host(device, Element::i32(), &[0, 0, 0, 0, 0], &[]).unwrap()
+}
+
+/// The dense mix entries' statics `specialization` with no key rounding
+/// (`KR`) and no index-list source (`KS`).
+#[allow(dead_code)]
+fn dense_statics(specialization: NativeSpecialization) -> NativeSpecialization {
+    specialization.with_static("KR", 0).with_static("AB", 0).with_static("KS", 0)
+}
+
+/// A dense entry's absent index-list source: `rows` rows of no picks
+/// (`KS` = 0) over an empty plane of `kv` heads of width `w` (`TS` = 0).
+#[allow(dead_code)]
+fn no_picks(device: &Device, rows: usize, kv: usize, w: usize) -> (Tensor, Tensor) {
+    (
+        Tensor::from_host(device, Element::i32(), &[rows as u64, 0], &[]).unwrap(),
+        Tensor::from_host(device, Element::bf16(), &[0, kv as u64, w as u64], &[]).unwrap(),
+    )
+}
+
 fn statics(geometry: Geometry) -> NativeSpecialization {
     NativeSpecialization::new()
         .with_static("KV", geometry.kv as u64)
@@ -348,14 +476,20 @@ fn statics(geometry: Geometry) -> NativeSpecialization {
 
 /// The `attention_*` family's statics of Qwen's form (attention.seismic):
 /// gates interleaved after each query head (I = W), no separate gate, one
-/// fresh layer, q/k norms, no value norm.
+/// fresh layer, q/k norms, no value norm, half-split leading rotary pairs,
+/// no output rotary and values of its own.
 fn qwen_form(specialization: NativeSpecialization, geometry: Geometry) -> NativeSpecialization {
     specialization
         .with_static("I", geometry.w() as u64)
         .with_static("U", 0)
         .with_static("F", 1)
+        .with_static("NQ", 1)
         .with_static("N", 1)
         .with_static("NV", 0)
+        .with_static("RA", 0)
+        .with_static("RT", 0)
+        .with_static("RO", 0)
+        .with_static("VK", 0)
 }
 
 /// The declared decode `SLICES` (query-group splits across simdgroups, warps
@@ -424,8 +558,3 @@ fn speculative_rows(rows: usize, context: i32) -> Vec<Row> {
         })
         .collect()
 }
-
-const TIMING: seismic::MeasureOptions = seismic::MeasureOptions {
-    samples: 15,
-    min_sample_seconds: 0.005,
-};

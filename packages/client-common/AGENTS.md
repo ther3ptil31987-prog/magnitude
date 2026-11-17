@@ -32,8 +32,8 @@ These follow directly from the principles above — declarative first, imperativ
 **3. `useAtomMount`** — Effect-scoped side effect with `Effect.addFinalizer`. The only sanctioned pattern when a side effect is inherent: no declarative mechanism exists, and no single user action is the sole trigger (state comes from server, timers, agent activity, or multiple sources).
 
 This decision applies to component-owned effects. A connection- or registry-lifetime resource owned
-by a client service is acquired by that service's `Layer.scoped`, as defined in
-`design/patterns/client-di.md`; React must not mount it to manufacture service lifetime.
+by a client service is acquired by that service's `Layer.scoped`; React must not mount it to
+manufacture service lifetime.
 
 **Decision:** Can output be `f(inputs)` with platform sync? → Declarative. Is a user action the sole trigger? → Event-source. Otherwise → `useAtomMount`.
 
@@ -75,8 +75,8 @@ remain explicit at each domain definition.
 `createAgentClient(sdk)` makes
 one application operation client; Effect Query never generates the RPC contract. Construction must
 close every embedded Effect requirement. `useAgentClient()` returns it. Every operation is a member of that client at its group name, already
-materialized: a query member is `(input) => QueryAtom` (`client.Sessions.GetSession({ sessionId })`),
-a mutation member is its `MutationAtom` (`client.Agent.SendMessage`), a subscription member is
+materialized: a query member is `(input) => QueryAtom` (`client.Projects.InspectProject({ projectId })`),
+a mutation member is its `MutationAtom` (`client.Projects.CreateProject`), a subscription member is
 `(input) => SubscriptionAtom` (`client.Changes.StreamChanges({})`). Members are the canonical atoms —
 equal inputs return the same atom — so they are never wrapped in `useMemo`. Domain services see the
 same members through `ClientEffectQuery`. Client code never passes a definition to
@@ -91,12 +91,10 @@ registry, or per-domain invalidation wiring.
 - A keyed watch (`WatchFile`, `WatchProjectFiles`) belongs to the service that exposes the queries
   it keeps fresh, as a dependency of those query atoms: the watch is open exactly while a query is
   observed. No component mounts a watch and no hook owns a stream fiber.
-- `StreamDisplayView(sessionId, shape)` is consumed by the display controller; a shape change is a
-  different subscription and resync/retry reopen it.
 
 ### Queries
 
-- Read server state with `useAtomValue(…)` over the query member (`client.Sessions.GetSession(input)`;
+- Read server state with `useAtomValue(…)` over the query member (`client.Projects.InspectProject(input)`;
   its value is the query state; render from `.result`) or over a service's read-only atom.
 - Render loading, success, and failure directly from the `Result`.
 - Derive transformed views with pure functions, `useMemo`, or derived atoms. Do not copy query results into writable state.
@@ -105,7 +103,7 @@ registry, or per-domain invalidation wiring.
 
 ### Mutations
 
-- Trigger a mutation from the user event that causes it with `useAtomSet(client.Sessions.CreateSession)` (the mutation member is the atom); the argument is the payload.
+- Trigger a mutation from the user event that causes it with `useAtomSet(client.Projects.CreateProject)` (the mutation member is the atom); the argument is the payload.
 - If the UI displays mutation pending/failure state, read the mutation atom's `Result` with `useAtomValue`. Do not wrap the call with `busy`/`error` `useState` or `try/finally` bookkeeping.
 - Prefer value mode. Use `{ mode: "promise" }` only when the event handler genuinely needs the returned success value for immediate one-shot control flow. A promise is not a state store and must not be used to mirror loading, errors, progress, or query data.
 - For long-running work, the mutation should acknowledge or return an operation ID. Progress and terminal state belong to a query, not to the mutation promise.
@@ -114,7 +112,7 @@ registry, or per-domain invalidation wiring.
 
 ### Services
 
-A client service (Tag + `Layer.scoped`, see `design/patterns/client-di.md`) exists when a domain has
+A client service (Tag + `Layer.scoped`) exists when a domain has
 connection-lifetime state, a resident resource (a keyed watch), reusable operations with
 dependencies, or a stateful client-owned use case. Services expose read-only atoms and Effects;
 hooks project them (`client.runtime.atom(Tag)`), never construct them. Sessions, projects, provider

@@ -1,0 +1,38 @@
+// Read directory-selected slots, rows16 rows of the table's resident
+// representation, through the packet decoders, a thread per value, and round
+// once to the activation element. Slot s is row s % P of record s / P, read
+// where its storage holds the record (`records (slots)`).
+#define KERNEL_W0 SEISMIC_SLOTS
+#include "lib/core/activation.glsl"
+#include "lib/core/gathered.glsl"
+#include <seismic/packets.glsl>
+#include <seismic/slab.glsl>
+
+void stored_rows() {
+    const uint64_t slots = SEISMIC_PTR(SEISMIC_BUFFER_SLOTS);
+    const uint64_t tokens = SEISMIC_PTR(SEISMIC_BUFFER_TOKENS);
+    const Out rows = SEISMIC_RESULT_0_OUT;
+    const uint width = uint(SEISMIC_DIM_W);
+    const uint column = gl_WorkGroupID.y * 256u + gl_LocalInvocationID.x;
+    if (column >= width)
+        return;
+    const packets_rows16 geometry = PACKETS_W0_ROWS;
+    for (uint64_t row = gl_WorkGroupID.x; row < SEISMIC_DIM_M; row += gl_NumWorkGroups.x) {
+        const int64_t held = gathered_row(SEISMIC_PTR(SEISMIC_BUFFER_DIRECTORY), SEISMIC_DIRECTORY_STRIDE_0,
+            SEISMIC_DIM_R, SEISMIC_DIM_F, element_i32_index(tokens, row * SEISMIC_TOKENS_STRIDE_0));
+        const uint64_t at = row * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(column) * SEISMIC_RESULT_0_STRIDE_1;
+        // A row without a slot reads zeros.
+        if (held < 0l) {
+            out_put(rows, at, 0.0);
+            continue;
+        }
+        const uint64_t per = uint64_t(SEISMIC_DIM_P);
+        // A slot is a nonnegative i32.
+        uint64_t record_at, slot_at;
+        seismic_split(uint(held), per, record_at, slot_at);
+        const uint64_t record = slab_region(slots, record_at);
+        const packets_packet packet = packets_load(PACKETS_W0, record + slot_at * geometry.stride,
+            geometry, column / 32u, width);
+        out_put(rows, at, packets_value_at(PACKETS_W0, packet, column % 32u));
+    }
+}

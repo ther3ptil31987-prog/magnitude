@@ -2,7 +2,7 @@ import { NodeContext } from "@effect/platform-node"
 import { FileSystem } from "@effect/platform"
 import { Effect, Fiber, Ref, Schedule, Schema } from "effect"
 import { describe, expect, it } from "vitest"
-import { ApplicationSnapshot } from "@magnitudedev/sdk/desktop-host"
+import { ApplicationSnapshot, type ApplicationIntent } from "@magnitudedev/sdk/desktop-host"
 import { ApplicationControlClosed, ApplicationControlFailed, ApplicationControlUnavailable } from "./application-control"
 import { launchApplicationProcess, makeApplicationClient } from "./application-client"
 
@@ -26,7 +26,7 @@ describe("desktop client startup", () => {
         }).pipe(Effect.zipRight(observe)),
         request: () => Effect.sync(() => {
           observations++
-          return launched && observations >= 3 ? ready : { ...ready, owner: { _tag: "Headless" as const } }
+          return launched && observations >= 3 ? ready : { ...ready, owner: { _tag: "Headless" as const, service: false } }
         }),
       })
       expect((yield* client.ensure("ShowWindow")).owner._tag).toBe("Desktop")
@@ -42,7 +42,7 @@ describe("desktop client startup", () => {
       launch: (_, observe) => Effect.sync(() => { launches++ }).pipe(Effect.zipRight(observe)),
       request: () => Effect.gen(function* () {
         requests++
-        if (requests === 1) return { ...ready, owner: { _tag: "Headless" as const } }
+        if (requests === 1) return { ...ready, owner: { _tag: "Headless" as const, service: false } }
         if (requests === 2) return yield* new ApplicationControlClosed()
         if (requests === 3) return yield* new ApplicationControlUnavailable({ message: "retiring" })
         return ready
@@ -64,7 +64,7 @@ describe("desktop client startup", () => {
     const malformed = makeApplicationClient({
       launch: (_, observe) => Effect.sync(() => { launches++ }).pipe(Effect.zipRight(observe)),
       request: () => Effect.suspend(() => launches === 0
-        ? Effect.succeed({ ...ready, owner: { _tag: "Headless" as const } })
+        ? Effect.succeed({ ...ready, owner: { _tag: "Headless" as const, service: false } })
         : new ApplicationControlFailed({ message: "Invalid control frame" })),
     })
     const result = await Effect.runPromise(malformed.ensure("ShowWindow").pipe(Effect.either))
@@ -76,7 +76,7 @@ describe("desktop client startup", () => {
   it("observes an existing application without launching or showing another instance", async () => {
     await Effect.runPromise(Effect.gen(function* () {
       const launches = yield* Ref.make(0)
-      const intents = yield* Ref.make<string[]>([])
+      const intents = yield* Ref.make<ApplicationIntent[]>([])
       const client = makeApplicationClient({ launch: (_, observe) => Ref.update(launches, x => x + 1).pipe(Effect.zipRight(observe)),
         request: intent => Ref.update(intents, values => [...values, intent]).pipe(Effect.as(ready)) })
       expect(yield* client.awaitReady(yield* client.ensure(), 1)).toEqual(ready)

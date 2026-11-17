@@ -51,37 +51,76 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// `from`'s state at its position. Features `from` holds for an image
     /// with a span straddling that position are adopted; every image placed
     /// after it that still lacks features is returned as an encode. Opening
-    /// into free banks changes no bindings; growing one orphans a queued
-    /// lookahead first.
+    /// into free banks changes no bindings; growing one orphans the queued
+    /// steps first, by `unchained`'s proof that no chain holds them: an open
+    /// during another request's chain waits for its end. Admission is new
+    /// work's: refused, changing nothing, where the device's ledger cannot
+    /// reserve the rows it is about to write, its `rows` (its prompt, or the
+    /// history it replays), with its drafter's rows past them and a launch's
+    /// rows ahead (`RequestRows::opening`, `Ledger::reserve`), so no prompt
+    /// row waits on memory. Its later rows are reserved ahead at its steps'
+    /// boundaries ([`Self::provision`]). Opened, the request holds its
+    /// reservation, backed, and the idle optional components are committed
+    /// again for it to draft and encode with.
     pub fn open_state(
         &mut self,
-        bindings: &mut StateBindings<F>,
+        mut unchained: Unchained<'_>,
         request: RequestId,
         from: Option<&ResumeState>,
+        rows: u64,
     ) -> Result<Vec<Operation>, DomainError> {
-        self.orphan_lookahead(bindings)?;
         let installed = self
             .input
             .get(&request)
             .ok_or_else(|| DomainError::invariant("request has no installed input"))?;
-        if installed.resident || self.target.contains_key(&request) || self.head.contains_key(&request)
+        if installed.resident
+            || self.target.contains_key(&request)
+            || self.head.contains_key(&request)
         {
             return Err(DomainError::invariant(format!(
                 "request {} is already resident",
                 request.0
             )));
         }
+        let resumes = from.map_or(0, ResumeState::position) as u64;
+        if resumes > rows {
+            return Err(DomainError::invariant(format!(
+                "request {} resumes at row {resumes}, past the {rows} rows it opens with",
+                request.0
+            )));
+        }
+        let ledgers = self.resources.ledgers();
+        let reserved = crate::memory::ledger::RequestRows::of(&self.execution).opening(rows);
+        let mut reservation = ledgers
+            .device()
+            .reserve(&self.request_slot, request, reserved)
+            .map_err(DomainError::request_short)?;
+        self.activate_components();
+        self.orphan_queue(&mut unchained)?;
         let (target, head) = match from {
             Some(from) => self.fork_resume_state(from)?,
-            None => self.fresh_state(bindings)?,
+            None => self.fresh_state(&mut unchained)?,
         };
         let position = target.position();
+        reservation.grow(position as u64);
+        self.change_state(|this| this.state_claims.insert(request, reservation));
         self.target.insert(request, target);
         if let Some(head) = head {
             self.head.insert(request, head);
         }
+        if let Err(error) = self.back_reservation(unchained.bindings(), request) {
+            self.target.remove(&request);
+            self.head.remove(&request);
+            self.change_state(|this| this.drop_state_claim(request));
+            return Err(error);
+        }
         let installed = self.input.get_mut(&request).expect("input checked above");
         installed.resident = true;
+        installed.boundary = from.and_then(|from| from.boundary.clone());
+        // A resumed sequence holds the tokens of the state it resumes.
+        installed.tokens = from.map_or_else(Default::default, |from| {
+            input::TokenHistory::starting(&from.tokens)
+        });
         let spans = installed.input.layout().spans();
         let mut encodes = Vec::new();
         for (identity, slot) in &mut installed.images {
@@ -106,11 +145,26 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(encodes)
     }
 
+    /// A test's open of `request` about to write the load's served context:
+    /// its whole context reserved ([`Self::open_state`]); refused as invariant while a
+    /// chain is under way, which a test opens beside only to see deferred.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub fn open_served(
+        &mut self,
+        bindings: &mut StateBindings,
+        request: RequestId,
+        from: Option<&ResumeState>,
+    ) -> Result<Vec<Operation>, DomainError> {
+        let rows = self.execution.resources().target_state().context_rows as u64;
+        let unchained = self.unchained(bindings).ok_or_else(|| DomainError::invariant("a test opens a request beside a chain"))?;
+        self.open_state(unchained, request, from, rows)
+    }
+
     fn fresh_state(
         &mut self,
-        bindings: &mut StateBindings<F>,
+        unchained: &mut Unchained<'_>,
     ) -> Result<(SequenceState, Option<SequenceState>), DomainError> {
-        self.provision_open(bindings)?;
+        self.provision_open(unchained)?;
         let requirements = self.open_requirements();
         self.can_open(requirements).map_err(DomainError::Capacity)?;
         let target = self.target_store.create().map_err(|error| {
@@ -137,7 +191,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         from: &ResumeState,
     ) -> Result<(SequenceState, Option<SequenceState>), DomainError> {
         let target = from.target.fork();
-        if !target.belongs_to(&self.target_store) || from.head.is_some() != self.head_store.is_some()
+        if !target.belongs_to(&self.target_store)
+            || from.head.is_some() != self.head_store.is_some()
         {
             return Err(DomainError::invariant(
                 "resume state differs from domain state arenas",
@@ -190,103 +245,69 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             })
             .collect::<Result<_, String>>()?;
         Ok(ResumeState {
+            tokens: installed.tokens.before(position)?.into(),
             target,
             head,
             features,
+            boundary: installed.boundary.clone(),
         })
     }
 
     /// Drop a request's input and any numerical state. A resident request's
-    /// state must not be in flight.
+    /// state must not be in flight; a chain holder's is its chain's, dropped
+    /// with it once its queued chunks, which still read the chain's rows,
+    /// are waited for.
     pub fn close(&mut self, request: RequestId) -> Result<(), String> {
         let installed = self.input.get(&request).ok_or("request is not open")?;
+        let holds_chain = self.chain_holder() == Some(request);
         if installed.resident
-            && (!self.target.contains_key(&request)
+            && ((!holds_chain && !self.target.contains_key(&request))
                 || (self.head_store.is_some() && !self.head.contains_key(&request)))
         {
             return Err("request has unresolved work".into());
         }
+        if holds_chain {
+            self.drain_queue().map_err(|error| error.to_string())?;
+        }
+        self.release_prefetches(&[request])?;
         self.head.remove(&request);
+        self.proposed.remove(&request);
+        self.publishing.remove(&request);
         self.input.remove(&request);
         self.target.remove(&request);
+        self.change_state(|this| this.drop_state_claim(request));
+        self.poisoned.remove(&request);
         Ok(())
-    }
-
-    /// State bytes released by evicting exactly these requests, priced as a
-    /// set: rows and banks shared with anything outside it are not counted.
-    pub fn reclaimable(&self, requests: &[RequestId]) -> Result<u64, String> {
-        let target = requests
-            .iter()
-            .map(|request| {
-                self.target.get(request).map(Holder::State).ok_or_else(|| {
-                    "reclamation request has unresolved or absent target state".to_owned()
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut bytes = self
-            .target_store
-            .exclusive_bytes(&target)
-            .map_err(|error| error.to_string())?;
-        if let Some(store) = &self.head_store {
-            let head = requests
-                .iter()
-                .map(|request| {
-                    self.head.get(request).map(Holder::State).ok_or_else(|| {
-                        "reclamation request has unresolved or absent head state".to_owned()
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            bytes = bytes
-                .checked_add(
-                    store
-                        .exclusive_bytes(&head)
-                        .map_err(|error| error.to_string())?,
-                )
-                .ok_or("reclaim byte count overflow")?;
-        }
-        Ok(bytes)
     }
 
     /// Evict these requests: release their numerical state and encoded
     /// features. Their input stays installed for when they are resident
-    /// again.
-    pub fn release_state(&mut self, requests: &[RequestId]) -> Result<u64, String> {
-        let bytes = self.reclaimable(requests)?;
+    /// again. Refused, releasing nothing, where one holds no resolved
+    /// state (a head priming not yet completed).
+    pub fn release_state(&mut self, requests: &[RequestId]) -> Result<(), String> {
+        if !requests.iter().all(|request| self.target.contains_key(request)) {
+            return Err("an evicted request has unresolved or absent target state".into());
+        }
+        if self.head_store.is_some() && !requests.iter().all(|request| self.head.contains_key(request)) {
+            return Err("an evicted request has unresolved or absent head state".into());
+        }
+        // Prefetched for the residency that ends; a state opened again
+        // prefetches its own.
+        self.release_prefetches(requests)?;
         for request in requests {
             let installed = self
                 .input
                 .get_mut(request)
                 .ok_or("evicted request has no installed input")?;
             installed.resident = false;
+            installed.boundary = None;
             for slot in installed.images.values_mut() {
                 slot.features = None;
             }
             self.target.remove(request);
             self.head.remove(request);
         }
-        Ok(bytes)
-    }
-
-    /// Release every slab of a store no sequence or checkpoint owns. That
-    /// changes bindings, so a queued lookahead is orphaned first.
-    pub fn reclaim_idle(&mut self, bindings: &mut StateBindings<F>) -> Result<u64, String> {
-        self.orphan_lookahead(bindings)
-            .map_err(|error| error.to_string())?;
-        let mut bytes = u64::try_from(
-            bindings
-                .target
-                .release_idle()
-                .map_err(|error| error.to_string())?,
-        )
-        .map_err(|_| "target idle bytes exceed u64")?;
-        if let Some(store) = &mut bindings.head {
-            bytes = bytes
-                .checked_add(
-                    u64::try_from(store.release_idle().map_err(|error| error.to_string())?)
-                        .map_err(|_| "head idle bytes exceed u64")?,
-                )
-                .ok_or("idle reclaim byte count overflow")?;
-        }
-        Ok(bytes)
+        self.change_state(|this| requests.iter().for_each(|request| this.drop_state_claim(*request)));
+        Ok(())
     }
 }

@@ -1,4 +1,4 @@
-use super::{source_import_peak_bytes, weight_bytes_by_component, ModelLoadPlan, PlannedMethod};
+use super::{assessment, weight_bytes_by_component, ModelLoadPlan, PlannedMethod};
 use crate::{
     PreparedDrafterGraphs, PreparedStateCopyGraphs, PreparedTargetGraphs,
     PreparedTargetReadoutGraphs, PreparedVisionGraphs,
@@ -9,8 +9,45 @@ use magnitude_state::{
     HistoryDomainLayout, HistoryDomainPlan, HistoryDomainTrace, KvCodec, LayerRef,
     ModelStateLayout, StateStore, StoreBindings,
 };
-use seismic::{BackendName, DType, Device, Element, SlabLayout, SlabRegion};
-use std::rc::Rc;
+use seismic::{BackendName, Device, Pool, SlabLayout};
+use std::{num::NonZeroUsize, rc::Rc};
+
+/// Rows of one prefill forward in the evaluation harness's loads, as the
+/// service bounds them.
+pub const EVALUATION_PREFILL_ROWS: usize = 512;
+
+/// The token allowances of a service's steps, from which a load's launch
+/// bounds follow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StepAllowances {
+    pub prefill_tokens: usize,
+    pub decode_tokens: usize,
+}
+
+impl StepAllowances {
+    /// The evaluation harness's drafting load: prefill forwards of
+    /// [`EVALUATION_PREFILL_ROWS`] rows, decode rounds of sixteen.
+    pub const EVALUATION_DRAFTING: Self =
+        Self { prefill_tokens: EVALUATION_PREFILL_ROWS, decode_tokens: 16 };
+
+    /// The most rows one launch carries: the larger step allowance.
+    pub const fn launch_rows(self) -> usize {
+        if self.prefill_tokens > self.decode_tokens { self.prefill_tokens } else { self.decode_tokens }
+    }
+
+    /// The most requests one launch serves. Every request consumes at least
+    /// one token in either phase, so a prefill round can have as many
+    /// request slots as its larger allowance admits.
+    pub const fn launch_slots(self) -> usize {
+        self.launch_rows()
+    }
+
+    /// The most rows one launch selects a token for, and the most requests
+    /// one drafter launch drafts for: the decode allowance.
+    pub const fn selection_bound(self) -> usize {
+        self.decode_tokens
+    }
+}
 
 /// The service's bounds a load plans for. None is a request-count batch
 /// width: a launch is bounded by its token budget (rows and request slots
@@ -38,21 +75,116 @@ pub struct ResourceLimits {
     /// completes (cross-step pipelining): one more target launch in flight
     /// and one more successor bank per live request.
     pub lookahead: bool,
+    /// The most launches one chain runs (`TargetProgram::submit`): a
+    /// prompt's consecutive chunks run layer-major as one chain, each with
+    /// its own region of the launch-row buffers and its own output slot of
+    /// the chain's rotation. Every chunk of a whole-context prompt; a group
+    /// runs within the places its class claims as it opens
+    /// (`ExecutorDomain::open_group`).
+    pub chain_capacity: NonZeroUsize,
+    /// Conversations the load holds at once at the fit depth: the workload
+    /// whose history and recurrent banks the plan charges and opportunistic
+    /// growth leaves room for (`StateCapacityPlan::workload_state_bytes`).
+    /// One for a served load, whose further requests wait for memory; a
+    /// diagnostic that holds several sequences at once declares them.
+    pub conversations: NonZeroUsize,
 }
 
-/// The most merged cells one image encodes, whatever its model declares:
-/// about 4.2 MP at Qwen3-VL's 32-pixel cells. A larger image is resized
-/// down to it.
+/// The most launches of a prompt group one merged-expert pass covers: its
+/// rows are a launch region's times these. It sizes the pass's merged
+/// experts and row table, which every group shares, and the pass graphs
+/// sealed at each length up to it; a group of more launches runs several
+/// passes. It is a priced holding: one
+/// launch is the least that is a pass, and each larger count is worth the
+/// prefill seconds its fewer passes save. The arena the launches' own graphs
+/// fix still bounds it (`group_pass_rows`), as do the chain's places.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PassLaunches(NonZeroUsize);
+
+impl PassLaunches {
+    /// One launch a pass: the least that is a pass, and what a prompt
+    /// group's routed layers run when nothing more is granted.
+    pub const FLOOR: Self = Self(NonZeroUsize::MIN);
+
+    pub const fn new(launches: NonZeroUsize) -> Self {
+        Self(launches)
+    }
+
+    pub const fn get(self) -> usize {
+        self.0.get()
+    }
+
+    /// As many launches as `limits`' chain holds: a pass over a whole
+    /// group, the most a pass can cover.
+    pub const fn whole_chain(limits: ResourceLimits) -> Self {
+        Self(limits.chain_capacity)
+    }
+}
+
+/// A value at each pass size a load may hold (`planning::pass_ladder` of
+/// its chain's places): what a prompt group of the places a pass of that
+/// size merges holds, priced at that count and no other.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ByPass<T>(std::sync::Arc<[(PassLaunches, T)]>);
+
+impl<T> ByPass<T> {
+    /// `value` at each pass size of the ladder up to `most`.
+    pub fn of<E>(most: PassLaunches, mut value: impl FnMut(PassLaunches) -> Result<T, E>) -> Result<Self, E> {
+        super::pass_ladder(most)
+            .into_iter()
+            .map(|pass| value(pass).map(|value| (pass, value)))
+            .collect::<Result<Vec<_>, E>>()
+            .map(|values| Self(values.into()))
+    }
+
+    /// The ladder's last pass size: the pass the load holds.
+    pub fn most(&self) -> PassLaunches {
+        self.0.last().expect("a ladder holds one launch's pass").0
+    }
+
+    /// The value at `pass`, a size of the ladder.
+    pub fn at(&self, pass: PassLaunches) -> &T {
+        self.0
+            .iter()
+            .find(|(of, _)| *of == pass)
+            .map(|(_, value)| value)
+            .unwrap_or_else(|| panic!("invariant violated: {pass:?} is no pass size of the load's ladder"))
+    }
+}
+
+/// The most merged cells one image encodes, whatever its model declares and
+/// whatever its device: about 4.2 MP at Qwen3-VL's 32-pixel cells. A larger
+/// image is resized down to it.
 pub const MAX_IMAGE_CELLS: usize = 4096;
 
+/// The most merged cells one image encodes on the CPU backend. An image is
+/// one launch, and a CPU launch completes during its submission, so nothing
+/// (a cancellation, a stop, an admission, a status request) is applied until
+/// the whole tower has run. On a 4-vCPU x86 host Qwen3.5 0.8B's tower encodes
+/// 64 cells in ~4 s, 256 in ~17 s, 1024 in ~130 s and 4000 in ~45 min. A
+/// larger image is resized down to it: about 0.26 MP at Qwen3-VL's 32-pixel
+/// cells.
+pub const CPU_IMAGE_CELLS: usize = 256;
+
+/// The most merged cells one image encodes on `backend`, whatever its model
+/// declares.
+pub const fn max_image_cells(backend: BackendName) -> usize {
+    match backend {
+        BackendName::Cpu => CPU_IMAGE_CELLS,
+        _ => MAX_IMAGE_CELLS,
+    }
+}
+
 /// The most merged cells one image of `definition` encodes in a load whose
-/// launches carry `launch_rows` rows: the declared resize's bound within
-/// [`MAX_IMAGE_CELLS`]. Prefill places an image's features across launches,
-/// unless its rows attend each other in the decoder: such an image is one
-/// launch. Zero without vision.
+/// launches carry `launch_rows` rows and whose device encodes at most
+/// `device_cells` ([`max_image_cells`]): the declared resize's bound within
+/// `device_cells`. Prefill places an image's features across launches, unless
+/// its rows attend each other in the decoder: such an image is one launch.
+/// Zero without vision.
 pub fn image_cell_limit(
     definition: &ModelDefinition,
     launch_rows: usize,
+    device_cells: usize,
 ) -> Result<usize, crate::PlanError> {
     let Some(vision) = &definition.vision else {
         return Ok(0);
@@ -68,7 +200,7 @@ pub fn image_cell_limit(
                 if attention.media_rows == magnitude_family_contracts::MediaRowAttention::Bidirectional
         )
     });
-    let limit = declared.min(MAX_IMAGE_CELLS);
+    let limit = declared.min(device_cells);
     let limit = if bidirectional {
         limit.min(launch_rows)
     } else {
@@ -82,28 +214,126 @@ pub fn image_cell_limit(
     Ok(limit)
 }
 
-impl ResourceLimits {
-    /// Target launches in flight at once: a step and, with lookahead, its
-    /// queued successor. The owner submits one launch at a time.
-    pub fn target_launches(&self) -> usize {
-        1 + usize::from(self.lookahead)
+/// The submitter's in-flight depth: the one authority on how many copies of
+/// a per-step device resource the host keeps, so that it never rewrites one
+/// the device still reads. Every copy count derives from it; only
+/// [`ResourceLimits::flights`] forms one.
+///
+/// The target step groups begun and not ended at once are the submitted
+/// step's and, with lookahead, its queued successor's (`domain::queue`): a
+/// further group is queued only once the owner has taken the submitted
+/// one's outcome, which ends its group, and the rest of a chain runs in the
+/// chain's group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FlightDepth {
+    groups: NonZeroUsize,
+}
+
+impl FlightDepth {
+    /// A depth of one group in flight, no lookahead: a host-only routing
+    /// replay's, which takes its reads one at a time (`experts::replay`).
+    pub(crate) const SERIAL: Self = Self { groups: NonZeroUsize::MIN };
+
+    /// Whether a continuable step's successor is queued behind it
+    /// (cross-step pipelining).
+    pub fn pipelines(self) -> bool {
+        self.groups.get() > 1
     }
 
-    /// The graph slots a load commits at startup: what one request needs to
-    /// run. Activations cover the launches in flight at once, whatever the
-    /// request count; each holds its own upload regions, and every one binds
-    /// the device's one workspace arena. The target's outputs are its
-    /// residual pair: each block graph reads one and writes the other, and
-    /// the device's submission order lets every launch reuse the same pair.
+    /// Target step groups begun and not ended at once.
+    pub fn groups(self) -> usize {
+        self.groups.get()
+    }
+
+    /// Target launches in flight at once with prompt groups of `places`
+    /// launches: a step and, with lookahead, its queued successor, or a
+    /// group's launches, each at a place of its own.
+    pub fn launches(self, places: usize) -> usize {
+        self.groups().max(places)
+    }
+
+    /// The in-flight capacity of a per-launch resource with a held class of
+    /// `places` places: what `lanes` lanes, each launch of which uses the
+    /// resource `uses` times, can have in flight at once. Each lane keeps
+    /// its [`Self::launches`] in flight, a launch holding its lease until
+    /// its completion is observed; one launch more is being built or having
+    /// its completion observed. A ring of this many entries reuses each only
+    /// after the work that last used it has completed: the one sizing rule
+    /// of every per-launch ring (`seismic::FlightRing`).
+    pub fn capacity(self, places: usize, lanes: usize, uses: usize) -> usize {
+        (lanes * self.launches(places) + 1) * uses
+    }
+
+    /// Steps begun and not ended at once on a load of `places` chain places:
+    /// each group in flight of at most `places` steps, each at a place of
+    /// its own (`BankPart::placed`). The routed kernels' `FLIGHT`: step `q`'s
+    /// records are its sequence modulo these.
+    pub const fn steps(self, places: u64) -> u64 {
+        self.groups.get() as u64 * places
+    }
+}
+
+impl FlightDepth {
+    /// A depth of a step and its lookahead successor: a served load's.
+    pub(crate) const PIPELINED: Self = Self { groups: NonZeroUsize::new(2).unwrap() };
+}
+
+impl ResourceLimits {
+    /// The most rows a decode step's launch takes: a row for each of its
+    /// requests, at most a launch's slots, in the row class covering them.
+    /// A launch of no more rows is one a decode step may make, whose graphs
+    /// a family keeps live for every launch in flight and charges
+    /// (`seismic::LaunchGraphs::of`).
+    pub fn decode_rows(&self) -> u64 {
+        magnitude_batching::row_class(self.max_launch_slots.min(self.max_launch_rows))
+            .expect("a launch takes a row and no more than a class holds") as u64
+    }
+
+    /// The in-flight depth these limits plan for: the one authority every
+    /// per-step copy count reads.
+    pub const fn flights(&self) -> FlightDepth {
+        // The submitted step's group, and its queued successor's.
+        FlightDepth {
+            groups: NonZeroUsize::MIN.saturating_add(self.lookahead as usize),
+        }
+    }
+
+    /// Successor banks a request holds in flight at once: one for each
+    /// group in flight ([`FlightDepth::groups`]), its step's and its queued
+    /// successor's; a chain's launches alternate two
+    /// (`magnitude_state::OwnedChainedAdvance`), whatever its length. So
+    /// they do not follow a group's class: every class of two places or
+    /// more takes two, and a request's banks are granted when it opens
+    /// (`ExecutorDomain::provision_open`), before any group's class is.
+    pub fn target_successor_banks(&self) -> usize {
+        self.flights().groups().max(self.chain_capacity.get().min(2))
+    }
+
+    /// The graph slots a load commits at startup: its prompt groups' floor
+    /// of one place (`class_slots`). Nothing below it is ever released, so
+    /// a group always runs, in Reclaim too, without allocating.
+    pub fn startup_slots(&self) -> StartupSlots {
+        self.class_slots(1)
+    }
+
+    /// The graph slots prompt groups of `places` launches hold: what one
+    /// request needs to run them. Activations cover the launches in flight
+    /// at once, whatever the request count; each holds its own upload
+    /// regions, and every one binds the device's one workspace arena. The
+    /// target's outputs are a chain's rotation (`TargetProgram::submit`):
+    /// each graph reads its launch's latest output and writes the free slot,
+    /// so a chain of `n` launches holds `n + 1`. A chain's slots return at
+    /// its submission and the device's submission order runs the next chain
+    /// after it, so the longest chain's rotation serves every launch.
     /// Outputs a request retains after its launch completes (readout
     /// features, head drafts, encoded images) start at one request's need
     /// and grow one slot at a time under a heap claim.
-    pub fn startup_slots(&self) -> StartupSlots {
-        let launches = self.target_launches();
+    pub fn class_slots(&self, places: usize) -> StartupSlots {
+        let launches = self.flights().launches(places);
         StartupSlots {
             target: GraphSlots {
                 activations: launches,
-                output: 2,
+                output: places + 1,
             },
             readout: GraphSlots {
                 activations: launches,
@@ -152,22 +382,93 @@ pub struct StartupSlots {
 /// entry that reads history decoded for the call, for heads of `head_width`
 /// columns: on Metal the direct form on tensor operations (any head) and
 /// the co-issue form on simdgroup matrices (128-, 256- and 512-column heads,
-/// a 512-column head as two 256-column windows).
+/// a 512-column head as two 256-column windows); on CUDA the request-local
+/// F16 operand-staging form for the affine entry's32..512-column head bands.
 /// Such forms take the history row tiles their launch's rows see; every
 /// other form reads the history in place.
-pub fn reads_decoded_history(backend: BackendName, tensor_operations: bool, head_width: u64) -> bool {
-    backend == BackendName::Metal && (tensor_operations || matches!(head_width, 128 | 256 | 512))
+pub fn reads_decoded_history(
+    backend: BackendName,
+    tensor_operations: bool,
+    head_width: u64,
+) -> bool {
+    DecodedHistoryForm::of(backend, tensor_operations, head_width).is_some()
+}
+
+/// How a form of the affine K8/V4 prefill entry that reads history decoded
+/// for the call takes the history row tiles its launch lists. The form
+/// declares what its work follows, and with it the smallest listing class
+/// worth sealing a graph for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodedHistoryForm {
+    /// Metal's direct and co-issue forms decode the listed tiles into a
+    /// window of the call's partial-output scratch, a round per window. A
+    /// listing that fits the window is one round whatever its class, and a
+    /// tile the launch does not see reads no rows, so classes below the
+    /// floor would change nothing of what a launch does.
+    Windowed,
+    /// CUDA's operand-staging form stages the listed tiles into scratch
+    /// sized by the class (`history_keys`, `history_values`). An entry of
+    /// the list that names no tile stages nothing and is never looked up,
+    /// so the form's work follows the tiles a launch sees whatever its
+    /// class: one class of one request's worth serves every listing.
+    Staged,
+}
+
+impl DecodedHistoryForm {
+    /// The form a device of `backend` has for heads of `head_width`
+    /// columns, if any ([`reads_decoded_history`]).
+    pub fn of(backend: BackendName, tensor_operations: bool, head_width: u64) -> Option<Self> {
+        match backend {
+            BackendName::Metal
+                if tensor_operations || matches!(head_width, 128 | 256 | 512) =>
+            {
+                Some(Self::Windowed)
+            }
+            BackendName::Cuda if matches!(head_width, 32 | 64 | 128 | 256 | 512) => {
+                Some(Self::Staged)
+            }
+            _ => None,
+        }
+    }
+
+    /// The tile count of the form's smallest listing class below one
+    /// request's worth, if it has classes there.
+    pub fn smallest_listing_tiles(self) -> Option<u64> {
+        match self {
+            Self::Windowed => Some(16),
+            Self::Staged => None,
+        }
+    }
+
+    /// Whether the form's listing classes are sealed for every history
+    /// segment count, as the classes that list none are. Metal's forms
+    /// reserve threadgroup memory per segment, so theirs are. CUDA's reads
+    /// its rows' spans from a table of a few bytes a segment beside the
+    /// operand stages, and does nothing for a span that is empty: its
+    /// listing class is sealed for the most segments alone, and a launch
+    /// of fewer pads each row's spans with empty ones.
+    pub fn lists_every_segment_count(self) -> bool {
+        match self {
+            Self::Windowed => true,
+            Self::Staged => false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResourceCapacity {
     /// Stable capacity of the selected device's physical allocation domain.
     pub domain_bytes: u64,
-    /// Whether the selected device forms Metal tensor operations: its own
-    /// probe (`seismic::DeviceInfo::forms_tensor_operations`), which decides
-    /// the graph classes a plan has, so assessment and load plan the same
-    /// graphs. A plan for no concrete device states which it assumes.
+    /// Whether the selected device forms Metal tensor operations, as its
+    /// executor reports (`seismic::Executor::forms_tensor_operations`):
+    /// it decides the graph classes a plan has, so assessment and load plan
+    /// the same graphs. A plan for no concrete device states which it
+    /// assumes.
     pub tensor_operations: TensorOperations,
+    /// How the selected device makes its native allocations
+    /// (`seismic::Limits::allocations`): what the state pool's blocks are,
+    /// and so what its slabs are charged in whole blocks of.
+    pub allocations: seismic::NativeAllocations,
 }
 
 /// Whether a device forms Metal tensor operations.
@@ -196,6 +497,7 @@ pub struct StateCapacityPlan {
     /// Cross-request prefix entries retention may hold.
     pub retention_entries: usize,
     pub history_rows: usize,
+    pub workload_state_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -212,31 +514,44 @@ pub struct ResourceBytes {
 
 /// A Seismic-derived physical family charge at startup. The engine chooses
 /// the slot counts; Seismic supplies every byte and every tensor layout
-/// within each slot. Each activation holds `upload_regions` upload regions
-/// of `upload_bytes`, allocated with it: one per graph run its lease keeps
-/// in flight at once. Output slots beyond `output_slots` are elastic
-/// run-time claims of `output_bytes` each. `workspace_bytes` is not part of
-/// `committed_bytes`: every family binds the device's one workspace arena,
-/// which the plan charges once at the largest family's workspace.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// within each slot. Each activation holds its own sync region of
+/// `sync_bytes` and the upload regions of `upload_regions` bytes each,
+/// allocated with it: one per graph run its lease keeps in flight at once,
+/// holding what that run writes. Output
+/// slots beyond `output_slots` are elastic run-time claims of
+/// `output_bytes` each. `workspace_bytes` is not part of `committed_bytes`:
+/// every family binds the device's one workspace arena, which the plan
+/// charges once at the largest family's workspace. Its activations, each a
+/// launch in flight, hold what `graphs` holds at their count of the
+/// device's graph budget (`seismic::LaunchGraphs::held`).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeGraphCharge {
     pub workspace_bytes: u64,
+    pub sync_bytes: u64,
     pub output_bytes: u64,
-    pub upload_bytes: u64,
-    pub upload_regions: usize,
+    pub upload_regions: Vec<u64>,
     pub activations: usize,
     pub output_slots: usize,
     pub committed_bytes: u64,
+    pub graphs: seismic::LaunchGraphs,
 }
 
-/// A family's per-slot storage: scratch, output arena and upload region
-/// bytes, and the runs one workspace lease keeps in flight.
-#[derive(Clone, Copy, Debug)]
+/// A family's per-slot storage: scratch, sync region and output arena
+/// bytes, the bytes of each upload region of an activation, and what its
+/// launches' graphs hold.
+#[derive(Clone, Debug)]
 struct FamilyFootprint {
     workspace_bytes: u64,
+    sync_bytes: u64,
     output_bytes: u64,
-    upload_bytes: u64,
-    runs_in_flight: usize,
+    upload_regions: Vec<u64>,
+    graphs: seismic::LaunchGraphs,
+}
+
+/// The upload regions of a family whose lease runs one graph at a time to
+/// completion: one that holds any of its runs' input.
+pub(crate) fn serial_upload_regions(upload_bytes: u64) -> Vec<u64> {
+    vec![upload_bytes]
 }
 
 impl FamilyFootprint {
@@ -244,25 +559,41 @@ impl FamilyFootprint {
     fn serial(family: &seismic::NativeGraphFamily) -> Self {
         Self {
             workspace_bytes: family.workspace_bytes(),
+            sync_bytes: family.sync_bytes(),
             output_bytes: family.output_bytes(),
-            upload_bytes: family.upload_bytes(),
-            runs_in_flight: 1,
+            upload_regions: serial_upload_regions(family.upload_bytes()),
+            graphs: family.graphs(),
         }
     }
 }
 
 impl NativeGraphCharge {
+    /// The charge of a family whose lease runs one graph at a time to
+    /// completion: a launch is one run, in a submission of its own
+    /// (`seismic::NativeGraphFamily::new`), of one of its graphs, which hold
+    /// `graphs` (`seismic::LaunchGraphs::of`, as its sealed family's).
+    pub(crate) fn serial(
+        storage: seismic::NativeGraphStorageBytes,
+        graphs: seismic::LaunchGraphs,
+        slots: GraphSlots,
+    ) -> Result<Self, String> {
+        Self::from_checked(storage, serial_upload_regions(storage.upload), slots, graphs)
+    }
+
+    /// The charge of a checked family whose launches' graphs hold `graphs`.
     pub(crate) fn from_checked(
         storage: seismic::NativeGraphStorageBytes,
-        runs_in_flight: usize,
+        upload_regions: Vec<u64>,
         slots: GraphSlots,
+        graphs: seismic::LaunchGraphs,
     ) -> Result<Self, String> {
         Self::from_footprint(
             FamilyFootprint {
                 workspace_bytes: storage.workspace,
+                sync_bytes: storage.sync,
                 output_bytes: storage.output,
-                upload_bytes: storage.upload,
-                runs_in_flight,
+                upload_regions,
+                graphs,
             },
             slots,
         )
@@ -272,12 +603,18 @@ impl NativeGraphCharge {
         Self::from_footprint(
             FamilyFootprint {
                 workspace_bytes: graphs.workspace_bytes(),
+                sync_bytes: graphs.family().sync_bytes(),
                 output_bytes: graphs.output_bytes(),
-                upload_bytes: graphs.family().upload_bytes(),
-                runs_in_flight: graphs.runs_per_step(),
+                upload_regions: graphs.upload_regions().to_vec(),
+                graphs: graphs.family().graphs(),
             },
             slots,
         )
+    }
+
+    /// Bytes of one activation's sync region and upload regions.
+    pub fn activation_bytes(&self) -> u64 {
+        self.sync_bytes + self.upload_regions.iter().sum::<u64>()
     }
 
     fn from_footprint(footprint: FamilyFootprint, slots: GraphSlots) -> Result<Self, String> {
@@ -287,8 +624,9 @@ impl NativeGraphCharge {
         } = slots;
         let count = |value: usize| u64::try_from(value).map_err(|_| "slot count exceeds u64");
         let per_activation = footprint
-            .upload_bytes
-            .checked_mul(count(footprint.runs_in_flight)?)
+            .upload_regions
+            .iter()
+            .try_fold(footprint.sync_bytes, |bytes, region| bytes.checked_add(*region))
             .ok_or("graph activation byte count overflows")?;
         let committed_bytes = per_activation
             .checked_mul(count(activations)?)
@@ -301,14 +639,78 @@ impl NativeGraphCharge {
             .ok_or("graph charge overflows")?;
         Ok(Self {
             workspace_bytes: footprint.workspace_bytes,
+            sync_bytes: footprint.sync_bytes,
             output_bytes: footprint.output_bytes,
-            upload_bytes: footprint.upload_bytes,
-            upload_regions: footprint.runs_in_flight,
+            upload_regions: footprint.upload_regions,
             activations,
             output_slots,
             committed_bytes,
+            graphs: footprint.graphs,
         })
     }
+}
+
+impl NativeGraphCharge {
+    /// What growing the family's slots from `from` to `to` allocates
+    /// ([`class_bytes`] of the slots beyond `from`) and adds to the device's
+    /// graph budget: its hold at `to`'s activations beyond its hold at
+    /// `from`'s, each a launch in flight (`seismic::LaunchGraphs::held`).
+    /// What a pool of it allocates and records as it grows
+    /// (`NativeGraphPool::hold_bytes`, `hold_graphs`).
+    pub(crate) fn growth(&self, from: GraphSlots, to: GraphSlots) -> Result<(u64, seismic::GraphCensus), String> {
+        let bytes = class_bytes(
+            self.activation_bytes(),
+            to.activations.saturating_sub(from.activations),
+            self.output_bytes,
+            to.output.saturating_sub(from.output),
+        )?;
+        let held = |activations: usize| u64::try_from(activations).ok().and_then(|activations| self.graphs.held(activations));
+        let graphs = held(to.activations.max(from.activations))
+            .zip(held(from.activations))
+            .and_then(|(grown, held)| grown.minus(held))
+            .ok_or("a graph family's hold overflows")?;
+        Ok((bytes, graphs))
+    }
+}
+
+/// The bytes of `activations` activations of `activation_bytes` and
+/// `outputs` output slots of `output_bytes`.
+pub(crate) fn class_bytes(activation_bytes: u64, activations: usize, output_bytes: u64, outputs: usize) -> Result<u64, &'static str> {
+    let slots = |bytes: u64, slots: usize| u64::try_from(slots).ok().and_then(|slots| bytes.checked_mul(slots));
+    slots(activation_bytes, activations)
+        .zip(slots(output_bytes, outputs))
+        .and_then(|(activations, outputs)| activations.checked_add(outputs))
+        .ok_or("a graph pool's bytes overflow")
+}
+
+/// What recording the graphs of `more` takes on a device of `cost` whose
+/// graph budget is `budget` (`seismic::Device::graph_budget`): the memory
+/// the budget with them costs beyond what it costs now, in the storage the
+/// graphs hold it in. A device's graphs are priced as a whole, so the
+/// difference counts the granules `more` adds.
+pub(crate) fn graph_demand(
+    cost: seismic::GraphCost,
+    budget: seismic::GraphCensus,
+    more: seismic::GraphCensus,
+) -> Result<crate::memory::ClaimDemand, String> {
+    let priced = |census| cost.bytes(census).ok_or_else(|| "a graph budget's memory overflows".to_owned());
+    let grown = budget.plus(more).ok_or("a graph budget overflows")?;
+    let bytes = priced(grown)?.beyond(priced(budget)?);
+    Ok(crate::memory::ClaimDemand { device: bytes.device, upload: bytes.upload, ..Default::default() })
+}
+
+/// What the startup activations of `charges` hold of their device's graph
+/// budget: each family's graphs at its activations, each a launch in
+/// flight (`NativeGraphCharge::graphs`), whatever places or classes they
+/// run.
+pub(crate) fn startup_graphs(charges: &[&NativeGraphCharge]) -> Result<seismic::GraphCensus, String> {
+    charges.iter().try_fold(seismic::GraphCensus::default(), |census, charge| {
+        u64::try_from(charge.activations)
+            .ok()
+            .and_then(|activations| charge.graphs.held(activations))
+            .and_then(|held| census.plus(held))
+            .ok_or_else(|| "the startup graphs' census overflows".to_owned())
+    })
 }
 
 /// The device's one workspace arena: the largest workspace of the `charges`
@@ -351,6 +753,13 @@ pub struct StateStorePlan {
     pub recurrent_bank_bytes: u64,
     pub zero_seed_bytes: u64,
     pub recurrent_pool_bytes: u64,
+    /// The bytes of a granule of the state's pool ([`state_granule`]): each
+    /// slab takes one, and holds as many whole pages or banks as fit it.
+    pub granule: u64,
+    /// The state pool's block of those granules (`seismic::block_bytes`),
+    /// what a load opens it at: its slabs are charged in whole blocks
+    /// ([`Self::slab_charge`]).
+    pub block: seismic::BlockSize,
 }
 
 /// One stored history domain of a store plan: exactly what the store derives
@@ -364,6 +773,27 @@ pub struct HistoryStorePlan {
     pub row_bytes: u64,
     pub slab_rows: u32,
     pub page_rows: u32,
+    pub span_limit: usize,
+}
+
+/// A stored history domain as a draft head's graphs bind it: its read (the
+/// index of its tables among a launch row's histories), its reserved rows and
+/// its slab rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct DomainRows {
+    pub read: usize,
+    pub rows: u64,
+    pub slab_rows: u32,
+}
+
+/// The state a causal draft head's graphs bind ([`StateStorePlan::head_geometry`]):
+/// the rows of its block's attention, its indexer's pending keys (Window) and
+/// unit keys (Block) if it selects, and the most spans any of them presents
+/// to a launch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct HeadHistoryGeometry {
+    pub tokens: DomainRows,
+    pub indexer: Option<[DomainRows; 2]>,
     pub span_limit: usize,
 }
 
@@ -391,13 +821,17 @@ impl HistoryStorePlan {
     }
 
     /// The tile counts of the graph classes that list a launch's history
-    /// row tiles, ascending: powers of two from 16 tiles, then one request's
-    /// worth (`launch_tiles(1)`). A launch takes the smallest that holds the
-    /// tiles its rows see, so a form that attends the listed rows a part at
-    /// a time dispatches at most twice the parts the launch needs.
-    pub fn listed_tile_classes(&self) -> Result<Vec<u64>, String> {
+    /// row tiles for `form`, ascending: powers of two from the form's
+    /// smallest class ([`DecodedHistoryForm::smallest_listing_tiles`]),
+    /// then one request's worth (`launch_tiles(1)`). A launch takes the
+    /// smallest that holds the tiles its rows see, so a form that attends
+    /// the listed rows a part at a time dispatches at most twice the parts
+    /// the launch needs.
+    pub fn listed_tile_classes(&self, form: DecodedHistoryForm) -> Result<Vec<u64>, String> {
         let most = self.launch_tiles(1)?;
-        let mut classes = std::iter::successors(Some(16u64), |tiles| tiles.checked_mul(2))
+        let mut classes = std::iter::successors(form.smallest_listing_tiles(), |tiles| {
+            tiles.checked_mul(2)
+        })
             .take_while(|tiles| *tiles < most)
             .collect::<Vec<_>>();
         classes.push(most);
@@ -417,15 +851,7 @@ impl HistoryStorePlan {
     }
 
     pub fn slab_layout(&self) -> Result<SlabLayout, String> {
-        let regions = self
-            .components
-            .iter()
-            .flat_map(ComponentDescriptor::planes)
-            .map(|plane| SlabRegion {
-                element: slab_element(plane.dtype),
-                row_shape: plane.row_extents.iter().map(|&size| size as u64).collect(),
-            })
-            .collect::<Vec<_>>();
+        let regions = magnitude_state::slab_regions(&self.components);
         SlabLayout::for_regions(u64::from(self.slab_rows), self.rows as u64, &regions)
             .map_err(|error| error.to_string())
     }
@@ -461,7 +887,7 @@ impl StateStorePlan {
             store
                 .components
                 .iter()
-                .find(|component| component.layer == owner)
+                .find(|component| component.layer == owner && component.attended())
                 .map(|component| LayerHistory {
                     domain: HistoryDomainId(index),
                     store,
@@ -470,8 +896,65 @@ impl StateStorePlan {
         })
     }
 
+    /// The history reads of a launch row of the store this plans
+    /// (`StateStore::history_reads`).
+    pub fn history_reads(&self) -> Result<magnitude_state::HistoryReads, String> {
+        magnitude_state::HistoryReads::of(&self.history, self.context_rows, self.max_advance)
+            .map_err(|error| error.to_string())
+    }
+
+    /// The raw keys' (Window) and block keys' (Block) domains of target
+    /// block `block`'s indexer over its token rows
+    /// (`LayerRef::IndexKeys { block, part: 0 }`). `None` for a block
+    /// without one.
+    pub fn indexer_history(&self, block: u32) -> Option<(&HistoryStorePlan, &HistoryStorePlan)> {
+        let layer = LayerRef::IndexKeys { block, part: 0 };
+        let find = |blocks: bool| self.produced_domain(layer, blocks).map(|(_, store)| store);
+        Some((find(false)?, find(true)?))
+    }
+
+    /// The domains of target block `block`'s pooled source `part`
+    /// (`LayerRef::Pooled`), as `StateStore::produced_domains` binds them: the
+    /// Window of its incomplete group (none at rate 1) and the Block of its
+    /// rows, whose index keys (`LayerRef::IndexKeys`) share it. `None` for a
+    /// source the block does not own.
+    pub fn pooled_history(
+        &self,
+        block: u32,
+        part: u32,
+    ) -> Option<(Option<&HistoryStorePlan>, &HistoryStorePlan)> {
+        let layer = LayerRef::Pooled { block, part };
+        let find = |blocks: bool| self.produced_domain(layer, blocks).map(|(_, store)| store);
+        Some((find(false), find(true)?))
+    }
+
+    /// The history read of target block `block`'s pooled source `part`'s
+    /// Block domain: a stored domain's read is its index
+    /// (`magnitude_state::HistoryReads`).
+    pub fn pooled_read(&self, block: u32, part: u32) -> Option<usize> {
+        self.produced_domain(LayerRef::Pooled { block, part }, true).map(|(read, _)| read)
+    }
+
+    /// The history read of target block `block`'s selected read's unit keys
+    /// (`LayerRef::IndexKeys`, its first source's): their Block domain's.
+    pub fn index_keys_read(&self, block: u32) -> Option<usize> {
+        self.produced_domain(LayerRef::IndexKeys { block, part: 0 }, true).map(|(read, _)| read)
+    }
+
+    /// The Block (`blocks`) or Window domain holding `layer`'s produced rows,
+    /// with its read index.
+    fn produced_domain(&self, layer: LayerRef, blocks: bool) -> Option<(usize, &HistoryStorePlan)> {
+        self.domains.iter().enumerate().find(|(_, store)| {
+            matches!(store.kind, HistoryDomainKind::Block { .. }) == blocks
+                && store
+                    .components
+                    .iter()
+                    .any(|component| component.layer == layer)
+        })
+    }
+
     /// The store's one history domain, for a store whose history the
-    /// caller addresses as one domain (the draft head's).
+    /// caller addresses as one domain.
     pub fn sole_history(&self) -> Result<&HistoryStorePlan, String> {
         match self.domains.as_slice() {
             [domain] => Ok(domain),
@@ -482,8 +965,47 @@ impl StateStorePlan {
         }
     }
 
+    /// The history a causal draft head's graphs bind: its own token rows and,
+    /// when its attention selects, its indexer's two domains. The store
+    /// holds nothing else.
+    pub(crate) fn head_geometry(&self) -> Result<HeadHistoryGeometry, String> {
+        let rows = |read: usize, store: &HistoryStorePlan| -> Result<DomainRows, String> {
+            Ok(DomainRows {
+                read,
+                rows: u64::try_from(store.rows).map_err(|_| "head history rows exceed u64")?,
+                slab_rows: store.slab_rows,
+            })
+        };
+        let tokens = self
+            .layer_history(LayerRef::Head(0))
+            .ok_or("a head's store keeps no history of its block")?;
+        let indexer = match (
+            self.produced_domain(LayerRef::HeadIndexKeys { block: 0, part: 0 }, false),
+            self.produced_domain(LayerRef::HeadIndexKeys { block: 0, part: 0 }, true),
+        ) {
+            (Some((window, pending)), Some((blocks, units))) => {
+                Some([rows(window, pending)?, rows(blocks, units)?])
+            }
+            (None, None) => None,
+            _ => return Err("a head's indexer keeps one of its two domains".into()),
+        };
+        let kept = 1 + 2 * usize::from(indexer.is_some());
+        if self.domains.len() != kept {
+            return Err(format!(
+                "a head's store has {} history domains where its block's attention keeps {kept}",
+                self.domains.len()
+            ));
+        }
+        Ok(HeadHistoryGeometry {
+            tokens: rows(tokens.domain.0, tokens.store)?,
+            indexer,
+            span_limit: self.span_limit(),
+        })
+    }
+
     pub fn bank_slab_banks(&self) -> Result<u32, String> {
-        u32::try_from(magnitude_state::banks_per_slab(self.recurrent_bank_bytes)?)
+        let regions = magnitude_state::bank_regions(&self.recurrent_components);
+        u32::try_from(magnitude_state::banks_per_slab(&regions, self.granule)?)
             .map_err(|_| "bank slab count exceeds u32".into())
     }
 
@@ -491,14 +1013,7 @@ impl StateStorePlan {
         if self.recurrent_components.is_empty() {
             return Ok(None);
         }
-        let regions = self
-            .recurrent_components
-            .iter()
-            .map(|component| SlabRegion {
-                element: slab_element(component.dtype),
-                row_shape: component.shape.iter().map(|&size| size as u64).collect(),
-            })
-            .collect::<Vec<_>>();
+        let regions = magnitude_state::bank_regions(&self.recurrent_components);
         let logical_banks = self
             .bank_capacity
             .storage_total()
@@ -512,83 +1027,98 @@ impl StateStorePlan {
         .map_err(|error| error.to_string())
     }
 
-    /// Every stored domain's address table and first slab.
+    /// Every stored domain's address table and first slab, a granule.
     pub fn startup_history_bytes(&self) -> Result<u64, String> {
         self.domains.iter().try_fold(0u64, |total, domain| {
-            let layout = domain.slab_layout()?;
-            layout
+            domain
+                .slab_layout()?
                 .address_table_bytes
-                .checked_add(layout.slab_bytes)
+                .checked_add(self.granule)
                 .and_then(|bytes| total.checked_add(bytes))
                 .ok_or_else(|| "initial history slab charge overflows".into())
         })
     }
 
+    /// The address table and the slabs of the banks committed at
+    /// construction ([`magnitude_state::BankCapacity::startup_banks`]).
     pub fn startup_bank_bytes(&self) -> Result<u64, String> {
-        self.bank_slab_layout()?.map_or(Ok(0), |layout| {
-            layout
-                .address_table_bytes
-                .checked_add(layout.slab_bytes)
-                .ok_or_else(|| "initial bank slab charge overflows".into())
-        })
+        self.bank_bytes_at_count(self.bank_capacity.startup_banks().map_err(|error| error.to_string())? as u64)
     }
 
-    /// One request's history at `depth` tokens: a Token domain holds `depth`
-    /// rows, a Window domain its steady footprint of `n` plus one advance,
-    /// independent of the depth; each rounded to whole slabs of its domain.
-    pub fn history_bytes_at_depth(&self, depth: u64) -> Result<u64, String> {
-        self.domains.iter().try_fold(0u64, |total, domain| {
-            let layout = domain.slab_layout()?;
-            let rows = match domain.kind {
-                HistoryDomainKind::Token => depth,
-                kind => u64::try_from(
-                    kind.row_limit(
-                        usize::try_from(depth).map_err(|_| "fit depth exceeds host range")?,
-                        self.max_advance,
-                    )
-                    .map_err(|error| error.to_string())?,
-                )
-                .map_err(|_| "window rows exceed u64")?,
-            };
-            // Whole pages: a history's first page may be partial once a
-            // window releases the rows before it, its last page always may.
-            let page = u64::from(domain.page_rows);
-            let front = u64::from(matches!(domain.kind, HistoryDomainKind::Window { .. }));
-            let pages = rows.max(1).div_ceil(page) + front;
-            let slabs = (pages * page).div_ceil(u64::from(domain.slab_rows));
-            layout
-                .slab_bytes
-                .checked_mul(slabs)
-                .and_then(|bytes| bytes.checked_add(layout.address_table_bytes))
-                .and_then(|bytes| total.checked_add(bytes))
-                .ok_or_else(|| "history slab fit charge overflows".into())
-        })
+    pub fn bank_slab_bytes_at_count(&self, banks: u64) -> Result<u64, String> {
+        if self.bank_slab_layout()?.is_none() {
+            return Ok(0);
+        }
+        let slabs = banks.max(1).div_ceil(u64::from(self.bank_slab_banks()?));
+        self.granule
+            .checked_mul(slabs)
+            .ok_or_else(|| "bank slab fit charge overflows".into())
     }
 
     pub fn bank_bytes_at_count(&self, banks: u64) -> Result<u64, String> {
         let Some(layout) = self.bank_slab_layout()? else {
             return Ok(0);
         };
-        let slabs = banks.max(1).div_ceil(u64::from(self.bank_slab_banks()?));
-        layout
-            .slab_bytes
-            .checked_mul(slabs)
-            .and_then(|bytes| bytes.checked_add(layout.address_table_bytes))
+        self.bank_slab_bytes_at_count(banks)?
+            .checked_add(layout.address_table_bytes)
             .ok_or_else(|| "bank slab fit charge overflows".into())
     }
 
     /// Address tables and the first history and bank slabs committed by
     /// `StateStore::new` for each present store.
     pub fn initial_committed_bytes(&self) -> Result<u64, String> {
-        self.startup_history_bytes()?
-            .checked_add(self.startup_bank_bytes()?)
-            .ok_or_else(|| "initial state slab charge overflows".into())
+        self.initial_slab_bytes()?
+            .checked_add(self.table_bytes()?)
+            .ok_or_else(|| "initial state charge overflows".into())
     }
 
-    /// The planned store and its one binding right.
-    pub fn allocate(&self, device: Rc<Device>) -> Result<StoreBindings, String> {
+    /// The address tables `StateStore::new` allocates: every stored
+    /// domain's and the banks'. They lie outside the pool
+    /// (`memory::ledger::CommittedKind::StateTables`).
+    pub fn table_bytes(&self) -> Result<u64, String> {
+        let banks = self.bank_slab_layout()?.map_or(0, |layout| layout.address_table_bytes);
+        self.domains.iter().try_fold(banks, |total, domain| {
+            total
+                .checked_add(domain.slab_layout()?.address_table_bytes)
+                .ok_or_else(|| "state table charge overflows".into())
+        })
+    }
+
+    /// The first slabs `StateStore::new` backs, granules of the pool
+    /// beside its tables: what the store holds of them
+    /// (`magnitude_state::StateStore::committed_bytes`) and its state floor
+    /// claims. The rest of the blocks holding them is the pool's own spare,
+    /// which its entry holds (`memory::ledger::Ledger::pool_block`) and the
+    /// plan charges once for every store sharing the pool
+    /// ([`Self::slab_charge`]).
+    pub fn initial_slab_bytes(&self) -> Result<u64, String> {
+        self.startup_history_bytes()?
+            .checked_add(self.startup_bank_bytes()?)
+            .ok_or("initial state slab charge overflows")?
+            .checked_sub(self.table_bytes()?)
+            .ok_or_else(|| "state tables exceed the state's committed bytes".into())
+    }
+
+    /// What `slab_bytes` of the state pool's granules cost: the whole blocks
+    /// holding them ([`seismic::BlockSize::charge`]).
+    pub fn slab_charge(&self, slab_bytes: u64) -> Result<u64, String> {
+        self.block.charge(self.granule, slab_bytes.div_ceil(self.granule)).ok_or_else(|| "state slab charge overflows".into())
+    }
+
+    /// The planned store and its one binding right, its slabs granules of
+    /// `pool`, the granule pool of the store on `device` the state lies in,
+    /// whose granule is the plan's.
+    pub fn allocate(&self, device: Rc<Device>, pool: Pool) -> Result<StoreBindings, String> {
+        if pool.granule() != self.granule {
+            return Err(format!(
+                "state planned in {}-byte granules given a pool of {}-byte granules",
+                self.granule,
+                pool.granule()
+            ));
+        }
         let (store, bindings) = StateStore::new(
             device,
+            pool,
             self.context_rows,
             self.max_advance,
             self.history.clone(),
@@ -639,26 +1169,22 @@ impl ResourceBytes {
 /// relevant projection of this value rather than recomputing capacity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResourcePlan {
-    pub(super) domain_capacity_bytes: u64,
+    domain_capacity_bytes: u64,
     capacity: StateCapacityPlan,
     target_state: StateStorePlan,
     head_state: Option<StateStorePlan>,
     retained_entry_bytes: u64,
     bytes: ResourceBytes,
-    pub(super) qualification_peak_bytes: u64,
     target_graph: NativeGraphCharge,
     target_readout_graph: NativeGraphCharge,
+    target_readout_chunk_graph: NativeGraphCharge,
     head_graph: Option<NativeGraphCharge>,
     vision_graph: Option<NativeGraphCharge>,
     state_graph: NativeGraphCharge,
-    steady_committed_bytes: u64,
-    startup_peak_bytes: u64,
 }
 
 impl ResourcePlan {
-    pub(crate) fn qualification_peak_bytes(&self) -> u64 {
-        self.qualification_peak_bytes
-    }
+    /// The device domain's capacity the plan was made for, as its summary reports it.
     pub fn domain_capacity_bytes(&self) -> u64 {
         self.domain_capacity_bytes
     }
@@ -683,6 +1209,7 @@ impl ResourcePlan {
         [
             Some(&self.target_graph),
             Some(&self.target_readout_graph),
+            Some(&self.target_readout_chunk_graph),
             self.head_graph.as_ref(),
             self.vision_graph.as_ref(),
             Some(&self.state_graph),
@@ -697,60 +1224,41 @@ impl ResourcePlan {
         arena_bytes(&self.graph_charges())
     }
 
-    pub(super) fn validate(mut self) -> Result<Self, String> {
+    /// The plan, its pooled charge checked against Seismic's footprints. Whether the load fits
+    /// is decided once, by assessment before the load, and each allocation is then admitted before
+    /// it is made (the engine's startup admissions), whose refusal is the typed memory shortage: the plan
+    /// decides neither.
+    pub(super) fn validate(self) -> Result<Self, String> {
         if self.bytes.scratch != graph_scratch_bytes(&self.graph_charges())? {
             return Err(
                 "resource plan pooled byte charge differs from admitted Seismic footprints".into(),
             );
         }
-        self.steady_committed_bytes = self.bytes.total()?;
-        self.startup_peak_bytes = self
-            .steady_committed_bytes
-            .checked_add(self.qualification_peak_bytes)
-            .ok_or("startup peak byte count overflow")?;
-        if self.startup_peak_bytes > self.domain_capacity_bytes {
-            return Err(format!(
-                "resource plan startup peak {} exceeds {} bytes",
-                self.startup_peak_bytes, self.domain_capacity_bytes
-            ));
-        }
         Ok(self)
     }
 
-    pub fn target_graph(&self) -> NativeGraphCharge {
-        self.target_graph
+    pub fn target_graph(&self) -> &NativeGraphCharge {
+        &self.target_graph
     }
-    pub fn target_readout_graph(&self) -> NativeGraphCharge {
-        self.target_readout_graph
+    pub fn target_readout_graph(&self) -> &NativeGraphCharge {
+        &self.target_readout_graph
     }
-    pub fn head_graph(&self) -> Option<NativeGraphCharge> {
-        self.head_graph
+    /// The chunk readout family's charge (`PreparedTargetReadoutGraphs::chunk_family`).
+    pub fn target_readout_chunk_graph(&self) -> &NativeGraphCharge {
+        &self.target_readout_chunk_graph
     }
-    pub fn vision_graph(&self) -> Option<NativeGraphCharge> {
-        self.vision_graph
+    pub fn head_graph(&self) -> Option<&NativeGraphCharge> {
+        self.head_graph.as_ref()
     }
-    pub fn state_graph(&self) -> NativeGraphCharge {
-        self.state_graph
+    pub fn vision_graph(&self) -> Option<&NativeGraphCharge> {
+        self.vision_graph.as_ref()
     }
-    pub fn steady_committed_bytes(&self) -> u64 {
-        self.steady_committed_bytes
-    }
-    pub fn startup_peak_bytes(&self) -> u64 {
-        self.startup_peak_bytes
+    pub fn state_graph(&self) -> &NativeGraphCharge {
+        &self.state_graph
     }
 
-    pub fn allocate_target_state(&self, device: Rc<Device>) -> Result<StoreBindings, String> {
-        self.target_state.allocate(device)
-    }
-
-    pub fn allocate_head_state(
-        &self,
-        device: Rc<Device>,
-    ) -> Result<Option<StoreBindings>, String> {
-        self.head_state
-            .as_ref()
-            .map(|plan| plan.allocate(device))
-            .transpose()
+    pub fn allocate_target_state(&self, device: Rc<Device>, pool: Pool) -> Result<StoreBindings, String> {
+        self.target_state.allocate(device, pool)
     }
 }
 
@@ -792,27 +1300,25 @@ impl StateResourcePlan {
     /// planned device has a form of the affine prefill entry that reads
     /// history decoded for the call ([`reads_decoded_history`]).
     pub fn lists_history_tiles(&self, backend: BackendName, head_width: u64) -> bool {
-        self.codec == KvCodec::AffineK8V4
-            && reads_decoded_history(backend, self.tensor_operations(), head_width)
+        self.decoded_history_form(backend, head_width).is_some()
+    }
+
+    /// The form of the affine prefill entry that reads this plan's history
+    /// decoded for `head_width`-column heads on the planned device of
+    /// `backend`: what the listing classes of such a block's graphs follow
+    /// ([`HistoryStorePlan::listed_tile_classes`]). None where the graphs
+    /// list no tiles.
+    pub fn decoded_history_form(
+        &self,
+        backend: BackendName,
+        head_width: u64,
+    ) -> Option<DecodedHistoryForm> {
+        DecodedHistoryForm::of(backend, self.tensor_operations(), head_width)
+            .filter(|_| self.codec == KvCodec::AffineK8V4)
     }
 
     pub fn capacity(&self) -> StateCapacityPlan {
         self.capacity
-    }
-
-    pub fn fit_state_bytes(&self, depth: u64, banks: u64) -> Result<u64, String> {
-        let target_history = self.target_state.history_bytes_at_depth(depth)?;
-        let head_history = self
-            .head_state
-            .as_ref()
-            .map(|state| state.history_bytes_at_depth(depth))
-            .transpose()?
-            .unwrap_or(0);
-        let target_banks = self.target_state.bank_bytes_at_count(banks)?;
-        target_history
-            .checked_add(head_history)
-            .and_then(|bytes| bytes.checked_add(target_banks))
-            .ok_or_else(|| "state fit charge overflows".into())
     }
 
     /// The state slabs a load commits at startup, before any request.
@@ -858,21 +1364,19 @@ impl ResourcePlanner {
         if capacity_bytes.domain_bytes == 0 {
             return Err("device domain has zero capacity".into());
         }
-        let drafter = if load.head.is_some() {
-            crate::operators::draft::drafter_blocks(definition)
-        } else {
-            Vec::new()
-        };
-        let layout =
-            ModelStateLayout::derive(&definition.decoder, &drafter, codec, method.draft_rows())?;
+        let layout = state_layout(definition, load, method, codec)?;
         let history_domains = || layout.target_history.iter().chain(&layout.head_history);
         let checkpoint_history_row_bytes = history_row_bytes(&layout.target_history)?
             .checked_add(history_row_bytes(&layout.head_history)?)
             .ok_or("history row byte count overflow")?;
         let recurrent_bank_bytes = recurrent_bank_bytes(&layout.target_recurrent)?;
-        let context = usize::try_from(definition.decoder.context_limit)
-            .map_err(|_| "context limit exceeds host domain")?;
+        let context = state_context(definition)?;
         let max_advance = limits.max_launch_rows;
+        let granule = state_granule(&layout, context, max_advance)?;
+        // The state pool's block, by the rule a load opens it by
+        // (`memory::ledger::Ledgers::open_pool`).
+        let block = seismic::block_bytes(seismic::BlockSizing { granule, allocations: capacity_bytes.allocations })
+            .map_err(|error| format!("the state pool's blocks: {error:?}"))?;
         // A checkpoint's window rows: `n` per Window(n) domain.
         let checkpoint_window_bytes = history_domains()
             .filter(|domain| matches!(domain.kind(), HistoryDomainKind::Window { .. }))
@@ -920,9 +1424,6 @@ impl ResourcePlanner {
         let history_bound =
             usize::try_from(capacity_bytes.domain_bytes / checkpoint_history_row_bytes.max(1))
                 .unwrap_or(usize::MAX);
-        if checkpoint_history_row_bytes != 0 && history_bound < context {
-            return Err("one context exceeds the device domain's history capacity".into());
-        }
         // A request needs at least one history row and one recurrent bank.
         // This is an address-space ceiling from physical bytes, never an
         // admission policy; each actual row and bank is claimed on demand.
@@ -937,21 +1438,18 @@ impl ResourcePlanner {
         let bank_capacity = BankCapacity {
             active: possible_requests,
             in_flight: possible_requests
-                .checked_mul(limits.target_launches())
+                .checked_mul(limits.target_successor_banks())
                 .ok_or("in-flight bank count overflow")?,
             retained: possible_requests
                 .checked_add(retention_entries)
                 .ok_or("retained numerical capacity overflow")?,
         };
-        let capacity = StateCapacityPlan {
-            live_requests: possible_requests,
-            checkpoints: possible_requests,
-            retention_entries,
-            // The history reservation (graphs are sealed over it): a context
-            // for every bank owner, but never more rows than the device's
-            // stable domain capacity could ever back.
-            history_rows: history_bound.max(context),
-        };
+        // The history reservation (graphs are sealed over it): as many rows
+        // as the device's stable domain capacity could ever back, and at
+        // least one context. A context whose history the domain cannot back
+        // is not refused here: whether the model fits is the assessment's
+        // verdict at its fit depth, and each row is claimed on demand.
+        let history_rows = history_bound.max(context);
         let bank_count = bank_capacity
             .storage_total()
             .map_err(|error| error.to_string())?;
@@ -961,7 +1459,7 @@ impl ResourcePlanner {
         let rows = HistoryRows {
             context,
             max_advance,
-            token: capacity.history_rows,
+            token: history_rows,
             domain_bytes: capacity_bytes.domain_bytes,
         };
         let target_state = state_store_plan(
@@ -969,9 +1467,11 @@ impl ResourcePlanner {
             layout.target_history,
             layout.target_recurrent,
             bank_capacity,
+            granule,
+            block,
         )?;
         let head_state = (!layout.head_history.is_empty())
-            .then(|| state_store_plan(rows, layout.head_history, Vec::new(), bank_capacity))
+            .then(|| state_store_plan(rows, layout.head_history, Vec::new(), bank_capacity, granule, block))
             .transpose()?;
         let planned_recurrent = target_state
             .recurrent_pool_bytes
@@ -986,16 +1486,6 @@ impl ResourcePlanner {
         }
         // Seismic's fixed address tables and first history and bank slabs are
         // committed at store construction. Further slabs use heap claims.
-        let history = target_state
-            .startup_history_bytes()?
-            .checked_add(
-                head_state
-                    .as_ref()
-                    .map(|state| state.startup_history_bytes())
-                    .transpose()?
-                    .unwrap_or(0),
-            )
-            .ok_or("startup history slab charge overflows")?;
         let planned_recurrent = target_state
             .startup_bank_bytes()?
             .checked_add(
@@ -1006,6 +1496,46 @@ impl ResourcePlanner {
                     .unwrap_or(0),
             )
             .ok_or("startup bank slab charge overflows")?;
+        // What the stores' construction commits: their tables and the whole
+        // blocks of the one state pool holding their first slabs (their
+        // state floor claims and the pool's spare beside them), of which the
+        // history's share is the rest beside the banks'.
+        let stores = || std::iter::once(&target_state).chain(head_state.as_ref());
+        let slabs = stores().try_fold(0u64, |total, store| total.checked_add(store.initial_slab_bytes()?).ok_or_else(|| String::from("startup slab charge overflows")))?;
+        let tables = stores().try_fold(0u64, |total, store| total.checked_add(store.table_bytes()?).ok_or_else(|| String::from("startup table charge overflows")))?;
+        let history = target_state
+            .slab_charge(slabs)?
+            .checked_add(tables)
+            .and_then(|committed| committed.checked_sub(planned_recurrent))
+            .ok_or("startup history slab charge overflows")?;
+        // What the standard workload charges of the stores, exactly as
+        // assessment does: retained prefixes are held only within it.
+        // The page rule's slabs of `conversations` histories at the fit depth
+        // (`magnitude_state::state_bytes`, the one state-size estimator), plus
+        // each stored domain's address table, which a slab count leaves out
+        // and `StateStore::new` commits.
+        let fit_depth = assessment::fit_depth(definition);
+        let conversations = limits.conversations.get() as u64;
+        let mut workload_slabs = 0u64;
+        for store in std::iter::once(&target_state).chain(head_state.as_ref()) {
+            let slabs = crate::memory::ledger::StoreShape::of(store)
+                .state_bytes(conversations, fit_depth)
+                .map_err(|error| error.to_string())?;
+            workload_slabs = workload_slabs.checked_add(slabs).ok_or("state fit charge overflows")?;
+        }
+        let bank_slabs = target_state.bank_slab_bytes_at_count(assessment::conversation_banks(limits)?)?;
+        workload_slabs = workload_slabs.checked_add(bank_slabs).ok_or("state fit charge overflows")?;
+        let workload_state_bytes = target_state
+            .slab_charge(workload_slabs)?
+            .checked_add(tables)
+            .ok_or("state fit charge overflows")?;
+        let capacity = StateCapacityPlan {
+            live_requests: possible_requests,
+            checkpoints: possible_requests,
+            retention_entries,
+            history_rows,
+            workload_state_bytes,
+        };
         Ok(StateResourcePlan {
             definition: definition.clone(),
             load: load.clone(),
@@ -1022,7 +1552,6 @@ impl ResourcePlanner {
     }
 
     pub fn plan_with_state(
-        backend: BackendName,
         state: StateResourcePlan,
         target_graphs: &PreparedTargetGraphs,
         target_readout_graphs: &PreparedTargetReadoutGraphs,
@@ -1030,26 +1559,22 @@ impl ResourcePlanner {
         vision_graphs: Option<&PreparedVisionGraphs>,
         state_graphs: &PreparedStateCopyGraphs,
     ) -> Result<ResourcePlan, String> {
-        let definition = &state.definition;
         let load = &state.load;
         let limits = state.limits;
-        let capacity_bytes = state.capacity_bytes;
-        let qualification_peak = crate::AttestedPrograms::qualification_peak_bytes(load)?;
-        let source_import_peak = load
-            .target
-            .iter()
-            .chain(load.head.iter().flatten())
-            .chain(load.vision.iter().flatten())
-            .map(|weight| weight.source_bytes)
-            .max()
-            .unwrap_or(0);
-        let source_import_peak = source_import_peak_bytes(source_import_peak)?;
-        let qualification_peak_bytes = qualification_peak.max(source_import_peak);
         let slots = limits.startup_slots();
         let target_graph = NativeGraphCharge::from_prepared(target_graphs, slots.target)?;
         let target_readout_graph = NativeGraphCharge::from_footprint(
             FamilyFootprint::serial(target_readout_graphs.family()),
             slots.readout,
+        )?;
+        // A prompt chunk's readout slots beyond the floor's: none until a
+        // group's class is held (`ExecutorDomain::open_group`).
+        let target_readout_chunk_graph = NativeGraphCharge::from_footprint(
+            FamilyFootprint::serial(target_readout_graphs.chunk_family()),
+            GraphSlots {
+                activations: 0,
+                output: 0,
+            },
         )?;
         let head_graph = head_graphs
             .map(|graphs| {
@@ -1074,6 +1599,7 @@ impl ResourcePlanner {
         let charges = [
             Some(&target_graph),
             Some(&target_readout_graph),
+            Some(&target_readout_chunk_graph),
             head_graph.as_ref(),
             vision_graph.as_ref(),
             Some(&state_graph),
@@ -1082,13 +1608,6 @@ impl ResourcePlanner {
         .flatten()
         .collect::<Vec<_>>();
         let scratch = graph_scratch_bytes(&charges)?;
-        let prepared_programs = crate::AttestedPrograms::planned_invocation_workspace_bytes(
-            &load
-                .program_plan(definition, state.codec)
-                .map_err(|error| error.to_string())?,
-            backend,
-        )
-        .map_err(|error| error.to_string())?;
         let [target_weights, head_weights, vision_weights] = weight_bytes_by_component(load)?;
         let bytes = ResourceBytes {
             target_weights,
@@ -1096,11 +1615,14 @@ impl ResourcePlanner {
             vision_weights,
             history: state.history_bytes,
             recurrent_banks: state.recurrent_banks_bytes,
-            prepared_programs,
+            prepared_programs: crate::AttestedPrograms::DEVICE_BYTES,
             scratch,
         };
-        let required = bytes.total()?;
         if std::env::var_os("MAGNITUDE_TRACE_RESOURCES").is_some() {
+            let capacity_bytes = state.capacity_bytes;
+            let required = bytes.total()?;
+            let qualification_peak_bytes = crate::AttestedPrograms::qualification_peak_bytes(load)?
+                .max(load.imports().peak_bytes());
             eprintln!(
                 "resource plan domain_capacity={} required={} qualification_peak={} weights=[{},{},{}] history={} recurrent_banks={} prepared_programs={} scratch={} graph=[target:{},readout:{},head:{},vision:{},state:{}]",
                 capacity_bytes.domain_bytes,
@@ -1115,8 +1637,8 @@ impl ResourcePlanner {
                 bytes.scratch,
                 target_graph.committed_bytes,
                 target_readout_graph.committed_bytes,
-                head_graph.map_or(0, |graph| graph.committed_bytes),
-                vision_graph.map_or(0, |graph| graph.committed_bytes),
+                head_graph.as_ref().map_or(0, |graph| graph.committed_bytes),
+                vision_graph.as_ref().map_or(0, |graph| graph.committed_bytes),
                 state_graph.committed_bytes,
             );
             // Each family's placed workspace against its liveness floor: a
@@ -1138,27 +1660,19 @@ impl ResourcePlanner {
                 workspace(state_graphs.family()),
             );
         }
-        if required > capacity_bytes.domain_bytes {
-            return Err(format!(
-                "resource plan requires {required} bytes but the device domain has {}",
-                capacity_bytes.domain_bytes
-            ));
-        }
         ResourcePlan {
-            domain_capacity_bytes: capacity_bytes.domain_bytes,
+            domain_capacity_bytes: state.capacity_bytes.domain_bytes,
             capacity: state.capacity,
             target_state: state.target_state,
             head_state: state.head_state,
             retained_entry_bytes: state.retained_entry_bytes,
             bytes,
-            qualification_peak_bytes,
             target_graph,
             target_readout_graph,
+            target_readout_chunk_graph,
             head_graph,
             vision_graph,
             state_graph,
-            steady_committed_bytes: 0,
-            startup_peak_bytes: 0,
         }
         .validate()
     }
@@ -1191,11 +1705,64 @@ impl HistoryRows {
                     )
             }
             HistoryDomainKind::Shared { .. } => 0,
-            HistoryDomainKind::Block { .. } => {
-                return Err(format!("history domain {kind:?} is not supported"))
-            }
+            // A block row per `rate` of the Token domain's.
+            HistoryDomainKind::Block { rate } => self.token.div_ceil(rate),
         })
     }
+}
+
+/// The state layout of a load of `definition` planned as `load`, `method`
+/// and `codec`: its drafter's history where the load holds a head.
+fn state_layout(
+    definition: &ModelDefinition,
+    load: &ModelLoadPlan,
+    method: PlannedMethod,
+    codec: KvCodec,
+) -> Result<ModelStateLayout, String> {
+    let drafter = if load.head.is_some() {
+        crate::operators::draft::drafter_blocks(definition)
+    } else {
+        Vec::new()
+    };
+    ModelStateLayout::derive(&definition.decoder, &drafter, codec, method.draft_rows())
+}
+
+/// The context a load's state stores hold for a request.
+fn state_context(definition: &ModelDefinition) -> Result<usize, String> {
+    usize::try_from(definition.decoder.context_limit).map_err(|_| "context limit exceeds host domain".into())
+}
+
+/// The granule of the pool `layout`'s state slabs lie in, its histories at
+/// `context` advanced at most `max_advance` rows at a time: the state's own
+/// class (§4.7), whatever bank lies beside it, of its smallest slabs
+/// ([`state_pool_granule`]).
+pub(crate) fn state_granule(layout: &ModelStateLayout, context: usize, max_advance: usize) -> Result<u64, String> {
+    state_pool_granule(smallest_slab(layout, context, max_advance)?)
+}
+
+/// The granule of a state pool whose slab stores each fit `slab`: `slab`'s
+/// bytes at a multiple of its alignment, so each granule holds a store's
+/// smallest slab, and the pool's blocks gather granules to the backend's
+/// allocations (`seismic::block_bytes`); the least a granule is
+/// ([`seismic::BLOCK_ALIGNMENT`]) without state slabs, whose pool holds
+/// none. The one rule of a state pool's granule; an expert bank's records
+/// are pooled at their own (`ExpertBankPlan::granule`).
+pub(crate) fn state_pool_granule(slab: Option<super::PoolSlab>) -> Result<u64, String> {
+    slab.map_or(Ok(seismic::BLOCK_ALIGNMENT), super::PoolSlab::granule)
+}
+
+/// The slab every slab store of `layout`'s state stores fits: the largest
+/// of their smallest slabs, at a multiple of every one's alignment; none
+/// without state slabs.
+fn smallest_slab(layout: &ModelStateLayout, context: usize, max_advance: usize) -> Result<Option<super::PoolSlab>, String> {
+    let stores = [(&layout.target_history, &layout.target_recurrent[..]), (&layout.head_history, &[][..])];
+    stores.into_iter().try_fold(None, |slab: Option<super::PoolSlab>, (history, recurrent)| {
+        magnitude_state::smallest_slabs(history, recurrent, context, max_advance)
+            .map_err(|error| error.to_string())?
+            .iter()
+            .map(super::PoolSlab::of)
+            .try_fold(slab, |slab, store| slab.map_or(Ok(store), |slab| slab.with(store)).map(Some))
+    })
 }
 
 fn state_store_plan(
@@ -1203,6 +1770,8 @@ fn state_store_plan(
     history: Vec<HistoryDomainLayout>,
     recurrent_components: Vec<ComponentSpec>,
     bank_capacity: BankCapacity,
+    granule: u64,
+    block: seismic::BlockSize,
 ) -> Result<StateStorePlan, String> {
     let layouts = history;
     // The rows the store reserves for each stored domain (whole pages), which
@@ -1213,7 +1782,7 @@ fn state_store_plan(
             let logical_rows = match layout {
                 HistoryDomainLayout::Shared { .. } => 0,
                 _ => layout
-                    .geometry(&layouts, rows.context, rows.max_advance)
+                    .pages(&layouts, rows.context, rows.max_advance)
                     .map_err(|error| error.to_string())?
                     .reserved_rows(rows.rows(layout)?)
                     .ok_or("history rows overflow whole pages")?,
@@ -1231,7 +1800,7 @@ fn state_store_plan(
             let row_bytes = plan.layout.row_bytes().map_err(|error| error.to_string())?;
             let geometry = plan
                 .layout
-                .geometry(&layouts, rows.context, rows.max_advance)
+                .geometry(&layouts, rows.context, rows.max_advance, granule)
                 .map_err(|error| error.to_string())?;
             Ok(HistoryStorePlan {
                 kind: plan.layout.kind(),
@@ -1267,25 +1836,106 @@ fn state_store_plan(
         recurrent_bank_bytes,
         zero_seed_bytes: recurrent_bank_bytes,
         recurrent_pool_bytes,
+        granule,
+        block,
     })
-}
-
-fn slab_element(dtype: DType) -> Element {
-    match dtype {
-        DType::F32 => Element::f32(),
-        DType::F16 => Element::f16(),
-        DType::BF16 => Element::bf16(),
-        DType::I32 => Element::i32(),
-        DType::U32 => Element::u32(),
-        DType::Bool => Element::bool(),
-    }
 }
 
 #[cfg(test)]
 mod slab_plan_tests {
     use super::*;
     use magnitude_state::LayerRef;
-    use seismic::{BackendName, DeviceCatalog};
+    use seismic::{BackendName, DType};
+
+    #[test]
+    fn listed_history_classes_bound_capacity_for_small_and_large_extents() {
+        for most in [1, 3, 5, 16, 17, 257, 1024] {
+            let plan = HistoryStorePlan {
+                kind: HistoryDomainKind::Token,
+                components: Vec::new(),
+                rows: most * magnitude_state::SLAB_ROW_TILE,
+                row_bytes: 1,
+                slab_rows: magnitude_state::SLAB_ROW_TILE as u32,
+                page_rows: magnitude_state::SLAB_ROW_TILE as u32,
+                span_limit: most,
+            };
+            // A form whose work follows the tiles a launch sees has one
+            // class: one request's worth.
+            assert_eq!(
+                plan.listed_tile_classes(DecodedHistoryForm::Staged).unwrap(),
+                [most as u64]
+            );
+            // A form that decodes into a window seals no class below its
+            // floor: powers of two from it, then one request's worth.
+            let windowed = plan
+                .listed_tile_classes(DecodedHistoryForm::Windowed)
+                .unwrap();
+            assert_eq!(windowed.last(), Some(&(most as u64)));
+            assert!(windowed.windows(2).all(|pair| pair[0] < pair[1]));
+            assert!(
+                windowed[..windowed.len() - 1]
+                    .iter()
+                    .all(|tiles| *tiles >= 16 && tiles.is_power_of_two())
+            );
+        }
+    }
+
+    /// A class's launches are in flight at once and rotate one output slot
+    /// each and a spare; a class of one leaves a step and its lookahead
+    /// successor sharing those two. A load starts at the floor of one,
+    /// whatever its chain capacity.
+    #[test]
+    fn a_class_sizes_launches_and_output_rotation() {
+        let limits = |lookahead, capacity| ResourceLimits {
+            max_launch_rows: 512,
+            max_launch_slots: 8,
+            max_selected_rows: 8,
+            max_drafting_slots: 8,
+            exported_logits_rows: 0,
+            max_images_per_request: 1,
+            max_image_cells: 0,
+            lookahead,
+            chain_capacity: NonZeroUsize::new(capacity).unwrap(),
+            conversations: NonZeroUsize::MIN,
+        };
+        let slots = |lookahead, places| {
+            let slots = limits(lookahead, 128).class_slots(places);
+            (slots.target, slots.readout.activations)
+        };
+        assert_eq!(limits(true, 128).startup_slots(), limits(true, 128).class_slots(1));
+        let target = |activations, output| GraphSlots {
+            activations,
+            output,
+        };
+        assert_eq!(slots(false, 1), (target(1, 2), 1));
+        assert_eq!(slots(true, 1), (target(2, 2), 2));
+        assert_eq!(slots(true, 4), (target(4, 5), 4));
+        // A chain's launches alternate two successor banks.
+        let banks = |lookahead, capacity| limits(lookahead, capacity).target_successor_banks();
+        assert_eq!(
+            (banks(false, 1), banks(true, 1), banks(false, 4), banks(true, 116)),
+            (1, 2, 2, 2)
+        );
+    }
+
+    /// The form a backend's device has declares its listing classes: no
+    /// graph is sealed for a class its form does nothing different at.
+    #[test]
+    fn the_decoded_history_form_declares_its_smallest_listing_class() {
+        let form = |backend, tensor_operations, width| {
+            DecodedHistoryForm::of(backend, tensor_operations, width)
+        };
+        assert_eq!(form(BackendName::Metal, true, 64), Some(DecodedHistoryForm::Windowed));
+        assert_eq!(form(BackendName::Metal, false, 256), Some(DecodedHistoryForm::Windowed));
+        assert_eq!(form(BackendName::Metal, false, 64), None);
+        assert_eq!(form(BackendName::Cuda, false, 64), Some(DecodedHistoryForm::Staged));
+        assert_eq!(form(BackendName::Cpu, false, 256), None);
+        assert_eq!(DecodedHistoryForm::Windowed.smallest_listing_tiles(), Some(16));
+        assert_eq!(DecodedHistoryForm::Staged.smallest_listing_tiles(), None);
+    }
+
+    /// The state granule the slab storage test plans at.
+    const GRANULE: u64 = 64 << 20;
 
     #[test]
     fn startup_and_fit_charges_match_slab_storage() {
@@ -1314,56 +1964,76 @@ mod slab_plan_tests {
                 in_flight: 2,
                 retained: 1,
             },
+            GRANULE,
+            // A block of three granules the backend rounds up, as CUDA's and
+            // Vulkan's are: the store's slabs are granules of it whatever
+            // the block, and the plan agrees with the store.
+            seismic::BlockSize { bytes: 3 * GRANULE, held: 3 * GRANULE + (1 << 20) },
         )
         .unwrap();
+        // Each slab is a granule of the store's pool.
+        let granule = plan.granule;
         let history = plan.domains[0].slab_layout().unwrap();
         let banks = plan.bank_slab_layout().unwrap().unwrap();
         assert_eq!(plan.bank_slab_banks().unwrap(), 4);
+        assert!(history.slab_bytes <= granule && banks.slab_bytes <= granule);
         assert_eq!(
             plan.initial_committed_bytes().unwrap(),
-            history.address_table_bytes
-                + history.slab_bytes
-                + banks.address_table_bytes
-                + banks.slab_bytes
+            history.address_table_bytes + granule + banks.address_table_bytes + granule
         );
         let device = Rc::new(
-            DeviceCatalog::discover()
-                .unwrap()
-                .open_backend(BackendName::Cpu)
+            crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), BackendName::Cpu)
                 .unwrap(),
         );
-        let store = plan.allocate(device).unwrap();
+        let entry = device.entry(seismic::Contract::DeviceOnly);
+        let pool = device.pool(seismic::Contract::DeviceOnly, granule, granule, seismic::PoolEntries::one(entry)).unwrap();
+        let store = plan.allocate(device, pool).unwrap();
         assert_eq!(
             store.committed_bytes(),
             plan.initial_committed_bytes().unwrap()
         );
+        // The pool's blocks holding the first two slabs: one, rounded.
+        assert_eq!(plan.slab_charge(2 * granule).unwrap(), 3 * GRANULE + (1 << 20));
+        assert_eq!(plan.slab_charge(4 * granule).unwrap(), 2 * (3 * GRANULE + (1 << 20)));
 
         let history_depth = u64::from(plan.domains[0].slab_rows) + 1;
+        let slabs = |conversations| {
+            crate::memory::ledger::StoreShape::of(&plan)
+                .state_bytes(conversations, history_depth)
+                .unwrap()
+        };
+        assert_eq!(slabs(1), 2 * granule);
+        // Each conversation's rows in pages of its own, slabs over them all.
+        let page = u64::from(plan.domains[0].page_rows);
+        let slab = u64::from(plan.domains[0].slab_rows);
         assert_eq!(
-            plan.history_bytes_at_depth(0).unwrap(),
-            history.address_table_bytes + history.slab_bytes
-        );
-        assert_eq!(
-            plan.history_bytes_at_depth(history_depth).unwrap(),
-            history.address_table_bytes + 2 * history.slab_bytes
+            slabs(3),
+            (3 * history_depth.div_ceil(page) * page).div_ceil(slab) * granule
         );
         assert_eq!(
             plan.bank_bytes_at_count(5).unwrap(),
-            banks.address_table_bytes + 2 * banks.slab_bytes
+            banks.address_table_bytes + 2 * granule
         );
     }
 }
 
-/// History bytes per token of context: the rows of every Token domain.
-/// Window domains hold a bounded number of rows whatever the context (see
-/// `StateStorePlan::history_bytes_at_depth`).
+/// History bytes per token of context: the rows of every Token domain, and
+/// a `rate`-th of every Block domain's (rounded up). Window domains hold a
+/// bounded number of rows whatever the context (see
+/// `magnitude_state::state_bytes`).
 pub(super) fn history_row_bytes(domains: &[HistoryDomainLayout]) -> Result<u64, String> {
     domains
         .iter()
-        .filter(|domain| domain.kind() == HistoryDomainKind::Token)
         .try_fold(0u64, |total, domain| {
+            let row_bytes = domain.row_bytes().map_err(|error| error.to_string())?;
+            // A Block domain keeps a row per `rate` tokens.
+            let bytes = match domain.kind() {
+                HistoryDomainKind::Token => row_bytes,
+                HistoryDomainKind::Block { rate } => row_bytes.div_ceil(rate as u64),
+                HistoryDomainKind::Window { .. } | HistoryDomainKind::Shared { .. } => 0,
+            };
             total
-                .checked_add(domain.row_bytes().map_err(|error| error.to_string())?)
+                .checked_add(bytes)
                 .ok_or_else(|| "history row byte count overflow".into())
         })
 }

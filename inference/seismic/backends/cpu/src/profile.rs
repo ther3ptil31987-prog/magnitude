@@ -104,12 +104,13 @@ pub struct HostFacts {
 
 pub(crate) fn profile_for_workers(
     workers: &mut crate::workers::Workers,
+    scratch: &std::sync::Arc<dyn seismic_memory::entry::Entry>,
     device: std::sync::Arc<seismic_native_target::DeviceDescription<Cpu>>,
 ) -> Result<seismic_compiler::evaluation::AnalyticalEvaluationContext<Cpu>, TargetError> {
     let total_started = Instant::now();
     let probe_started = Instant::now();
-    let services = services::probe_services(workers)?;
-    let composition_qualification = services::qualify_compositions(workers)?;
+    let services = services::probe_services(workers, scratch)?;
+    let composition_qualification = services::qualify_compositions(workers, &services, scratch)?;
     let probe_execution_ns = u64::try_from(probe_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let execution_parts = ExecutionProfileParts::new(
         device,
@@ -198,7 +199,8 @@ pub(crate) fn device_for_workers(
         atomics: scalars
             .iter()
             .copied()
-            .filter(|dtype| dtype.is_numeric())
+            // The host atomics are 32-bit and narrower read-modify-writes.
+            .filter(|dtype| dtype.is_numeric() && dtype.bytes() <= 4)
             .collect(),
         representations,
     };

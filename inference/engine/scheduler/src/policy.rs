@@ -6,24 +6,43 @@ pub enum Phase {
     Prefill,
     Decode,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ServiceLimits {
     pub prefill_tokens: usize,
     pub decode_tokens: usize,
     pub decode_share: f64,
     pub locality_seconds: f64,
+    /// Conversations the load plans state for at once, each at its fit
+    /// depth (`ResourceLimits::conversations`): one for the service, whose
+    /// further requests wait for memory; a client that holds several
+    /// sequences at once and cannot wait declares them.
+    pub conversations: std::num::NonZeroUsize,
 }
 impl ServiceLimits {
     /// The most rows one launch selects a token for, and the most requests
     /// one drafter launch drafts for: the decode allowance. A decode round
     /// never exceeds it; the owner admits no prefill round beyond it.
     pub fn selection_bound(&self) -> usize {
-        self.decode_tokens
+        self.steps().selection_bound()
+    }
+
+    /// The step token allowances the load's launch bounds follow from.
+    pub fn steps(&self) -> magnitude_executor::StepAllowances {
+        magnitude_executor::StepAllowances {
+            prefill_tokens: self.prefill_tokens,
+            decode_tokens: self.decode_tokens,
+        }
     }
 
     /// The most rows one launch carries: the larger step token allowance.
     pub fn launch_rows(&self) -> usize {
-        self.prefill_tokens.max(self.decode_tokens)
+        self.steps().launch_rows()
+    }
+
+    /// The decode time owed each unit of time prefill runs while decode
+    /// waits: decode's share of the device over prefill's.
+    pub fn decode_owed(&self) -> f64 {
+        self.decode_share / (1.0 - self.decode_share)
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -51,6 +70,9 @@ pub struct Operation {
     pub waiting_since_ns: u64,
     pub service_ns: u64,
     pub preemption_debt: u32,
+    /// Whether this candidate holds a chain: work already queued on the
+    /// device that its next round continues, ahead of every other candidate.
+    pub holds_chain: bool,
 }
 /// A selection is consumed when its preparation-through-completion cost is charged.
 #[derive(Debug)]
@@ -125,6 +147,16 @@ impl Scheduler {
             self.decode_debt_ns = 0.0;
         }
         self.contended = contended;
+        // A chain runs on the device as one: its holder alone continues it,
+        // charged under this round's contention, so the time it takes is
+        // owed to a decode waiting behind it as any prefill round's.
+        if let Some(holder) = candidates.iter().find(|c| c.holds_chain) {
+            return Ok(Some(Selection {
+                phase: holder.phase,
+                requests: vec![holder.identity],
+                contended,
+            }));
+        }
         let phase = if decoding && (!prefill || first || self.decode_debt_ns > 0.0) {
             Phase::Decode
         } else {
@@ -154,6 +186,7 @@ impl Scheduler {
             contended,
         }))
     }
+
     pub fn completed(&mut self, selection: Selection, elapsed_ns: u64) {
         self.completed_service_ns += u128::from(elapsed_ns);
         if selection.contended {
@@ -162,43 +195,15 @@ impl Scheduler {
                     self.decode_debt_ns = (self.decode_debt_ns - elapsed_ns as f64).max(0.0)
                 }
                 Phase::Prefill => {
-                    self.decode_debt_ns += elapsed_ns as f64 * self.limits.decode_share
-                        / (1.0 - self.limits.decode_share)
+                    self.decode_debt_ns += elapsed_ns as f64 * self.limits.decode_owed()
                 }
             }
         }
     }
 }
 
-/// Candidate eligibility (live, resident, unsubmitted, unprotected, unselected)
-/// belongs to the service. Byte prices come from the model for actual ownership.
-pub struct Victim {
-    pub identity: RequestId,
-    pub output_blocked: bool,
-    pub preemption_debt: u32,
-    pub exclusive_bytes: u64,
-    pub replay_tokens: u64,
-    pub service_ns: u64,
-}
-/// Ordered candidates only. The service must price growing *sets* again because
-/// shared allocations may become reclaimable only after several owners close.
-pub fn order_victims(victims: &mut [Victim]) {
-    victims.sort_by(|a, b| {
-        b.output_blocked
-            .cmp(&a.output_blocked)
-            .then_with(|| a.preemption_debt.cmp(&b.preemption_debt))
-            .then_with(|| {
-                let left = u128::from(a.exclusive_bytes) * u128::from(b.replay_tokens.max(1));
-                let right = u128::from(b.exclusive_bytes) * u128::from(a.replay_tokens.max(1));
-                right.cmp(&left)
-            })
-            .then_with(|| a.service_ns.cmp(&b.service_ns))
-            .then_with(|| a.identity.cmp(&b.identity))
-    });
-}
-
-/// Counts the events that free capacity. A request short of capacity retries
-/// only after it moves.
+/// Counts the events that free memory. A request waiting on memory (a blind
+/// reading) retries only after it moves.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AvailabilityEpoch(u64);
 impl AvailabilityEpoch {

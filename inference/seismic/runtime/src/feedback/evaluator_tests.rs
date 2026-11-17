@@ -1,7 +1,23 @@
 //! A downstream evaluator selects ordinary domain coordinates, then executes
 //! admitted native artifacts through the compiler's production command path.
-struct FixedTestResources<'a, B>(&'a [RuntimeBuffer<B>]);
-impl<B> seismic_compiler::executable::ExecutionResources<B> for FixedTestResources<'_, B> {
+struct FixedTestResources<B>(Vec<RuntimeBuffer<B>>);
+impl<B: Clone> FixedTestResources<B> {
+    /// The allocated `buffers` as device work binds them.
+    fn bound<W: std::borrow::Borrow<B>>(buffers: &[RuntimeBuffer<W>]) -> Self {
+        Self(
+            buffers
+                .iter()
+                .map(|buffer| RuntimeBuffer {
+                    tensor: buffer.tensor.clone(),
+                    buffer: buffer.buffer.borrow().clone(),
+                    base_offset: buffer.base_offset,
+                    accessible_bytes: buffer.accessible_bytes,
+                })
+                .collect(),
+        )
+    }
+}
+impl<B> seismic_compiler::executable::ExecutionResources<B> for FixedTestResources<B> {
     fn retire_completed_instances(
         &mut self,
         _: &[seismic_compiler::executable::ExecutableAllocationId],
@@ -164,12 +180,12 @@ struct RecordingCompiler {
     width: AtomicU32,
 }
 impl NativeCompiler<Metal> for RecordingCompiler {
-    type Context = DeviceHandle;
+    type Context = seismic_metal::MetalPrograms;
     type Candidate = seismic_metal::NativeCandidate;
     type Handle = Pipeline;
     fn form(
         &self,
-        context: &DeviceHandle,
+        context: &seismic_metal::MetalPrograms,
         target: &DeviceDescription<Metal>,
         kernel: &seismic_ir::kernel::Kernel<Metal>,
         layout: &seismic_ir::physical_target::KernelEmissionLayout,
@@ -227,8 +243,15 @@ impl NativeSubmission<Metal> for AuditSubmission {
 #[test]
 #[ignore = "requires Metal device"]
 fn authored_failure_before_subgroup_preserves_prefix_and_reconverges_after_if() {
-    let device = MetalDevice::open(DeviceHandle::system_default().unwrap()).unwrap();
-    let target = seismic_metal::profile::open_device(&device).unwrap();
+    let tally = seismic_memory::entry::Tally::unbounded(seismic_topology::StoreIdentity::HostRam);
+    let charge: std::sync::Arc<dyn seismic_memory::entry::Entry> = std::sync::Arc::new(tally.clone());
+    let device = MetalDevice::open(DeviceHandle::system_default().unwrap(), std::sync::Arc::new(tally)).unwrap();
+    let store = crate::artifacts::ProgramStore::user();
+    let target = seismic_metal::profile::open_device(&device, &*store).unwrap();
+    let programs: seismic_metal::MetalPrograms = std::sync::Arc::new(crate::formation::ProgramFormer::new(
+        seismic_metal::toolchain::MetalToolchain::new(device.clone(), target.facts()),
+        store,
+    ));
     let registry = seismic_metal::profile::registry();
     let module=check_source(SourceSet::new(vec![SourceFile { path:"cohort-failure.seismic".into(),text:r#"fn probe(indices: &tensor[64] i32, later: &tensor[64] i32, input: &tensor[1] f32, out: &mut tensor[64] f32):
     parallel for i in 0..64:
@@ -271,7 +294,7 @@ lower probe(indices: &tensor[64] i32, later: &tensor[64] i32, input: &tensor[1] 
         &target,
         &registry,
         &compiler,
-        device.handle(),
+        &programs,
         &PrecisionPolicy::Exact,
         &budget,
         &PlanningBudget::default(),
@@ -320,7 +343,7 @@ lower probe(indices: &tensor[64] i32, later: &tensor[64] i32, input: &tensor[1] 
                     .unwrap()
                     .try_into()
                     .expect("fixture allocation must fit the device byte address domain");
-                let buffer = device.allocate(bytes.max(1), allocation.alignment).unwrap();
+                let buffer = device.allocate(seismic_metal::topology::SHARED_KIND, bytes.max(1), allocation.alignment, &charge).unwrap();
                 device
                     .write(
                         &buffer,
@@ -396,7 +419,7 @@ lower probe(indices: &tensor[64] i32, later: &tensor[64] i32, input: &tensor[1] 
             variant,
             &mut submission,
             &device,
-            &mut FixedTestResources(&buffers),
+            &mut FixedTestResources::<MetalBuffer>::bound(&buffers),
             &mut values,
         );
         let status = submission
@@ -460,7 +483,13 @@ lower probe(indices: &tensor[64] i32, later: &tensor[64] i32, input: &tensor[1] 
 
 #[test]
 fn cpu_public_evaluator_selects_and_executes_an_independent_body() {
-    let opened = seismic_cpu::open_host().unwrap();
+    let tally = seismic_memory::entry::Tally::unbounded(seismic_topology::StoreIdentity::HostRam);
+    let charge: std::sync::Arc<dyn seismic_memory::entry::Entry> = std::sync::Arc::new(tally.clone());
+    let opened = seismic_cpu::open_host(crate::backends::host_cores().unwrap(), std::sync::Arc::new(tally)).unwrap();
+    let programs: seismic_cpu::CpuPrograms = std::sync::Arc::new(crate::formation::ProgramFormer::new(
+        seismic_cpu::toolchain::CpuToolchain::new(&opened.device),
+        crate::artifacts::ProgramStore::user(),
+    ));
     let registry = seismic_cpu::registry();
     let module = check_source(SourceSet::new(vec![SourceFile {
         path: "public-evaluator.seismic".into(),
@@ -482,7 +511,7 @@ fn cpu_public_evaluator_selects_and_executes_an_independent_body() {
         &opened.device,
         &registry,
         seismic_cpu::native_compiler(),
-        &(),
+        &programs,
         &PrecisionPolicy::Exact,
         &PreparationBudget::default(),
         &PlanningBudget::default(),
@@ -512,7 +541,7 @@ fn cpu_public_evaluator_selects_and_executes_an_independent_body() {
                 .expect("fixture allocation must fit the device byte address domain");
             let buffer = opened
                 .service
-                .allocate(bytes.max(1), allocation.alignment)
+                .allocate(seismic_cpu::topology::kind().id, bytes.max(1), allocation.alignment, &charge)
                 .unwrap();
             opened
                 .service
@@ -570,7 +599,7 @@ fn cpu_public_evaluator_selects_and_executes_an_independent_body() {
         variant,
         &mut submission,
         &opened.service,
-        &mut FixedTestResources(&buffers),
+        &mut FixedTestResources::<seismic_cpu::Buffer>::bound(&buffers),
         &mut values,
     );
     let mut execution = submission.submit();

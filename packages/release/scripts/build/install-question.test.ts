@@ -1,0 +1,222 @@
+import { NodeContext } from "@effect/platform-node"
+import { Effect } from "effect"
+import { createHash, generateKeyPairSync } from "node:crypto"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { spawnSync } from "node:child_process"
+import { afterEach, beforeEach, describe, expect, it } from "vitest"
+import { signUpdateRelease } from "../../src/hosted-update/release"
+import { renderUnixInstallationScript } from "./installation-scripts"
+
+const which = (tool: string) => spawnSync("/bin/sh", ["-c", `command -v ${tool}`], { encoding: "utf8" }).stdout.trim()
+const python = which("python3"), setsid = which("setsid")
+const tools = ["awk", "date", "cat", "chmod", "cp", "cut", "getconf", "id", "kill", "mkdir", "mktemp", "openssl", "python3", "rm", "sha256sum", "sh", "sleep", "timeout", "tr", "uname", "wc"]
+// Drives the installer in a new session whose controlling terminal is a pty, with the script on
+// stdin as `curl | sh` does, and answers the question once it appears.
+const driver = `
+import json, os, pty, select, sys
+script, answer = sys.argv[1:3]
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv("/bin/sh", ["sh", "-c", 'exec sh -s < "$0"', script])
+output, answered = b"", False
+while True:
+    ready, _, _ = select.select([fd], [], [], 20)
+    if not ready: break
+    try: chunk = os.read(fd, 4096)
+    except OSError: break
+    if not chunk: break
+    output += chunk
+    if not answered and b"[y/N]" in output:
+        answered = True
+        if answer == "<eof>": os.write(fd, b"\\x04")
+        elif answer != "<none>": os.write(fd, (answer + "\\n").encode())
+_, status = os.waitpid(pid, 0)
+print(json.dumps({"output": output.decode(errors="replace"), "status": os.waitstatus_to_exitcode(status)}))
+`
+const question = "Run Magnitude as a server? It starts on boot, runs without the desktop app,\r\nand you can use it from a browser on another computer. [y/N]"
+
+const arch = process.arch === "x64" || process.arch === "arm64" ? process.arch : undefined
+
+describe.skipIf(process.platform !== "linux" || !arch || !python || !setsid)("Linux installer question", () => {
+  let root: string, bin: string, log: string, script: string, environment: Record<string, string>
+  beforeEach(async () => {
+    root = mkdtempSync(join(tmpdir(), "magnitude-question-"))
+    bin = join(root, "bin")
+    log = join(root, "events")
+    mkdirSync(bin)
+    for (const tool of tools) { const found = which(tool); if (found) symlinkSync(found, join(bin, tool)) }
+    // Stubs replace links to real tools; unlinking first never writes through a link to the system copy.
+    const stub = (name: string, contents: string) => { rmSync(join(bin, name), { force: true }); writeFileSync(join(bin, name), `#!/bin/sh\n${contents}`, { mode: 0o700 }) }
+    stub("curl", 'while [ "$#" -gt 0 ]; do case "$1" in --output) output=$2; shift 2;; *) url=$1; shift;; esac; done\nprintf "download %s\\n" "$url" >> "$TEST_LOG"\ncase "$url" in */api/installer?*) cp "$TEST_OFFER" "$output";; *) cp "$TEST_PACKAGE" "$output";; esac\n')
+    // Behaves like sudo on standard cloud images (verifypw=all): an account with NOPASSWD also matches a
+    // rule that needs a password, so `-v` asks for one even though running a command never does.
+    stub("sudo", [
+      'printf "sudo %s\\n" "$*" >> "$TEST_LOG"',
+      'case "$*" in',
+      '  -v|"-n -v") echo "sudo: a password is required" >&2; exit 1;;',
+      '  "-n true") [ -z "${TEST_SUDO_REFUSES:-}${TEST_SUDO_NEEDS_PASSWORD:-}" ] || exit 1; exit 0;;',
+      '  true) [ -z "${TEST_SUDO_REFUSES:-}" ] || exit 1; exit 0;;',
+      'esac',
+      '[ "$1" != -n ] || shift',
+      'exec "$@"',
+    ].join("\n") + "\n")
+    stub("systemctl", 'printf "systemctl %s\\n" "$*" >> "$TEST_LOG"\n[ "$1 ${TEST_SERVICE_INACTIVE:-}" != "is-active 1" ] || exit 3\n')
+    stub("dpkg-query", '[ -n "${TEST_INSTALLED:-}" ] || exit 1\nprintf "%s" "$(cat "$TEST_INSTALLED")"\n')
+    stub("env", 'while [ "$#" -gt 0 ]; do case "$1" in *=*) shift;; *) break;; esac; done\nexec "$@"\n')
+    stub("apt-get", 'printf "%s\\n" "$1" >> "$TEST_LOG"\n[ "$1" != install ] || [ -z "${TEST_INSTALL_FAILS:-}" ] || exit 100\n[ "$1" != install ] || [ -z "${TEST_INSTALLED:-}" ] || printf "0.1.6" > "$TEST_INSTALLED"\n')
+    stub("magnitude", 'printf "magnitude %s\\n" "$*" >> "$TEST_LOG"\nif [ "$1" = _server-wait-ready ] && [ -n "${TEST_READY_FAILS:-}" ]; then echo "The inference engine could not start." >&2; exit 1; fi\n')
+    // The installer behaves as an ordinary account, whatever account runs the tests.
+    stub("id", 'case "$1" in -u) echo 1000;; *) exec /usr/bin/id "$@";; esac\n')
+    const keys = generateKeyPairSync("ed25519")
+    const bytes = Buffer.from("verified package fixture")
+    writeFileSync(join(root, "package.deb"), bytes)
+    const release = await Effect.runPromise(signUpdateRelease({ version: "0.1.6", bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") },
+      { os: "linux", arch: arch ?? "x64", package: "deb" }, keys.privateKey))
+    writeFileSync(join(root, "offer.json"), JSON.stringify({ release, download: "https://github.com/magnitudedev/magnitude/releases/download/test/magnitude.deb" }))
+    script = join(root, "install.sh")
+    writeFileSync(script, (await Effect.runPromise(renderUnixInstallationScript({ origin: "https://magnitude.dev", appleTeam: "ABCDEFGHIJ",
+      publicKey: keys.publicKey.export({ type: "spki", format: "pem" }).toString() }).pipe(Effect.provide(NodeContext.layer)))).replace("server_marker=/etc/magnitude/server", `server_marker=${join(root, "server")}`).replace(
+        "/usr/lib/magnitude-desktop/resources/magnitude _server-wait-ready", `${bin}/magnitude _server-wait-ready`))
+    environment = { PATH: bin, HOME: root, TEST_LOG: log, TEST_OFFER: join(root, "offer.json"), TEST_PACKAGE: join(root, "package.deb") }
+  })
+  afterEach(() => rmSync(root, { recursive: true, force: true }))
+
+  const events = () => existsSync(log) ? readFileSync(log, "utf8").trimEnd().split("\n") : []
+  const answer = (value: string, extra: Record<string, string> = {}) => {
+    const result = spawnSync(python, ["-c", driver, script, value], { encoding: "utf8", timeout: 30000, env: { ...environment, ...extra } })
+    return JSON.parse(result.stdout) as { output: string; status: number }
+  }
+  const unattended = (extra: Record<string, string> = {}, args: readonly string[] = []) =>
+    spawnSync(setsid, ["-w", "/bin/sh", "-s", "--", ...args], { input: readFileSync(script), encoding: "utf8", timeout: 30000, env: { ...environment, ...extra } })
+
+  it("asks first, gets sudo before any download, then runs server setup after Yes", () => {
+    const result = answer("y", { DISPLAY: ":0" })
+    expect(result.status, result.output).toBe(0)
+    expect(result.output).toContain(question)
+    const seen = events()
+    expect(seen[0]).toBe("sudo -n true")
+    expect(seen.findIndex(line => line.startsWith("download"))).toBeGreaterThan(0)
+    expect(seen.at(-1)).toBe("magnitude server setup")
+    expect(seen).not.toContain("magnitude app open")
+    expect(result.output).not.toContain("Not set up as a server")
+  })
+  it.each([["n", "No"], ["", "Enter"], ["<eof>", "Ctrl-D"]])("skips server setup for %j (%s)", value => {
+    const result = answer(value)
+    expect(result.status, result.output).toBe(0)
+    expect(result.output).not.toContain("To run it as one later")
+    expect(events()).not.toContain("magnitude server setup")
+    expect(events()).toContain("install")
+  })
+  it.each<Record<string, string>>([{ DISPLAY: ":0" }, { WAYLAND_DISPLAY: "wayland-0" }])("opens the desktop after declining server setup in %j", display => {
+    const result = answer("n", display)
+    expect(result.status, result.output).toBe(0)
+    expect(events().at(-1)).toBe("magnitude app open")
+    expect(result.output).toContain("Opened Magnitude")
+  })
+  it("does not open the desktop over SSH, even with X forwarding", () => {
+    const result = answer("n", { DISPLAY: "localhost:10.0", SSH_CONNECTION: "fixture" })
+    expect(result.status, result.output).toBe(0)
+    expect(events()).not.toContain("magnitude app open")
+  })
+  it("names the version it installed or upgraded from, without the package revision", () => {
+    const installed = join(root, "installed")
+    rmSync(installed, { force: true })
+    expect(answer("n", { TEST_INSTALLED: installed }).output).toContain("Magnitude 0.1.6 was installed.")
+    writeFileSync(installed, "0.1.5-58")
+    expect(answer("n", { TEST_INSTALLED: installed }).output).toContain("Magnitude was upgraded from 0.1.5 to 0.1.6.")
+  })
+  it("treats no answer within 60 seconds as No", () => {
+    // The real timeout is exercised on the test machines; here it reports expiry at once.
+    rmSync(join(bin, "timeout"), { force: true })
+    writeFileSync(join(bin, "timeout"), "#!/bin/sh\nexit 124\n", { mode: 0o700 })
+    const result = answer("<none>")
+    expect(result.status, result.output).toBe(0)
+    expect(result.output).toContain(question)
+    expect(result.output).not.toContain("To run it as one later")
+    expect(events()).not.toContain("magnitude server setup")
+  })
+  it("does not ask without a terminal, uses non-interactive sudo, and leaves a headless desktop closed", () => {
+    const result = unattended()
+    expect(result.status, result.stderr).toBe(0)
+    expect(`${result.stdout}${result.stderr}`).not.toContain("[y/N]")
+    expect(result.stdout).toContain("Magnitude was installed.")
+    expect(events()).not.toContain("magnitude app open")
+    expect(events()[0]).toBe("sudo -n true")
+  })
+  it("never validates with sudo -v, which asks NOPASSWD accounts for a password under verifypw=all", () => {
+    const result = answer("y")
+    expect(result.status, result.output).toBe(0)
+    expect(result.output).not.toContain("password is required")
+    expect(events().filter(line => line.startsWith("sudo")).every(line => !/(^| )-v( |$)/.test(line))).toBe(true)
+  })
+  it("asks for the password in the terminal when sudo needs one", () => {
+    const result = answer("n", { TEST_SUDO_NEEDS_PASSWORD: "1" })
+    expect(result.status, result.output).toBe(0)
+    expect(events().slice(0, 2)).toEqual(["sudo -n true", "sudo true"])
+    expect(events()).toContain("install")
+  })
+  it("fails at once without a terminal or passwordless sudo, before downloading", () => {
+    const result = unattended({ TEST_SUDO_REFUSES: "1" })
+    expect(result.status).not.toBe(0)
+    expect(result.stderr).toContain("no terminal to ask for a password")
+    expect(events().some(line => line.startsWith("download"))).toBe(false)
+  })
+  describe("on a set-up server", () => {
+    const service = () => events().filter(line => line.includes("systemctl") || line === "update" || line === "install")
+    // The marker lives under /etc; point this copy of the script at one the test owns.
+    beforeEach(() => {
+      writeFileSync(join(root, "server"), "")
+      environment.DISPLAY = ":0"
+      writeFileSync(join(root, "installed"), "0.1.5")
+      environment.TEST_INSTALLED = join(root, "installed")
+    })
+    it("upgrades around a stopped service without asking", () => {
+      const result = unattended()
+      expect(result.status, result.stderr).toBe(0)
+      expect(service()).toEqual(["update", "systemctl is-active --quiet magnitude.service", "sudo systemctl stop magnitude.service",
+        "systemctl stop magnitude.service", "install", "sudo systemctl start magnitude.service", "systemctl start magnitude.service"])
+      expect(result.stdout).toContain("Magnitude was upgraded from 0.1.5 to 0.1.6.")
+      expect(events()).toContain("magnitude _server-wait-ready")
+      expect(events()).not.toContain("magnitude app open")
+      expect(result.stdout).toContain("The server restarted and is ready.")
+    })
+    it("says so when the installed version is already current", () => {
+      writeFileSync(join(root, "installed"), "0.1.6")
+      const result = unattended()
+      expect(result.status, result.stderr).toBe(0)
+      expect(result.stdout).toContain("Magnitude 0.1.6 is already up to date.")
+      expect(result.stdout).not.toContain("upgraded")
+    })
+    it("leaves a server the administrator stopped stopped", () => {
+      const result = unattended({ TEST_SERVICE_INACTIVE: "1" })
+      expect(result.status, result.stderr).toBe(0)
+      expect(service()).toEqual(["update", "systemctl is-active --quiet magnitude.service", "install"])
+      expect(result.stdout).toContain("left stopped")
+      expect(events()).not.toContain("magnitude _server-wait-ready")
+    })
+    it("reports a failed restart instead of success when the installed runtime does not become ready", () => {
+      const result = unattended({ TEST_READY_FAILS: "1" })
+      expect(result.status).toBe(1)
+      expect(result.stderr).toContain("The inference engine could not start.")
+      expect(result.stderr).toContain("The package was installed, but the server did not become ready.")
+      expect(result.stdout).not.toContain("The server restarted")
+      expect(events()).toContain("magnitude _server-wait-ready")
+    })
+    it("starts the server again when the package does not install", () => {
+      const result = unattended({ TEST_INSTALL_FAILS: "1" })
+      expect(result.status).toBe(1)
+      expect(result.stderr).toContain("The Magnitude package could not be installed")
+      expect(result.stderr).toContain("The Magnitude server was started again.")
+      expect(service()).toEqual(["update", "systemctl is-active --quiet magnitude.service", "sudo systemctl stop magnitude.service",
+        "systemctl stop magnitude.service", "install", "sudo -n systemctl start magnitude.service", "systemctl start magnitude.service"])
+    })
+  })
+  it("takes no options", () => {
+    const result = unattended({}, ["--channel", "beta"])
+    expect(result.status).not.toBe(0)
+    expect(result.stderr).toContain("takes no options")
+    expect(events()).toEqual([])
+  })
+})

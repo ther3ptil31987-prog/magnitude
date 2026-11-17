@@ -3,19 +3,34 @@
 // GELU-tanh).
 #define KERNEL_W0 SEISMIC_GATE_WEIGHT
 #define KERNEL_W1 SEISMIC_UP_WEIGHT
+// The expansion's limit as its F32 bits LB (0: none), which the Glu epilogue
+// clamps at.
+#if SEISMIC_STATIC_LB != 0
+#define PROJECTION_GLU_LIMIT SEISMIC_STATIC_LB
+#endif
 #include "lib/projection/projection.h"
 #include "lib/projection/packing.h"
+#include "lib/projection/operator.h"
+#if defined(SEISMIC_FORMING_DENSE_EXPAND_GEMV) || defined(SEISMIC_FORMING_DENSE_EXPAND_GEMV_ROWS) || defined(SEISMIC_FORMING_DENSE_EXPAND_GEMV_PAIR)
+#include "lib/projection/gemv.h"
+#endif
 
 typedef element::Act activation;
 typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
+// The rows both weights take (the normalized rows, or NVFP4 operands): the
+// GEMV row classes form them while staging, the normalize launches into
+// the scratch every other form reads.
+constant constexpr bool NVFP4 =
+    projection::OperandRecipe<packets::W0_OPERANDS_NVFP4, packets::W1_OPERANDS_NVFP4>::NVFP4;
+typedef projection::operands<NVFP4> Operands;
 
-#define DENSE_EXPAND_ARGUMENTS                                                          \
+#define PROJECTION_ARGUMENTS                                                            \
     device const float *residual [[buffer(SEISMIC_BUFFER_RESIDUAL)]],                   \
     device const uchar *norm [[buffer(SEISMIC_BUFFER_NORM)]],                           \
     device const uchar *gate_weight [[buffer(SEISMIC_BUFFER_GATE_WEIGHT)]],             \
     device const uchar *up_weight [[buffer(SEISMIC_BUFFER_UP_WEIGHT)]],                 \
     device const int *out_rows [[buffer(SEISMIC_BUFFER_OUT_ROWS)]],                     \
-    device uchar *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],                           \
+    SEISMIC_RESULT_0_PARAM(result_cells),                                               \
     device uchar *normalized [[buffer(SEISMIC_BUFFER_SCRATCH_NORMALIZED)]],             \
     device uchar *quantized [[buffer(SEISMIC_BUFFER_SCRATCH_QUANTIZED)]],               \
     device half *row_scales [[buffer(SEISMIC_BUFFER_SCRATCH_ROW_SCALES)]],              \
@@ -33,297 +48,139 @@ typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
     device float *up_scales [[buffer(SEISMIC_BUFFER_SCRATCH_UP_SCALES)]],               \
     device const float *gate_scale [[buffer(SEISMIC_BUFFER_GATE_SCALE)]],               \
     device const float *up_scale [[buffer(SEISMIC_BUFFER_UP_SCALE)]],                   \
+    device const float *gate_bound [[buffer(SEISMIC_BUFFER_GATE_BOUND)]],               \
+    device const float *up_bound [[buffer(SEISMIC_BUFFER_UP_BOUND)]],                   \
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
 
-#define DENSE_EXPAND_OPERANDS                                                           \
-    projection::Rms<activation, norm_element, projection::SelectedRows> in{residual,    \
+// `raw` is the residual rows under the norm; `in` the normalized rows every
+// form past the GEMV reads.
+#define PROJECTION_OPERANDS                                                             \
+    const uint m = uint(SEISMIC_DIM_O), n = uint(SEISMIC_DIM_F), k = uint(SEISMIC_DIM_H); \
+    projection::Rms<activation, norm_element, projection::SelectedRows> raw{residual,   \
         SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1, norm, SEISMIC_NORM_STRIDE_0, \
-        as_type<float>(uint(SEISMIC_PARAM_EPS)), uint(SEISMIC_DIM_H), {out_rows}};      \
+        as_type<float>(uint(SEISMIC_PARAM_EPS)), k, {out_rows}};                        \
+    const projection::Plain<activation, projection::AllRows> in{normalized, k, 1, k, {}}; \
     const auto out = projection::scaling<(SEISMIC_DIM_GS != 0 || SEISMIC_DIM_US != 0)>::wrap( \
-        projection::Glu<activation>{result, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, \
-            int(SEISMIC_PARAM_ACTIVATION)},                                             \
+        projection::Glu<activation>{element::Out<activation>(result_cells), SEISMIC_RESULT_0_STRIDE_0, \
+            SEISMIC_RESULT_0_STRIDE_1, int(SEISMIC_PARAM_ACTIVATION)},                  \
         projection::scale_factor(gate_scale, SEISMIC_DIM_GS, 0, 0),                     \
         projection::scale_factor(up_scale, SEISMIC_DIM_US, 0, 0));                      \
-    projection::Weights<packets::W0> gate{gate_weight, KERNEL_W0_LAYOUT(SEISMIC_DIM_H), \
-        uint(SEISMIC_DIM_H)};                                                           \
-    projection::Weights<packets::W1> up{up_weight, KERNEL_W1_LAYOUT(SEISMIC_DIM_H), uint(SEISMIC_DIM_H)}
+    projection::Weights<packets::W0> w0{gate_weight, KERNEL_W0_LAYOUT(k), k};           \
+    projection::Weights<packets::W1> w1{up_weight, KERNEL_W1_LAYOUT(k), k}
 
-// The GEMV of a launch that serves COUNT (ONE, SEVERAL) rows.
-#define DENSE_EXPAND_GEMV(ROWS, LANES, TILED, COUNT)                                    \
-    DENSE_EXPAND_OPERANDS;                                                              \
-    uint rows = uint(SEISMIC_DIM_O);                                                    \
-    PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);                            \
-    projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);   \
-    const auto x = projection::shared_norm(in, squares);                                \
-    if (TILED == 1 && projection::gemv_tile_row_serves(gate, rows) && projection::gemv_tile_row_serves(up, rows)) { \
-        PROJECTION_FOR_##COUNT##_TILE_ROWS(rows,                                        \
-            projection::gemv_tile_row<packets::W0, packets::W1, true, ROWS, MAXM, LANES>( \
-                x, out, gate, up, rows, uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H), tile, shared, simdgroups, sg, \
-                lane));                                                                 \
-        return;                                                                         \
-    }                                                                                   \
-    PROJECTION_FOR_##COUNT##_ROWS(rows,                                                 \
-        projection::gemv_form<packets::W0, packets::W1, true, ROWS, MAXM, LANES, (TILED == 2)>( \
-            x, out, gate, up, rows, uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H), tile, shared, \
-            simdgroups, sg, lane))
-
-// One row.
-#ifdef SEISMIC_FORMING_DENSE_EXPAND_GEMV
-template <uint ROWS, uint LANES, uint TILED>
-kernel void dense_expand_gemv(DENSE_EXPAND_ARGUMENTS,
-    threadgroup uchar *shared [[threadgroup(0)]],
-    uint tile [[threadgroup_position_in_grid]],
-    uint simdgroups [[simdgroups_per_threadgroup]],
-    uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]) {
-    DENSE_EXPAND_GEMV(ROWS, LANES, TILED, ONE);
-}
-#endif
-
-// Three rows up to BATCH_FROM: the same GEMV under this launch's mapping.
-#ifdef SEISMIC_FORMING_DENSE_EXPAND_GEMV_ROWS
-template <uint ROWS, uint LANES, uint TILED>
-kernel void dense_expand_gemv_rows(DENSE_EXPAND_ARGUMENTS,
-    threadgroup uchar *shared [[threadgroup(0)]],
-    uint tile [[threadgroup_position_in_grid]],
-    uint simdgroups [[simdgroups_per_threadgroup]],
-    uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]) {
-    DENSE_EXPAND_GEMV(ROWS, LANES, TILED, SEVERAL);
-}
-#endif
-
-// Two rows: the same GEMV under this launch's mapping.
-#ifdef SEISMIC_FORMING_DENSE_EXPAND_GEMV_PAIR
-template <uint ROWS, uint LANES, uint TILED>
-kernel void dense_expand_gemv_pair(DENSE_EXPAND_ARGUMENTS,
-    threadgroup uchar *shared [[threadgroup(0)]],
-    uint tile [[threadgroup_position_in_grid]],
-    uint simdgroups [[simdgroups_per_threadgroup]],
-    uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]) {
-    DENSE_EXPAND_GEMV(ROWS, LANES, TILED, PAIR);
-}
-#endif
-
-#ifdef SEISMIC_FORMING_DENSE_EXPAND_BATCH
-template <uint BATCH_ROWS, uint BATCH_PARTS>
-kernel void dense_expand_batch(DENSE_EXPAND_ARGUMENTS,
-    threadgroup uchar *shared [[threadgroup(0)]],
-    uint tile [[threadgroup_position_in_grid]],
-    uint simdgroups [[simdgroups_per_threadgroup]],
-    uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]) {
-    DENSE_EXPAND_OPERANDS;
-    projection::Plain<activation, projection::AllRows> x{normalized,
-        SEISMIC_DIM_H, 1, uint(SEISMIC_DIM_H), {}};
-    if constexpr (projection::matrix_codes<packets::W0>::available
-        && projection::matrix_codes<packets::W1>::available && SEISMIC_DIM_H % 256 == 0) {
-        projection::gemv_matrix_paired<packets::W0, packets::W1, BATCH_PARTS>(x, out,
-            gate, up, uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H),
-            tile, shared, simdgroups, sg, lane);
-        return;
-    }
-    if (tile * simdgroups * BATCH_ROWS * 8u >= uint(SEISMIC_DIM_F))
-        return;
-    projection::gemv_batch_paired_runtime<packets::W0, packets::W1, BATCH_ROWS>(x, out,
-        gate, up, uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H), tile, shared,
-        simdgroups, sg, lane);
-}
-#endif
+// The norm prologue: the GEMV normalizes its rows while staging them, and
+// the normalize launches into `normalized`, in the tall GEMM's order where
+// the TALL form runs.
+#define PROJECTION_GEMV_INPUT(x)                                                        \
+    PROJECTION_SQUARES_SHARED(squares, decltype(raw)::parts);                           \
+    projection::threadgroup_squares_runtime(raw, m, squares, simdgroups, sg, lane);     \
+    const auto x = projection::shared_norm(raw, squares)
+#define PROJECTION_FRAGMENTS normalized
+#define PROJECTION_INT8_SCRATCH                                                         \
+    const projection::int8_scratch scratch0{quantized, row_scales, block_sums, gate_coefficients, gate_biases}; \
+    const projection::int8_scratch scratch1{quantized, row_scales, block_sums, up_coefficients, up_biases}
+#define PROJECTION_PACKING_SCRATCH                                                      \
+    const projection::packing_scratch scratch0{packed, token_factors, token_scales, gate_factors, gate_scales}; \
+    const projection::packing_scratch scratch1{packed, token_factors, token_scales, up_factors, up_scales}
+#define PROJECTION_BOUNDED ((SEISMIC_DIM_GB != 0 ? 1u : 0u) | (SEISMIC_DIM_UB != 0 ? 2u : 0u))
+#define PROJECTION_BOUND_TABLES {gate_bound, up_bound}
 
 #ifdef SEISMIC_FORMING_DENSE_EXPAND_NORMALIZE
-kernel void dense_expand_normalize(DENSE_EXPAND_ARGUMENTS,
+kernel void dense_expand_normalize(PROJECTION_ARGUMENTS,
     uint item [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
     PROJECTION_NORMALIZE_SHARED(norms);
-    DENSE_EXPAND_OPERANDS;
-    projection::device_normalize<256>(in, item, normalized, uint(SEISMIC_DIM_H), norms, thread_index);
+    PROJECTION_OPERANDS;
+    Operands::normalize<256>(raw, item, normalized, k, norms, thread_index);
 }
 #endif
 
-#define DENSE_EXPAND_GEMM(TM, TN)                                                       \
-    PROJECTION_GEMM_SHARED(shared, TM, TN);                                             \
-    DENSE_EXPAND_OPERANDS;                                                              \
-    projection::Plain<activation, projection::AllRows> x{normalized, SEISMIC_DIM_H, 1, uint(SEISMIC_DIM_H), {}}; \
-    projection::gemm_paired<packets::W0, packets::W1, TM, TN>(x, out, gate, up, uint(SEISMIC_DIM_O), \
-        uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H), tile.y, tile.x, shared, sg, lane)
+#ifdef SEISMIC_FORMING_DENSE_EXPAND_NORMALIZE_TALL
+kernel void dense_expand_normalize_tall(PROJECTION_ARGUMENTS,
+    uint item [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    PROJECTION_NORMALIZE_SHARED(norms);
+    PROJECTION_OPERANDS;
+    Operands::normalize<256, projection::TallOrder<activation>>(raw, item, normalized, k, norms, thread_index);
+}
+#endif
 
-// 17..64 rows: the fixed small-row tile.
+// The `dense` projection's launches (`lib/projection/operator.h`).
+#ifdef SEISMIC_FORMING_DENSE_EXPAND_GEMV
+template <uint LANES, uint TILED, uint ROWS>
+kernel void dense_expand_gemv(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
+    PROJECTION_PAIRED_GEMV(ONE, TILED);
+}
+#endif
+#ifdef SEISMIC_FORMING_DENSE_EXPAND_GEMV_PAIR
+template <uint LANES, uint TILED, uint ROWS>
+kernel void dense_expand_gemv_pair(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
+    PROJECTION_PAIRED_GEMV(PAIR, TILED);
+}
+#endif
+#ifdef SEISMIC_FORMING_DENSE_EXPAND_GEMV_ROWS
+template <uint LANES, uint TILED, uint ROWS>
+kernel void dense_expand_gemv_rows(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
+    PROJECTION_PAIRED_GEMV(SEVERAL, TILED);
+}
+#endif
+#ifdef SEISMIC_FORMING_DENSE_EXPAND_BATCH
+template <uint MATRIX, uint BATCH_ROWS, uint BATCH_PARTS>
+kernel void dense_expand_batch(PROJECTION_ARGUMENTS, PROJECTION_ROW_ARGUMENTS) {
+    PROJECTION_PAIRED_BATCH;
+}
+#endif
 #ifdef SEISMIC_FORMING_DENSE_EXPAND_GEMM_SMALL
-kernel void dense_expand_gemm_small(DENSE_EXPAND_ARGUMENTS,
-    uint2 tile [[threadgroup_position_in_grid]],
-    uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]) {
-    DENSE_EXPAND_GEMM(projection::small_tile_m, projection::small_tile_n);
+kernel void dense_expand_gemm_small(PROJECTION_ARGUMENTS, PROJECTION_TILE_ARGUMENTS) {
+    PROJECTION_PAIRED_GEMM_SMALL;
 }
 #endif
-
 #ifdef SEISMIC_FORMING_DENSE_EXPAND_GEMM
 template <uint TILE_M, uint TILE_N>
-kernel void dense_expand_gemm(DENSE_EXPAND_ARGUMENTS,
-    uint2 tile [[threadgroup_position_in_grid]],
-    uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]) {
-    DENSE_EXPAND_GEMM(TILE_M, TILE_N);
+kernel void dense_expand_gemm(PROJECTION_ARGUMENTS, PROJECTION_TILE_ARGUMENTS) {
+    PROJECTION_PAIRED_GEMM;
 }
 #endif
-
-// The TALL form past 64 rows: the normalized rows in the tall GEMM's order,
-// then its tiles.
-#ifdef SEISMIC_FORMING_DENSE_EXPAND_NORMALIZE_TALL
-kernel void dense_expand_normalize_tall(DENSE_EXPAND_ARGUMENTS,
-    uint item [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]]) {
-    PROJECTION_NORMALIZE_SHARED(norms);
-    DENSE_EXPAND_OPERANDS;
-    projection::device_normalize<256, projection::TallOrder<activation>>(in, item, normalized, uint(SEISMIC_DIM_H),
-        norms, thread_index);
-}
-#endif
-
 #ifdef SEISMIC_FORMING_DENSE_EXPAND_TALL
 template <uint TALL_M, uint TALL_K, uint STAGERS>
-kernel void dense_expand_tall(DENSE_EXPAND_ARGUMENTS,
-    uint2 tile [[threadgroup_position_in_grid]],
-    uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]) {
-    PROJECTION_GEMM_TALL_SHARED(shared, TALL_K);
-    DENSE_EXPAND_OPERANDS;
-    projection::Plain<activation, projection::AllRows> x{normalized, SEISMIC_DIM_H, 1, uint(SEISMIC_DIM_H), {}};
-    projection::gemm_tall_paired<packets::W0, packets::W1, TALL_M, TALL_K, STAGERS>(
-        projection::tall_operand(x, normalized), out, gate, up, uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_F),
-        uint(SEISMIC_DIM_H), tile.y, tile.x, shared, sg, lane);
+kernel void dense_expand_tall(PROJECTION_ARGUMENTS, PROJECTION_TILE_ARGUMENTS) {
+    PROJECTION_PAIRED_TALL;
 }
 #endif
-
-// The INT8 form past 64 rows: the normalized rows (`dense_expand_normalize`)
-// quantized per (row, 32 columns), both weights' block scales and biases,
-// then the paired int8 tiles.
-#define DENSE_EXPAND_INT8_SCRATCH                                                        \
-    const projection::int8_scratch gate_scratch{quantized, row_scales, block_sums, gate_coefficients, gate_biases}; \
-    const projection::int8_scratch up_scratch{quantized, row_scales, block_sums, up_coefficients, up_biases}
-#define DENSE_EXPAND_INT8_AVAILABLE \
-    (projection::int8_codes<packets::W0>::available && projection::int8_codes<packets::W1>::available && \
-        projection::int8_codes<packets::W0>::interleaved == projection::int8_codes<packets::W1>::interleaved)
-
 #ifdef SEISMIC_FORMING_DENSE_EXPAND_QUANTIZE
-kernel void dense_expand_quantize(DENSE_EXPAND_ARGUMENTS,
-    uint row [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]) {
-    if constexpr (!DENSE_EXPAND_INT8_AVAILABLE)
-        return;
-    DENSE_EXPAND_INT8_SCRATCH;
-    projection::Plain<activation, projection::AllRows> x{normalized, SEISMIC_DIM_H, 1, uint(SEISMIC_DIM_H), {}};
-    projection::int8_quantize<projection::int8_codes<packets::W0>::interleaved>(x, gate_scratch,
-        uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_H), row, thread_index, lane, 1.0f);
+kernel void dense_expand_quantize(PROJECTION_ARGUMENTS, PROJECTION_THREADGROUP_ARGUMENTS) {
+    PROJECTION_PAIRED_QUANTIZE;
 }
 #endif
-
 #ifdef SEISMIC_FORMING_DENSE_EXPAND_COEFFICIENTS
-kernel void dense_expand_coefficients(DENSE_EXPAND_ARGUMENTS,
-    uint item [[thread_position_in_grid]]) {
-    if constexpr (!DENSE_EXPAND_INT8_AVAILABLE)
-        return;
-    DENSE_EXPAND_OPERANDS;
-    DENSE_EXPAND_INT8_SCRATCH;
-    projection::int8_coefficients(gate, gate_scratch, uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H), item);
-    projection::int8_coefficients(up, up_scratch, uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H), item);
+kernel void dense_expand_coefficients(PROJECTION_ARGUMENTS, PROJECTION_ITEM_ARGUMENTS) {
+    PROJECTION_PAIRED_COEFFICIENTS;
 }
 #endif
-
 #ifdef SEISMIC_FORMING_DENSE_EXPAND_INT8
-kernel void dense_expand_int8(DENSE_EXPAND_ARGUMENTS,
-    uint2 tile [[threadgroup_position_in_grid]],
-    uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup float exchange[DENSE_EXPAND_INT8_AVAILABLE ? 2 * 32 * 32 : 1];
-    // The default form's tile only where the launch takes that form:
-    // threadgroup memory a kernel does not use still slows its products.
-    threadgroup float4 shared_words[DENSE_EXPAND_INT8_AVAILABLE ? 1 : projection::gemm_tile<64, 64>::bytes / 16];
-    threadgroup uchar *shared = reinterpret_cast<threadgroup uchar *>(shared_words);
-    DENSE_EXPAND_OPERANDS;
-    DENSE_EXPAND_INT8_SCRATCH;
-    projection::Plain<activation, projection::AllRows> x{normalized, SEISMIC_DIM_H, 1, uint(SEISMIC_DIM_H), {}};
-    projection::gemm_int8_paired<packets::W0, packets::W1>(x, out, gate, up, gate_scratch, up_scratch,
-        uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H), tile.y, tile.x, shared, exchange, sg, lane);
+kernel void dense_expand_int8(PROJECTION_ARGUMENTS, PROJECTION_TILE_ARGUMENTS) {
+    PROJECTION_PAIRED_INT8;
 }
 #endif
-
-// The PACK form past 64 rows: the normalized rows (`dense_expand_normalize`)
-// as integer codes, two tokens packed per operand element, both weights'
-// block scales and biases, then the paired packed tiles.
-#define DENSE_EXPAND_PACKING_SCRATCH                                                     \
-    const projection::packing_scratch gate_scratch{packed, token_factors, token_scales, gate_factors, gate_scales}; \
-    const projection::packing_scratch up_scratch{packed, token_factors, token_scales, up_factors, up_scales}
-#define DENSE_EXPAND_PACKING_AVAILABLE \
-    (projection::packing_codes<packets::W0>::available \
-        && projection::packing_serves<packets::W1, projection::packing_codes<packets::W0>::folds>::value)
-
 #ifdef SEISMIC_FORMING_DENSE_EXPAND_PACK
-kernel void dense_expand_pack(DENSE_EXPAND_ARGUMENTS,
-    uint pairs [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]],
-    uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]) {
-    if constexpr (!DENSE_EXPAND_PACKING_AVAILABLE)
-        return;
-    threadgroup float4 peaks[8];
-    DENSE_EXPAND_PACKING_SCRATCH;
-    projection::Plain<activation, projection::AllRows> x{normalized, SEISMIC_DIM_H, 1, uint(SEISMIC_DIM_H), {}};
-    projection::packing_operand<projection::packing_shared<packets::W0, packets::W1>::centre,
-        projection::packing_shared<packets::W0, packets::W1>::folds>(x, gate_scratch, uint(SEISMIC_DIM_O),
-        uint(SEISMIC_DIM_H), pairs, peaks, thread_index, sg, lane);
+template <uint RESIDUE>
+kernel void dense_expand_pack(PROJECTION_ARGUMENTS, PROJECTION_THREADGROUP_ARGUMENTS) {
+    PROJECTION_PAIRED_PACK;
 }
 #endif
-
 #ifdef SEISMIC_FORMING_DENSE_EXPAND_PACK_COEFFICIENTS
-kernel void dense_expand_pack_coefficients(DENSE_EXPAND_ARGUMENTS,
-    uint tile [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]],
-    uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]) {
-    if constexpr (!DENSE_EXPAND_PACKING_AVAILABLE)
-        return;
-    threadgroup float gate_peaks[8];
-    threadgroup float up_peaks[8];
-    DENSE_EXPAND_OPERANDS;
-    DENSE_EXPAND_PACKING_SCRATCH;
-    projection::packing_tile_coefficients(gate, gate_scratch, uint(SEISMIC_DIM_H), tile, gate_peaks, thread_index,
-        sg, lane);
-    projection::packing_tile_coefficients(up, up_scratch, uint(SEISMIC_DIM_H), tile, up_peaks, thread_index, sg,
-        lane);
+kernel void dense_expand_pack_coefficients(PROJECTION_ARGUMENTS, PROJECTION_THREADGROUP_ARGUMENTS) {
+    PROJECTION_PAIRED_PACK_COEFFICIENTS;
 }
 #endif
-
 #ifdef SEISMIC_FORMING_DENSE_EXPAND_PACKED
-template <uint PACK_TOKENS, uint WEIGHTS_AHEAD>
-kernel void dense_expand_packed(DENSE_EXPAND_ARGUMENTS,
-    uint tile [[threadgroup_position_in_grid]],
-    uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]) {
-    if constexpr (!DENSE_EXPAND_PACKING_AVAILABLE)
-        return;
-    threadgroup float4 exchange[projection::packing_simdgroups / 2 * projection::packing_exchange];
-    DENSE_EXPAND_OPERANDS;
-    DENSE_EXPAND_PACKING_SCRATCH;
-    const uint m = uint(SEISMIC_DIM_O);
-    projection::gemm_packed_paired<packets::W0, packets::W1, PACK_TOKENS, WEIGHTS_AHEAD>(out, gate,
-        up, gate_scratch, up_scratch, m, (m + 63u) / 64u * 64u, uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H), tile,
-        projection::packing_simdgroups, exchange, sg, lane);
+template <uint RESIDUE, uint PACK_TOKENS, uint WEIGHTS_AHEAD>
+kernel void dense_expand_packed(PROJECTION_ARGUMENTS, PROJECTION_THREADGROUP_ARGUMENTS) {
+    PROJECTION_PAIRED_PACKED;
 }
 #endif
-
-// PACK with weights that have no packed path: the staged paired tiles of the
-// default form, with its results.
 #ifdef SEISMIC_FORMING_DENSE_EXPAND_UNPACKED
-kernel void dense_expand_unpacked(DENSE_EXPAND_ARGUMENTS,
-    uint2 tile [[threadgroup_position_in_grid]],
-    uint sg [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]) {
-    if constexpr (DENSE_EXPAND_PACKING_AVAILABLE)
-        return;
-    DENSE_EXPAND_GEMM(64, 64);
+kernel void dense_expand_unpacked(PROJECTION_ARGUMENTS, PROJECTION_TILE_ARGUMENTS) {
+    PROJECTION_PAIRED_UNPACKED;
 }
 #endif

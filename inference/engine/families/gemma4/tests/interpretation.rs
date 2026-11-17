@@ -1,24 +1,33 @@
-//! Interpretation of every catalog Gemma 4 header
-//! (`inference/validation/results/catalog-headers/`), plus negative cases
-//! derived from them.
+//! Interpretation of every catalog Gemma 4 header (`headers::target`) and of
+//! Gemma 4 E2B's, which the catalog does not list, at pinned artifacts
+//! (`headers::artifact`), plus negative cases derived from them.
 
 use magnitude_artifacts::{
-    gguf::{Directory, Metadata, Scalar, Value},
+    gguf::{Array, Directory, Metadata, Scalar, Value},
     ArtifactIdentity, InputLayout, PackageIdentity, TokenId,
 };
-use magnitude_family_common::headers::directory as header;
+use magnitude_family_common::headers;
 use magnitude_family_contracts::{
-    ActivationFunction, CellReduction, EmbeddingScale, FeedForwardUp, HistoryDomain,
-    ImportTransform, InputNorm, KeyValue, MediaRowAttention, ModelDefinition, ModelInputAdapter,
-    Operator, OutputForm, PositionSampling, Rotary, SublayerIndex, TokenPlan, ValueNorm,
-    ValueSource, VisionActivation, VisionAttentionScale, VisionResize, VisionStem, VisionUp,
+    ActivationFunction, CellReduction, EmbeddingScale, FeedForwardUp, HistoryRows,
+    ImportTransform, InputNorm, MediaRowAttention, ProjectedRows, RowProducer, TokenDomain, ModelDefinition, ModelInputAdapter,
+    Operator, OutputForm, OutputRotary, PositionSampling, QueryProjection, Rotary, RotaryLayout, SublayerIndex, TokenPlan, ValueNorm,
+    ValueSource, VisionActivation, VisionAttentionScale, VisionOperator, VisionResize, VisionStem,
+    VisionUp,
 };
-use magnitude_family_gemma4::{
-    describe_projector, inputs, inspect_components, recognize,
-};
+use magnitude_family_gemma4::{describe_projector, inputs, inspect_components, recognize};
 
 fn target(model: &str) -> Directory {
-    header(&format!("gemma-4-{model}-it-qat__target-gguf_q4.json"))
+    match model {
+        "e2b" => headers::artifact("gemma-4-e2b-it-qat-q4"),
+        _ => headers::target(&format!("gemma-4-{model}-it-qat:gguf:q4")),
+    }
+}
+
+fn projector(model: &str) -> Directory {
+    match model {
+        "e2b" => headers::artifact("gemma-4-e2b-it-qat-mmproj"),
+        _ => headers::projector(&format!("gemma-4-{model}-it-qat:gguf:q4")),
+    }
 }
 
 fn identity() -> PackageIdentity {
@@ -84,24 +93,27 @@ fn per_layer_input_models_bind_every_catalog_weight() {
             assert_eq!(attention.width, if full { 512 } else { 256 });
             assert_eq!(attention.scale, 1.0);
             assert_eq!(attention.media_rows, MediaRowAttention::Causal);
-            match &attention.key_value {
-                KeyValue::Owned {
+            assert_eq!(attention.history.len(), 1);
+            match &attention.fresh().rows {
+                HistoryRows::Own(RowProducer::Projected(ProjectedRows {
                     value,
                     value_norm,
                     domain,
                     ..
-                } => {
+                })) => {
                     assert!(layer < owning);
                     assert!(matches!(value, ValueSource::Projected(_)));
                     assert!(matches!(value_norm, ValueNorm::RmsUnweighted(_)));
                     let expected = if full {
-                        HistoryDomain::Token
+                        TokenDomain::Token
                     } else {
-                        HistoryDomain::Window { tokens: window }
+                        TokenDomain::Window { tokens: window }
                     };
                     assert_eq!(*domain, expected);
                 }
-                KeyValue::Shared { source } => {
+                HistoryRows::Own(RowProducer::Pooled(_)) => panic!("{model} pools no history"),
+                HistoryRows::Shared { source, part } => {
+                    assert_eq!(*part, 0);
                     assert!(layer >= owning);
                     let expected = if full { sources.1 } else { sources.0 };
                     assert_eq!(source.block, expected, "{model} layer {layer}");
@@ -138,7 +150,13 @@ fn e2b_feed_forward_doubles_in_its_sharing_layers() {
 fn full_layers_rotate_a_quarter_of_their_pairs_over_the_whole_head() {
     let definition = inspect(&target("e2b")).unwrap();
     let window = attention(&definition, 0);
-    let Rotary::Table { pairs, divisors } = &window.rotary else {
+    let Rotary::Table {
+        pairs,
+        layout: RotaryLayout::HALF_SPLIT_LEADING,
+        divisors,
+        output: OutputRotary::None,
+    } = &window.rotary
+    else {
         panic!("table rotary");
     };
     assert_eq!(pairs.len(), 128);
@@ -147,7 +165,13 @@ fn full_layers_rotate_a_quarter_of_their_pairs_over_the_whole_head() {
     assert!(divisors.is_none());
 
     let full = attention(&definition, 4);
-    let Rotary::Table { pairs, divisors } = &full.rotary else {
+    let Rotary::Table {
+        pairs,
+        layout: RotaryLayout::HALF_SPLIT_LEADING,
+        divisors,
+        output: OutputRotary::None,
+    } = &full.rotary
+    else {
         panic!("table rotary");
     };
     // Pair p rotates dimensions (p, p + 256); only the first 64 turn.
@@ -160,10 +184,14 @@ fn full_layers_rotate_a_quarter_of_their_pairs_over_the_whole_head() {
     assert_eq!(divisors.bases.len(), 256);
     assert!((divisors.bases[100] - 1e6f64.powf(-200.0 / 512.0)).abs() < 1e-15);
     // No weight is reordered.
-    let KeyValue::Owned { key, .. } = &full.key_value else {
+    let HistoryRows::Own(RowProducer::Projected(ProjectedRows { key, .. })) = &full.fresh().rows
+    else {
         panic!("owning layer");
     };
-    assert!(full.query.transforms.is_empty() && key.transforms.is_empty());
+    assert!(
+        matches!(&full.query, QueryProjection::Full(query) if query.transforms.is_empty())
+            && key.transforms.is_empty()
+    );
 }
 
 /// 12B, 26B and 31B take full-layer values from their raw keys.
@@ -178,15 +206,16 @@ fn values_are_keys_on_full_layers_without_a_value_projection() {
         assert!(definition.decoder.entry.per_layer.is_none());
         for layer in 0..layers {
             let full = (layer + 1) % period == 0;
-            let KeyValue::Owned { value, domain, .. } = &attention(&definition, layer).key_value
+            let HistoryRows::Own(RowProducer::Projected(ProjectedRows { value, domain, .. })) =
+                &attention(&definition, layer).fresh().rows
             else {
                 panic!("{model}: every layer owns its history");
             };
-            assert_eq!(matches!(value, ValueSource::Key), full, "{model} {layer}");
+            assert_eq!(matches!(value, ValueSource::RawKey), full, "{model} {layer}");
             let expected = if full {
-                HistoryDomain::Token
+                TokenDomain::Token
             } else {
-                HistoryDomain::Window { tokens: window }
+                TokenDomain::Window { tokens: window }
             };
             assert_eq!(*domain, expected);
         }
@@ -214,11 +243,11 @@ fn image_rows_are_bidirectional_only_on_window_layers_of_the_larger_models() {
             // Sharing layers carry no domain; every catalog window layer is
             // 256 wide and every full layer 512.
             let window = matches!(
-                &attention.key_value,
-                KeyValue::Owned {
-                    domain: HistoryDomain::Window { .. },
+                &attention.fresh().rows,
+                HistoryRows::Own(RowProducer::Projected(ProjectedRows {
+                    domain: TokenDomain::Window { .. },
                     ..
-                }
+                }))
             ) || attention.width == 256;
             let expected = if window && bidirectional_windows {
                 MediaRowAttention::Bidirectional
@@ -304,7 +333,7 @@ fn rejects_missing_tensors_unknown_metadata_wrong_shapes_and_unbound_roles() {
         .retain(|tensor| tensor.name != "blk.3.attn_k_norm.weight");
     assert_eq!(
         inspect(&missing).unwrap_err(),
-        "missing Gemma weight \"blk.3.attn_k_norm.weight\""
+        "missing weight \"blk.3.attn_k_norm.weight\""
     );
 
     let mut unknown = target("e2b");
@@ -314,7 +343,7 @@ fn rejects_missing_tensors_unknown_metadata_wrong_shapes_and_unbound_roles() {
     });
     assert_eq!(
         inspect(&unknown).unwrap_err(),
-        "Gemma artifact carries uninterpreted metadata gemma4.attn_logit_softcapping"
+        "unknown metadata [\"gemma4.attn_logit_softcapping\"]"
     );
 
     let mut wrong = target("e2b");
@@ -326,15 +355,15 @@ fn rejects_missing_tensors_unknown_metadata_wrong_shapes_and_unbound_roles() {
     query.shape = vec![2048, 1536];
     assert!(inspect(&wrong)
         .unwrap_err()
-        .starts_with("Gemma weight \"blk.4.attn_q.weight\": expected [4096, 1536]"));
+        .starts_with("weight \"blk.4.attn_q.weight\": expected [4096, 1536]"));
 
     let mut unbound = target("e2b");
     let mut extra = unbound.tensors[0].clone();
-    extra.name = "blk.20.attn_k.weight".into();
+    extra.name = "blk.20.attn_k.bias".into();
     unbound.tensors.push(extra);
     assert_eq!(
         inspect(&unbound).unwrap_err(),
-        "Gemma artifact contains unbound weight role \"blk.20.attn_k.weight\""
+        "artifact contains unbound weight roles [\"blk.20.attn_k.bias\"]"
     );
 
     let mut pattern = target("e2b");
@@ -343,7 +372,7 @@ fn rejects_missing_tensors_unknown_metadata_wrong_shapes_and_unbound_roles() {
         .iter_mut()
         .find(|entry| entry.name == "gemma4.attention.sliding_window_pattern")
         .unwrap();
-    flags.value = Value::Array(vec![Scalar::Bool(true); 34]);
+    flags.value = Value::Array(vec![true; 34].into());
     assert_eq!(
         inspect(&pattern).unwrap_err(),
         "the Gemma window pattern must hold one flag per layer"
@@ -359,9 +388,13 @@ fn encoder_projectors_bind_sandwich_blocks_pooling_and_axial_rotary() {
         ("26b-a4b", 2816, 27, 1152, 16, false, true),
         ("31b", 5376, 27, 1152, 16, false, true),
     ] {
-        let projector = header(&format!("gemma-4-{model}-it-qat__projector.json"));
+        let projector = projector(model);
         let vision = describe_projector(&projector, output).unwrap();
-        assert_eq!((vision.hidden, vision.output_hidden), (hidden, output), "{model}");
+        assert_eq!(
+            (vision.hidden, vision.output_hidden),
+            (hidden, output),
+            "{model}"
+        );
         assert_eq!(vision.blocks.len(), depth, "{model}");
         assert_eq!(vision.preprocessing.merge, 3);
         assert_eq!(
@@ -370,16 +403,18 @@ fn encoder_projectors_bind_sandwich_blocks_pooling_and_axial_rotary() {
         );
         assert_eq!(vision.preprocessing.mean, [0.5; 3]);
         assert_eq!(
-            vision.stem.positions().sampling,
+            vision.stem.positions().expect("position table").sampling,
             PositionSampling::Axes { length: 10240 }
         );
         let block = &vision.blocks[0];
-        let attention = &block.attention;
+        let VisionOperator::Attention(attention) = &block.operator else {
+            panic!("Gemma 4 vision blocks attend");
+        };
         let width = hidden / heads;
         assert_eq!((attention.heads, attention.width), (heads, width));
         assert_eq!(attention.scale, VisionAttentionScale::Unit);
-        assert_eq!(attention.rotary_base, 100.0);
-        assert!(attention.value_norm.is_some() && block.attention_post_norm.is_some());
+        assert_eq!(attention.rotary_base, Some(100.0));
+        assert!(attention.value_norm.is_some() && block.operator_post_norm.is_some());
         assert_eq!(attention.query.clamp.is_some(), clipped, "{model}");
         assert!(matches!(block.feedforward.up, VisionUp::Gated { .. }));
         assert_eq!(block.feedforward.activation, VisionActivation::GeluTanh);
@@ -404,19 +439,40 @@ fn encoder_projectors_bind_sandwich_blocks_pooling_and_axial_rotary() {
     }
     let model = inspect_components(
         &target("e2b"),
-        Some(&header("gemma-4-e2b-it-qat__projector.json")),
+        Some(&projector("e2b")),
         identity(),
     )
     .unwrap();
     assert!(model.vision.is_some());
 }
 
+/// Another model's projector, or one of another width (the 12B's 3840-wide features beside a
+/// 2560-wide target), disagrees with the target.
+#[test]
+fn another_models_projector_is_a_mismatch() {
+    for error in [
+        describe_projector(&headers::projector("muse-glimmer-30b:gguf:q4"), 2560).unwrap_err(),
+        describe_projector(&headers::projector("gemma-4-12b-it-qat:gguf:q4"), 2560).unwrap_err(),
+    ] {
+        assert!(
+            matches!(
+                error.reasons[..],
+                [magnitude_artifacts::UnsupportedReason::TargetMismatch { .. }]
+            ),
+            "{error}"
+        );
+    }
+}
+
 #[test]
 fn the_unified_projector_is_a_normalized_patch_projection() {
-    let projector = header("gemma-4-12b-it-qat__projector.json");
+    let projector = headers::projector("gemma-4-12b-it-qat:gguf:q4");
     let vision = describe_projector(&projector, 3840).unwrap();
     assert!(vision.blocks.is_empty());
-    assert_eq!((vision.preprocessing.patch, vision.preprocessing.merge), (48, 1));
+    assert_eq!(
+        (vision.preprocessing.patch, vision.preprocessing.merge),
+        (48, 1)
+    );
     assert_eq!(
         vision.preprocessing.resize,
         VisionResize::PatchBudget { max_patches: 280 }
@@ -424,11 +480,9 @@ fn the_unified_projector_is_a_normalized_patch_projection() {
     assert_eq!(vision.patch_row_width().unwrap(), 6912);
     assert!(matches!(vision.stem, VisionStem::NormalizedPatch { .. }));
     assert_eq!(
-        vision.stem.positions().sampling,
+        vision.stem.positions().expect("position table").sampling,
         PositionSampling::Axes { length: 1120 }
     );
-    assert_eq!(describe_projector(&projector, 2560).unwrap_err().to_string(),
-        "projector width differs from the decoder width");
 }
 
 #[test]
@@ -458,6 +512,7 @@ fn feed_forward_up_is_gated_gelu_tanh() {
         dense.up,
         FeedForwardUp::Gated {
             activation: ActivationFunction::GeluTanh,
+            limit: None,
             ..
         }
     ));

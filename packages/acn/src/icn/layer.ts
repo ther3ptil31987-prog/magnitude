@@ -1,13 +1,14 @@
 import { ProcessGroupController } from "@magnitudedev/utils/process-groups";
 import { ProcessGroupControllerLive } from "@magnitudedev/utils/process-groups/native";
-import { FileSystem } from "@effect/platform";
+import { FetchHttpClient, FileSystem } from "@effect/platform";
 import { ModelAssessmentsSnapshot } from "@magnitudedev/icn-protocol/schemas";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { nativeWindowsJobOwnerLayer, nativeWindowsPrivatePipesLayer } from "@magnitudedev/utils/windows-native";
 import { WindowsIcnChildSpawner } from "./windows-child";
-import { Duration, Effect, Layer, Option, Ref, Schema } from "effect";
-import { MagnitudeStorage, resolveModelStoreLocation } from "@magnitudedev/storage";
+import { Clock, Duration, Effect, Layer, Option, Ref, Schema } from "effect";
+import type { LocalModelsConfiguration } from "@magnitudedev/icn-protocol/schemas";
+import { EMPTY_CUSTOM_MODELS_CONFIG, MagnitudeStorage, resolveUsableModelStoreLocation } from "@magnitudedev/storage";
 import {
   type AcnInstallationPlan,
   type AcnStartupProgress,
@@ -20,9 +21,12 @@ import {
   IcnModelAssessments,
   makeIcnCatalog,
   makeIcnCatalogInstallations,
-  makeIcnDiscovery,
+  makeIcnLocalModels,
+  makeIcnDownloads,
+  IcnCandidatesLive,
   makeIcnModelAssessments,
   makeIcnClient,
+  makeIcnHuggingFaceCredential,
   makeIcnProcess,
   UnixIcnChildSpawner,
   makeIcnHardware,
@@ -32,8 +36,11 @@ import {
   IcnPreparationReporter,
 } from "@magnitudedev/icn";
 import { ACN_VERSION } from "../version";
-import { resolveHuggingFaceCacheRoots } from "./hugging-face-cache";
+import { hostDiscoveryEnvironment, resolveAutomaticLocations } from "./discovery-roots";
+import { localModelsConfiguration } from "../custom-models";
+import { HuggingFaceCredentialDeliveryLive } from "../hugging-face-credential-delivery";
 import { AcnServiceLifecycle } from "../service-lifecycle";
+import { isContainerInstallation } from "../container";
 
 const artifactProgress = (
   event: Extract<ArtifactInstallationEvent, { readonly _tag: "Downloading" }>,
@@ -45,6 +52,13 @@ const artifactProgress = (
   attempt: Option.some(event.progress.attempt),
 });
 const defaultDataDir = () => join(homedir(), ".magnitude");
+// ICN bounds its own work (a stalled Hub transfer fails there), so its calls carry no client deadline.
+// Bun's fetch otherwise ends every request after five minutes, and a repository inspection that
+// outlasts that on a slow connection would be reported as ICN being unreachable.
+const icnFetchOptions: globalThis.RequestInit & { readonly timeout: false } = { timeout: false };
+export const icnHttpClient = FetchHttpClient.layer.pipe(
+  Layer.provide(Layer.succeed(FetchHttpClient.RequestInit, icnFetchOptions)),
+);
 const AcceptanceAssessmentDiagnostics = Schema.Struct({
   assessments: ModelAssessmentsSnapshot,
   inferenceDiagnosticTail: Schema.String,
@@ -117,7 +131,7 @@ const resolveModelStore = (dataDir: string) =>
       ),
       Effect.orElseSucceed(() => Option.none<string>())
     );
-    const location = yield* resolveModelStoreLocation(dataDir, configured);
+    const location = yield* resolveUsableModelStoreLocation(dataDir, configured);
     if (Option.isSome(location.warning)) yield* Effect.logWarning(location.warning.value);
     yield* Effect.logInfo("Model store resolved").pipe(
       Effect.annotateLogs({ root: location.root, source: location.source })
@@ -125,12 +139,31 @@ const resolveModelStore = (dataDir: string) =>
     return location.root;
   });
 
-const makeProcess = (dataDir: string, modelStore: string) =>
+/**
+ * The local-models snapshot ICN scans first, from the saved choices as they stand at spawn, chosen
+ * drafters included with their persisted methods.
+ */
+const resolveLocalModelsSnapshot = Effect.gen(function* () {
+  const storage = yield* MagnitudeStorage;
+  const config = yield* storage.config.load().pipe(
+    Effect.map((loaded) => Option.getOrElse(loaded.models, () => EMPTY_CUSTOM_MODELS_CONFIG)),
+    Effect.tapError((error) =>
+      Effect.logWarning("Could not read model choices from config.json; scanning only the automatic locations").pipe(
+        Effect.annotateLogs({ cause: error.message })
+      )
+    ),
+    Effect.orElseSucceed(() => EMPTY_CUSTOM_MODELS_CONFIG)
+  );
+  const locations = yield* resolveAutomaticLocations(hostDiscoveryEnvironment());
+  return localModelsConfiguration(config, locations);
+});
+
+const makeProcess = (dataDir: string, modelStore: string, localModels: LocalModelsConfiguration, container: boolean) =>
   makeIcnProcess(
     new IcnLifecycleConfig({
       binary: new IcnBinaryResolutionConfig({
         source: binarySource(dataDir),
-        supportedApiVersion: 1,
+        supportedApiVersion: 2,
         expectedNativeBuild: Option.none(),
         expectedTarget: Option.none(),
         requiredCapabilities: [
@@ -147,7 +180,8 @@ const makeProcess = (dataDir: string, modelStore: string) =>
       storage: new IcnStorageConfig({
         modelStore: Option.some(modelStore),
         cacheRoot: Option.some(join(dataDir, "cache")),
-        huggingFaceCaches: resolveHuggingFaceCacheRoots(),
+        localModelsConfigurationFile: join(dataDir, "cache", "local-models-configuration.json"),
+        localModels,
       }),
       host: "127.0.0.1",
       startupTimeout: Duration.seconds(150),
@@ -155,6 +189,7 @@ const makeProcess = (dataDir: string, modelStore: string) =>
       forceShutdownTimeout: Duration.millis(500),
       outputLimitBytes: 256 * 1024,
       logFile: Option.some(join(dataDir, "logs", "inference.log")),
+      echoOutput: container,
     })
   ).pipe(Layer.provide(process.platform === "win32"
     ? WindowsIcnChildSpawner.pipe(Layer.provide(Layer.merge(
@@ -233,6 +268,14 @@ export const makeAcnIcn = (dataDir: string = defaultDataDir()) => {
                   )
                 );
               }
+              case "Retrying": {
+                const seconds = Math.max(1, Math.round((event.retryAtMillis - (yield* Clock.currentTimeMillis)) / 1000));
+                yield* Effect.logWarning(`${event.message} Retrying in ${seconds} s.`);
+                return yield* lifecycle.reportRetrying({
+                  message: event.message,
+                  retryAtMillis: event.retryAtMillis,
+                });
+              }
               case "Starting": {
                 const current = yield* Ref.get(state);
                 if (!current.installationRequired) {
@@ -252,27 +295,29 @@ export const makeAcnIcn = (dataDir: string = defaultDataDir()) => {
                   Option.none()
                 );
               }
-              case "PreparingBackend":
-                return yield* lifecycle.reportStarting({
-                  _tag: "PreparingBackend",
-                  backend: event.backend,
-                }, Option.none());
             }
           }),
       };
     })
   );
   const process = Layer.unwrapEffect(
-    resolveModelStore(dataDir).pipe(
-      Effect.map((modelStore) => makeProcess(dataDir, modelStore).pipe(Layer.provide(preparation)))
+    Effect.all([resolveModelStore(dataDir), resolveLocalModelsSnapshot, isContainerInstallation()]).pipe(
+      Effect.map(([modelStore, localModels, container]) =>
+        makeProcess(dataDir, modelStore, localModels, container).pipe(Layer.provide(preparation)))
     )
   );
   const supervisedProcess = Layer.provideMerge(makeSupervision(), process);
-  const withClient = Layer.provideMerge(makeIcnClient(), supervisedProcess);
-  const withEvents = Layer.provideMerge(makeIcnEvents(), withClient);
+  const withClient = Layer.provideMerge(makeIcnClient().pipe(Layer.provide(icnHttpClient)), supervisedProcess);
+  const withHubCredential = Layer.provideMerge(
+    HuggingFaceCredentialDeliveryLive.pipe(Layer.provideMerge(makeIcnHuggingFaceCredential())),
+    withClient,
+  );
+  const withEvents = Layer.provideMerge(makeIcnEvents(), withHubCredential);
   const withHardware = Layer.provideMerge(makeIcnHardware(), withEvents);
   const withCatalog = Layer.provideMerge(makeIcnCatalog(), withHardware);
-  const withModels = Layer.provideMerge(makeIcnDiscovery(), withCatalog);
+  const withLocalModels = Layer.provideMerge(makeIcnLocalModels(), withCatalog);
+  const withDownloads = Layer.provideMerge(makeIcnDownloads(), withLocalModels);
+  const withModels = Layer.provideMerge(IcnCandidatesLive, withDownloads);
   const withAssessments = Layer.provideMerge(makeIcnModelAssessments(), withModels);
   const withDiagnostics = globalThis.process.env.MAGNITUDE_ACCEPTANCE_ASSESSMENT_DIAGNOSTICS
     ? Layer.provideMerge(acceptanceAssessmentDiagnostics, withAssessments)

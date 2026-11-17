@@ -5,7 +5,7 @@
 
 #![allow(dead_code)]
 
-use seismic::{BackendName, Device, DeviceCatalog, Element, SlabRegion, SlabTensor, Tensor};
+use seismic::{BackendName, Device, Element, SlabRegion, SlabTensor, Tensor};
 
 pub const SENTINEL: f32 = 7.25;
 
@@ -87,7 +87,7 @@ pub fn bf16_round(value: f32) -> f32 {
 
 /// Every backend this host can open, the CPU always.
 pub fn devices() -> Vec<Device> {
-    let catalog = DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     let devices = [
         BackendName::Metal,
         BackendName::Cuda,
@@ -104,6 +104,13 @@ pub fn devices() -> Vec<Device> {
     devices
 }
 
+/// Every backend this host can open whose declaration offers `entry` at its
+/// bound elements: the entry's declaration, not the test, decides where it
+/// runs.
+pub fn offering<E: seismic::Entry>(entry: &seismic::BoundEntry<E>) -> Vec<Device> {
+    devices().into_iter().filter(|device| entry.offered(device).unwrap().is_some()).collect()
+}
+
 pub fn is_cpu(device: &Device) -> bool {
     device.backend() == BackendName::Cpu
 }
@@ -115,7 +122,8 @@ pub fn bytes(element: Element, values: &[f32]) -> Vec<u8> {
             .flat_map(|value| ((bf16_round(*value).to_bits() >> 16) as u16).to_le_bytes())
             .collect()
     } else {
-        assert_eq!(element, Element::f32());
+        // 32-bit words (`u32`, `i32`) travel as the bits of their f32 values.
+        assert!([Element::f32(), Element::u32(), Element::i32()].contains(&element));
         values.iter().flat_map(|value| value.to_le_bytes()).collect()
     }
 }
@@ -198,16 +206,16 @@ pub fn slab_arenas(
             element: arena.element,
             row_shape: arena.bank_shape.clone(),
         })
-        .collect();
-    let mut slabs = SlabTensor::new(device, slab_banks, banks as u64, regions).unwrap();
+        .collect::<Vec<_>>();
+    let slabs = crate::common::slab_tensor(device, slab_banks, banks as u64, &regions);
     let count = (banks as u64).div_ceil(slab_banks);
     for slab in 0..count {
-        assert_eq!(slabs.add_slab().unwrap(), slab as usize);
+        assert_eq!(slabs.add_slab(seismic::SlabFill::Zeroed).unwrap(), slab as usize);
     }
     if reuse {
         assert!(count >= 3);
         slabs.free_slab(1).unwrap();
-        assert_eq!(slabs.add_slab().unwrap(), 1);
+        assert_eq!(slabs.add_slab(seismic::SlabFill::Zeroed).unwrap(), 1);
     }
     for (region, arena) in arenas.iter().enumerate() {
         let contents = bytes(arena.element, arena.values);

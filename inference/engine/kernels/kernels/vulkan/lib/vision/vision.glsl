@@ -20,6 +20,7 @@
 // This file is independent of any entry ABI.
 #include "../projection/projection.glsl"
 #include "../core/rotary.glsl"
+#include "../core/norm.glsl"
 #include "../attention/flash.glsl"
 #include "../core/precise.glsl"
 
@@ -68,12 +69,12 @@ float vision_gelu_quick(float value) {
 // output (m, n).
 //   Linear  the projection is acc, plus bias[n] when `biased`, clamped to
 //           [minimum, maximum] when `clamped`; with `activation` nonzero
-//           y = Y(act(round_A(projection))); with a gate (A rows, 0: none)
-//           y = Y(round_A(projection) · gate[m, n]); otherwise
+//           y = Y(act(projection)); with a gate (A rows, 0: none)
+//           y = Y(projection · gate[m, n]), rounded once; otherwise
 //           y = Y(projection), plus residual[m, n] (F32) when bound
 //   Stem    y = ((partial[m, n] when bound) + acc [+ bias[n]]) + blended,
 //           F32, with blended the four table corners times their
-//           coefficients summed in order
+//           coefficients summed in order (zero without a table)
 
 #define VISION_LINEAR 0
 #define VISION_STEM 1
@@ -81,9 +82,8 @@ float vision_gelu_quick(float value) {
 struct vision_epilogue {
     int kind;
     int act;                // Linear: ELEMENT_* of A
-    int y_kind;             // ELEMENT_* of y
-    int activation;         // Linear: 0, 1 tanh GELU, 2 erf GELU, 3 quick GELU
-    uint64_t y;
+    int activation;         // Linear: 0, 1 tanh GELU, 2 erf GELU, 3 quick GELU, 4 squared ReLU
+    Out y;
     uint64_t y0;            // row stride of y, in elements
     bool biased;
     uint64_t bias;
@@ -95,28 +95,41 @@ struct vision_epilogue {
     bool clamped;           // Linear
     float minimum;
     float maximum;
-    uint64_t table;         // Stem: the position table [L, columns]
+    uint64_t table;         // Stem: the position table [L, columns], or 0
     int table_kind;
     uint64_t indices;       // Stem: [M, 4] i32
     uint64_t coefficients;  // Stem: [M, 4] F32
 };
 
-vision_epilogue vision_linear_epilogue(const int act, const int y_kind, int activation, uint64_t y, uint64_t y0,
+vision_epilogue vision_linear_epilogue(const int act, int activation, Out y, uint64_t y0,
     bool biased, uint64_t bias, const int bias_kind, uint64_t residual, uint64_t residual0, uint64_t gate,
     uint64_t gate0, bool clamped, float minimum, float maximum) {
-    return vision_epilogue(VISION_LINEAR, act, y_kind, activation, y, y0, biased, bias, bias_kind, residual,
+    return vision_epilogue(VISION_LINEAR, act, activation, y, y0, biased, bias, bias_kind, residual,
         residual0, gate, gate0, clamped, minimum, maximum, 0ul, ELEMENT_F32, 0ul, 0ul);
 }
 
-vision_epilogue vision_stem(uint64_t y, uint64_t y0, bool biased, uint64_t bias, const int bias_kind,
+vision_epilogue vision_stem(Out y, uint64_t y0, bool biased, uint64_t bias, const int bias_kind,
     uint64_t partial, uint64_t columns, uint64_t table, const int table_kind, uint64_t indices,
     uint64_t coefficients) {
-    return vision_epilogue(VISION_STEM, ELEMENT_F32, ELEMENT_F32, 0, y, y0, biased, bias, bias_kind, partial,
+    return vision_epilogue(VISION_STEM, ELEMENT_F32, 0, y, y0, biased, bias, bias_kind, partial,
         columns, 0ul, 0ul, false, 0.0, 0.0, table, table_kind, indices, coefficients);
 }
 
+float vision_relu_squared(float value) {
+    const float positive = max(value, 0.0);
+    return positive * positive;
+}
+
+float vision_silu(float value) {
+    return seismic_div_rn(value, 1.0 + precise_exp(-value));
+}
+
 float vision_activate(int code, float value) {
-    return code == 1 ? vision_gelu_tanh(value) : code == 2 ? vision_gelu_erf(value) : vision_gelu_quick(value);
+    return code == 1 ? vision_gelu_tanh(value)
+         : code == 2 ? vision_gelu_erf(value)
+         : code == 3 ? vision_gelu_quick(value)
+         : code == 4 ? vision_relu_squared(value)
+                     : vision_silu(value);
 }
 
 void vision_put(vision_epilogue out_, uint m, uint n, float value) {
@@ -129,13 +142,13 @@ void vision_put(vision_epilogue out_, uint m, uint n, float value) {
             projected = min(max(projected, out_.minimum), out_.maximum);
         float published = projected;
         if (out_.activation != 0)
-            published = vision_activate(out_.activation, element_round(out_.act, projected));
+            published = vision_activate(out_.activation, projected);
         else if (out_.gate != 0ul)
-            published = element_round(out_.act, projected)
+            published = projected
                 * element_at(out_.act, out_.gate, uint64_t(m) * out_.gate0 + n);
         else if (out_.residual != 0ul)
             published = element_f32_at(out_.residual + (uint64_t(m) * out_.residual0 + n) * 4ul) + projected;
-        element_put(out_.y_kind, out_.y, at, published);
+        out_put(out_.y, at, published);
     } else {
         float projected = value;
         if (out_.residual != 0ul)
@@ -143,12 +156,14 @@ void vision_put(vision_epilogue out_, uint m, uint n, float value) {
         if (out_.biased)
             projected = projected + element_at(out_.bias_kind, out_.bias, n);
         float blended = 0.0;
-        [[unroll]] for (uint i = 0u; i < 4u; ++i) {
-            const int index = element_i32_at(out_.indices + (uint64_t(m) * 4ul + i) * 4ul);
-            blended += element_at(out_.table_kind, out_.table, uint64_t(index) * out_.residual0 + n)
-                * element_f32_at(out_.coefficients + (uint64_t(m) * 4ul + i) * 4ul);
+        if (out_.table != 0ul) {
+            [[unroll]] for (uint i = 0u; i < 4u; ++i) {
+                const int index = element_i32_at(out_.indices + (uint64_t(m) * 4ul + i) * 4ul);
+                blended += element_at(out_.table_kind, out_.table, uint64_t(index) * out_.residual0 + n)
+                    * element_f32_at(out_.coefficients + (uint64_t(m) * 4ul + i) * 4ul);
+            }
         }
-        element_f32_put(out_.y + at * 4ul, projected + blended);
+        out_put(out_.y, at, projected + blended);
     }
 }
 
@@ -171,46 +186,37 @@ void vision_gemm(const int wk, projection_prologue in_, vision_epilogue out_, pr
     }
 }
 
-// Dense weight rows of an [N, K] row-major matrix (`stride` elements per row
-// of `bytes` each).
-projection_weights vision_weights(uint64_t base, uint64_t stride, const uint bytes, uint k) {
-    return projection_weights(base, packets_rows16(stride * uint64_t(bytes), 0ul, 0ul, 0ul, 0ul), k, 0ul);
+// Dense weight rows of a row-major matrix of `rows` (its slot's,
+// <seismic/packets.glsl>).
+projection_weights vision_weights(uint64_t base, packets_rows16 rows, uint k) {
+    return projection_weights(base, rows, k, 0ul, 1ul, 0u);
 }
 
 // ---------------------------------------------------------------------------
-// Norm of one F32 row of `width` values by the whole workgroup: two-pass F32
-// statistics, centered (a layer norm) or not (the mean taken as 0, a
+// Norm of one F32 row of `width` values by the whole workgroup: `norm_*`'s
+// two-pass statistics, centered (a layer norm) or not (the mean taken as 0, a
 // root-mean-square norm), out[i * stride] = Y(centered * inverse [* weight]
 // [+ bias]). Shared: one float per subgroup at float 0.
-void vision_row_norm(const int y_kind, uint64_t x, uint64_t out_, uint64_t stride, const bool weighted, uint64_t weight,
+void vision_row_norm(uint64_t x, Out out_, uint64_t stride, const bool weighted, uint64_t weight,
     const int weight_kind, const bool biased, uint64_t bias, const int bias_kind, uint width, bool centered,
-    float epsilon) {
+    float epsilon, int activation) {
     float mean = 0.0;
     if (centered) {
         float sum = 0.0;
         for (uint i = gl_LocalInvocationIndex; i < width; i += gl_WorkGroupSize.x)
             sum += element_f32_at(x + uint64_t(i) * 4ul);
-        mean = seismic_div_rn(reduce_group_sum(sum, 0u), float(width));
+        mean = norm_mean(reduce_group_sum(sum, 0u), width);
     }
     float squares = 0.0;
-    for (uint i = gl_LocalInvocationIndex; i < width; i += gl_WorkGroupSize.x) {
-        const float value = element_f32_at(x + uint64_t(i) * 4ul) - mean;
-        squares = seismic_fma_rn(value, value, squares);
-    }
-    const float inverse = inversesqrt(seismic_div_rn(reduce_group_sum(squares, 0u), float(width)) + epsilon);
-    // One expression per form, as the layer norm has always been written.
+    for (uint i = gl_LocalInvocationIndex; i < width; i += gl_WorkGroupSize.x)
+        squares = norm_square(element_f32_at(x + uint64_t(i) * 4ul) - mean, squares);
+    const float inverse = norm_inverse(reduce_group_sum(squares, 0u), width, epsilon);
     for (uint i = gl_LocalInvocationIndex; i < width; i += gl_WorkGroupSize.x) {
         const float centered = element_f32_at(x + uint64_t(i) * 4ul) - mean;
-        float value;
-        if (weighted && biased)
-            value = centered * inverse * element_at(weight_kind, weight, i) + element_at(bias_kind, bias, i);
-        else if (weighted)
-            value = centered * inverse * element_at(weight_kind, weight, i);
-        else if (biased)
-            value = centered * inverse + element_at(bias_kind, bias, i);
-        else
-            value = centered * inverse;
-        element_put(y_kind, out_, uint64_t(i) * stride, value);
+        const float w = weighted ? element_at(weight_kind, weight, i) : 0.0;
+        const float b = biased ? element_at(bias_kind, bias, i) : 0.0;
+        const float normalized = norm_apply(centered, inverse, weighted, w, biased, b);
+        out_put(out_, uint64_t(i) * stride, activation != 0 ? vision_activate(activation, normalized) : normalized);
     }
 }
 
@@ -262,19 +268,21 @@ void vision_prepare_head(const int act, uint64_t source, uint64_t target, bool n
 // query rows, head), 16 query rows per subgroup, keys streamed in
 // FLASH_KEYS-row tiles, one online-softmax pass of `lib/attention/flash.glsl`
 // per VISION_WINDOW output columns. `operands` are the f16 rows
-// [3][heads][padded][wp] (zero past the head width w); the output row r of
+// [heads + 2 * (heads / group)][padded][wp]: the query, then key, then value
+// head rows (zero past the head width w), query head h reading key and value
+// head h / group; the output row r of
 // head h is A at out_[r * heads * w + h * w ..], rounded from F32. Scores
 // are scaled by `score_scale`. Without `spans` (0) every row attends to every
 // row; with them row r attends to rows [spans[2r], spans[2r + 1]), the
 // workgroup walking the union of its rows' spans. Shared: the K/V tile
 // (FLASH_KEYS x (wp + 8) f16), then FLASH_SCRATCH_FLOATS floats per subgroup.
-void vision_attend(const int act, uint64_t operands, uint64_t out_, uint rows, uint padded, uint heads, const uint w,
-    const uint wp, float score_scale, uint64_t spans, uint tile, uint head) {
+void vision_attend(const int act, uint64_t operands, Out out_, uint rows, uint padded, uint heads,
+    const uint group, const uint w, const uint wp, float score_scale, uint64_t spans, uint tile, uint head) {
     const uint lane = SEISMIC_LANE;
-    const uint64_t plane = uint64_t(heads) * padded * wp * 2ul;   // bytes of one of Q, K, V
-    const uint64_t head_rows = uint64_t(head) * padded * wp * 2ul;
-    const uint64_t keys = operands + plane + head_rows;
-    const uint64_t values = operands + 2ul * plane + head_rows;
+    const uint64_t head_bytes = uint64_t(padded) * wp * 2ul;   // bytes of one head's rows
+    const uint64_t head_rows = uint64_t(head) * head_bytes;
+    const uint64_t keys = operands + uint64_t(heads + head / group) * head_bytes;
+    const uint64_t values = keys + uint64_t(heads / group) * head_bytes;
     const uint block_row = tile * VISION_ATTEND_ROWS + 16u * SEISMIC_SUBGROUP;
     const uint64_t block_queries = operands + head_rows + uint64_t(block_row) * wp * 2ul;
     const uint scratch = (FLASH_KEYS * flash_pitch(wp)) / 2u + SEISMIC_SUBGROUP * FLASH_SCRATCH_FLOATS;
@@ -336,7 +344,7 @@ void vision_attend(const int act, uint64_t operands, uint64_t out_, uint rows, u
             const uint row = block_row + r;
             const uint column = flash_output_column(wp, VISION_WINDOW, column0, q);
             if (row < rows && column < w)
-                element_put(act, out_, uint64_t(row) * width + uint64_t(head) * w + column,
+                out_put(out_, uint64_t(row) * width + uint64_t(head) * w + column,
                     seismic_div_rn(value, row_denominator));
         }
     }

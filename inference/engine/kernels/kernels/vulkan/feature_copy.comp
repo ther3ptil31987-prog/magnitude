@@ -1,0 +1,16 @@
+// feature_copy: out[row, column] = input[row, column], copied as stored in A
+// through out's owner; one invocation per element over a grid-stride loop (the
+// grid is capped below the 65535-group floor).
+#include <seismic/element.glsl>
+
+void feature_copy() {
+    // `input` and `output` are reserved words in GLSL.
+    const uint64_t source = SEISMIC_PTR(SEISMIC_BUFFER_INPUT);
+    const Out destination = SEISMIC_OUT_OUT;
+    const uint64_t count = SEISMIC_DIM_M * SEISMIC_DIM_D;
+    for (seismic_walk at = seismic_walk_grid(count, u64vec3(1ul, 1ul, SEISMIC_DIM_D)); at.index < count; seismic_walk_next(at)) {
+        const uint64_t row = at.axes.x, column = at.axes.w;
+        out_copy_stored(destination, row * SEISMIC_OUT_STRIDE_0 + column * SEISMIC_OUT_STRIDE_1,
+            source, row * SEISMIC_INPUT_STRIDE_0 + column * SEISMIC_INPUT_STRIDE_1, 1ul);
+    }
+}

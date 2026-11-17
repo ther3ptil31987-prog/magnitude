@@ -11,7 +11,8 @@ catalog-headers = ["dep:serde_json"]
 [dependencies]
 magnitude-artifacts = { path = "../../artifacts" }
 magnitude-family-contracts = { path = "../contracts" }
-serde_json = { workspace = true, optional = true }
+# Header floats parse to the values GGUF stores, whatever else the build unifies.
+serde_json = { workspace = true, optional = true, features = ["float_roundtrip"] }
 
 [dev-dependencies]
 magnitude-family-common = { path = ".", features = ["catalog-headers"] }
@@ -19,9 +20,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2 = "=0.11.0"
 magnitude-family-dflash = { path = "../dflash" }
-magnitude-family-gemma4 = { path = "../gemma4" }
-magnitude-family-lfm2 = { path = "../lfm2" }
-magnitude-family-llama = { path = "../llama" }
-magnitude-family-muse-glimmer = { path = "../muse_glimmer" }
-magnitude-family-nemotron-h = { path = "../nemotron_h" }
-magnitude-family-qwen35 = { path = "../qwen35" }
+magnitude-family-registry = { path = "../registry" }
+# The worker wire's encoding, which every built definition crosses (`tests/catalog_definitions.rs`).
+postcard.workspace = true
+flate2.workspace = true

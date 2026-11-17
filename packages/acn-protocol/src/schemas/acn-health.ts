@@ -35,14 +35,6 @@ export const AcnInstallationPlanSchema = Schema.Struct({
 });
 export type AcnInstallationPlan = typeof AcnInstallationPlanSchema.Type;
 
-export const StartupBackendSchema = Schema.Union(
-  Schema.TaggedStruct("Cpu", { hardwareLabel: NonEmptyString }),
-  Schema.TaggedStruct("Metal", { hardwareLabel: NonEmptyString }),
-  Schema.TaggedStruct("Cuda", { hardwareLabel: NonEmptyString }),
-  Schema.TaggedStruct("Vulkan", { hardwareLabel: NonEmptyString }),
-)
-export type StartupBackend = typeof StartupBackendSchema.Type
-
 export const AcnInstallingActivitySchema = Schema.TaggedStruct("Installing", {
   phase: AcnInstallationPhaseSchema,
   plan: AcnInstallationPlanSchema,
@@ -51,7 +43,6 @@ export type AcnInstallingActivity = typeof AcnInstallingActivitySchema.Type;
 
 export const AcnStartupActivitySchema = Schema.Union(
   Schema.Literal("WaitingForOwnership", "Resolving", "Starting"),
-  Schema.TaggedStruct("PreparingBackend", { backend: StartupBackendSchema }),
   AcnInstallingActivitySchema,
 );
 export type AcnStartupActivity = typeof AcnStartupActivitySchema.Type;
@@ -68,19 +59,51 @@ export const AcnStoppingReasonSchema = Schema.Literal(
 );
 export type AcnStoppingReason = typeof AcnStoppingReasonSchema.Type;
 
+/** A step of startup that failed and runs again at `retryAtMillis`, such as an engine download during an outage. */
+export const AcnStartupRetrySchema = Schema.Struct({
+  message: NonEmptyString,
+  retryAtMillis: NonNegativeSafeInteger,
+});
+export type AcnStartupRetry = typeof AcnStartupRetrySchema.Type;
+
 export class AcnStarting extends Schema.TaggedClass<AcnStarting>()("Starting", {
   activity: AcnStartupActivitySchema,
   progress: Schema.optionalWith(AcnStartupProgressSchema, {
     as: "Option",
     exact: true,
   }),
+  retry: Schema.optionalWith(AcnStartupRetrySchema, {
+    as: "Option",
+    exact: true,
+  }),
 }) {}
 
-export class AcnReady extends Schema.TaggedClass<AcnReady>()("Ready", {}) {}
+export const AcnHardwareSummarySchema = Schema.Struct({
+  /** The active device's backend: a resident model's device, and otherwise the serving device. */
+  backend: Schema.Literal("cpu", "metal", "cuda", "vulkan"),
+  gpuName: Schema.optionalWith(NonEmptyString, { as: "Option", exact: true }),
+  gpuKind: Schema.optionalWith(Schema.Literal("discrete", "integrated"), { as: "Option", exact: true }),
+  gpuMemoryBytes: Schema.optionalWith(NonNegativeSafeInteger, { as: "Option", exact: true }),
+  gpuCount: NonNegativeSafeInteger,
+  gpuUnusedReason: Schema.optionalWith(NonEmptyString, { as: "Option", exact: true }),
+  cpuModel: Schema.optionalWith(NonEmptyString, { as: "Option", exact: true }),
+  cpuCores: Schema.optionalWith(PositiveSafeInteger, { as: "Option", exact: true }),
+  memoryBytes: NonNegativeSafeInteger,
+})
+export type AcnHardwareSummary = typeof AcnHardwareSummarySchema.Type
 
+export class AcnReady extends Schema.TaggedClass<AcnReady>()("Ready", {
+  hardware: Schema.optionalWith(AcnHardwareSummarySchema, { as: "Option", exact: true }),
+}) {}
+
+/** `permanent` marks a stop that starting again cannot fix, such as an engine release the host doesn't have. */
 export class AcnStopping extends Schema.TaggedClass<AcnStopping>()("Stopping", {
   reason: AcnStoppingReasonSchema,
   safeDetail: Schema.optionalWith(NonEmptyString, {
+    as: "Option",
+    exact: true,
+  }),
+  permanent: Schema.optionalWith(Schema.Boolean, {
     as: "Option",
     exact: true,
   }),

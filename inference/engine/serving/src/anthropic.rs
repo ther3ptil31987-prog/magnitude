@@ -25,6 +25,7 @@ use utoipa::ToSchema;
 
 use crate::chat::{ReasoningEffortRequest, admitted, collect, ended_without_outcome};
 use crate::error::{ApiError, ServingError, insert_retry_after};
+use crate::sampling::{SamplingRequest, sampling};
 use crate::source::{GenerationEvent, GenerationStream};
 use crate::{Serving, media};
 
@@ -267,11 +268,6 @@ pub fn adapt(request: MessagesRequest) -> Result<AdaptedRequest, ApiError> {
     })?;
     let max_tokens = NonZeroU32::new(request.max_tokens)
         .ok_or_else(|| ApiError::invalid("max_tokens must be greater than zero"))?;
-    if request.top_k.is_some() {
-        return Err(ApiError::invalid(
-            "top_k is not supported by this local runtime",
-        ));
-    }
     if request
         .metadata
         .as_ref()
@@ -282,11 +278,13 @@ pub fn adapt(request: MessagesRequest) -> Result<AdaptedRequest, ApiError> {
     for stop in &request.stop_sequences {
         crate::chat::require_non_empty(stop, "stop sequence")?;
     }
-    let sampling = crate::responses::sampling(
-        request.temperature.unwrap_or(1.0),
-        request.top_p.unwrap_or(1.0),
-        request.seed,
-    )?;
+    let sampling = sampling(SamplingRequest {
+        temperature: request.temperature,
+        top_p: request.top_p,
+        top_k: request.top_k,
+        seed: request.seed,
+        ..SamplingRequest::default()
+    })?;
     Ok(AdaptedRequest {
         model: adapted.model,
         request: GenerationRequest {
@@ -1109,19 +1107,6 @@ async fn project(mut stream: GenerationStream, mut projector: StreamProjector) {
     }
 }
 
-fn validate_anthropic_version(headers: &HeaderMap) -> Result<(), ApiError> {
-    let version = headers
-        .get("anthropic-version")
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| ApiError::invalid("anthropic-version header is required"))?;
-    if version != "2023-06-01" {
-        return Err(ApiError::invalid(format!(
-            "unsupported anthropic-version: {version}"
-        )));
-    }
-    Ok(())
-}
-
 fn with_anthropic_request_id(mut response: Response, request_id: &str) -> Response {
     if let Ok(value) = request_id.parse() {
         response.headers_mut().insert("request-id", value);
@@ -1179,12 +1164,10 @@ fn anthropic_error_response(request_id: String, error: ApiError) -> Response {
 )]
 pub async fn anthropic_count_tokens(
     State(state): State<Serving>,
-    headers: HeaderMap,
     payload: Result<Json<CountTokensRequest>, JsonRejection>,
 ) -> Response {
     let request_id = state.next_id("req_icn_");
     let result = async {
-        validate_anthropic_version(&headers)?;
         let Json(request) = payload.map_err(|error| ApiError::invalid(error.body_text()))?;
         let adapted = adapt_input(request)?;
         let host = state
@@ -1193,9 +1176,8 @@ pub async fn anthropic_count_tokens(
             .await
             .map_err(ApiError::from)?;
         let input = adapted.input;
-        let count = tokio::task::spawn_blocking(move || host.count(&input))
+        let count = magnitude_service_utils::blocking::run(move || host.count(&input))
             .await
-            .map_err(|error| ApiError::server(format!("token-count task failed: {error}")))?
             .map_err(ApiError::from)?;
         Ok::<_, ApiError>(
             Json(CountTokensResponse {
@@ -1250,7 +1232,6 @@ async fn messages(
     request: MessagesRequest,
     request_id: String,
 ) -> Result<Response, ApiError> {
-    validate_anthropic_version(&headers)?;
     let adapted = adapt(request)?;
     let response_model = headers
         .get("Magnitude-Gateway-Model")

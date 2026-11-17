@@ -36,9 +36,25 @@ macro_rules! identity {
 identity!(ProgramIdentity);
 identity!(ResourceDomainId);
 
-/// Engine-wide identity of an admitted request.
+/// Engine-wide identity of an admitted request: unique in the process, and
+/// ordered as requests were admitted across every load
+/// ([`Self::admitted`]). A store's ledger, shared by every load in the
+/// process, keys each sequence's state by it, so no two loads' sequences
+/// share one and "admitted after" is one order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RequestId(pub u64);
+
+impl RequestId {
+    /// The identity of a request admitted now: the one way a request's
+    /// identity is made, later than every one made before it in the
+    /// process.
+    pub fn admitted() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        assert!(id != u64::MAX, "invariant violated: request identities exhausted");
+        Self(id)
+    }
+}
 
 /// A contiguous row range within an aggregate feature lease.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -142,6 +158,30 @@ pub enum WorkKind {
     Replay,
     Decode,
     Verify,
+}
+
+/// What a target launch's rows are, as policy tells them apart: a prompt's
+/// (any of its requests prefills or replays), or generation's (each of its
+/// requests decodes or verifies). Independent of the launch's form: a
+/// generation launch wider than the decode form runs the grouped form, and a
+/// short prompt tail the decode form, and neither is the other's work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaunchWork {
+    Prompt,
+    Generation,
+}
+
+impl LaunchWork {
+    /// The work of a launch of requests of `kinds`, at least one: a launch
+    /// of no request is the caller's broken invariant.
+    pub fn of(kinds: impl IntoIterator<Item = WorkKind>) -> Self {
+        let mut kinds = kinds.into_iter().peekable();
+        assert!(kinds.peek().is_some(), "a launch runs a request");
+        match kinds.any(|kind| matches!(kind, WorkKind::Prefill | WorkKind::Replay)) {
+            true => Self::Prompt,
+            false => Self::Generation,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -261,13 +301,18 @@ pub enum Operation {
     },
 }
 
-/// A prompt chunk's drafter entry: `tokens[i]` pairs with the chunk's
-/// feature of row `i` (the row that selected it; the prompt knows every
-/// token, so the chunk's own rows condition it), committed to drafter state
-/// at `position` when the chunk commits. Entry rows never exceed the chunk's.
-/// The first draft anchors at `draft_from` (see [`HeadPhase::Priming`]).
+/// A prompt chunk's drafter entry, committed at `position` with the chunk.
+/// A successor-dependent entry pairs its first token with the previous
+/// boundary feature when one exists, followed by this chunk's complete
+/// pairs. A feature-only entry reads the current chunk directly. Entry rows
+/// never exceed the chunk's.
+/// `draft_from` is the earliest anchor this history must support, including a
+/// continuation from a retained prefix (see [`HeadPhase::Priming`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Priming {
+    /// Keep the last target feature independently, entering only token pairs
+    /// wholly inside the prefix. Chained MTP heads require this boundary.
+    pub boundary: bool,
     pub tokens: Vec<TokenId>,
     pub position: usize,
     pub draft_from: usize,
@@ -279,7 +324,7 @@ pub struct Priming {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeadPhase {
     /// Entering committed history before drafting; the first draft block
-    /// will anchor at `draft_from` (the position after the primed history),
+    /// cannot anchor before `draft_from`, including after prefix reuse,
     /// so windowed draft histories never read rows before
     /// `draft_from + 1 - window`.
     Priming {
@@ -302,6 +347,17 @@ pub enum DraftForm {
     Block,
 }
 
+/// The draft passes every slot of one head launch shares. A causal head
+/// drafts nothing, so it has no selection to pad a drafting slot with;
+/// chained drafts pad to the longest; a block's width is physical, so
+/// unequal blocks cannot be padded together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DraftShape {
+    Causal,
+    Chained,
+    Block(usize),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ExecutableKind {
     Target,
@@ -320,6 +376,7 @@ pub struct GroupKey {
     pub program_identity: ProgramIdentity,
     pub executable: ExecutableKind,
     pub commitment: CommittedClass,
+    pub draft: Option<DraftShape>,
 }
 
 impl Operation {
@@ -379,6 +436,22 @@ impl Operation {
         }
     }
 
+    pub fn draft_shape(&self) -> Option<DraftShape> {
+        match self {
+            Self::Head { proposals, .. } if proposals.is_empty() => Some(DraftShape::Causal),
+            Self::Head {
+                form: DraftForm::Chained,
+                ..
+            } => Some(DraftShape::Chained),
+            Self::Head {
+                form: DraftForm::Block,
+                proposals,
+                ..
+            } => Some(DraftShape::Block(proposals.len())),
+            Self::Forward { .. } | Self::Encode { .. } => None,
+        }
+    }
+
     pub fn commitment(&self) -> CommittedClass {
         match self {
             Self::Forward {
@@ -432,9 +505,13 @@ impl Operation {
                 }
                 validate_forward_select(*kind, tokens.len(), *demand, select)?;
                 if let Some(prime) = prime {
-                    if *kind != WorkKind::Prefill
+                    let closed_prefix = !prime.boundary
+                        || (prime.tokens == *tokens
+                            || (prime.position == 0 && prime.tokens == tokens[1..]));
+                    if !closed_prefix
+                        || *kind != WorkKind::Prefill
                         || !demand.contains(Demand::FEATURES)
-                        || prime.tokens.is_empty()
+                        || (prime.tokens.is_empty() && !prime.boundary)
                         || prime.tokens.len() > tokens.len()
                     {
                         return Err(OperationError::Priming);
@@ -556,7 +633,9 @@ impl fmt::Display for OperationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyRows => formatter.write_str("operation requires at least one row"),
-            Self::PrimingHeadProposals => formatter.write_str("priming head cannot draft proposals"),
+            Self::PrimingHeadProposals => {
+                formatter.write_str("priming head cannot draft proposals")
+            }
             Self::Priming => formatter.write_str(
                 "a drafter entry primes a feature-demanding prompt chunk from at most its rows",
             ),
@@ -619,16 +698,34 @@ pub struct RowResult {
     pub logits: Option<LogitsRef>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Outcome {
     Forward {
         rows: Vec<RowResult>,
     },
-    /// One selection per requested proposal, in chain order.
+    /// One selection per requested proposal, in chain order, with the
+    /// drafter's confidence in each, its probability under the logits it was
+    /// sampled from, when the drafter samples them: a drafter choosing by
+    /// path scores has none to give.
     Head {
         proposals: Vec<Selected>,
+        confidence: Option<Vec<f32>>,
     },
     Encode {
         features: FeatureRef,
     },
+    /// A forward whose sequence's weights (table rows or experts) could not
+    /// be read, in this step or an earlier one (the sequence is poisoned):
+    /// its outputs were
+    /// discarded, and reconciling it fails the sequence.
+    WeightReadFailed(crate::WeightReadError),
+    /// A forward its step's expert bank interrupted (a late beat of its
+    /// load's pulse: a wait of the step may have ended before its answer),
+    /// for `reason`. Its outputs are not to be used, its inputs are whole,
+    /// and nothing of it is poisoned: aborting it returns the sequence's
+    /// accepted state, from which its round is re-run where it stays
+    /// `resident`; where it does not (a chunk of a chain, released with its
+    /// holder's state), the sequence re-prefills, as an evicted one.
+    /// Reconciling it is an invariant violation.
+    Interrupted { reason: String, resident: bool },
 }

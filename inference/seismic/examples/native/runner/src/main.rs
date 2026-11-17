@@ -189,7 +189,7 @@ fn verify_native_graph(device: &seismic::Device) -> Result<(), Box<dyn std::erro
     )?;
     small_graph.export(small_output.tensor())?;
     let small_plan = small_graph.seal()?;
-    let family = seismic::NativeGraphFamily::new(&[owned_plan.clone(), small_plan.clone()])?;
+    let family = seismic::NativeGraphFamily::new(&[owned_plan.clone(), small_plan.clone()], 1)?;
     assert_eq!(
         family.workspace_bytes(),
         owned_plan
@@ -197,7 +197,7 @@ fn verify_native_graph(device: &seismic::Device) -> Result<(), Box<dyn std::erro
             .max(small_plan.workspace_bytes())
     );
     assert_eq!(family.output_bytes(), owned_plan.output_bytes());
-    let mut family_slot = family.new_slot(1)?;
+    let mut family_slot = family.new_slot(&[family.upload_bytes()])?;
     let mut active = family_slot.activate(&owned_plan)?;
     active.write_input(&input, &bytes(&[2.0, 3.0, 4.0, 5.0]))?;
     let owned_outputs = run(active.attach(
@@ -250,8 +250,8 @@ fn verify_native_graph(device: &seismic::Device) -> Result<(), Box<dyn std::erro
     scratch_graph.export(scratch_result.tensor())?;
     let scratch_plan = scratch_graph.seal()?;
     assert_eq!(scratch_plan.workspace_bytes(), 24);
-    let scratch_family = seismic::NativeGraphFamily::new(&[scratch_plan.clone()])?;
-    let mut scratch_slot = scratch_family.new_slot(1)?;
+    let scratch_family = seismic::NativeGraphFamily::new(&[scratch_plan.clone()], 1)?;
+    let mut scratch_slot = scratch_family.new_slot(&[scratch_family.upload_bytes()])?;
     let mut scratch_active = scratch_slot.activate(&scratch_plan)?;
     let mut borrowed_local = scratch_active.local(&prewritten).expect("checked local");
     borrowed_local.write_from_host(&bytes(&[2.0, 5.0]))?;
@@ -388,7 +388,7 @@ fn verify_native_graph(device: &seismic::Device) -> Result<(), Box<dyn std::erro
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let catalog = seismic::DeviceCatalog::discover()?;
+    let catalog = seismic::Devices::discover(&[])?;
     let device = catalog.open_backend(seismic::BackendName::Metal)?;
     let x = seismic::Tensor::from_host(
         &device,
@@ -445,7 +445,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     verify_native_graph(&device)?;
     println!(
         "native dense and polymorphic fixtures executed successfully on {}",
-        device.info().name
+        device.info().name()
     );
     Ok(())
 }

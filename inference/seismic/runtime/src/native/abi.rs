@@ -9,15 +9,23 @@
 //! the words; the single push constant is the block's address.
 
 use super::plan::ParameterAddress;
-use seismic_lang::checked::{NativeImplementation, NativeSpecialization};
+use seismic_lang::checked::{
+    LaunchGrid, NativeAsset, NativeImplementation, NativeSpecialization, PROJECTION_SEGMENTS, RecordPort,
+};
 use seismic_lang::entry::{
     CallSchema, ElementBindings, LogicalEntry, ParameterKind, ResultKind, TensorAccess,
 };
-use seismic_lang::expr::compiled::InvocationValues;
 use seismic_lang::expr::SymbolValue;
+use seismic_lang::expr::compiled::InvocationValues;
 use seismic_lang::ids::RepresentationId;
+use seismic_lang::native_parameter::{
+    OwnerReach, native_parameter_names, parameter_reach, representation_reach, result_handle,
+};
+use seismic_lang::producers;
 use seismic_lang::registry;
+use seismic_lang::repack::WordTable;
 
+mod conversion;
 #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
 pub(crate) mod vulkan;
 
@@ -27,11 +35,24 @@ pub(crate) mod vulkan;
 pub(crate) enum Dialect {
     /// MSL, with the device's feature macros.
     Metal(MetalFeatures),
-    Cuda,
+    /// CUDA C++, with the device's fact macros.
+    Cuda(CudaFeatures),
     /// GLSL 4.60 compute for Vulkan 1.3, with the device's feature macros.
     /// Vulkan is not built on macOS; its prefix still renders in tests there.
     #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
     Vulkan(vulkan::VulkanFeatures),
+}
+
+impl Dialect {
+    /// The backend the dialect's sources run on.
+    pub(crate) fn backend(self) -> registry::BackendName {
+        match self {
+            Self::Metal(_) => registry::BackendName::Metal,
+            Self::Cuda(_) => registry::BackendName::Cuda,
+            #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
+            Self::Vulkan(_) => registry::BackendName::Vulkan,
+        }
+    }
 }
 
 /// The Metal device features a native source tests as `SEISMIC_HAS_<NAME>`,
@@ -60,13 +81,58 @@ fn metal_header(features: MetalFeatures) -> String {
     header
 }
 
+/// The CUDA device facts a native source reads as `SEISMIC_<NAME>`, from the
+/// opened device's facts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CudaFeatures {
+    /// Streaming multiprocessors (`SEISMIC_MULTIPROCESSORS`): a kernel that
+    /// states its grid sizes its blocks' residency to the waves they fill.
+    pub(crate) multiprocessors: u64,
+}
+
+impl CudaFeatures {
+    /// The facts a source renders at without an opened device (formation
+    /// coverage, a kernel's identity): a source reads the multiprocessor
+    /// count only as a constant, which no preprocessor group tests, so one
+    /// count renders every group the same way as any other.
+    pub(crate) const UNOPENED: Self = Self { multiprocessors: 48 };
+}
+
+/// The helpers and the device fact macros.
+fn cuda_header(features: CudaFeatures) -> String {
+    let mut header = String::from(CUDA_HELPERS);
+    header.push_str(&format!(
+        "#define SEISMIC_MULTIPROCESSORS {}\n",
+        features.multiprocessors
+    ));
+    header
+}
+
 /// A 64-bit constant in the dialect's syntax.
 fn literal(dialect: Dialect, value: u64) -> String {
     match dialect {
         Dialect::Metal(_) => format!("((ulong){value})"),
-        Dialect::Cuda => format!("((unsigned long long){value})"),
+        Dialect::Cuda(_) => format!("((unsigned long long){value})"),
         #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
         Dialect::Vulkan(_) => format!("uint64_t({value}ul)"),
+    }
+}
+
+/// `numerator` / `divisor` for a dialect's 64-bit `numerator` expression and
+/// constant `divisor`. Vulkan divides no 64-bit integers, which drivers
+/// expand into long instruction sequences; its prelude divides by a divisor
+/// below 2^16 in 32-bit arithmetic (`seismic_quotient`).
+fn quotient(dialect: Dialect, numerator: &str, divisor: u64) -> String {
+    match dialect {
+        Dialect::Metal(_) | Dialect::Cuda(_) => format!("(({numerator}) / {divisor})"),
+        #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
+        Dialect::Vulkan(_) => {
+            assert!(
+                (1..1 << 16).contains(&divisor),
+                "a Vulkan quotient's constant divisor {divisor} is below 2^16"
+            );
+            format!("seismic_quotient({numerator}, {divisor}u)")
+        }
     }
 }
 
@@ -130,23 +196,161 @@ pub(crate) fn native_word_count(
     schema: &CallSchema,
     implementation: &NativeImplementation,
 ) -> usize {
-    word_count(schema) + runtime_parameters(implementation).len()
+    word_count(schema) + emitted_words(implementation) + runtime_parameters(implementation).len()
 }
 
-/// Argument slots an implementation binds: its buffers (tensor parameters,
-/// tensor results, scratch), the argument words and the scalar-result slots.
+/// The words that tell a call whether it emits each operand its launches
+/// can write (`NativeOperand::Emitted`): one per such buffer, in buffer
+/// order, after the schema's words. Nonzero only where a sealed graph pairs
+/// the operand with a consumer that reads it (`graph::operand_pairs`), so a
+/// standalone call, and a node nothing reads the operand of, emits none.
+pub(crate) fn emitted_words(implementation: &NativeImplementation) -> usize {
+    implementation.scratch.iter().filter(|scratch| emits(scratch)).count()
+}
+
+/// The word of buffer `scratch`'s emitted operand ([`emitted_words`]).
+pub(crate) fn emitted_word(schema: &CallSchema, implementation: &NativeImplementation, scratch: usize) -> usize {
+    assert!(emits(&implementation.scratch[scratch]), "buffer {scratch} holds no emitted operand");
+    word_count(schema) + implementation.scratch[..scratch].iter().filter(|scratch| emits(scratch)).count()
+}
+
+fn emits(scratch: &seismic_lang::checked::NativeScratch) -> bool {
+    matches!(scratch.operand, Some(seismic_lang::checked::NativeOperand::Emitted { .. }))
+}
+
+/// Argument slots an implementation binds: its bound buffers ([`bound`]),
+/// the argument words and the scalar-result slots.
 pub(crate) fn buffer_slots(schema: &CallSchema, implementation: &NativeImplementation) -> usize {
-    let tensors = schema
+    bound(schema, implementation).iter().filter(|bound| **bound).count() + 2
+}
+
+/// Whether each of the entry's buffers, in ABI order ([`buffer_writes`]),
+/// is bound in the kernel's argument table: every one but a host port,
+/// which the kernel never accesses. A host port is still one of the call's
+/// buffers, which its hazards order by ([`host_writes`]).
+pub(crate) fn bound(schema: &CallSchema, implementation: &NativeImplementation) -> Vec<bool> {
+    let parameters = schema.parameters().iter().filter_map(|parameter| match &parameter.kind {
+        ParameterKind::Tensor { access, .. } => Some(!matches!(access, TensorAccess::Host { .. })),
+        _ => None,
+    });
+    let rest = buffer_writes(schema, implementation).len() - parameters.clone().count();
+    parameters.chain(std::iter::repeat_n(true, rest)).collect()
+}
+
+/// Whether each of the entry's buffers, in ABI order ([`buffer_writes`]),
+/// is a record port of launch `launch` (`NativeImplementation::launch_records`), bound as
+/// the table of its view's records' device addresses: a tensor parameter,
+/// or a tensor result, which follow the tensor parameters.
+pub(crate) fn records(schema: &CallSchema, implementation: &NativeImplementation, launch: usize) -> Vec<bool> {
+    let mut records = vec![false; buffer_writes(schema, implementation).len()];
+    let tensor = |kind: &ResultKind| matches!(kind, ResultKind::Tensor { .. });
+    for port in implementation.launch_records(launch) {
+        let buffer = match port {
+            RecordPort::Parameter(name) => {
+                tensor_buffer(schema, name).expect("a checked record port is a tensor parameter")
+            }
+            RecordPort::Result(ordinal) => {
+                tensor_buffer_count(schema)
+                    + schema.results()[..*ordinal as usize]
+                        .iter()
+                        .filter(|result| tensor(&result.kind))
+                        .count()
+            }
+        };
+        records[buffer] = true;
+    }
+    records
+}
+
+/// Tensor parameters: the leading buffers.
+fn tensor_buffer_count(schema: &CallSchema) -> usize {
+    schema
         .parameters()
         .iter()
         .filter(|parameter| matches!(parameter.kind, ParameterKind::Tensor { .. }))
         .count()
-        + schema
-            .results()
+}
+
+/// The ABI buffer of tensor parameter `name`: tensor parameters lead the
+/// buffers, in schema order.
+pub(crate) fn tensor_buffer(schema: &CallSchema, name: &str) -> Option<usize> {
+    schema
+        .parameters()
+        .iter()
+        .filter(|parameter| matches!(parameter.kind, ParameterKind::Tensor { .. }))
+        .position(|parameter| parameter.name == name)
+}
+
+/// The name of the tensor parameter ABI buffer `buffer` is, one leading the
+/// buffers ([`tensor_buffer`]).
+pub(crate) fn tensor_buffer_name(schema: &CallSchema, buffer: usize) -> &str {
+    &schema
+        .parameters()
+        .iter()
+        .filter(|parameter| matches!(parameter.kind, ParameterKind::Tensor { .. }))
+        .nth(buffer)
+        .expect("a tensor parameter's buffer leads the buffers")
+        .name
+}
+
+/// The ABI buffer holding launch grid `grid`: a tensor parameter, or a
+/// scratch buffer, which follow every tensor parameter and result.
+pub(crate) fn grid_buffer(
+    schema: &CallSchema,
+    implementation: &NativeImplementation,
+    grid: &LaunchGrid,
+) -> usize {
+    match grid {
+        LaunchGrid::Parameter(name) => {
+            tensor_buffer(schema, name).expect("a checked launch grid is a tensor parameter")
+        }
+        LaunchGrid::Scratch(name) => scratch_buffer(schema, implementation, name),
+    }
+}
+
+/// The ABI buffer of scratch buffer `name`, which follows every tensor
+/// parameter and result.
+pub(crate) fn scratch_buffer(schema: &CallSchema, implementation: &NativeImplementation, name: &str) -> usize {
+    buffer_writes(schema, implementation).len() - implementation.scratch.len()
+        + implementation
+            .scratch
             .iter()
-            .filter(|result| matches!(result.kind, ResultKind::Tensor { .. }))
-            .count();
-    tensors + implementation.scratch.len() + 2
+            .position(|buffer| buffer.name == name)
+            .expect("a checked scratch name is a scratch buffer")
+}
+
+/// Whether the entry writes each of its buffers, in ABI order: a tensor
+/// parameter as its access declares, then every tensor result and every
+/// scratch buffer.
+pub(crate) fn buffer_writes(schema: &CallSchema, implementation: &NativeImplementation) -> Vec<bool> {
+    let parameters = schema.parameters().iter().filter_map(|parameter| match &parameter.kind {
+        ParameterKind::Tensor { access, .. } => {
+            Some(matches!(access, TensorAccess::Owned | TensorAccess::Mutable))
+        }
+        _ => None,
+    });
+    let results = schema
+        .results()
+        .iter()
+        .filter(|result| matches!(result.kind, ResultKind::Tensor { .. }))
+        .map(|_| true);
+    let scratch = implementation.scratch.iter().map(|_| true);
+    parameters.chain(results).chain(scratch).collect()
+}
+
+/// Whether the host rewrites each of the entry's buffers once it sees the
+/// launch (`&host mut`), in ABI order as [`buffer_writes`]. The device never
+/// writes such a buffer; a launch is ordered as though it did. (A `&host`
+/// port the host only reads is ordered as the read every bound buffer is.)
+pub(crate) fn host_writes(schema: &CallSchema, implementation: &NativeImplementation) -> Vec<bool> {
+    let parameters = schema.parameters().iter().filter_map(|parameter| match &parameter.kind {
+        ParameterKind::Tensor { access, .. } => {
+            Some(matches!(access, TensorAccess::Host { write: true }))
+        }
+        _ => None,
+    });
+    let rest = buffer_writes(schema, implementation).len() - parameters.clone().count();
+    parameters.chain(std::iter::repeat_n(false, rest)).collect()
 }
 
 /// Number of 64-bit scalar-result slots.
@@ -154,25 +358,11 @@ pub(crate) fn scalar_word_count(schema: &CallSchema) -> usize {
     schema
         .results()
         .iter()
-        .map(|result| match &result.kind {
-            ResultKind::Range { .. } => 2,
-            ResultKind::Scalar(_) | ResultKind::Index { .. } => 1,
-            ResultKind::Tensor { .. } => 0,
-        })
+        .map(|result| result.kind.class().scalar_words())
         .sum()
 }
 
-pub(crate) fn native_macro(name: &str) -> String {
-    name.chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character.to_ascii_uppercase()
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
+pub(crate) use seismic_lang::native_name::native_macro;
 
 /// The geometry of one tensor argument fixed by the specialization's static
 /// dimensions (S10): each axis extent the static dimensions determine, and
@@ -181,6 +371,14 @@ pub(crate) fn native_macro(name: &str) -> String {
 pub(crate) struct StaticTensor {
     pub extents: Vec<Option<u64>>,
     pub strides: Option<Vec<u64>>,
+}
+
+impl StaticTensor {
+    /// Whether the tensor is absent: a static extent is zero, so it has no
+    /// element under any binding and its address names nothing.
+    pub(crate) fn absent(&self) -> bool {
+        self.extents.contains(&Some(0))
+    }
 }
 
 /// Per tensor parameter and tensor result (by schema ordinal; `None` for
@@ -252,6 +450,60 @@ pub(crate) fn static_geometry(
     }
 }
 
+/// The element-kind constant (`element.glsl`) of a floating dense representation: the kind its
+/// Vulkan handle carries.
+#[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
+fn vulkan_element_kind(representation: RepresentationId) -> &'static str {
+    match &registry::representation_info(representation).kind {
+        registry::RepresentationKind::Dense(seismic_lang::types::DType::F32) => "ELEMENT_F32",
+        registry::RepresentationKind::Dense(seismic_lang::types::DType::BF16) => "ELEMENT_BF16",
+        registry::RepresentationKind::Dense(seismic_lang::types::DType::F16) => "ELEMENT_F16",
+        other => unreachable!("{other:?} has no owner handle"),
+    }
+}
+
+/// The macro through which a kernel reaches the tensor of `element_prefix` bound to buffer
+/// `buffer`. CUDA: `expression` is the tensor's owner handle. Metal: `declaration(name)` declares
+/// the kernel parameter of the tensor's cells.
+fn render_owner_handle(
+    out: &mut String,
+    dialect: Dialect,
+    expression: &str,
+    declaration: &str,
+    element_prefix: &str,
+    representation: RepresentationId,
+    buffer: usize,
+    slab: bool,
+) {
+    // A slab port's buffer is the slab address table: its handle is `SlabOut`, whose regions and
+    // rows are handles.
+    match (dialect, slab) {
+        (Dialect::Cuda(_), false) => out.push_str(&format!(
+            "#define {expression} element::abi_out<ELEMENT_OF({element_prefix})>(seismic_buffer_{buffer})\n"
+        )),
+        (Dialect::Cuda(_), true) => out.push_str(&format!(
+            "#define {expression} element::abi_slab_out<ELEMENT_OF({element_prefix})>(seismic_buffer_{buffer})\n"
+        )),
+        (Dialect::Metal(_), false) => out.push_str(&format!(
+            "#define {declaration}(name) device element::Cell<ELEMENT_OF({element_prefix})> *name [[buffer({buffer})]]\n"
+        )),
+        (Dialect::Metal(_), true) => out.push_str(&format!(
+            "#define {declaration}(name) device const slab::Table<ELEMENT_OF({element_prefix})> *name [[buffer({buffer})]]\n"
+        )),
+        // A Vulkan handle wraps the buffer's device address; a slab port's is its address table.
+        #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
+        (Dialect::Vulkan(_), false) => {
+            let kind = vulkan_element_kind(representation);
+            out.push_str(&format!("#define {expression} Out(SEISMIC_PTR({buffer}), {kind})\n"))
+        }
+        #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
+        (Dialect::Vulkan(_), true) => {
+            let kind = vulkan_element_kind(representation);
+            out.push_str(&format!("#define {expression} SlabOut(SEISMIC_PTR({buffer}), {kind})\n"))
+        }
+    }
+}
+
 /// The complete formation source: generated prefix followed by the asset.
 pub(crate) fn render_source(
     dialect: Dialect,
@@ -259,7 +511,7 @@ pub(crate) fn render_source(
     bindings: &ElementBindings,
     implementation: &NativeImplementation,
     specialization: &NativeSpecialization,
-    asset: &str,
+    asset: NativeAsset<'_>,
 ) -> String {
     render_source_with(
         dialect,
@@ -283,7 +535,7 @@ pub(crate) fn render_launch_source(
     bindings: &ElementBindings,
     implementation: &NativeImplementation,
     specialization: &NativeSpecialization,
-    asset: &str,
+    asset: NativeAsset<'_>,
     ordinal: usize,
 ) -> String {
     render_source_with(
@@ -303,23 +555,112 @@ fn render_source_with(
     bindings: &ElementBindings,
     implementation: &NativeImplementation,
     specialization: &NativeSpecialization,
-    asset: &str,
+    asset: NativeAsset<'_>,
     forming: Option<&str>,
 ) -> String {
     let schema = logical.schema();
     let geometry = static_geometry(logical, specialization);
+    // The launch being formed, by ordinal.
+    let forming_launch = forming.map(|kernel| {
+        implementation
+            .launches
+            .iter()
+            .position(|launch| launch.kernel == kernel)
+            .expect("forming guard names a declared launch")
+    });
+    // The launch whose record ports are the source's: the forming one's,
+    // else any (an entry formed whole is not launch-scoped).
+    let formed = forming_launch.unwrap_or(0);
     let mut prefix = match dialect {
         Dialect::Metal(features) => metal_header(features),
-        Dialect::Cuda => String::from(CUDA_HELPERS),
+        Dialect::Cuda(features) => cuda_header(features),
         #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
-        Dialect::Vulkan(features) => vulkan::header(features),
+        Dialect::Vulkan(features) => {
+            // The conversions' tile rows as a signed literal, for the
+            // library's `#if`s (`lib/repack/repack.glsl`).
+            const { assert!(conversion::TILE_ROWS < 1 << 16, "the tile rows must be below 2^16, a Vulkan kernel divisor") };
+            vulkan::header(features)
+                + vulkan::shared_views().as_str()
+                + format!("#define REPACK_TILE_ROWS_INT {}\n", conversion::TILE_ROWS).as_str()
+        }
     };
+    // Whether a call that parks waits inside its kernel, spinning on its
+    // awaited words, or at a submission boundary before it: the backend's
+    // fact (`BackendName::parks_in_kernels`), stated there alone.
+    prefix.push_str(&format!(
+        "#define SEISMIC_PARKS_IN_KERNELS {}\n",
+        u8::from(dialect.backend().parks_in_kernels())
+    ));
+    render_axis_constants(&mut prefix, dialect);
     for (name, representation) in bindings.iter() {
         render_representation(
             &mut prefix,
             &format!("SEISMIC_ELEMENT_{}", native_macro(name)),
             representation,
+            dialect,
         );
+    }
+    for (from, source) in bindings.iter() {
+        for (to, destination) in bindings.iter() {
+            if let Some(conversion) = registry::representation_conversion(source, destination) {
+                render_conversion(
+                    &mut prefix,
+                    &format!(
+                        "SEISMIC_CONVERSION_{}_{}",
+                        native_macro(from),
+                        native_macro(to)
+                    ),
+                    conversion,
+                    dialect,
+                );
+            }
+        }
+    }
+    // Each resident kernel's name (`launch K resident (BARRIER)`), which a
+    // grid barrier needs to form, so no other kernel forms one; then the
+    // barrier itself (`metal_resident.h`), over the registry's layout. Only
+    // Metal runs resident launches (`BackendName::resident_launches`).
+    let mut resident = Vec::new();
+    for launch in implementation.launches.iter().filter(|launch| launch.resident.is_some()) {
+        if !resident.contains(&&launch.kernel) {
+            resident.push(&launch.kernel);
+            prefix.push_str(&format!("#define SEISMIC_RESIDENT_{} 1u\n", native_macro(&launch.kernel)));
+        }
+    }
+    if !resident.is_empty() {
+        assert!(
+            matches!(dialect, Dialect::Metal(_)),
+            "only Metal runs resident launches, as the checker admits them"
+        );
+        prefix.push_str(&format!(
+            "#define SEISMIC_RESIDENT_GIVE_UP_WORD {}u\n",
+            registry::RESIDENT_GIVE_UP_BYTE / 4
+        ));
+        prefix.push_str(include_str!("metal_resident.h"));
+    }
+    // A `segmented` projection's grouping of its weights, the declaration's
+    // alone: its segments (none where the entry projects no segments), and the
+    // weights each serves (one, a pair, or none past the last), which the
+    // projection libraries read. Plain integers, which an `#if` and a pasted
+    // name read; every source has them, so a library shared with entries of
+    // no segments tests the count, never whether it is defined.
+    let segments = implementation.segments.as_deref().unwrap_or(&[]);
+    assert!(
+        (implementation.segments.is_none() || !segments.is_empty())
+            && segments.len() <= PROJECTION_SEGMENTS
+            && segments.iter().all(|weights| (1..=2).contains(weights)),
+        "the checker admits one to {PROJECTION_SEGMENTS} segments of one weight or a pair, not {segments:?}"
+    );
+    prefix.push_str(&format!("#define SEISMIC_PROJECTION_SEGMENTS {}\n", segments.len()));
+    for segment in 0..PROJECTION_SEGMENTS {
+        prefix.push_str(&format!(
+            "#define SEISMIC_SEGMENT_WEIGHTS_{segment} {}\n",
+            segments.get(segment).copied().unwrap_or(0)
+        ));
+        prefix.push_str(&format!(
+            "#define SEISMIC_SEGMENT_ORDERED_{segment} {}\n",
+            usize::from(implementation.ordered_segments.get(segment).copied().unwrap_or(false))
+        ));
     }
     if let Some(kernel) = forming {
         prefix.push_str(&format!(
@@ -335,6 +676,9 @@ fn render_source_with(
         }
     }
     let mut buffer = 0usize;
+    // Per bound buffer, whether it is absent (`StaticTensor::absent`): its
+    // address reads as 0 (`SEISMIC_PTR`), so no source guards it.
+    let mut absent = Vec::new();
     let mut word = 0usize;
     for dimension in schema.dimensions() {
         let name = native_macro(&dimension.name);
@@ -344,12 +688,10 @@ fn render_source_with(
                     "#define SEISMIC_DIM_{name} {}\n",
                     literal(dialect, value)
                 ));
-                // GLSL's preprocessor evaluates no typed literal: an `#if`
-                // guard on a static extent reads it as a plain integer.
-                #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
-                if matches!(dialect, Dialect::Vulkan(_)) {
-                    prefix.push_str(&format!("#define SEISMIC_STATIC_{name} {value}\n"));
-                }
+                // No preprocessor evaluates the typed literal (GLSL's reads
+                // no suffix, C++'s no cast): an `#if` guard on a static
+                // extent reads it as a plain integer.
+                prefix.push_str(&format!("#define SEISMIC_STATIC_{name} {value}\n"));
             }
             None => prefix.push_str(&format!(
                 "#define SEISMIC_DIM_{name} (seismic_words[{word}])\n"
@@ -357,64 +699,106 @@ fn render_source_with(
         }
         word += 1;
     }
-    for (ordinal, parameter) in schema.parameters().iter().enumerate() {
-        let name = native_macro(&parameter.name);
-        let named = schema
+    let names = native_parameter_names(
+        &schema
             .parameters()
             .iter()
-            .filter(|candidate| candidate.name == parameter.name)
-            .count()
-            == 1;
+            .map(|parameter| parameter.name.as_str())
+            .collect::<Vec<_>>(),
+    );
+    for ((ordinal, parameter), names) in schema.parameters().iter().enumerate().zip(&names) {
         match &parameter.kind {
+            // A host port takes no argument slot: the kernel never
+            // accesses it. Its words keep their places.
+            ParameterKind::Tensor {
+                axes,
+                access: TensorAccess::Host { .. },
+                ..
+            } => word += axes.len() * 2,
             ParameterKind::Tensor {
                 axes,
                 representation,
-                ..
+                access,
             } => {
-                if named {
-                    prefix.push_str(&format!("#define SEISMIC_BUFFER_{name} {buffer}\n"));
+                let reach = parameter_reach(
+                    representation_reach(*representation),
+                    matches!(access, TensorAccess::Mutable),
+                    implementation
+                        .launch_records(formed)
+                        .contains(&RecordPort::Parameter(parameter.name.clone())),
+                );
+                if reach == OwnerReach::Owner {
+                    // A floating tensor the kernel mutates is reached only through its owner's
+                    // handle: no buffer index is defined for it.
+                    let element = names
+                        .tensor_prefixes()
+                        .next()
+                        .expect("a tensor has a prefix");
+                    for (expression, declaration) in names
+                        .tensor_handles(false)
+                        .zip(names.tensor_handles(true))
+                    {
+                        render_owner_handle(
+                            &mut prefix,
+                            dialect,
+                            &expression,
+                            &declaration,
+                            &element,
+                            *representation,
+                            buffer,
+                            parameter.binding == seismic_lang::entry::PortBinding::Slab,
+                        );
+                    }
+                } else {
+                    for symbol in names.tensor_buffers() {
+                        prefix.push_str(&format!("#define {symbol} {buffer}\n"));
+                    }
                 }
-                prefix.push_str(&format!(
-                    "#define SEISMIC_PARAM_{ordinal}_BUFFER {buffer}\n"
-                ));
+                let fixed = geometry.parameters[ordinal]
+                    .as_ref()
+                    .expect("a tensor parameter has static geometry");
+                absent.push(fixed.absent());
                 let tensor = TensorAbi {
                     representation: *representation,
                     rank: axes.len(),
                     word,
-                    fixed: geometry.parameters[ordinal]
-                        .as_ref()
-                        .expect("a tensor parameter has static geometry"),
+                    fixed,
                     dialect,
                 };
-                tensor.render(&mut prefix, &format!("SEISMIC_PARAM_{ordinal}"));
-                if named {
-                    tensor.render(&mut prefix, &format!("SEISMIC_{name}"));
+                // A record parameter's records are the host's to land while
+                // the work that reads them runs: host-written, where the
+                // backend's plain loads would not read them
+                // (`BackendName::plain_loads_read_host_writes`). The source's
+                // record ports are its launch's; an entry not launch-scoped
+                // lists the same at every launch.
+                let host_written = !dialect.backend().plain_loads_read_host_writes()
+                    && implementation
+                        .launch_records(formed)
+                        .contains(&RecordPort::Parameter(parameter.name.clone()));
+                for symbol in names.tensor_prefixes() {
+                    tensor.render(&mut prefix, &symbol);
+                    if host_written {
+                        prefix.push_str(&format!("#define {symbol}_HOST_WRITTEN 1\n"));
+                    }
                 }
                 buffer += 1;
                 word += axes.len() * 2;
             }
             ParameterKind::Scalar { .. } | ParameterKind::Index { .. } => {
-                prefix.push_str(&format!(
-                    "#define SEISMIC_PARAM_{ordinal} (seismic_words[{word}])\n"
-                ));
-                if named {
-                    prefix.push_str(&format!(
-                        "#define SEISMIC_PARAM_{name} SEISMIC_PARAM_{ordinal}\n"
-                    ));
+                let (symbol, alias) = names.word();
+                prefix.push_str(&format!("#define {symbol} (seismic_words[{word}])\n"));
+                if let Some(alias) = alias {
+                    prefix.push_str(&format!("#define {alias} {symbol}\n"));
                 }
                 word += 1;
             }
             ParameterKind::Range { .. } => {
-                prefix.push_str(&format!(
-                    "#define SEISMIC_PARAM_{ordinal}_START (seismic_words[{word}])\n"
-                ));
-                prefix.push_str(&format!(
-                    "#define SEISMIC_PARAM_{ordinal}_END (seismic_words[{}])\n",
-                    word + 1
-                ));
-                if named {
+                let ([start, end], aliases) = names.range();
+                prefix.push_str(&format!("#define {start} (seismic_words[{word}])\n"));
+                prefix.push_str(&format!("#define {end} (seismic_words[{}])\n", word + 1));
+                if let Some([start_alias, end_alias]) = aliases {
                     prefix.push_str(&format!(
-                        "#define SEISMIC_PARAM_{name}_START SEISMIC_PARAM_{ordinal}_START\n#define SEISMIC_PARAM_{name}_END SEISMIC_PARAM_{ordinal}_END\n"
+                        "#define {start_alias} {start}\n#define {end_alias} {end}\n"
                     ));
                 }
                 word += 2;
@@ -428,16 +812,39 @@ fn render_source_with(
             representation,
         } = &result.kind
         {
-            prefix.push_str(&format!(
-                "#define SEISMIC_RESULT_{ordinal}_BUFFER {buffer}\n"
-            ));
+            let record_port = implementation
+                .launch_records(formed)
+                .contains(&RecordPort::Result(ordinal as u32));
+            if parameter_reach(representation_reach(*representation), true, false) == OwnerReach::Owner {
+                // A floating result is reached only through its owner's handle: no buffer index is
+                // defined for it.
+                let result = format!("SEISMIC_RESULT_{ordinal}");
+                render_owner_handle(
+                    &mut prefix,
+                    dialect,
+                    &result_handle(ordinal, false),
+                    &result_handle(ordinal, true),
+                    &result,
+                    *representation,
+                    buffer,
+                    // A record result's buffer is its records' address table.
+                    record_port,
+                );
+            } else {
+                prefix.push_str(&format!(
+                    "#define SEISMIC_RESULT_{ordinal}_BUFFER {buffer}
+"
+                ));
+            }
+            let fixed = geometry.results[ordinal]
+                .as_ref()
+                .expect("a tensor result has static geometry");
+            absent.push(fixed.absent());
             TensorAbi {
                 representation: *representation,
                 rank: axes.len(),
                 word,
-                fixed: geometry.results[ordinal]
-                    .as_ref()
-                    .expect("a tensor result has static geometry"),
+                fixed,
                 dialect,
             }
             .render(&mut prefix, &format!("SEISMIC_RESULT_{ordinal}"));
@@ -447,24 +854,16 @@ fn render_source_with(
             prefix.push_str(&format!(
                 "#define SEISMIC_RESULT_{ordinal}_WORD {scalar_word}\n"
             ));
-            scalar_word += if matches!(result.kind, ResultKind::Range { .. }) {
-                2
-            } else {
-                1
-            };
+            scalar_word += result.kind.class().scalar_words();
         }
     }
+    word += emitted_words(implementation);
     let runtime_parameters = if forming.is_some() {
         runtime_parameters(implementation)
     } else {
         Vec::new()
     };
-    if let Some(kernel) = forming {
-        let current = implementation
-            .launches
-            .iter()
-            .position(|launch| launch.kernel == kernel)
-            .expect("forming guard names a declared launch");
+    if let Some(current) = forming_launch {
         let reads = implementation.launches[current].parameters();
         for (offset, address) in runtime_parameters.iter().enumerate() {
             let name = match address {
@@ -487,15 +886,21 @@ fn render_source_with(
             "#define SEISMIC_BUFFER_SCRATCH_{} {buffer}\n",
             native_macro(&scratch.name)
         ));
+        absent.push(false);
         buffer += 1;
     }
-    // Tensor parameters lead the buffer order; a shared (`&`) parameter is
+    debug_assert_eq!(absent.len(), buffer);
+    // Bound tensor parameters lead the buffer order; a shared (`&`) one is
     // read-only. Results and scratch follow.
     let read_only = schema
         .parameters()
         .iter()
         .filter_map(|parameter| match &parameter.kind {
-            ParameterKind::Tensor { access, .. } => Some(*access == TensorAccess::Shared),
+            ParameterKind::Tensor {
+                access: TensorAccess::Host { .. },
+                ..
+            } => None,
+            ParameterKind::Tensor { access, .. } => Some(matches!(access, TensorAccess::Shared)),
             ParameterKind::Scalar { .. }
             | ParameterKind::Index { .. }
             | ParameterKind::Range { .. } => None,
@@ -504,9 +909,10 @@ fn render_source_with(
         .take(buffer);
     #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
     if let Dialect::Vulkan(_) = dialect {
-        prefix.push_str(&vulkan::tail(buffer, read_only));
-        debug_assert_eq!(word, word_count(schema) + runtime_parameters.len());
-        prefix.push_str(asset);
+        prefix.push_str(&vulkan::tail(read_only, &absent));
+        debug_assert_eq!(word, word_count(schema) + emitted_words(implementation) + runtime_parameters.len());
+        constant_macros(&mut prefix, asset);
+        prefix.push_str(asset.text);
         prefix.push_str(vulkan::SUFFIX);
         return prefix;
     }
@@ -515,29 +921,172 @@ fn render_source_with(
         "#define SEISMIC_BUFFER_SCALAR_RESULTS {}\n",
         buffer + 1
     ));
-    if dialect == Dialect::Cuda {
+    if matches!(dialect, Dialect::Cuda(_)) {
         prefix.push_str(&format!(
             "struct seismic_words_t {{ unsigned long long w[{}]; }};\n#define seismic_words (seismic_words_value.w)\n",
             word.max(1)
         ));
         // A read-only buffer is `const`, so its loads are eligible for the
         // non-coherent path.
-        let buffers = read_only
+        let qualifiers = read_only
+            .map(|read_only| if read_only { "const " } else { "" })
+            .collect::<Vec<_>>();
+        let buffers = qualifiers
+            .iter()
             .enumerate()
-            .map(|(index, read_only)| {
-                let qualifier = if read_only { "const " } else { "" };
-                format!("{qualifier}unsigned char* __restrict__ seismic_buffer_{index}, ")
-            })
+            .map(|(index, qualifier)| format!("{qualifier}unsigned char* __restrict__ seismic_buffer_{index}, "))
             .collect::<String>();
         prefix.push_str(&format!(
             "#define SEISMIC_KERNEL_PARAMS {buffers}seismic_words_t seismic_words_value, unsigned long long* seismic_scalar_results\n"
         ));
-        prefix.push_str("#define SEISMIC_PTR_(index) seismic_buffer_##index\n#define SEISMIC_PTR(index) SEISMIC_PTR_(index)\n");
+        prefix.push_str(&addresses(
+            &absent,
+            |index| format!("seismic_buffer_{index}"),
+            |index| format!("(({}unsigned char *)0)", qualifiers[index]),
+        ));
         prefix.push_str("#define SEISMIC_SCALAR_RESULTS seismic_scalar_results\n");
     }
-    debug_assert_eq!(word, word_count(schema) + runtime_parameters.len());
-    prefix.push_str(asset);
+    // The launch being formed, when it dispatches a written grid authored
+    // as a block.
+    let written = forming_launch
+        .filter(|ordinal| {
+            implementation.backend.authors_written_grid_blocks() && implementation.launches[*ordinal].grid.is_some()
+        });
+    if let (Dialect::Cuda(_), Some(_)) = (dialect, written) {
+        prefix.push_str(WRITTEN_GRID_BLOCK);
+    }
+    debug_assert_eq!(word, word_count(schema) + emitted_words(implementation) + runtime_parameters.len());
+    constant_macros(&mut prefix, asset);
+    if matches!(dialect, Dialect::Cuda(_)) {
+        let tensors = schema.parameters().iter().filter_map(|parameter| match &parameter.kind {
+            ParameterKind::Tensor { representation, .. } => Some(*representation),
+            ParameterKind::Scalar { .. } | ParameterKind::Index { .. } | ParameterKind::Range { .. } => None,
+        });
+        render_tables_read(&mut prefix, bindings.iter().map(|(_, representation)| representation).chain(tensors));
+    }
+    prefix.push_str(asset.text);
+    if let (Dialect::Cuda(_), Some(ordinal)) = (dialect, written) {
+        written_grid_loop(&mut prefix, schema, implementation, ordinal, buffer);
+    }
     prefix
+}
+
+/// `SEISMIC_PTR(index)`: buffer `index`'s address, `bound(index)` (its
+/// argument), or `null(index)`, address 0 of the same type, where the buffer
+/// is absent (`StaticTensor::absent`). An absent operand has nothing to
+/// dereference, so its address is 0 by construction and no source guards it.
+fn addresses(absent: &[bool], bound: impl Fn(usize) -> String, null: impl Fn(usize) -> String) -> String {
+    let mut out = String::from("#define SEISMIC_PTR_(index) SEISMIC_ADDRESS_##index\n#define SEISMIC_PTR(index) SEISMIC_PTR_(index)\n");
+    for (index, absent) in absent.iter().enumerate() {
+        let address = if *absent { null(index) } else { bound(index) };
+        out.push_str(&format!("#define SEISMIC_ADDRESS_{index} {address}\n"));
+    }
+    out
+}
+
+/// CUDA has no indirect launch, so a launch with a written grid
+/// (`NativeLaunch::grid`) is authored as `__device__ void` the block
+/// function `registry::written_grid_block` names
+/// (`BackendName::authors_written_grid_blocks`), taking
+/// `SEISMIC_KERNEL_PARAMS`: the body of one block. It runs as the kernel
+/// [`written_grid_loop`] appends: a grid-stride loop of the device's
+/// resident blocks (the runtime sizes its grid,
+/// `NativePrepared::launches_at`) over the written grid's blocks, x fastest.
+/// Within the body, and every library function it calls, `blockIdx` and
+/// `gridDim` are the block's place in the written grid and that grid.
+const WRITTEN_GRID_BLOCK: &str = "static __shared__ uint3 seismic_written_block, seismic_written_grid;\n#define blockIdx seismic_written_block\n#define gridDim seismic_written_grid\n";
+
+/// The kernel of written-grid launch `ordinal` ([`WRITTEN_GRID_BLOCK`]). It
+/// reads the grid once its predecessor completed (a programmatic one too).
+/// Each block's body starts after its place is published and ends at a
+/// barrier, as a block's exit would, before the next reuses its shared
+/// memory.
+fn written_grid_loop(
+    out: &mut String,
+    schema: &CallSchema,
+    implementation: &NativeImplementation,
+    ordinal: usize,
+    buffers: usize,
+) {
+    let launch = &implementation.launches[ordinal];
+    let grid = launch.grid.as_ref().expect("a written-grid launch");
+    // The grid's argument: its buffer among the bound ones.
+    let argument = bound(schema, implementation)[..grid_buffer(schema, implementation, grid)]
+        .iter()
+        .filter(|bound| **bound)
+        .count();
+    let (header, instance) = match implementation.code_parameters(ordinal).is_empty() {
+        true => ("", ""),
+        false => ("template <auto... SEISMIC_CODE>\n", "<SEISMIC_CODE...>"),
+    };
+    let arguments = (0..buffers)
+        .map(|index| format!("seismic_buffer_{index}, "))
+        .collect::<String>();
+    out.push_str(&format!(
+        "\n#undef blockIdx\n#undef gridDim\n{header}__global__ void {kernel}(SEISMIC_KERNEL_PARAMS) {{\n    seismic_dependency_wait();\n    const int *grid = reinterpret_cast<const int *>(seismic_buffer_{argument});\n    const unsigned x = unsigned(grid[0]), y = unsigned(grid[1]), z = unsigned(grid[2]);\n    const unsigned long long blocks = (unsigned long long)x * y * z;\n    for (unsigned long long block = blockIdx.x; block < blocks; block += gridDim.x) {{\n        if (threadIdx.x + threadIdx.y + threadIdx.z == 0) {{\n            seismic_written_block.x = unsigned(block % x);\n            seismic_written_block.y = unsigned(block / x % y);\n            seismic_written_block.z = unsigned(block / x / y);\n            seismic_written_grid.x = x;\n            seismic_written_grid.y = y;\n            seismic_written_grid.z = z;\n        }}\n        __syncthreads();\n        {block}{instance}({arguments}seismic_words_value, seismic_scalar_results);\n        __syncthreads();\n    }}\n}}\n",
+        kernel = launch.kernel,
+        block = registry::written_grid_block(&launch.kernel),
+    ));
+}
+
+/// The spelling every module constant's symbol starts with.
+const CONSTANT_PREFIX: &str = "SEISMIC_CONST_";
+
+/// `#define SEISMIC_CONST_<NAME> <value>` for each module constant the asset
+/// names, in module order. A source that names none renders as before the
+/// module declared any, so the kernel digests tuning results are stored
+/// under keep.
+pub(super) fn constant_macros(prefix: &mut String, asset: NativeAsset<'_>) {
+    let named = named_constants(asset.text);
+    for (name, value) in asset.constants {
+        let symbol = format!("{CONSTANT_PREFIX}{}", native_macro(name));
+        if named.contains(symbol.as_str()) {
+            prefix.push_str(&format!("#define {symbol} {value}\n"));
+        }
+    }
+}
+
+/// Every whole identifier of `text` that starts with [`CONSTANT_PREFIX`], in
+/// one pass over the text: an asset is most of its source, and a module
+/// declares many constants.
+fn named_constants(text: &str) -> std::collections::BTreeSet<&str> {
+    let identifier = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let bytes = text.as_bytes();
+    // The prefix has no proper prefix that is also its suffix, so its
+    // non-overlapping occurrences are all of them.
+    text.match_indices(CONSTANT_PREFIX)
+        .filter(|(at, _)| !at.checked_sub(1).is_some_and(|before| identifier(bytes[before])))
+        .map(|(at, _)| {
+            let end = bytes[at..]
+                .iter()
+                .position(|byte| !identifier(*byte))
+                .map_or(text.len(), |length| at + length);
+            &text[at..end]
+        })
+        .collect()
+}
+
+/// The tables a CUDA source's tensors read that its tables header declares
+/// only where read (seismic/lang/build.rs): the magnitude operands of the
+/// grid of each records plane (`packets::Records`),
+/// `SEISMIC_TABLES_READ_MAGNITUDES(ID)`.
+fn render_tables_read(out: &mut String, representations: impl Iterator<Item = RepresentationId>) {
+    let mut grids: Vec<String> = representations
+        .filter_map(|representation| match &registry::representation_info(representation).kind {
+            registry::RepresentationKind::PackedRows(rows) => rows.planes.iter().find_map(|plane| match plane.content {
+                registry::RowPlaneContent::Records { grid, .. } => Some(grid_id(grid)),
+                _ => None,
+            }),
+            _ => None,
+        })
+        .collect();
+    grids.sort_unstable();
+    grids.dedup();
+    let read = grids.iter().map(|grid| format!("(ID) == {grid}")).collect::<Vec<_>>();
+    out.push_str(&format!(
+        "#define SEISMIC_TABLES_READ_MAGNITUDES(ID) ({})\n",
+        if read.is_empty() { "0".to_owned() } else { read.join(" || ") }
+    ));
 }
 
 /// The CUDA device library every native source receives in place of vendor
@@ -560,7 +1109,8 @@ struct TensorAbi<'a> {
 
 impl TensorAbi<'_> {
     fn render(&self, out: &mut String, prefix: &str) {
-        render_representation(out, prefix, self.representation);
+        render_representation(out, prefix, self.representation, self.dialect);
+        out.push_str(&format!("#define {prefix}_RANK {}\n", self.rank));
         let constant = |value| literal(self.dialect, value);
         for axis in 0..self.rank {
             match self.fixed.extents[axis] {
@@ -593,7 +1143,13 @@ impl TensorAbi<'_> {
                 .expect("checked row-layout tensors have a packing axis");
             match self.fixed.extents[last] {
                 Some(extent) => render_static_rows(out, prefix, rows, extent, self.dialect),
-                None => render_symbolic_rows(out, prefix, rows, &format!("{prefix}_EXTENT_{last}")),
+                None => render_symbolic_rows(
+                    out,
+                    prefix,
+                    rows,
+                    &format!("{prefix}_EXTENT_{last}"),
+                    self.dialect,
+                ),
             }
         }
     }
@@ -622,6 +1178,32 @@ fn render_static_rows(
             name = native_macro(plane.name),
         ));
     }
+    render_row_roles(out, prefix, rows, dialect);
+}
+
+/// The row planes a native library addresses by role
+/// (`RowPlaneInfo::role`), every role defined, 0 where the layout has none:
+/// `_ROW_<ROLE>` (row offset), `_ROW_<ROLE>_BYTES` (bytes per row) and
+/// `_ROW_<ROLE>_TAIL` (the gap from its end to the next plane's start, or
+/// the row's end, as the layout places them).
+fn render_row_roles(out: &mut String, prefix: &str, rows: &registry::PackedRowLayout, dialect: Dialect) {
+    for role in registry::RowPlaneRole::ALL {
+        let role_name = native_macro(role.name());
+        match rows.planes.iter().position(|plane| plane.role() == role) {
+            Some(index) => out.push_str(&format!(
+                "#define {prefix}_ROW_{role_name} {prefix}_PLANE_{name}_ROW_OFFSET\n#define {prefix}_ROW_{role_name}_BYTES {prefix}_PLANE_{name}_BYTES_PER_ROW\n#define {prefix}_ROW_{role_name}_TAIL ({next} - ({prefix}_PLANE_{name}_ROW_OFFSET + {prefix}_PLANE_{name}_BYTES_PER_ROW))\n",
+                name = native_macro(rows.planes[index].name),
+                next = rows.planes.get(index + 1).map_or_else(
+                    || format!("{prefix}_ROW_STRIDE_BYTES"),
+                    |next| format!("{prefix}_PLANE_{}_ROW_OFFSET", native_macro(next.name))
+                ),
+            )),
+            None => out.push_str(&format!(
+                "#define {prefix}_ROW_{role_name} {zero}\n#define {prefix}_ROW_{role_name}_BYTES {zero}\n#define {prefix}_ROW_{role_name}_TAIL {zero}\n",
+                zero = literal(dialect, 0)
+            )),
+        }
+    }
 }
 
 /// Row geometry of a row-layout tensor as expressions of its packing-axis
@@ -631,41 +1213,223 @@ fn render_symbolic_rows(
     prefix: &str,
     rows: &registry::PackedRowLayout,
     extent: &str,
+    dialect: Dialect,
 ) {
     let align = registry::ROW_ALIGNMENT;
     let group = rows.group();
-    let groups = format!("(({extent} + {}) / {group})", group - 1);
+    let ceil = |value: &str, divisor: u64| {
+        quotient(dialect, &format!("{value} + {}", divisor - 1), divisor)
+    };
+    let groups = ceil(extent, u64::from(group));
     let groups = match rows.group_multiple {
         1 => groups,
-        multiple => format!("(({groups} + {}) / {multiple} * {multiple})", multiple - 1),
+        multiple => format!("({} * {multiple})", ceil(&groups, u64::from(multiple))),
     };
     out.push_str(&format!("#define {prefix}_ROW_GROUPS {groups}\n"));
     let mut end = String::from("0");
     for plane in &rows.planes {
         let name = native_macro(plane.name);
         out.push_str(&format!(
-            "#define {prefix}_PLANE_{name}_ROW_OFFSET (({end} + {}) / {align} * {align})\n#define {prefix}_PLANE_{name}_BYTES_PER_ROW ({prefix}_ROW_GROUPS * {})\n",
-            align - 1,
+            "#define {prefix}_PLANE_{name}_ROW_OFFSET ({} * {align})\n#define {prefix}_PLANE_{name}_BYTES_PER_ROW ({prefix}_ROW_GROUPS * {})\n",
+            ceil(&end, align),
             plane.bytes_per_group,
         ));
         end = format!("({prefix}_PLANE_{name}_ROW_OFFSET + {prefix}_PLANE_{name}_BYTES_PER_ROW)");
     }
     out.push_str(&format!(
-        "#define {prefix}_ROW_STRIDE_BYTES (({end} + {}) / {align} * {align})\n",
-        align - 1
+        "#define {prefix}_ROW_STRIDE_BYTES ({} * {align})\n",
+        ceil(&end, align)
     ));
+    render_row_roles(out, prefix, rows, dialect);
 }
 
-fn render_representation(out: &mut String, prefix: &str, representation: RepresentationId) {
+/// A registered conversion between two bound elements, as the word form
+/// (`WordTable`) of its recipe: `{prefix}` defined, `{prefix}_WORDS` the
+/// record's words; for a row layout per group role (`RowPlaneRole::ALL`)
+/// `{prefix}_{ROLE}_WORD` and `_BYTES`, its share's first record word and
+/// bytes (0 and 0 without the role); `{prefix}_UNIT_COLUMNS`, the columns of
+/// a unit, and per code role `{prefix}_{ROLE}_FIRST` and `_UNIT_WORDS`
+/// (`WordSpan`); the alignments a kernel stores the
+/// record's bytes in (`render_record_alignments`); then the word form as
+/// code (`conversion::render_conversion_code`).
+fn render_conversion(
+    out: &mut String,
+    prefix: &str,
+    conversion: &registry::RepresentationConversion,
+    dialect: Dialect,
+) {
+    let words = WordTable::of(conversion);
+    out.push_str(&format!("#define {prefix} 1\n"));
+    out.push_str(&format!("#define {prefix}_WORDS {}\n", words.words()));
+    if !words.roles().is_empty() {
+        for role in registry::RowPlaneRole::ALL {
+            let (first, bytes) = words
+                .roles()
+                .iter()
+                .find(|(candidate, _, _)| *candidate == role)
+                .map_or((0, 0), |(_, first, bytes)| (*first, *bytes));
+            let role = native_macro(role.name());
+            out.push_str(&format!("#define {prefix}_{role}_WORD {first}\n"));
+            out.push_str(&format!("#define {prefix}_{role}_BYTES {bytes}\n"));
+        }
+    }
+    // Per code role its segment of the span: its first record word and a
+    // unit's words (0 and 0 without the role).
+    let span = words.span();
+    out.push_str(&format!("#define {prefix}_UNIT_COLUMNS {}\n", span.columns));
+    for role in registry::RowPlaneRole::CODES {
+        let (first, unit_words) = span
+            .segments
+            .iter()
+            .find(|segment| segment.role == role)
+            .map_or((0, 0), |segment| (segment.first, segment.unit_words));
+        let role = native_macro(role.name());
+        out.push_str(&format!("#define {prefix}_{role}_FIRST {first}\n"));
+        out.push_str(&format!(
+            "#define {prefix}_{role}_UNIT_WORDS {unit_words}\n"
+        ));
+    }
+    render_record_alignments(out, prefix, words, conversion.destination_layout);
+    conversion::render_conversion_code(out, prefix, words, conversion.source_layout, dialect);
+}
+
+/// The widest unit (`repack::alignment`, to 16 bytes) each range of record
+/// bytes a kernel stores together keeps: its start, its length and its
+/// destination's alignment allow. For a row layout, per role
+/// (`RowPlaneRole::ALL`, from a row plane's 16-byte-aligned start)
+/// `{prefix}_{ROLE}_ALIGNMENT`: a code role's unit's words, a group role's
+/// share; and per code role `{prefix}_{ROLE}_REST_ALIGNMENT`: its share's
+/// bytes past its units' words (an mma16 record's factors); per code role
+/// `{prefix}_{ROLE}_CHUNK_BYTES` and `_CHUNK_ALIGNMENT`, a unit's 32-column
+/// chunk placed as a unit of the plane (`{prefix}_CHUNK_COLUMNS` its columns);
+/// and in `mma16`, `{prefix}_{ROLE}_FRAGMENT_ALIGNMENT`, a lane's two `k16`
+/// steps of the role's codes, and `{prefix}_KBLOCK_BYTES` and
+/// `_KBLOCK_ALIGNMENT`, a row's k-block of grid entries, which sit at a
+/// multiple of it and need not be a power of two (iq3s's eight 3-byte
+/// entries: 24). For the packet
+/// layout (from a packet's start): `{prefix}_CODES_ALIGNMENT`, a unit's
+/// codes; `{prefix}_LEADING_ALIGNMENT` and `{prefix}_TRAILING_ALIGNMENT`,
+/// the record's bytes before and after the codes (to the packet's end).
+fn render_record_alignments(
+    out: &mut String,
+    prefix: &str,
+    words: &WordTable,
+    layout: registry::ConversionLayout,
+) {
+    use seismic_lang::repack::alignment;
+    let span = words.span();
+    let segment = |role| {
+        span.segments
+            .iter()
+            .find(|segment| segment.role == role)
+            .map_or((0, 0), |segment| (segment.first, segment.unit_words))
+    };
+    match layout {
+        registry::ConversionLayout::Packet(packet) => {
+            let size = packet.packet_size;
+            let (first, unit_words) = segment(registry::RowPlaneRole::Codes);
+            let end = 4 * (first + span.units * unit_words);
+            let stored = (4 * words.words()).min(size);
+            let base = alignment(size).min(alignment(4 * first));
+            out.push_str(&format!(
+                "#define {prefix}_CODES_ALIGNMENT {}\n#define {prefix}_LEADING_ALIGNMENT {}\n#define {prefix}_TRAILING_ALIGNMENT {}\n",
+                base.min(alignment(4 * unit_words)),
+                base,
+                alignment(size)
+                    .min(alignment(end))
+                    .min(alignment(stored.checked_sub(end).expect("the codes are within the packet"))),
+            ));
+        }
+        registry::ConversionLayout::Rows(rows) => {
+            let mma16 = rows.layout == registry::Layout::Mma16;
+            out.push_str(&format!(
+                "#define {prefix}_CHUNK_COLUMNS {}\n",
+                registry::ROWS32_CHUNK
+            ));
+            if mma16 {
+                let (_, unit_words) = segment(registry::RowPlaneRole::Codes);
+                let kblock = 4 * unit_words * registry::MMA_KBLOCK as u32 / span.columns;
+                out.push_str(&format!(
+                    "#define {prefix}_KBLOCK_BYTES {kblock}\n#define {prefix}_KBLOCK_ALIGNMENT {}\n",
+                    alignment(kblock)
+                ));
+            }
+            for role in registry::RowPlaneRole::ALL {
+                let bytes = words
+                    .roles()
+                    .iter()
+                    .find(|(candidate, _, _)| *candidate == role)
+                    .map_or(0, |(_, _, bytes)| *bytes);
+                let name = native_macro(role.name());
+                if registry::RowPlaneRole::CODES.contains(&role) {
+                    let (_, unit_words) = segment(role);
+                    out.push_str(&format!(
+                        "#define {prefix}_{name}_ALIGNMENT {}\n#define {prefix}_{name}_REST_ALIGNMENT {}\n",
+                        alignment(4 * unit_words),
+                        alignment(
+                            bytes
+                                .checked_sub(4 * span.units * unit_words)
+                                .expect("a code role's share holds its units' words")
+                        ),
+                    ));
+                    let chunk = 4 * unit_words * registry::ROWS32_CHUNK as u32 / span.columns;
+                    out.push_str(&format!(
+                        "#define {prefix}_{name}_CHUNK_BYTES {chunk}\n#define {prefix}_{name}_CHUNK_ALIGNMENT {}\n",
+                        alignment(chunk)
+                    ));
+                    if mma16 {
+                        out.push_str(&format!(
+                            "#define {prefix}_{name}_FRAGMENT_ALIGNMENT {}\n",
+                            alignment(2 * unit_words)
+                        ));
+                    }
+                } else {
+                    out.push_str(&format!("#define {prefix}_{name}_ALIGNMENT {}\n", alignment(bytes)));
+                }
+            }
+        }
+    }
+}
+
+fn render_representation(
+    out: &mut String,
+    prefix: &str,
+    representation: RepresentationId,
+    dialect: Dialect,
+) {
     let info = registry::representation_info(representation);
+    // The representation as a flag and as a name a library can paste onto
+    // its own names.
+    let name = native_macro(info.representation);
     out.push_str(&format!(
-        "#define {prefix}_REPRESENTATION_{} 1\n",
-        native_macro(info.representation)
+        "#define {prefix}_REPRESENTATION_{name} 1\n#define {prefix}_REPRESENTATION {name}\n"
     ));
+    if let registry::RepresentationKind::PackedRows(_) = &info.kind {
+        let coded = Coded::of(representation);
+        for (axis, value) in CODING_AXES {
+            out.push_str(&format!("#define {prefix}_{axis} {}\n", value(&coded)));
+        }
+        for (form, value) in seismic_lang::forms::forms(dialect.backend(), representation) {
+            out.push_str(&format!("#define {prefix}_FORM_{form} {value}\n"));
+        }
+    }
+    // GLSL's preprocessor pastes no tokens in `#if`: Vulkan libraries read a
+    // tensor's axes through its prefix.
+    #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
+    if matches!(dialect, Dialect::Vulkan(_)) {
+        render_axes_tuple(out, prefix, info);
+    }
+    #[cfg(not(any(not(target_os = "macos"), test, feature = "coverage")))]
+    let _ = dialect;
     out.push_str(&format!(
         "#define {prefix}_DECODED_{} 1\n",
         native_macro(info.decoded.name())
     ));
+    // The operand recipe of products over the representation, as
+    // `operands(W)` gives it to declarations.
+    if info.operands == registry::OperandRecipe::Nvfp4Rows {
+        out.push_str(&format!("#define {prefix}_OPERANDS_NVFP4 1\n"));
+    }
     match &info.kind {
         registry::RepresentationKind::Dense(dtype) => {
             out.push_str(&format!("#define {prefix}_KIND_DENSE 1\n"));
@@ -677,20 +1441,32 @@ fn render_representation(out: &mut String, prefix: &str, representation: Represe
         }
         registry::RepresentationKind::PackedRows(rows) => {
             out.push_str(&format!(
-                "#define {prefix}_KIND_PACKED 1\n#define {prefix}_LAYOUT_{} 1\n#define {prefix}_LOGICAL_GROUP {}\n#define {prefix}_GROUP_MULTIPLE {}\n#define {prefix}_ROW_ALIGNMENT {}\n#define {prefix}_TILE_ROWS {}\n#define {prefix}_CODE_BITS {}\n",
+                "#define {prefix}_KIND_PACKED 1\n#define {prefix}_LAYOUT_{} 1\n#define {prefix}_LOGICAL_GROUP {}\n#define {prefix}_GROUP_MULTIPLE {}\n#define {prefix}_ROW_ALIGNMENT {}\n#define {prefix}_TILE_ROWS {}\n",
                 native_macro(info.layout.as_str()),
                 rows.group(),
                 rows.group_multiple,
                 registry::ROW_ALIGNMENT,
                 rows.tile_rows(),
-                rows.packet.planes[0].entry_bits,
             ));
             if info.layout == registry::Layout::Mma16 {
                 out.push_str(&format!(
-                    "#define {prefix}_MMA_KBLOCK {}\n#define {prefix}_MMA_LANES {}\n",
+                    "#define {prefix}_MMA_KBLOCK {}\n#define {prefix}_MMA_LANES {}\n#define {prefix}_MMA_STEP {}\n#define {prefix}_MMA_STEP_SLOTS {}\n",
                     registry::MMA_KBLOCK,
-                    registry::MMA_LANES
+                    registry::MMA_LANES,
+                    registry::MMA_STEP,
+                    registry::MMA_STEP_SLOTS,
                 ));
+                use registry::PackedRowLayout as Rows;
+                for (name, rule) in [
+                    ("MMA_FRAGMENT_ROW", Rows::MMA_FRAGMENT_ROW_RULE),
+                    ("MMA_FRAGMENT_COLUMN", Rows::MMA_FRAGMENT_COLUMN_RULE),
+                    ("MMA_FRAGMENT_BYTE", Rows::MMA_FRAGMENT_BYTE_RULE),
+                    ("RECORD_ENTRY", Rows::RECORD_ENTRY_RULE),
+                    ("RECORD_FACTOR", Rows::RECORD_FACTOR_RULE),
+                ] {
+                    // A long rule's text may hold line breaks; a macro's can't.
+                    out.push_str(&format!("#define {prefix}_{name}{}\n", rule.replace('\n', " ")));
+                }
             }
             for plane in &rows.planes {
                 let plane_prefix = format!("{prefix}_PLANE_{}", native_macro(plane.name));
@@ -698,10 +1474,37 @@ fn render_representation(out: &mut String, prefix: &str, representation: Represe
                     "#define {plane_prefix} 1\n#define {plane_prefix}_BYTES_PER_GROUP {}\n",
                     plane.bytes_per_group
                 ));
-                if let registry::RowPlaneContent::Codes { shift, bits } = plane.content {
-                    out.push_str(&format!(
-                        "#define {plane_prefix}_CODE_SHIFT {shift}\n#define {plane_prefix}_CODE_BITS {bits}\n"
-                    ));
+                match plane.content {
+                    registry::RowPlaneContent::Codes { bits, .. } => {
+                        out.push_str(&format!("#define {plane_prefix}_CODE_BITS {bits}\n"))
+                    }
+                    registry::RowPlaneContent::Grids { bits, .. }
+                    | registry::RowPlaneContent::Records { bits, .. } => {
+                        out.push_str(&format!("#define {plane_prefix}_CODE_BITS {bits}\n"));
+                        // A records tile's factors follow every group's
+                        // entries (`PackedRowLayout::record_byte`).
+                        if matches!(plane.content, registry::RowPlaneContent::Records { .. }) {
+                            out.push_str(&format!(
+                                "#define {plane_prefix}_ENTRY_BYTES {}\n#define {plane_prefix}_FACTORS_OFFSET ({prefix}_ROW_GROUPS * {})\n#define {plane_prefix}_ENTRY_BITS {}\n#define {plane_prefix}_KBLOCK_ENTRIES {}\n",
+                                rows.record_entry_bytes(),
+                                rows.record_entry_bytes(),
+                                registry::GRID_VALUES * bits,
+                                registry::MMA_KBLOCK / u64::from(registry::GRID_VALUES),
+                            ));
+                        }
+                        // The entry bit carrying the coefficient codes.
+                        if let Some((_, carried)) = rows.carried() {
+                            out.push_str(&format!(
+                                "#define {plane_prefix}_CARRIED_BIT {carried}\n"
+                            ));
+                        }
+                    }
+                    // An entry's bits past its whole bytes: `ENTRY_BITS` an
+                    // entry.
+                    registry::RowPlaneContent::GridHigh { bits, .. } => {
+                        out.push_str(&format!("#define {plane_prefix}_ENTRY_BITS {bits}\n"))
+                    }
+                    registry::RowPlaneContent::Groups { .. } => {}
                 }
             }
         }
@@ -729,7 +1532,6 @@ fn render_representation(out: &mut String, prefix: &str, representation: Represe
                     plane.entry_bits,
                     native_macro(plane.storage_dtype.name())
                 ));
-                render_plane_encoding(out, &plane_prefix, &plane.encoding);
             }
         }
         registry::RepresentationKind::External(layout) => {
@@ -738,78 +1540,407 @@ fn render_representation(out: &mut String, prefix: &str, representation: Represe
                 "#define {prefix}_PACKET_SIZE {}\n#define {prefix}_PACKET_ALIGNMENT {}\n#define {prefix}_LOGICAL_GROUP {}\n#define {prefix}_PLANE_COUNT 0\n",
                 layout.packet_size, layout.packet_alignment, layout.logical_group
             ));
-        }
-    }
-}
-
-fn render_plane_encoding(out: &mut String, prefix: &str, encoding: &registry::PlaneEncoding) {
-    match encoding {
-        registry::PlaneEncoding::Dense(dtype) => {
+            // The grid a planar source's scales lie in (`GridPlanes`), none
+            // (zeros) where each packet holds its own.
+            let (scale_bytes, tile) = layout.planes.map_or((0, [0, 0]), |planes| (planes.scale_bytes, planes.tile));
+            // Vulkan's kernels divide by these (`seismic_quotient`): a layout past 2^16 is refused here.
+            for (name, value) in [
+                ("logical group", u64::from(layout.logical_group)),
+                ("grid tile rows", u64::from(tile[0])),
+                ("grid tile columns", u64::from(tile[1])),
+            ] {
+                assert!(
+                    value < 1 << 16,
+                    "an external layout's {name} {value} must be below 2^16, a Vulkan kernel divisor"
+                );
+            }
             out.push_str(&format!(
-                "#define {prefix}_ENCODING_DENSE 1\n#define {prefix}_ENCODING_DTYPE_{} 1\n",
-                native_macro(dtype.name())
-            ));
-        }
-        registry::PlaneEncoding::Packed {
-            bits,
-            interpretation,
-        } => {
-            out.push_str(&format!(
-                "#define {prefix}_ENCODING_PACKED 1\n#define {prefix}_ENCODING_BITS {bits}\n"
-            ));
-            render_code_interpretation(out, prefix, interpretation);
-        }
-        registry::PlaneEncoding::FloatCode { format } => {
-            let name = match format {
-                registry::FloatCodeFormat::E2M1 => "E2M1",
-                registry::FloatCodeFormat::E4M3 => "E4M3",
-                registry::FloatCodeFormat::UE4M3 => "UE4M3",
-                registry::FloatCodeFormat::E8M0 => "E8M0",
-            };
-            out.push_str(&format!(
-                "#define {prefix}_ENCODING_FLOAT_CODE 1\n#define {prefix}_ENCODING_FLOAT_CODE_{name} 1\n#define {prefix}_ENCODING_BITS {}\n",
-                format.bits()
+                "#define {prefix}_GRID_PLANAR {}\n#define {prefix}_GRID_SCALE_BYTES {scale_bytes}\n#define {prefix}_GRID_TILE_ROWS {}\n#define {prefix}_GRID_TILE_COLUMNS {}\n",
+                u32::from(scale_bytes != 0),
+                tile[0],
+                tile[1]
             ));
         }
     }
 }
 
-fn render_code_interpretation(
-    out: &mut String,
-    prefix: &str,
-    interpretation: &registry::CodeInterpretation,
-) {
-    match interpretation {
-        registry::CodeInterpretation::Unsigned => {
-            out.push_str(&format!("#define {prefix}_CODE_UNSIGNED 1\n"));
+/// One axis of the native decode ABI: its values are the constants
+/// `SEISMIC_<AXIS>_<NAME>`, numbered from 1 in `ALL` order (an axis a form
+/// lacks is 0). `render_axis_constants` defines them.
+trait Axis: Copy + PartialEq + 'static {
+    const AXIS: &'static str;
+    const ALL: &'static [Self];
+    fn name(self) -> &'static str;
+
+    fn constant(self) -> String {
+        format!("SEISMIC_{}_{}", Self::AXIS, self.name())
+    }
+}
+
+fn render_axis_values<A: Axis>(out: &mut String) {
+    for value in A::ALL {
+        let number = producers::number(A::ALL, Some(*value));
+        out.push_str(&format!("#define {} {number}\n", value.constant()));
+    }
+}
+
+impl Axis for registry::RepresentationForm {
+    const AXIS: &'static str = "FORM";
+    const ALL: &'static [Self] = &registry::RepresentationForm::ALL;
+    fn name(self) -> &'static str {
+        registry::RepresentationForm::name(self)
+    }
+}
+
+impl Axis for registry::CodeKind {
+    const AXIS: &'static str = "CODES";
+    const ALL: &'static [Self] = &registry::CodeKind::ALL;
+    fn name(self) -> &'static str {
+        registry::CodeKind::name(self)
+    }
+}
+
+/// A code interpretation's axis values beside its kind (`producers::Axis`):
+/// its offset, its codebook (`SEISMIC_CODEBOOK_<NAME>`), and its grid
+/// (`grid`, `SEISMIC_GRID_<NAME>`) with the grid's index bits, values a
+/// point, signs (`SEISMIC_GRID_SIGNS_<NAME>`, their first bit and their
+/// count) and delta (`delta`, its exponent, and its bit); 0 where it has
+/// none (and every value 0 for no interpretation).
+struct Interpretation {
+    offset: i32,
+    table: String,
+    grid: Option<&'static registry::GridCodes>,
+}
+
+impl Interpretation {
+    fn none() -> Self {
+        Self {
+            offset: 0,
+            table: "0".to_owned(),
+            grid: None,
         }
-        registry::CodeInterpretation::TwosComplement => {
-            out.push_str(&format!("#define {prefix}_CODE_TWOS_COMPLEMENT 1\n"));
+    }
+
+    fn of(code: &registry::CodeInterpretation) -> Self {
+        match code {
+            registry::CodeInterpretation::Unsigned
+            | registry::CodeInterpretation::TwosComplement => Self::none(),
+            registry::CodeInterpretation::Offset(offset)
+            | registry::CodeInterpretation::Odd(offset) => Self {
+                offset: *offset,
+                ..Self::none()
+            },
+            registry::CodeInterpretation::Table(codebook) => Self {
+                table: format!("SEISMIC_CODEBOOK_{}", native_macro(codebook.name)),
+                ..Self::none()
+            },
         }
-        registry::CodeInterpretation::Offset(offset) => {
-            out.push_str(&format!(
-                "#define {prefix}_CODE_OFFSET 1\n#define {prefix}_CODE_OFFSET_VALUE {offset}\n"
-            ));
+    }
+
+    /// The axis values of a decoder's value codes: their interpretation's,
+    /// a grid's, or none (E4M3 bytes).
+    fn of_values(codes: &registry::ValueCodes) -> Self {
+        match codes {
+            registry::ValueCodes::Fields(code) => Self::of(code),
+            registry::ValueCodes::Grid(grid) => Self {
+                grid: Some(grid),
+                ..Self::none()
+            },
+            registry::ValueCodes::E4m3 => Self::none(),
         }
-        registry::CodeInterpretation::Table(values) => {
-            out.push_str(&format!(
-                "#define {prefix}_CODE_TABLE 1\n#define {prefix}_CODE_TABLE_COUNT {}\n",
-                values.len()
-            ));
-            for (ordinal, value) in values.iter().enumerate() {
-                out.push_str(&format!("#define {prefix}_CODE_TABLE_{ordinal} {value}\n"));
+    }
+
+    /// A fact of its grid, 0 where it has none.
+    fn grid_value(&self, value: fn(&registry::GridCodes) -> u32) -> String {
+        self.grid.map_or(0, value).to_string()
+    }
+}
+
+/// A grid's id (`SEISMIC_GRID_<NAME>`, its tables header's).
+fn grid_id(grid: &registry::GridCodes) -> String {
+    format!("SEISMIC_GRID_{}", native_macro(grid.grid.name))
+}
+
+impl Axis for registry::GridSigns {
+    const AXIS: &'static str = "GRID_SIGNS";
+    const ALL: &'static [Self] = &registry::GridSigns::ALL;
+    fn name(self) -> &'static str {
+        registry::GridSigns::name(self)
+    }
+}
+
+impl Axis for registry::CoefficientKind {
+    const AXIS: &'static str = "COEFF";
+    const ALL: &'static [Self] = &registry::CoefficientKind::ALL;
+    fn name(self) -> &'static str {
+        registry::CoefficientKind::name(self)
+    }
+}
+
+impl Axis for registry::BiasKind {
+    const AXIS: &'static str = "BIAS_KIND";
+    const ALL: &'static [Self] = &registry::BiasKind::ALL;
+    fn name(self) -> &'static str {
+        registry::BiasKind::name(self)
+    }
+}
+
+impl Axis for registry::ScaleEncoding {
+    const AXIS: &'static str = "SCALE";
+    const ALL: &'static [Self] = &registry::ScaleEncoding::ALL;
+    fn name(self) -> &'static str {
+        registry::ScaleEncoding::name(self)
+    }
+}
+
+/// A row-layout packed element's decode axes as the ABI's flat values, 0
+/// where its coefficients have none. The axes its producers are declared by
+/// are the weight's (`producers::Weight::value`, the one computation of
+/// them); beside them, a direct coefficient's scale is `scale`; a
+/// hierarchical one's factor is `scale`, a minimum's sign `bias_sign` (1
+/// without one) and a signed bias's exponent `signed_exponent`.
+struct Coded {
+    weight: producers::Weight,
+    code: Interpretation,
+    code_exponent: i32,
+    scale: registry::ScaleEncoding,
+    bias_sign: i32,
+    exponent: i32,
+    /// The bits of a local code read as its scale code
+    /// (`registry::LocalCodes::scale_bits`).
+    local_scale_bits: u32,
+    local: Interpretation,
+    signed_exponent: i32,
+    /// The code domain and the local coefficient code domain, where its
+    /// local scales are codes (`registry::profile::Profile`).
+    codes: registry::profile::Domain,
+    locals: Option<registry::profile::Domain>,
+}
+
+impl Coded {
+    fn of(id: RepresentationId) -> Self {
+        let weight = producers::Weight::of(registry::representation_info(id))
+            .expect("packed rows have decode axes");
+        let axes = weight.axes.clone();
+        let profile = axes.profile();
+        let codes = profile.codes;
+        let locals = match profile.local.scale {
+            registry::profile::LocalScale::Code(locals) => Some(locals),
+            registry::profile::LocalScale::Stored(_) => None,
+        };
+        let flat = |scale| Self {
+            weight,
+            code: Interpretation::of_values(&axes.coding.codes()),
+            code_exponent: axes.code_exponent,
+            scale,
+            bias_sign: 1,
+            exponent: 0,
+            local_scale_bits: 0,
+            local: Interpretation::none(),
+            signed_exponent: 0,
+            codes,
+            locals,
+        };
+        match &axes.coding {
+            registry::CodingAxes::Direct { scale, .. } => flat(*scale),
+            registry::CodingAxes::Hierarchical {
+                factor,
+                exponent,
+                bits,
+                interpretation,
+                locals,
+                ..
+            } => {
+                let (bias_sign, signed_exponent) = match locals.bias() {
+                    None => (1, 0),
+                    Some(registry::LocalBias::Minimum(sign)) => (sign.value(), 0),
+                    Some(registry::LocalBias::Signed { exponent }) => (1, exponent),
+                };
+                Self {
+                    exponent: *exponent,
+                    bias_sign,
+                    signed_exponent,
+                    local_scale_bits: locals.scale_bits(*bits),
+                    local: Interpretation::of(interpretation),
+                    ..flat(*factor)
+                }
             }
         }
     }
+
+    /// The weight's value of `axis` as the ABI writes it: a number, or an
+    /// enumerated value's name (`SEISMIC_<AXIS>_<NAME>`), 0 for none.
+    fn axis(&self, axis: producers::Axis) -> String {
+        match self.weight.value(axis) {
+            producers::AxisValue::Number(value) => value.to_string(),
+            producers::AxisValue::Codes(kind) => kind.map_or_else(|| "0".to_owned(), Axis::constant),
+            producers::AxisValue::Coeff(kind) => kind.constant(),
+            producers::AxisValue::Bias(kind) => kind.map_or_else(|| "0".to_owned(), Axis::constant),
+        }
+    }
+}
+
+/// The decode axes of a packed row-layout element, each defined as
+/// `<prefix>_<AXIS>` (`render_representation`), in the order of the axes
+/// tuple (`render_axes_tuple`).
+const CODING_AXES: [(&str, fn(&Coded) -> String); 32] = [
+    (producers::Axis::CodeLowBits.name(), |c| c.axis(producers::Axis::CodeLowBits)),
+    (producers::Axis::CodeHighBits.name(), |c| c.axis(producers::Axis::CodeHighBits)),
+    (producers::Axis::Codes.name(), |c| c.axis(producers::Axis::Codes)),
+    (producers::Axis::CodesOffset.name(), |c| c.axis(producers::Axis::CodesOffset)),
+    ("CODES_TABLE", |c| c.code.table.clone()),
+    ("CODES_GRID", |c| {
+        c.code.grid.map_or_else(|| "0".to_owned(), grid_id)
+    }),
+    ("CODES_GRID_INDEX_BITS", |c| {
+        c.code.grid_value(registry::GridCodes::index_bits)
+    }),
+    ("CODES_GRID_LANES", |c| {
+        c.code.grid_value(registry::GridCodes::lanes)
+    }),
+    ("CODES_EXPONENT", |c| c.code_exponent.to_string()),
+    (producers::Axis::Coeff.name(), |c| c.axis(producers::Axis::Coeff)),
+    ("COEFF_SCALE", |c| c.scale.constant()),
+    (producers::Axis::CoeffBias.name(), |c| c.axis(producers::Axis::CoeffBias)),
+    ("COEFF_BIAS_SIGN", |c| c.bias_sign.to_string()),
+    (producers::Axis::CoeffGroup.name(), |c| c.axis(producers::Axis::CoeffGroup)),
+    (producers::Axis::CoeffFactorGroup.name(), |c| c.axis(producers::Axis::CoeffFactorGroup)),
+    ("COEFF_EXPONENT", |c| c.exponent.to_string()),
+    (producers::Axis::CoeffLocalBits.name(), |c| c.axis(producers::Axis::CoeffLocalBits)),
+    ("COEFF_LOCAL_SCALE_BITS", |c| c.local_scale_bits.to_string()),
+    (producers::Axis::CoeffLocal.name(), |c| c.axis(producers::Axis::CoeffLocal)),
+    ("COEFF_LOCAL_OFFSET", |c| c.local.offset.to_string()),
+    (producers::Axis::CoeffCarried.name(), |c| c.axis(producers::Axis::CoeffCarried)),
+    ("CODES_LEAST", |c| c.codes.least.to_string()),
+    ("CODES_GREATEST", |c| c.codes.greatest.to_string()),
+    ("COEFF_LOCAL_LEAST", |c| {
+        c.locals.map_or(0, |locals| locals.least).to_string()
+    }),
+    ("COEFF_LOCAL_GREATEST", |c| {
+        c.locals.map_or(0, |locals| locals.greatest).to_string()
+    }),
+    ("CODES_GRID_SIGNS", |c| {
+        c.code
+            .grid
+            .map_or_else(|| "0".to_owned(), |grid| grid.signs.constant())
+    }),
+    ("CODES_GRID_DELTA", |c| {
+        c.code.grid_value(|grid| u32::from(grid.delta.is_some()))
+    }),
+    ("CODES_GRID_DELTA_EXPONENT", |c| {
+        c.code.grid_value(|grid| grid.delta.unwrap_or(0))
+    }),
+    // An entry's first sign bit, its sign bits and its delta bit
+    // (`registry::GridCodes::{sign_bit, delta_bit}`).
+    ("CODES_GRID_SIGN_BIT", |c| {
+        c.code.grid_value(registry::GridCodes::sign_bit)
+    }),
+    ("CODES_GRID_SIGN_BITS", |c| {
+        c.code.grid_value(|grid| grid.signs.bits())
+    }),
+    ("CODES_GRID_DELTA_BIT", |c| {
+        c.code.grid_value(|grid| {
+            if grid.delta.is_some() {
+                grid.delta_bit()
+            } else {
+                0
+            }
+        })
+    }),
+    ("COEFF_SIGNED_BIAS_EXPONENT", |c| {
+        c.signed_exponent.to_string()
+    }),
+];
+
+/// The tensor's prefix as a function-like macro over its axes, emitted for
+/// Vulkan sources (`render_representation`): `<prefix>(F)` =
+/// `F(<TUPLE_AXES>, <CODING_AXES>)`, its representation's identity
+/// (its registry key, nonzero), its form (`SEISMIC_FORM_*`), a dense form's
+/// dtype (`SEISMIC_DTYPE_*`), its storage group (`_LOGICAL_GROUP`) and a row
+/// form's decode axes, 0 where it has none. A selector `SEISMIC_AXIS_<AXIS>`
+/// takes one of them, and `SEISMIC_AXES_NONE(F)` is the tuple of no tensor
+/// (`render_axis_constants`). Through the prefix a library reaches every
+/// value by expansion alone, so it can evaluate them in `#if`, where glslang
+/// pastes no tokens.
+#[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
+fn render_axes_tuple(out: &mut String, prefix: &str, info: &registry::RepresentationInfo) {
+    let id = info.id.key();
+    let form = info.kind.form();
+    let dtype = match &info.kind {
+        registry::RepresentationKind::Dense(dtype) => {
+            format!("SEISMIC_DTYPE_{}", native_macro(dtype.name()))
+        }
+        registry::RepresentationKind::PackedRows(_)
+        | registry::RepresentationKind::Packed(_)
+        | registry::RepresentationKind::External(_) => "0".to_owned(),
+    };
+    let axes: Vec<String> = CODING_AXES
+        .iter()
+        .map(|(axis, _)| match form {
+            registry::RepresentationForm::Rows => format!("{prefix}_{axis}"),
+            registry::RepresentationForm::Dense
+            | registry::RepresentationForm::Packet
+            | registry::RepresentationForm::External => "0".to_owned(),
+        })
+        .collect();
+    out.push_str(&format!(
+        "#define {prefix}(F) F({id}, {}, {dtype}, {prefix}_LOGICAL_GROUP, {})\n",
+        form.constant(),
+        axes.join(", ")
+    ));
+}
+
+/// The leading axes of a tensor's axes tuple (`render_axes_tuple`), before
+/// its decode axes.
+#[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
+const TUPLE_AXES: [&str; 4] = ["ID", "FORM", "DTYPE", "LOGICAL_GROUP"];
+
+/// The axis values every native source defines (storage forms, dtypes, code
+/// interpretations, coefficient structures and scale encodings), which a
+/// tensor's axes take; on Vulkan also the axes tuple's selectors
+/// (`render_axes_tuple`). Codebook and grid ids are their tables header's
+/// (seismic/lang/build.rs).
+fn render_axis_constants(out: &mut String, dialect: Dialect) {
+    render_axis_values::<registry::CodeKind>(out);
+    render_axis_values::<registry::CoefficientKind>(out);
+    render_axis_values::<registry::BiasKind>(out);
+    render_axis_values::<registry::ScaleEncoding>(out);
+    render_axis_values::<registry::GridSigns>(out);
+    // The axes tuple's form and dtype values (`render_axes_tuple`).
+    #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
+    if matches!(dialect, Dialect::Vulkan(_)) {
+        render_axis_values::<registry::RepresentationForm>(out);
+        for (index, dtype) in seismic_lang::types::DType::ALL.into_iter().enumerate() {
+            out.push_str(&format!(
+                "#define SEISMIC_DTYPE_{} {}\n",
+                native_macro(dtype.name()),
+                index + 1
+            ));
+        }
+        let names: Vec<&str> = TUPLE_AXES
+            .into_iter()
+            .chain(CODING_AXES.iter().map(|(axis, _)| *axis))
+            .collect();
+        let parameters = names.join(", ");
+        for name in &names {
+            out.push_str(&format!("#define SEISMIC_AXIS_{name}({parameters}) {name}\n"));
+        }
+        out.push_str(&format!(
+            "#define SEISMIC_AXES_NONE(F) F({})\n",
+            vec!["0"; names.len()].join(", ")
+        ));
+    }
+    #[cfg(not(any(not(target_os = "macos"), test, feature = "coverage")))]
+    let _ = dialect;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use seismic_lang::checked::{check_source, SourceFile, SourceSet};
+    use seismic_lang::checked::{SourceFile, SourceSet, check_source};
     use seismic_lang::registry::BackendName;
 
-    const PROBE: &str = "fn probe[N, K](x: &tensor[N, K] E) -> tensor[1] f32:\n    let mut output = tensor[1] f32\n    for i in 0..1:\n        output[i] = f32(x[0, 0])\n    return output\n\nnative probe for cuda from \"probe.cu\":\n    static (K)\n    params (TILE in [4, 8])\n    scratch partials bytes (N * 4)\n    launch probe:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (TILE, 1, 1)\n";
+    const PROBE: &str = "fn probe[N, K](x: &tensor[N, K] E) -> tensor[1] f32:\n    let mut output = tensor[1] f32\n    for i in 0..1:\n        output[i] = f32(x[0, 0])\n    return output\n\nnative probe for cuda from \"probe.cu\":\n    static (K)\n    params (TILE in [4, 8] default 4)\n    scratch partials bytes (N * 4)\n    launch probe:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (TILE, 1, 1)\n";
 
     fn render(dialect: Dialect, representation: &str) -> String {
         render_with(
@@ -819,10 +1950,41 @@ mod tests {
         )
     }
 
+    /// An asset of a module that declares no constant.
+    fn bare(text: &str) -> NativeAsset<'_> {
+        NativeAsset { text, constants: &[] }
+    }
+
     fn render_with(
         dialect: Dialect,
         representation: &str,
         specialization: NativeSpecialization,
+    ) -> String {
+        render_asset(dialect, representation, specialization, bare("\n// asset\n"))
+    }
+
+    /// A rendered source defines each module constant its asset names as a
+    /// whole identifier, and no other: a source naming none renders as it
+    /// would in a module without constants.
+    #[test]
+    fn a_source_defines_the_module_constants_it_names() {
+        let constants = [("FIRST".to_owned(), 2), ("SECOND".to_owned(), 3)];
+        let at = |text| {
+            let asset = NativeAsset { text, constants: &constants };
+            render_asset(CUDA, "f32", NativeSpecialization::new().with_static("K", 64), asset)
+        };
+        let source = at("\nint x = SEISMIC_CONST_FIRST;\n");
+        assert!(source.contains("#define SEISMIC_CONST_FIRST 2\n"));
+        assert!(!source.contains("SEISMIC_CONST_SECOND"));
+        assert!(!at("\nint x = SEISMIC_CONST_FIRSTLY;\n").contains("#define SEISMIC_CONST_FIRST "));
+        assert_eq!(at("\n// asset\n"), render(CUDA, "f32"));
+    }
+
+    fn render_asset(
+        dialect: Dialect,
+        representation: &str,
+        specialization: NativeSpecialization,
+        asset: NativeAsset<'_>,
     ) -> String {
         let module = check_source(SourceSet::new(vec![SourceFile {
             path: "probe.seismic".to_owned(),
@@ -845,7 +2007,7 @@ mod tests {
             &bindings,
             implementation,
             &specialization,
-            "\n// asset\n",
+            asset,
         )
     }
 
@@ -871,7 +2033,7 @@ mod tests {
             &bindings,
             implementation,
             &specialization,
-            "\n#ifdef SEISMIC_FORMING_PROBE\ntemplate <uint TILE> kernel void probe() {}\n#endif\n",
+            bare("\n#ifdef SEISMIC_FORMING_PROBE\ntemplate <uint TILE> kernel void probe() {}\n#endif\n"),
             0,
         );
         assert!(source.contains("#define SEISMIC_FORMING_PROBE 1\n"));
@@ -879,13 +2041,62 @@ mod tests {
         assert!(!source.contains("host_name"));
     }
 
+    /// A host port is never the device's write, and is the host's write
+    /// where it is `&host mut`; an entry's results and scratch are the
+    /// device's writes.
+    /// A host port is one of the call's buffers, which hazards order by (a
+    /// `&host mut` one as its writer), but no argument of the kernel: the
+    /// buffers after it bind one slot lower, and it has no buffer macro.
     #[test]
-    fn scoped_runtime_words_have_stable_entry_then_launch_offsets() {
-        let text = "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    params (SPLIT in [1, 2])\n    launch small when N < 16:\n        params (WIDTH in [32, 64], code ROWS in [1, 2])\n        reads (SPLIT)\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (WIDTH, 1, 1)\n    launch large when N >= 16:\n        params (WIDTH in [64, 128])\n        threadgroups (ceil_div(N, WIDTH), 1, 1)\n        threads_per_threadgroup (WIDTH, 1, 1)\n";
+    fn host_ports_are_the_hosts_writes_and_take_no_argument() {
+        let text = "fn request[N](served: &host tensor[N] i32, staged: &host mut tensor[N] i32, out: &mut tensor[1] i32):\n    out[0] = 1\n\nnative request for metal from \"request.metal\":\n    scratch counts bytes (4)\n    launch request:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n";
         let module = check_source(SourceSet::new(vec![SourceFile {
-            path: "scale.seismic".into(),
+            path: "request.seismic".into(),
             text: text.into(),
         }]))
+        .unwrap();
+        let entry = module.entry_named("request").unwrap();
+        let bindings = ElementBindings::default();
+        let logical = module.entry(entry, &bindings).unwrap();
+        let implementation = module
+            .native_implementation(entry, BackendName::Metal)
+            .unwrap();
+        assert_eq!(
+            buffer_writes(logical.schema(), implementation),
+            [false, false, true, true]
+        );
+        assert_eq!(
+            host_writes(logical.schema(), implementation),
+            [false, true, false, false]
+        );
+        assert_eq!(bound(logical.schema(), implementation), [false, false, true, true]);
+        assert_eq!(buffer_slots(logical.schema(), implementation), 4);
+        let source = render_source(
+            METAL,
+            &logical,
+            &bindings,
+            implementation,
+            &NativeSpecialization::new(),
+            bare(""),
+        );
+        assert!(!source.contains("SEISMIC_BUFFER_SERVED"));
+        assert!(!source.contains("SEISMIC_BUFFER_STAGED"));
+        assert!(source.contains("#define SEISMIC_BUFFER_OUT 0\n"));
+        assert!(source.contains("#define SEISMIC_BUFFER_SCRATCH_COUNTS 1\n"));
+        assert!(source.contains("#define SEISMIC_BUFFER_WORDS 2\n"));
+    }
+
+    #[test]
+    fn scoped_runtime_words_have_stable_entry_then_launch_offsets() {
+        let text = "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    params (SPLIT in [1, 2] default 1)\n    launch small when N < 16:\n        params (WIDTH in [32, 64] default 32, ROWS in [1, 2] default 1)\n        reads (SPLIT)\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (WIDTH, 1, 1)\n    launch large when N >= 16:\n        params (WIDTH in [64, 128] default 64)\n        threadgroups (ceil_div(N, WIDTH), 1, 1)\n        threads_per_threadgroup (WIDTH, 1, 1)\n";
+        // Its source's `small` takes `ROWS` as a template parameter.
+        let module = seismic_lang::native_source::check_fixture(
+            SourceSet::new(vec![SourceFile {
+                path: "scale.seismic".into(),
+                text: text.into(),
+            }]),
+            &["ROWS"],
+        )
         .unwrap();
         let entry = module.entry_named("scale").unwrap();
         let bindings = ElementBindings::default();
@@ -894,7 +2105,7 @@ mod tests {
             .native_implementation(entry, BackendName::Metal)
             .unwrap();
         let defaults = implementation
-            .default_specialization(&NativeSpecialization::new())
+            .device_independent().unwrap().default_specialization(&NativeSpecialization::new())
             .unwrap();
         let base = word_count(logical.schema());
         assert_eq!(
@@ -907,7 +2118,7 @@ mod tests {
             &bindings,
             implementation,
             &defaults,
-            "\n#ifdef SEISMIC_FORMING_SMALL\ntemplate <uint ROWS> kernel void small() {}\n#endif\n",
+            bare("\n#ifdef SEISMIC_FORMING_SMALL\ntemplate <uint ROWS> kernel void small() {}\n#endif\n"),
             0,
         );
         assert!(source.contains(&format!(
@@ -937,7 +2148,6 @@ mod tests {
             "#define SEISMIC_ELEMENT_E_LAYOUT_ROWS16 1\n",
             "#define SEISMIC_ELEMENT_E_TILE_ROWS 1\n",
             "#define SEISMIC_ELEMENT_E_PLANE_CODES_HI_BYTES_PER_GROUP 32\n",
-            "#define SEISMIC_ELEMENT_E_PLANE_CODES_HI_CODE_SHIFT 4\n",
             "#define SEISMIC_X_LAYOUT_ROWS16 1\n",
             "#define SEISMIC_X_ROW_STRIDE_BYTES ((ulong)192)\n",
             "#define SEISMIC_X_PLANE_CODES_LO_ROW_OFFSET ((ulong)0)\n",
@@ -950,10 +2160,11 @@ mod tests {
             assert!(source.contains(line), "missing {line:?}");
         }
         assert!(!source.contains("SEISMIC_X_PACKET_SIZE"));
-        let mma = render(Dialect::Cuda, "q8g32s@mma16");
+        let mma = render(CUDA, "q8g32s@mma16");
         assert!(mma.contains("#define SEISMIC_X_LAYOUT_MMA16 1\n"));
         assert!(mma.contains("#define SEISMIC_X_TILE_ROWS 16\n"));
         assert!(mma.contains("#define SEISMIC_X_MMA_KBLOCK 64\n"));
+        assert!(mma.contains("#define SEISMIC_X_MMA_FRAGMENT_ROW(lane, slot) ((lane) / 4 + 8 * ((slot) % 2))\n"));
         let packet = render(METAL, "q5k");
         assert!(packet.contains("#define SEISMIC_X_LAYOUT_PACKET 1\n"));
         assert!(!packet.contains("ROW_STRIDE_BYTES"));
@@ -1086,7 +2297,7 @@ mod tests {
         assert!(source.contains("#define SEISMIC_RESULT_0_EXTENT_0 ((ulong)1)\n"));
         assert!(source.contains("#define SEISMIC_RESULT_0_STRIDE_0 ((ulong)1)\n"));
         let fixed = render_with(
-            Dialect::Cuda,
+            CUDA,
             "f32",
             NativeSpecialization::new()
                 .with_static("K", 64)
@@ -1109,8 +2320,75 @@ mod tests {
         assert!(source.contains("#define SEISMIC_RESULT_0_REPRESENTATION_F32 1\n"));
     }
 
+    /// A row element's decode axes, one form of each coefficient kind: q4k
+    /// (hierarchical, a minimum), q8g32s (direct, no local codes), iq2xxs
+    /// (a grid carrying its local codes) and iq1s (a signed bias, its scale
+    /// code all but the local code's sign bit).
     #[test]
-    fn prefix_describes_packed_planes_and_encoding() {
+    fn prefix_names_the_decode_axes_of_row_storage() {
+        for (representation, axes) in [
+            (
+                "q4k@rows16",
+                &[
+                    ("CODE_LOW_BITS", "4"),
+                    ("CODE_HIGH_BITS", "0"),
+                    ("CODES", "SEISMIC_CODES_UNSIGNED"),
+                    ("COEFF", "SEISMIC_COEFF_HIER"),
+                    ("COEFF_SCALE", "SEISMIC_SCALE_F16"),
+                    ("COEFF_BIAS", "SEISMIC_BIAS_KIND_MINIMUM"),
+                    ("COEFF_BIAS_SIGN", "-1"),
+                    ("COEFF_GROUP", "32"),
+                    ("COEFF_FACTOR_GROUP", "256"),
+                    ("COEFF_LOCAL_BITS", "6"),
+                    ("COEFF_LOCAL_SCALE_BITS", "6"),
+                    ("COEFF_LOCAL", "SEISMIC_CODES_UNSIGNED"),
+                ][..],
+            ),
+            (
+                "q8g32s@rows16",
+                &[
+                    ("CODE_LOW_BITS", "8"),
+                    ("CODES", "SEISMIC_CODES_TWOS"),
+                    ("COEFF", "SEISMIC_COEFF_DIRECT"),
+                    ("COEFF_BIAS", "0"),
+                    ("COEFF_GROUP", "32"),
+                    ("COEFF_LOCAL", "0"),
+                ][..],
+            ),
+            (
+                "iq2xxs@rows16",
+                &[
+                    ("CODE_LOW_BITS", "16"),
+                    ("CODES", "SEISMIC_CODES_GRID"),
+                    ("CODES_GRID", "SEISMIC_GRID_IQ2XXS"),
+                    ("CODES_GRID_INDEX_BITS", "8"),
+                    ("CODES_GRID_LANES", "8"),
+                    ("COEFF", "SEISMIC_COEFF_HIER"),
+                    ("COEFF_LOCAL_BITS", "4"),
+                    ("COEFF_LOCAL_SCALE_BITS", "4"),
+                    ("COEFF_LOCAL", "SEISMIC_CODES_ODD"),
+                    ("COEFF_CARRIED", "15"),
+                ][..],
+            ),
+            (
+                "iq1s@rows16",
+                &[
+                    ("COEFF_BIAS", "SEISMIC_BIAS_KIND_SIGNED"),
+                    ("COEFF_LOCAL_BITS", "4"),
+                    ("COEFF_LOCAL_SCALE_BITS", "3"),
+                ][..],
+            ),
+        ] {
+            let source = render(CUDA, representation);
+            for (axis, value) in axes {
+                let line = format!("#define SEISMIC_ELEMENT_E_{axis} {value}\n");
+                assert!(source.contains(&line), "{representation}: missing {line:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn prefix_describes_packed_planes() {
         let source = render(METAL, "q8g32");
         assert!(source.contains("#define SEISMIC_ELEMENT_E_REPRESENTATION_Q8G32 1\n"));
         assert!(source.contains("#define SEISMIC_ELEMENT_E_KIND_PACKED 1\n"));
@@ -1119,12 +2397,9 @@ mod tests {
         assert!(source.contains("#define SEISMIC_ELEMENT_E_PLANE_COUNT 2\n"));
         assert!(source.contains("#define SEISMIC_ELEMENT_E_PLANE_0_NAME_WORDS 1\n"));
         assert!(source.contains("#define SEISMIC_ELEMENT_E_PLANE_0_BYTES_PER_GROUP 32\n"));
-        assert!(source.contains("#define SEISMIC_ELEMENT_E_PLANE_0_ENCODING_PACKED 1\n"));
-        assert!(source.contains("#define SEISMIC_ELEMENT_E_PLANE_0_CODE_UNSIGNED 1\n"));
         assert!(source.contains("#define SEISMIC_ELEMENT_E_PLANE_1_NAME_SCALE 1\n"));
         assert!(source.contains("#define SEISMIC_ELEMENT_E_PLANE_1_OFFSET 32\n"));
         assert!(source.contains("#define SEISMIC_ELEMENT_E_PLANE_1_STORAGE_F32 1\n"));
-        assert!(source.contains("#define SEISMIC_ELEMENT_E_PLANE_1_ENCODING_DENSE 1\n"));
     }
 
     #[test]
@@ -1144,14 +2419,167 @@ mod tests {
         assert!(source.contains("#define SEISMIC_DIM_K ((ulong)64)\n"));
         assert!(source.contains("#define SEISMIC_TUNE_TILE 8\n"));
         // x is buffer 0, the result buffer 1, scratch 2, words 3.
-        assert!(source.contains("#define SEISMIC_RESULT_0_BUFFER 1\n"));
+        // A floating result has an owner handle, and no buffer index.
+        assert!(source.contains(
+            "#define SEISMIC_RESULT_0_PARAM(name) device element::Cell<ELEMENT_OF(SEISMIC_RESULT_0)> *name [[buffer(1)]]\n"
+        ));
+        assert!(!source.contains("SEISMIC_RESULT_0_BUFFER"));
         assert!(source.contains("#define SEISMIC_BUFFER_SCRATCH_PARTIALS 2\n"));
         assert!(source.contains("#define SEISMIC_BUFFER_WORDS 3\n"));
         assert!(source.contains("#define SEISMIC_BUFFER_SCALAR_RESULTS 4\n"));
         assert!(!source.contains("seismic_words_t"));
     }
 
+    /// A floating result, and a floating tensor the kernel mutates, is reached only through its
+    /// owner's handle: the render defines the handle and no buffer index. What is not floating
+    /// (an integer tensor), or only read, keeps its buffer index.
+    #[test]
+    fn floating_results_and_mutated_tensors_have_no_buffer_index() {
+        let cuda = render(CUDA, "f32");
+        assert!(cuda.contains(
+            "#define SEISMIC_RESULT_0_OUT element::abi_out<ELEMENT_OF(SEISMIC_RESULT_0)>(seismic_buffer_1)\n"
+        ));
+        assert!(!cuda.contains("SEISMIC_RESULT_0_BUFFER"));
+        // Vulkan's handle carries the tensor's own element kind.
+        let vulkan = render(Dialect::Vulkan(VULKAN_FEATURES), "f32");
+        assert!(vulkan.contains("#define SEISMIC_RESULT_0_OUT Out(SEISMIC_PTR(1), ELEMENT_F32)\n"));
+        assert!(!vulkan.contains("SEISMIC_RESULT_0_BUFFER"));
+        // The shared input is read-only: it keeps its index.
+        assert!(cuda.contains("#define SEISMIC_BUFFER_X 0\n"));
+
+        let text = "fn fill[N](staged: &host mut tensor[N] i32, grid: &mut tensor[N] f32, flags: &mut tensor[N] i32):\n    flags[0] = 1\n    grid[0] = 1.0\n\nnative fill for {backend} from \"fill.{extension}\":\n    launch fill:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n";
+        for (dialect, backend, extension, handle, name) in [
+            (
+                CUDA,
+                BackendName::Cuda,
+                "cu",
+                "#define SEISMIC_OUT_GRID element::abi_out<ELEMENT_OF(SEISMIC_PARAM_1)>(seismic_buffer_0)\n",
+                "cuda",
+            ),
+            (
+                METAL,
+                BackendName::Metal,
+                "metal",
+                "#define SEISMIC_OUT_GRID_PARAM(name) device element::Cell<ELEMENT_OF(SEISMIC_PARAM_1)> *name [[buffer(0)]]\n",
+                "metal",
+            ),
+            (
+                Dialect::Vulkan(VULKAN_FEATURES),
+                BackendName::Vulkan,
+                "comp",
+                "#define SEISMIC_OUT_GRID Out(SEISMIC_PTR(0), ELEMENT_F32)\n",
+                "vulkan",
+            ),
+        ] {
+            let text = text.replace("{backend}", name).replace("{extension}", extension);
+            let module = check_source(SourceSet::new(vec![SourceFile {
+                path: "fill.seismic".into(),
+                text,
+            }]))
+            .unwrap();
+            let entry = module.entry_named("fill").unwrap();
+            let bindings = ElementBindings::default();
+            let logical = module.entry(entry, &bindings).unwrap();
+            let implementation = module.native_implementation(entry, backend).unwrap();
+            let source = render_source(
+                dialect,
+                &logical,
+                &bindings,
+                implementation,
+                &NativeSpecialization::new(),
+                bare(""),
+            );
+            assert!(source.contains(handle), "{name}: {source}");
+            assert!(!source.contains("SEISMIC_BUFFER_GRID"), "{name}");
+            assert!(!source.contains("SEISMIC_PARAM_1_BUFFER"), "{name}");
+            // The integer tensor keeps its index (after the grid's, which takes the first slot).
+            assert!(source.contains("#define SEISMIC_BUFFER_FLAGS 1\n"), "{name}");
+        }
+    }
+
+    /// A floating `&slab mut` port's buffer is its slab address table: its handle is the backend's
+    /// slab handle, and no buffer index is defined for it.
+    #[test]
+    fn a_floating_slab_port_has_a_slab_handle_and_no_buffer_index() {
+        let text = "fn stamp[N, T, KV, W](rows: &slab mut tensor[T, KV, W] f32, from: &tensor[N] i32, to: &tensor[N] i32, slab_rows: u32):\n    for item in 0..N:\n        parallel for head in 0..KV:\n            rows[to[item], head, :] = rows[from[item], head, :]\n\nnative stamp for {backend} from \"stamp.{extension}\":\n    launch stamp:\n        threadgroups (ceil_div(N * KV * W, 256), 1, 1)\n        threads_per_threadgroup (256, 1, 1)\n";
+        for (dialect, backend, extension, handle, name) in [
+            (
+                CUDA,
+                BackendName::Cuda,
+                "cu",
+                "#define SEISMIC_OUT_ROWS element::abi_slab_out<ELEMENT_OF(SEISMIC_PARAM_0)>(seismic_buffer_0)\n",
+                "cuda",
+            ),
+            (
+                METAL,
+                BackendName::Metal,
+                "metal",
+                "#define SEISMIC_OUT_ROWS_PARAM(name) device const slab::Table<ELEMENT_OF(SEISMIC_PARAM_0)> *name [[buffer(0)]]\n",
+                "metal",
+            ),
+            (
+                Dialect::Vulkan(VULKAN_FEATURES),
+                BackendName::Vulkan,
+                "comp",
+                "#define SEISMIC_OUT_ROWS SlabOut(SEISMIC_PTR(0), ELEMENT_F32)\n",
+                "vulkan",
+            ),
+        ] {
+            let text = text.replace("{backend}", name).replace("{extension}", extension);
+            let module = check_source(SourceSet::new(vec![SourceFile {
+                path: "stamp.seismic".into(),
+                text,
+            }]))
+            .unwrap();
+            let entry = module.entry_named("stamp").unwrap();
+            let bindings = ElementBindings::default();
+            let logical = module.entry(entry, &bindings).unwrap();
+            let implementation = module.native_implementation(entry, backend).unwrap();
+            let source = render_source(
+                dialect,
+                &logical,
+                &bindings,
+                implementation,
+                &NativeSpecialization::new(),
+                bare(""),
+            );
+            assert!(source.contains(handle), "{name}: {source}");
+            assert!(!source.contains("SEISMIC_BUFFER_ROWS"), "{name}");
+            assert!(!source.contains("SEISMIC_PARAM_0_BUFFER"), "{name}");
+        }
+    }
+
     const METAL: Dialect = Dialect::Metal(MetalFeatures { tensor_ops: false });
+
+    /// A record parameter is host-written where the backend's plain loads
+    /// would not read the host's writes (Metal), under each of its prefixes;
+    /// a record result and a port bound whole are not, and where plain loads
+    /// read them (Vulkan) no port is.
+    #[test]
+    fn a_record_parameter_is_host_written_where_plain_loads_miss_host_writes() {
+        let source = |dialect: Dialect| {
+            let backend = dialect.backend();
+            let module = check_source(SourceSet::new(vec![SourceFile {
+                path: "scale.seismic".to_owned(),
+                text: format!(
+                    "fn scale[M, N](x: &tensor[M, N] f32, y: &tensor[M, N] f32) -> tensor[M, N] f32:\n    let mut result = zeros_like(x)\n    parallel for row in 0..M:\n        parallel for column in 0..N:\n            result[row, column] = x[row, column] * y[row, column]\n    return result\n\nnative scale for {} from \"scale.src\":\n    records (x, result 0)\n    launch scale:\n        threadgroups (M, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n",
+                    backend.as_str()
+                ),
+            }]))
+            .expect("record ports check");
+            let entry = module.entries()[0].id;
+            let bindings = ElementBindings::new();
+            let logical = module.entry(entry, &bindings).expect("entry monomorphizes");
+            let implementation = module.native_implementation(entry, backend).expect("native implementation");
+            render_source(dialect, &logical, &bindings, implementation, &NativeSpecialization::new(), bare("\n"))
+        };
+        let metal = source(METAL);
+        for line in ["#define SEISMIC_PARAM_0_HOST_WRITTEN 1\n", "#define SEISMIC_X_HOST_WRITTEN 1\n"] {
+            assert!(metal.contains(line), "missing {line:?}");
+        }
+        assert_eq!(metal.matches("_HOST_WRITTEN").count(), 2);
+        assert!(!source(Dialect::Vulkan(VULKAN_FEATURES)).contains("_HOST_WRITTEN"));
+    }
 
     #[test]
     fn metal_prefix_includes_tensor_operations_only_when_the_device_has_them() {
@@ -1173,6 +2601,7 @@ mod tests {
         subgroup_lanes: 32,
         float16: true,
         matrix: false,
+        matrix_hardware: false,
         wide_accumulators: true,
         mixed_dot: true,
         f32_atomic_add: false,
@@ -1220,6 +2649,7 @@ mod tests {
         let matrix = render(
             Dialect::Vulkan(vulkan::VulkanFeatures {
                 matrix: true,
+                matrix_hardware: true,
                 ..VULKAN_FEATURES
             }),
             "f32",
@@ -1260,7 +2690,6 @@ mod tests {
     fn vulkan_prefix_compiles_for_every_representation_kind() {
         const ASSET: &str = "
 void probe() {
-    seismic_f32 result = seismic_f32(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER));
     const uint lane = gl_LocalInvocationID.x;
     seismic_shared_f32[lane] = float(SEISMIC_X_STRIDE_0 + SEISMIC_DIM_N) * float(SEISMIC_TUNE_TILE);
     barrier();
@@ -1269,7 +2698,7 @@ void probe() {
     value += seismic_bf16_to_f32(seismic_f32_to_bf16(value)) + seismic_unpack_f16x2(seismic_pack_f16x2(value, 1.0)).x;
     value += float(seismic_dp4a_s8(int(lane), 3, 1) + seismic_dp4a_u8s8(lane, -3, 0) + seismic_redux_add_s32(1));
     if (SEISMIC_READONLY(SEISMIC_BUFFER_X) && lane == 0u)
-        result[0].v = value + seismic_tanh_approx(value);
+        seismic_shared_f32[0] = value + seismic_tanh_approx(value);
     seismic_u64(SEISMIC_SCALAR_RESULTS)[0].v = seismic_words[0];
 }
 ";
@@ -1298,15 +2727,91 @@ void probe() {
         }
     }
 
+    /// Every registered conversion's word form, as the Vulkan prefix
+    /// renders it over device memory and over the group memory, compiles,
+    /// seals and validates.
+    #[test]
+    fn vulkan_conversion_code_compiles_for_every_conversion() {
+        // The probe's source: a packet's address (or byte offset in the group
+        // memory), or a planar source's two pieces, its codes and its scale.
+        let asset = |planar: bool| {
+            let (device, shared) = match planar {
+                false => ("packet", "gl_WorkGroupID.y * 256u"),
+                true => ("packet, packet + 2048ul", "gl_WorkGroupID.y * 256u, gl_WorkGroupID.y * 256u + 128u"),
+            };
+            format!(
+                "
+layout(local_size_x = 1) in;
+void probe() {{
+    const uint64_t packet = uint64_t(gl_WorkGroupID.x) * 4096ul;
+    uint words[SEISMIC_CONVERSION_E_U_WORDS];
+    SEISMIC_CONVERSION_E_U_UNIT({device}, gl_WorkGroupID.z, words);
+    uint value = words[0];
+    SEISMIC_CONVERSION_E_U_FIXED({device}, words);
+    value |= words[SEISMIC_CONVERSION_E_U_WORDS - 1];
+    SEISMIC_CONVERSION_E_U_UNIT_SHARED({shared}, gl_WorkGroupID.z, words);
+    value |= words[0];
+    SEISMIC_CONVERSION_E_U_FIXED_SHARED({shared}, words);
+    value |= words[SEISMIC_CONVERSION_E_U_WORDS - 1];
+    seismic_u32(uint64_t(gl_WorkGroupID.y) * 4ul).v = value;
+}}
+"
+            )
+        };
+        for conversion in registry::representation_conversions() {
+            let mut source = vulkan::header(VULKAN_FEATURES) + vulkan::shared_views().as_str();
+            render_conversion(
+                &mut source,
+                "SEISMIC_CONVERSION_E_U",
+                conversion,
+                Dialect::Vulkan(VULKAN_FEATURES),
+            );
+            source.push_str(&asset(conversion.source_layout.planes.is_some()));
+            source.push_str(vulkan::SUFFIX);
+            let environment = seismic_vulkan::seal::Environment {
+                float16: true,
+                rounding_rte_32: true,
+                denorm_preserve_32: true,
+            };
+            seismic_vulkan::formation::compile(&source, "probe", environment).unwrap_or_else(
+                |error| {
+                    panic!(
+                        "{} -> {}: {error:?}",
+                        registry::representation_info(conversion.source).name,
+                        registry::representation_info(conversion.destination).name
+                    )
+                },
+            );
+        }
+    }
+
+    const CUDA: Dialect = Dialect::Cuda(CudaFeatures::UNOPENED);
+
     #[test]
     fn cuda_prefix_declares_kernel_parameters_and_helpers() {
-        let source = render(Dialect::Cuda, "f32");
+        let source = render(CUDA, "f32");
         assert!(source.contains("seismic_bf16_to_f32"));
+        assert!(source.contains("#define SEISMIC_MULTIPROCESSORS 48\n"));
         assert!(!source.contains("#include"));
         // Two dimensions, x (rank 2) and the result (rank 1): 2 + 4 + 2 words.
         assert!(source.contains("struct seismic_words_t { unsigned long long w[8]; };\n"));
         // The shared parameter `x` is read-only; the result and scratch are not.
         assert!(source.contains("#define SEISMIC_KERNEL_PARAMS const unsigned char* __restrict__ seismic_buffer_0, unsigned char* __restrict__ seismic_buffer_1, unsigned char* __restrict__ seismic_buffer_2, seismic_words_t seismic_words_value, unsigned long long* seismic_scalar_results\n"));
         assert!(source.contains("#define SEISMIC_PTR(index) SEISMIC_PTR_(index)\n"));
+    }
+
+    /// A buffer a static zero extent leaves absent reads as address 0, of
+    /// its own type; every other reads its argument.
+    #[test]
+    fn an_absent_buffer_reads_as_address_zero() {
+        let absent = NativeSpecialization::new().with_static("K", 0);
+        let cuda = render_with(CUDA, "f32", absent.clone());
+        assert!(cuda.contains("#define SEISMIC_ADDRESS_0 ((const unsigned char *)0)\n"));
+        assert!(cuda.contains("#define SEISMIC_ADDRESS_1 seismic_buffer_1\n"));
+        let vulkan = render_with(Dialect::Vulkan(VULKAN_FEATURES), "f32", absent);
+        assert!(vulkan.contains("#define SEISMIC_ADDRESS_0 0ul\n"));
+        assert!(vulkan.contains("#define SEISMIC_ADDRESS_1 (seismic_argument_block_t(seismic_arguments).w[1])\n"));
+        let present = render(Dialect::Vulkan(VULKAN_FEATURES), "f32");
+        assert!(present.contains("#define SEISMIC_ADDRESS_0 (seismic_argument_block_t(seismic_arguments).w[0])\n"));
     }
 }

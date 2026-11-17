@@ -11,18 +11,24 @@
 //! The encoding (serde) is versioned with the engine build: both ends
 //! exchange [`EngineBuild`] first and refuse a mismatch.
 
-use crate::census::{AllocationCensus, MemoryDomain};
+use super::measure::{MeasureFailure, MeasureRequest};
+use crate::census::AllocationCensus;
 use crate::error::{LoadError, RequestError, UnloadCause};
 use crate::options::{ExecutionManifest, ReadyInfo};
 use magnitude_chat::ConstraintPlan;
+use magnitude_executor::UnpreparedUnits;
 use magnitude_family_contracts::PreparedModelInput;
 use magnitude_generation::{DetailedUsage, FinishReason, Options, OutputToken};
 use magnitude_scheduler::prefix_cache::PrefixRetention;
+pub use magnitude_scheduler::protocol::{RoomAnswer, RoomRefusal};
+use seismic::measure::Record;
+use seismic::{PointKey, StoreIdentity};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-/// The engine build identity: the package version and a digest of the engine
-/// sources. Two processes speak the protocol only with equal builds.
+/// The engine build identity: the package version and a digest of the
+/// engine's dependency closure (`build.rs`). Two processes speak the protocol
+/// only with equal builds.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct EngineBuild(pub String);
@@ -38,6 +44,13 @@ impl fmt::Display for EngineBuild {
         formatter.write_str(&self.0)
     }
 }
+
+/// Host-assigned identity of a measurement room claim, unique for one
+/// worker connection: its answer names it, so the answer to a claim
+/// released before it arrived answers no later claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RoomClaimId(pub u64);
 
 /// Host-assigned request identity, unique for one worker connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -68,31 +81,94 @@ pub struct Admission {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum HostMessage {
     Hello { build: EngineBuild },
-    Load { manifest: ExecutionManifest },
-    /// Prepare `manifest`'s programs on its device, tuning what the kernel
-    /// cache lacks, then exit without loading the model.
-    Prepare { manifest: ExecutionManifest },
+    /// Load `manifest`'s model and serve it. A load never searches: each
+    /// tuning unit is prepared from its stored record. At a unit the kernel
+    /// cache has no record for, the load does what `unprepared` says: it
+    /// places nothing, answers `Unprepared` and exits, or it prepares the
+    /// unit at its canonical default and goes on.
+    Load {
+        manifest: ExecutionManifest,
+        unprepared: UnpreparedUnits,
+    },
+    /// Search the tuning units of `manifest`'s model the kernel cache has no
+    /// record for, on the device its load selects, publishing each record;
+    /// then exit without loading the model. The only search there is.
+    Prepare {
+        manifest: ExecutionManifest,
+    },
+    /// Measure this machine as `request` asks (the measurement job,
+    /// [`super::measure`]), reporting each record as it is stored; then
+    /// exit. Nothing is loaded.
+    Measure {
+        request: MeasureRequest,
+    },
     Admit(Admission),
     /// The host's consumer drained `batches` output batches.
-    Credit { request_id: HostRequestId, batches: u32 },
+    Credit {
+        request_id: HostRequestId,
+        batches: u32,
+    },
     /// Ordered stop: accepted output drains, then `Completed`.
-    Stop { request_id: HostRequestId },
+    Stop {
+        request_id: HostRequestId,
+    },
     /// The host abandoned the request; no further messages arrive for it.
-    Cancel { request_id: HostRequestId },
-    Status { request_id: HostRequestId },
+    Cancel {
+        request_id: HostRequestId,
+    },
+    Status {
+        request_id: HostRequestId,
+    },
     Observe,
+    /// Claim `bytes` of device memory beside the loaded model for the
+    /// service's measurement job, in place of any claim before: committed
+    /// on the device's ledger, which cache yields to at once, answered by
+    /// `MeasurementRoom` naming `claim` and held until
+    /// `ReleaseMeasurementRoom`.
+    ClaimMeasurementRoom { claim: RoomClaimId, bytes: u64 },
+    /// The measurement job holding the room was started as `process`: its
+    /// footprint is credited against the room from now, so its growth is
+    /// never read as others'.
+    AttachMeasurementProcess { process: magnitude_executor::ProcessId },
+    /// The measurement job ended: its room is free again.
+    ReleaseMeasurementRoom,
+    /// The measurement job stored new records: price the experts again
+    /// from what is stored.
+    Reprice,
     Shutdown,
 }
 
-/// Engine load progress, in order. Each measured step counts work done, never time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TuningOperation {
+    Discovery,
+    Form,
+    Measure,
+    Promote,
+    Confirm,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TuningWork {
+    pub entry: String,
+    pub operation: TuningOperation,
+}
+
+/// Engine load progress. Tuning reports time budget; import reports resident bytes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LoadProgress {
     /// Device selection, planning, opening the device and program preparation.
     Preparing,
-    /// Tuning kernels for the device. Reported only when this load searches: `total` is the
-    /// tuning time in milliseconds and `completed` the milliseconds spent. It starts at zero
-    /// when the census begins; tuning may finish before `total`.
-    Tuning { completed: u64, total: u64 },
+    /// Tuning kernels for the device. Reported only by a Prepare that searches, never by a
+    /// load: `total` is the tuning time in milliseconds and `completed` the milliseconds
+    /// spent. It starts at zero when the census begins; tuning may finish before `total`.
+    Tuning {
+        completed: u64,
+        total: u64,
+        work: Option<TuningWork>,
+        measured_configurations: u64,
+        formed_programs: u64,
+    },
     /// Target weight import, in resident bytes. It starts at zero before any import.
     ImportingWeights { completed_bytes: u64, total_bytes: u64 },
     /// State allocation, memory policy and warm-up.
@@ -106,7 +182,9 @@ pub enum RequestState {
     AwaitingCompletion,
     OutputBlocked,
     Preempted,
-    CapacityBlocked { required: u64, available: u64 },
+    /// It never ran, and waits for memory to be reclaimed; it may yet be
+    /// refused for memory.
+    MemoryBlocked,
     Finished(FinishReason),
 }
 
@@ -131,22 +209,21 @@ pub struct ExecutionTimings {
 }
 
 /// A loaded worker's observation of its memory (integration spec §5.4,
-/// §9.2): what the model holds and what each domain it uses has left.
+/// §9.2): what the model holds and what each store it uses has left.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryObservation {
     /// The heap's standing, classified.
     pub census: AllocationCensus,
-    /// A fresh reading of every memory domain the loaded device uses: its
-    /// allocation domain first, then host RAM for a dedicated device's
-    /// staged uploads.
-    pub domains: Vec<DomainHeadroom>,
+    /// A fresh reading of every store the loaded executor's placements
+    /// reach, and host RAM, in store order.
+    pub stores: Vec<StoreHeadroom>,
 }
 
-/// One memory domain's observed available bytes. Only the worker observes a
-/// dedicated device's live memory: it has the device open.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DomainHeadroom {
-    pub domain: MemoryDomain,
+/// One store's observed available bytes. Only the worker observes a
+/// device store's live memory: it has the executor open.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoreHeadroom {
+    pub store: StoreIdentity,
     /// Available bytes bounded by every applicable process limit; this
     /// process's existing charges are already absent from it.
     pub headroom_bytes: u64,
@@ -154,15 +231,52 @@ pub struct DomainHeadroom {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum WorkerMessage {
-    Hello { build: EngineBuild },
-    LoadProgress { progress: LoadProgress },
-    Ready { ready: ReadyInfo },
+    Hello {
+        build: EngineBuild,
+    },
+    LoadProgress {
+        progress: LoadProgress,
+    },
+    Ready {
+        ready: ReadyInfo,
+    },
     /// A `Prepare` finished; the worker exits after this message.
     Prepared,
-    LoadFailed { error: LoadError },
-    Admitted { request_id: HostRequestId },
-    AdmissionRefused { request_id: HostRequestId, error: RequestError },
-    Output { request_id: HostRequestId, tokens: Vec<OutputToken> },
+    /// A `Measure` is about to record its attempt of `key` and time it.
+    Attempting {
+        key: PointKey,
+    },
+    /// A `Measure` opened its device.
+    Opened,
+    /// A `Measure` stored `record` of `key`.
+    Recorded {
+        key: PointKey,
+        record: Record,
+    },
+    /// A `Measure` finished, with what it could not measure; the worker
+    /// exits after this message.
+    MeasureFinished {
+        failures: Vec<MeasureFailure>,
+    },
+    /// A `Load` asked to report tuning units without a stored record met
+    /// one and placed nothing; the worker exits after this message.
+    Unprepared,
+    LoadFailed {
+        error: LoadError,
+    },
+    /// The request began: it became resident, or published before it did.
+    /// One refused before it began is answered `AdmissionRefused` instead.
+    Admitted {
+        request_id: HostRequestId,
+    },
+    AdmissionRefused {
+        request_id: HostRequestId,
+        error: RequestError,
+    },
+    Output {
+        request_id: HostRequestId,
+        tokens: Vec<OutputToken>,
+    },
     Completed {
         request_id: HostRequestId,
         finish: FinishReason,
@@ -179,6 +293,15 @@ pub enum WorkerMessage {
     Observed {
         observation: Result<MemoryObservation, RequestError>,
     },
+    /// The census changed: sent as the owner counts a change of its
+    /// memory, never on a timer.
+    Census {
+        census: AllocationCensus,
+    },
+    /// The answer to `ClaimMeasurementRoom` `claim`, or why the worker
+    /// cannot answer it. A claim the host released is answered by no
+    /// message, as is one the model's end released (`Unloaded` follows).
+    MeasurementRoom { claim: RoomClaimId, room: Result<RoomAnswer, RequestError> },
     /// The model stopped serving. Every open request has already received
     /// its terminal outcome; the worker exits after this message.
     Unloaded { cause: UnloadCause },
@@ -187,39 +310,69 @@ pub enum WorkerMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::census::DomainAllocation;
     use crate::error::InsufficientMemory;
     use crate::options::InputModalities;
-    use seismic::DeviceSelector;
+    use magnitude_executor::StoreAllocation;
+    use crate::census::{BankResize, ExpertResidency, ServingCensus};
 
     fn round_trip<T: Serialize + serde::de::DeserializeOwned>(value: &T) -> T {
         postcard::from_bytes(&postcard::to_allocvec(value).unwrap()).unwrap()
     }
 
-    /// Memory observations, their failure and a domain-qualified load
+    /// Memory observations, their failure and a store-qualified load
     /// refusal survive the process encoding.
     #[test]
     fn memory_values_round_trip_through_the_worker_encoding() {
-        let device = MemoryDomain::DeviceLocal {
-            device: DeviceSelector::Cuda { uuid: [7; 16] },
-        };
+        let device = StoreIdentity::DeviceMemory(seismic::PhysicalIdentity::Uuid([7; 16]));
+        let positive = |value| std::num::NonZeroU64::new(value).unwrap();
         let observation = MemoryObservation {
             census: AllocationCensus {
-                domains: vec![DomainAllocation {
-                    domain: device,
+                stores: vec![StoreAllocation {
+                    store: device.clone(),
                     model_bytes: 1,
                     context_bytes: 2,
                     compute_bytes: 3,
                     auxiliary_bytes: 4,
                 }],
+                serving: ServingCensus {
+                    group_places: std::num::NonZeroUsize::new(3).unwrap(),
+                    group_capacity: std::num::NonZeroUsize::new(8).unwrap(),
+                    experts: Some(ExpertResidency {
+                        experts: positive(256),
+                        slots: 64,
+                        floor: 26,
+                        ceiling: 256,
+                        stores: vec![(device.clone(), 10)],
+                        host: Some(magnitude_executor::HostResidency {
+                            slots: 12,
+                            ceiling: 256,
+                            bytes: 14,
+                            last_resize: None,
+                        }),
+                        cover: magnitude_executor::ExpertCover { begun: 1, reading: false },
+                        disk_bytes: 11,
+                        tables: vec![magnitude_executor::TableResidency {
+                            records: 40,
+                            floor: 1,
+                            ceiling: positive(42),
+                            bytes: 13,
+                            last_resize: Some(BankResize::Shrank {
+                                to: 40,
+                                by: positive(1),
+                                at_unix_ms: 12,
+                            }),
+                        }],
+                        last_resize: None,
+                    }),
+                },
             },
-            domains: vec![
-                DomainHeadroom {
-                    domain: device,
+            stores: vec![
+                StoreHeadroom {
+                    store: device.clone(),
                     headroom_bytes: 5,
                 },
-                DomainHeadroom {
-                    domain: MemoryDomain::HostRam,
+                StoreHeadroom {
+                    store: StoreIdentity::HostRam,
                     headroom_bytes: 6,
                 },
             ],
@@ -247,7 +400,7 @@ mod tests {
         assert_eq!(decoded, failed);
         let refusal = LoadError::InsufficientMemory {
             purpose: "target import".into(),
-            domain: MemoryDomain::HostRam,
+            store: StoreIdentity::HostRam,
             memory: InsufficientMemory {
                 required: 8,
                 available: 9,

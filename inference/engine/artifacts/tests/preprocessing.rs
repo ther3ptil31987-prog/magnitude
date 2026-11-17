@@ -37,6 +37,67 @@ fn smart_resize_uses_half_to_even_and_pixel_bounds() {
     assert_eq!(downscale.resized_size(128, 64).unwrap(), (32, 32));
 }
 
+/// Expected canvases from transformers 5.17 `Glm5NextImageProcessor`
+/// (`smart_resize` with a 28-pixel cell, 16 to 8000 tokens), and the padding
+/// it leaves black before normalization (a 100 x 300 image on a 112 x 308
+/// canvas).
+#[test]
+fn padded_canvas_rounds_up_and_pads_with_black() {
+    let bounds = ImageResize::PaddedCanvas {
+        min_pixels: 12_544,
+        max_pixels: 6_272_000,
+    };
+    let value = configured(14, 2, bounds);
+    for (source, expected) in [
+        ((448, 560), (448, 560)),
+        ((100, 300), (112, 308)),
+        ((30, 40), (112, 140)),
+        ((5000, 3000), (3220, 1932)),
+        ((13, 2600), (28, 2604)),
+        ((1000, 1000), (1008, 1008)),
+        ((2000, 5000), (1568, 3920)),
+        ((3000, 4000), (2156, 2884)),
+    ] {
+        assert_eq!(value.resized_size(source.0, source.1).unwrap(), expected, "{source:?}");
+    }
+
+    let mut encoded = Cursor::new(Vec::new());
+    DynamicImage::ImageRgb8(RgbImage::from_pixel(300, 100, Rgb([255, 255, 255])))
+        .write_to(&mut encoded, ImageFormat::Png)
+        .unwrap();
+    let mean = [0.5f32; 3];
+    let unit = ImageProcessor::new(ImageProcessorConfig {
+        resize: bounds,
+        resampling: Resampling::Bicubic,
+        patch: 14,
+        merge: 2,
+        frames: 2,
+        mean,
+        std: [0.25; 3],
+    })
+    .unwrap();
+    let prepared = unit.prepare(&[encoded.into_inner()]).unwrap();
+    let pixels = prepared
+        .tensors()
+        .iter()
+        .find(|tensor| tensor.name() == "pixel_values")
+        .unwrap();
+    let values = pixels
+        .data()
+        .chunks_exact(4)
+        .map(|word| f32::from_le_bytes(word.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    // White content normalizes to 2, the padding (black) to -2.
+    assert!(values.iter().all(|value| (*value - 2.0).abs() < 1e-6 || (*value + 2.0).abs() < 1e-6));
+    assert!(values.iter().any(|value| *value > 1.0) && values.iter().any(|value| *value < -1.0));
+    let row_width = pixels.shape()[1];
+    assert_eq!(pixels.shape()[0], 8 * 22);
+    // The last cell row's patches (row 7) lie below the content's last pixel
+    // row 99 (patch row 7 spans rows 98 to 111): its first rows hold content.
+    let last = values.chunks_exact(row_width).last().unwrap();
+    assert!(last.iter().any(|value| *value < -1.0));
+}
+
 /// Expected sizes from transformers 5.17 `Gemma4ImageProcessor`
 /// (`get_aspect_ratio_preserving_size`, patch 16, pooling 3, 280 soft
 /// tokens).
@@ -76,6 +137,52 @@ fn cell_budget_picks_the_closest_aspect_in_python_set_order() {
     ] {
         assert_eq!(value.resized_size(source.0, source.1).unwrap(), expected, "{source:?}");
     }
+}
+
+/// Expected sizes from the released Nemotron 3.5 Omni processor
+/// (`NemotronH_Omni_Reasoning_V3ImageProcessor._compute_target_patches`,
+/// patch 16, pixel-shuffle factor 2, 1024 to 13312 patches), including its
+/// half-to-even `round(n + 0.5)` (48 pixels: 4 patches) and the scale-up to
+/// the minimum.
+#[test]
+fn patch_bounds_follow_the_nemotron_omni_tile() {
+    let value = configured(
+        16,
+        2,
+        ImageResize::PatchBounds {
+            min_patches: 1_024,
+            max_patches: 13_312,
+        },
+    );
+    for (source, expected) in [
+        ((512, 512), (512, 512)),
+        ((480, 640), (480, 640)),
+        ((48, 48), (512, 512)),
+        ((1000, 1010), (1024, 1024)),
+        ((3000, 4000), (1600, 2112)),
+        ((100, 1500), (160, 1888)),
+        ((1500, 100), (1888, 160)),
+        ((517, 803), (544, 832)),
+        ((20, 4000), (64, 5728)),
+        ((720, 1280), (736, 1280)),
+        ((2048, 2048), (1824, 1856)),
+        ((33, 47), (512, 512)),
+        ((1080, 1920), (1088, 1920)),
+        ((300, 200), (640, 448)),
+    ] {
+        assert_eq!(value.resized_size(source.0, source.1).unwrap(), expected, "{source:?}");
+    }
+    // A budget bounded to the minimum keeps the tile within it.
+    let bounded = configured(
+        16,
+        2,
+        ImageResize::PatchBounds {
+            min_patches: 512,
+            max_patches: 512,
+        },
+    );
+    let (height, width) = bounded.resized_size(3000, 4000).unwrap();
+    assert!((height / 16) * (width / 16) <= 512 && height % 32 == 0 && width % 32 == 0);
 }
 
 #[test]
@@ -163,5 +270,22 @@ fn bicubic_resize_preserves_pil_rgb_quantization() {
         .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
     {
         assert!((value * 255.0 - (value * 255.0).round()).abs() <= 2.0e-5);
+    }
+}
+
+#[test]
+fn oversized_preparation_is_refused_before_resizing_or_slicing() {
+    let mut bytes = Cursor::new(Vec::new());
+    DynamicImage::ImageRgb8(RgbImage::from_pixel(1, 1, Rgb([255, 0, 0])))
+        .write_to(&mut bytes, ImageFormat::Png)
+        .unwrap();
+    for resize in [
+        ImageResize::PixelBounds { min_pixels: 1 << 28, max_pixels: 1 << 28 },
+        ImageResize::Slices { resolution: 16_384, max_slices: 9 },
+    ] {
+        let error = configured(1, 1, resize)
+            .prepare(&[bytes.get_ref().clone()])
+            .unwrap_err();
+        assert!(error.contains("prepared image pixels exceed capacity"), "{error}");
     }
 }

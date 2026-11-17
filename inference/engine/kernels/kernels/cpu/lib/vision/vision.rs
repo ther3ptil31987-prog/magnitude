@@ -122,44 +122,30 @@ pub fn gelu_quick(value: f32) -> f32 {
     value / (1.0 + (-1.702 * value).exp())
 }
 
-/// The activation of `vision_linear`'s code (1 tanh, 2 erf, 3 quick GELU).
+/// The squared ReLU: `max(x, 0)²`.
+#[inline(always)]
+pub fn relu_squared(value: f32) -> f32 {
+    let positive = value.max(0.0);
+    positive * positive
+}
+
+/// SiLU: `x / (1 + exp(-x))`.
+#[inline(always)]
+pub fn silu(value: f32) -> f32 {
+    value / (1.0 + (-value).exp())
+}
+
+/// The activation of `vision_linear`'s code (1 tanh, 2 erf, 3 quick GELU,
+/// 4 squared ReLU, 5 SiLU).
 #[inline(always)]
 pub fn activate(code: i32, value: f32) -> f32 {
     match code {
         1 => gelu_tanh(value),
         2 => gelu_erf(value),
         3 => gelu_quick(value),
+        4 => relu_squared(value),
+        5 => silu(value),
         _ => unreachable!("activation code {code}"),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Row norms.
-
-/// The portable `vision_norm` of one F32 row, unpublished: centered
-/// (`centered`) or root-mean-square two-pass F32 statistics, times the
-/// decoded `weight` and plus the decoded `bias` when bound.
-#[inline(always)]
-pub fn norm(x: &[f32], centered: bool, weight: Option<&[f32]>, bias: Option<&[f32]>, epsilon: f32, out: &mut [f32]) {
-    let width = x.len() as f32;
-    let out = &mut out[..x.len()];
-    let mean = if centered { reduce::sum(x) / width } else { 0.0 };
-    for (target, value) in out.iter_mut().zip(x) {
-        *target = value - mean;
-    }
-    let inverse = 1.0 / (reduce::sum_squares(out) / width + epsilon).sqrt();
-    for target in out.iter_mut() {
-        *target *= inverse;
-    }
-    if let Some(weight) = weight {
-        for (target, w) in out.iter_mut().zip(weight) {
-            *target *= w;
-        }
-    }
-    if let Some(bias) = bias {
-        for (target, b) in out.iter_mut().zip(bias) {
-            *target += b;
-        }
     }
 }
 

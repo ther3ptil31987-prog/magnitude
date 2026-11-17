@@ -1,5 +1,5 @@
 use magnitude_executor::{
-    FeatureReader, FeatureRef, FeatureRows, FeatureSpan, Operation, Outcome, ResourceDomainId,
+    FeatureReader, FeatureRef, FeatureRows, FeatureSpan, LaunchDuration, Operation, Outcome, ResourceDomainId,
     Selected,
 };
 use magnitude_generation::{
@@ -33,6 +33,7 @@ fn feature(id: u64) -> FeatureRef {
     })
 }
 
+thread_local! { static BOUNDARY_ROWS: RefCell<HashMap<FeatureRef, usize>> = RefCell::new(HashMap::new()); }
 /// Reads row `r` of feature `id` as the four bytes `[id, r, 0, 0]`.
 struct Rows;
 
@@ -45,7 +46,8 @@ impl FeatureReader for Rows {
             .strip_prefix("generation-")
             .and_then(|id| id.parse::<u8>().ok())
             .ok_or("unknown test feature")?;
-        let bytes = (span.start..span.start + span.count)
+        let offset = BOUNDARY_ROWS.with(|rows| rows.borrow().get(&span.features).copied().unwrap_or(0));
+        let bytes = (span.start + offset..span.start + offset + span.count)
             .flat_map(|row| [id, row as u8, 0, 0])
             .collect::<Vec<_>>();
         FeatureRows::new(bytes.into(), span.count).map_err(|error| error.to_string())
@@ -127,6 +129,13 @@ fn resolve(
     samples: &[u32],
     features: Option<FeatureRef>,
 ) -> (Generation, Vec<Operation>) {
+    let features = features.map(|features| {
+        if round.round_forward().prime.as_ref().is_some_and(|prime| prime.boundary) {
+            let boundary = FeatureRef::logical(features.domain().clone(), 1, 4).unwrap();
+            BOUNDARY_ROWS.with(|rows| rows.borrow_mut().insert(boundary.clone(), round.round_forward().tokens.len() - 1));
+            features.with_boundary(boundary).unwrap()
+        } else { features }
+    });
     let samples = samples.iter().copied().map(TokenId).collect::<Vec<_>>();
     let transition = round
         .prepare_round_transition(RequestId(1), &samples, features, &mut Rows)
@@ -209,6 +218,38 @@ fn prefill_chunks_and_decode_share_the_round_protocol() {
     assert_eq!(generation.generated(), [TokenId(10), TokenId(11)]);
 }
 
+/// A prompt chunk plans the chunks after it, each following the one before:
+/// at most the number asked, none past the stop, and none after the chunk
+/// that selects the first token.
+#[test]
+fn a_prompt_chunk_plans_the_chunks_after_it() {
+    let prompt = (1..=10).map(TokenId).collect::<Vec<_>>();
+    let generation = resident(
+        Generation::new(prompt, InputLayout::new(10, vec![]).unwrap(), options(), None).unwrap(),
+    );
+    let first = start(generation, 2);
+    let spans = |planned: Vec<Operation>| {
+        planned
+            .into_iter()
+            .map(|operation| match operation {
+                Operation::Forward {
+                    position,
+                    tokens,
+                    select,
+                    ..
+                } => (position, tokens.len(), select.len()),
+                other => panic!("a planned chunk is a forward: {other:?}"),
+            })
+            .collect::<Vec<_>>()
+    };
+    let plan = |stop, chunks| spans(first.planned_prefill(RequestId(1), 3, stop, chunks).unwrap());
+    assert_eq!(plan(None, 2), [(2, 3, 0), (5, 3, 0)]);
+    // The last chunk selects the first token; nothing is planned past it.
+    assert_eq!(plan(None, 8), [(2, 3, 0), (5, 3, 0), (8, 2, 1)]);
+    assert_eq!(plan(Some(6), 8), [(2, 3, 0), (5, 1, 0)]);
+    assert!(plan(None, 0).is_empty());
+}
+
 #[test]
 fn forced_prefill_and_decode_are_committed_rounds_without_selection() {
     let generation = generation(Some(Box::new(Grammar {
@@ -276,9 +317,11 @@ fn prepared_transition_does_not_change_live_generation_until_commit() {
         reject: Some(TokenId(12)),
     })));
     let round = start(generation, 2);
-    assert!(round
-        .prepare_round_transition(RequestId(1), &[TokenId(12)], None, &mut Rows)
-        .is_err());
+    assert!(
+        round
+            .prepare_round_transition(RequestId(1), &[TokenId(12)], None, &mut Rows)
+            .is_err()
+    );
     assert_eq!(round.generation().finish_reason(), None);
     assert_eq!(round.generation().resident_position(), 0);
 
@@ -413,6 +456,36 @@ fn eviction_resumes_from_a_retained_prefix_and_replays_the_rest() {
     assert_eq!(decode.round_forward().kind, WorkKind::Decode);
 }
 
+/// A request evicted after it decoded, then resumed from a prefix inside its
+/// prompt, replays the prompt's tail and its generated rows in separate
+/// rounds: the executor admits target rows only within, or wholly past, the
+/// prepared input.
+#[test]
+fn replay_from_a_prompt_prefix_stops_at_the_prompt_end() {
+    let mut generation = prefill(generation(None), 10);
+    let checkpoint = generation.method_checkpoint().unwrap();
+    let decode = start(generation, 1);
+    assert_eq!(decode.round_forward().kind, WorkKind::Decode);
+    (generation, _) = resolve(decode, &[11], None);
+    assert_eq!(generation.resident_position(), 3);
+    generation.evicted().unwrap();
+    generation.resume_at(Some((1, &checkpoint))).unwrap();
+    let replay = start(generation, 4);
+    assert_eq!(replay.round_forward().kind, WorkKind::Replay);
+    assert_eq!(replay.round_forward().tokens, [TokenId(2)]);
+    let (generation, _) = resolve(replay, &[], None);
+    assert_eq!(generation.resident_position(), 2);
+    let replay = start(generation, 4);
+    assert_eq!(replay.round_forward().kind, WorkKind::Replay);
+    assert_eq!(replay.round_forward().tokens, [TokenId(10)]);
+    let (generation, _) = resolve(replay, &[], None);
+    assert_eq!(generation.resident_position(), 3);
+    assert_eq!(generation.generated(), [TokenId(10), TokenId(11)]);
+    let decode = start(generation, 1);
+    assert_eq!(decode.round_forward().kind, WorkKind::Decode);
+    assert_eq!(decode.round_forward().tokens, [TokenId(11)]);
+}
+
 /// An admitted MTP generation that is not yet resident.
 fn mtp_fresh(prompt: &[u32], proposals: u8) -> Generation {
     let mut configured = options();
@@ -452,6 +525,16 @@ fn head_parts(operation: &Operation) -> (Vec<TokenId>, Vec<(u8, u8)>, usize, Vec
 
 /// Reconcile a head transaction as the service does.
 fn reconcile_head(generation: &mut Generation, operation: &Operation, proposals: &[(u32, u8)]) {
+    reconcile_confident_head(generation, operation, proposals, None);
+}
+
+/// Reconcile a head transaction that gives its confidence in each proposal.
+fn reconcile_confident_head(
+    generation: &mut Generation,
+    operation: &Operation,
+    proposals: &[(u32, u8)],
+    confidence: Option<Vec<f32>>,
+) {
     let outcome = Outcome::Head {
         proposals: proposals
             .iter()
@@ -460,6 +543,7 @@ fn reconcile_head(generation: &mut Generation, operation: &Operation, proposals:
                 status,
             })
             .collect(),
+        confidence,
     };
     let transition = generation
         .prepare_method_transition(operation, &outcome)
@@ -513,15 +597,15 @@ fn drafting(generation: Generation) -> (Generation, Operation) {
 #[test]
 fn prompt_chunks_prime_the_drafter_on_the_device_and_keep_the_anchor() {
     for generation in drafters(&[1, 2, 3], 2) {
-        // First chunk: rows 1, 2. Its entry pairs 2 and 3 with them.
         let round = start(generation, 2);
-        assert_eq!(primed(&round), Some((vec![TokenId(2), TokenId(3)], 0, 3)));
+        let boundary = round.round_forward().prime.as_ref().unwrap().boundary;
+        assert_eq!(primed(&round), Some((if boundary { vec![TokenId(2)] } else { vec![TokenId(2), TokenId(3)] }, 0, 2)));
         let (generation, effects) = resolve(round, &[], Some(feature(5)));
         assert!(effects.is_empty());
         // Final chunk: row 3 selects 10. No prompt token follows it, so it
         // has no entry; the anchor (10, f6.0) waits for the first draft.
         let round = start(generation, 1);
-        assert_eq!(primed(&round), None);
+        assert_eq!(primed(&round), if boundary { Some((vec![TokenId(3)], 1, 3)) } else { None });
         let (mut generation, effects) = resolve(round, &[10], Some(feature(6)));
         assert!(effects.is_empty());
         generation.take(4).unwrap();
@@ -591,10 +675,23 @@ fn mtp_drafting(proposals: u8) -> (Generation, Operation) {
 
 #[test]
 fn verification_accepts_the_matching_prefix_and_re_enters_accepted_rows() {
+    use magnitude_generation::{DraftHistory, DraftRoundState};
+    let (head, drafted) = DraftRoundState::new(DraftHistory::Own, 4, 1, 1, false)
+        .unwrap()
+        .proposing(3)
+        .unwrap();
+    let successor = drafted.observed(3).unwrap().successor;
     let (mut generation, first) = mtp_drafting(3);
+    let (entered, _, position, proposed) = head_parts(&first);
+    let head = head.unwrap();
+    assert_eq!(
+        (entered.len(), position, proposed.len()),
+        (head.entry_rows, head.position, head.generated)
+    );
     reconcile_head(&mut generation, &first, &[(11, 0), (12, 0), (13, 0)]);
     let verify = start(generation, 4);
     assert_eq!(verify.round_forward().kind, WorkKind::Verify);
+    assert_eq!(verify.round_forward().tokens.len(), head.generated + 1);
     assert_eq!(
         verify.round_forward().tokens,
         [TokenId(10), TokenId(11), TokenId(12), TokenId(13)]
@@ -607,6 +704,10 @@ fn verification_accepts_the_matching_prefix_and_re_enters_accepted_rows() {
         [TokenId(10), TokenId(11), TokenId(12), TokenId(20)]
     );
     assert_eq!(generation.resident_position(), 5);
+    assert_eq!(
+        generation.resident_position(),
+        successor.target_position().unwrap()
+    );
     assert_eq!(generation.detailed_usage().draft_n, 3);
     assert_eq!(generation.detailed_usage().draft_n_accepted, 2);
     generation.take(4).unwrap();
@@ -617,6 +718,10 @@ fn verification_accepts_the_matching_prefix_and_re_enters_accepted_rows() {
     assert_eq!(tokens, [TokenId(11), TokenId(12), TokenId(20)]);
     assert_eq!(rows, [(2, 0), (2, 1), (2, 2)]);
     assert_eq!(position, 2);
+    assert_eq!(
+        (position, tokens.len()),
+        (successor.position(), successor.pending_rows())
+    );
 }
 
 #[test]
@@ -659,17 +764,57 @@ fn checkpoints_carry_host_rows_and_restore_at_their_target_boundary() {
     assert!(source.method_checkpoint().is_err());
 }
 
+/// A restored open feature belongs to the resumed anchor, not to the last
+/// complete pending pair. Drafting must wait until the anchor's plain
+/// target round supplies its successor and closes that feature.
+#[test]
+fn restored_pending_pairs_do_not_draft_before_the_open_anchor_is_closed() {
+    let (mut generation, first) = mtp_drafting(3);
+    reconcile_head(&mut generation, &first, &[(11, 0), (12, 0), (13, 0)]);
+    let (mut generation, effects) =
+        resolve(start(generation, 4), &[11, 12, 20, 30], Some(feature(2)));
+    assert!(effects.is_empty());
+    generation.take(4).unwrap();
+    let checkpoint = generation.method_checkpoint().unwrap();
+    let MethodCheckpoint::Mtp(state) = &checkpoint else {
+        panic!("MTP checkpoint")
+    };
+    assert_eq!(
+        (state.position(), state.target_rows(), state.retained_bytes()),
+        (2, 5, 12)
+    );
+    generation.evicted().unwrap();
+    generation.resume_at(Some((5, &checkpoint))).unwrap();
+    // Even a grant sufficient for the configured draft must execute the
+    // actual resumed anchor rather than draft from pending token 12.
+    let round = start(generation, 4);
+    assert_eq!(round.round_forward().kind, WorkKind::Decode);
+    assert_eq!(round.round_forward().tokens, [TokenId(20)]);
+    let (generation, effects) = resolve(round, &[21], Some(feature(3)));
+    assert!(effects.is_empty());
+    assert_eq!(generation.resident_position(), 6);
+    let MethodCheckpoint::Mtp(state) = generation.method_checkpoint().unwrap() else {
+        panic!("MTP checkpoint")
+    };
+    assert_eq!(
+        (state.position(), state.target_rows(), state.retained_bytes()),
+        (2, 6, 16)
+    );
+}
+
 #[test]
 fn mtp_choice_requires_an_injected_factory() {
     let mut configured = options();
     configured.method = MethodChoice::Mtp { proposals: 2 };
-    assert!(Generation::new(
-        vec![TokenId(1), TokenId(2)],
-        InputLayout::new(2, vec![]).unwrap(),
-        configured,
-        None,
-    )
-    .is_err());
+    assert!(
+        Generation::new(
+            vec![TokenId(1), TokenId(2)],
+            InputLayout::new(2, vec![]).unwrap(),
+            configured,
+            None,
+        )
+        .is_err()
+    );
 }
 
 struct PrimeMethod {
@@ -682,9 +827,13 @@ impl Method for PrimeMethod {
     fn requires(&self) -> MethodRequirements {
         MethodRequirements {
             prefill_demand: Demand::FEATURES,
+            closing_demand: Demand::NONE,
             verify_demand: Demand::FEATURES,
             head: true,
         }
+    }
+    fn embeds_prompt_tokens(&self) -> bool {
+        true
     }
     fn proposals(&self) -> usize {
         1
@@ -714,9 +863,9 @@ impl MethodState for PrimeState {
         _: RequestId,
         tokens: &[TokenId],
         next: Option<TokenId>,
-        _features: FeatureRef,
+        _features: Option<FeatureRef>,
         _draft_from: usize,
-        _primed: usize,
+        _primed: Option<usize>,
         _: &mut dyn FeatureReader,
     ) -> Result<MethodEffects, String> {
         self.calls.lock().unwrap().push((tokens.to_vec(), next));
@@ -841,9 +990,11 @@ fn retained_prefix_requires_an_exact_layout_boundary() {
     configured.context_limit = 128;
     configured.vocabulary = 256;
     let mut fresh = Generation::new(prompt, layout, configured, None).unwrap();
-    assert!(fresh
-        .resume_at(Some((64, &MethodCheckpoint::Plain)))
-        .is_err());
+    assert!(
+        fresh
+            .resume_at(Some((64, &MethodCheckpoint::Plain)))
+            .is_err()
+    );
     assert!(!fresh.is_resident());
     assert_eq!(fresh.resident_position(), 0);
     assert_eq!(fresh.detailed_usage().cached_tokens, 0);
@@ -892,6 +1043,31 @@ fn staged_causal_reconciliation_advances_after_finished_prefill() {
 }
 
 #[test]
+fn a_reply_that_reaches_the_context_end_owes_no_row_past_it() {
+    // The successor sampled from the last context row is accepted but never
+    // needs a row of its own, so the generation owes no reconciliation for it.
+    let mut configured = options();
+    configured.context_limit = 4;
+    let generation = resident(
+        Generation::new(
+            vec![TokenId(1), TokenId(2)],
+            InputLayout::new(2, vec![]).unwrap(),
+            configured,
+            None,
+        )
+        .unwrap(),
+    );
+    let generation = prefill(generation, 10);
+    let (generation, _) = resolve(start(generation, 4), &[11], None);
+    let (generation, _) = resolve(start(generation, 4), &[12], None);
+    assert_eq!(generation.finish_reason(), Some(FinishReason::Context));
+    assert_eq!(generation.resident_position(), 4);
+    assert_eq!(generation.accepted_position(), 5);
+    assert_eq!(generation.pending_reconciliation(), None);
+    assert!(generation.start_reconciliation(4).is_err());
+}
+
+#[test]
 fn ignored_end_of_generation_masks_stop_tokens_from_every_selection() {
     let mut configured = options();
     configured.end_of_generation = EndOfGeneration::Suppress;
@@ -910,9 +1086,11 @@ fn ignored_end_of_generation_masks_stop_tokens_from_every_selection() {
         .expect("suppression masks selection");
     assert_eq!(mask[99 / 32] & (1 << (99 % 32)), 0);
     assert_ne!(mask[98 / 32] & (1 << (98 % 32)), 0);
-    assert!(round
-        .prepare_round_transition(RequestId(1), &[TokenId(99)], None, &mut Rows)
-        .is_err());
+    assert!(
+        round
+            .prepare_round_transition(RequestId(1), &[TokenId(99)], None, &mut Rows)
+            .is_err()
+    );
 }
 
 #[test]
@@ -983,7 +1161,20 @@ fn dflash_verification_publishes_the_accepted_prefix_and_re_enters_it() {
         // Full: every proposal agrees; 40 is the bonus token.
         (vec![11, 12, 13, 40], 3, vec![11, 12, 13, 40]),
     ] {
-        let (mut generation, first) = dflash_drafting(3);
+        // Leave room for a second complete configured action; short tail
+        // grants deliberately run Plain instead of inventing another width.
+        let mut configured = options();
+        configured.max_tokens = 16;
+        configured.method = MethodChoice::DFlash { proposals: 3 };
+        let generation = Generation::new_with_method(
+            vec![TokenId(1), TokenId(2)],
+            InputLayout::new(2, vec![]).unwrap(),
+            configured,
+            None,
+            Arc::new(DFlash::new("fixture", 3).unwrap()),
+        )
+        .unwrap();
+        let (mut generation, first) = drafting(resident(generation));
         reconcile_head(&mut generation, &first, &[(11, 0), (12, 0), (13, 0)]);
         let verify = start(generation, 4);
         assert_eq!(verify.round_forward().kind, WorkKind::Verify);
@@ -1112,4 +1303,828 @@ fn publication_bound_before_start_covers_the_started_round() {
 
 fn generation_with(grammar: Grammar) -> Generation {
     generation(Some(Box::new(grammar)))
+}
+
+#[test]
+fn mtp_and_external_drafters_share_independent_generation_and_verification_budgets() {
+    use magnitude_generation::DraftBudget;
+    for external in [false, true] {
+        let budget = DraftBudget::new(3, 1).unwrap();
+        let mut configured = options();
+        configured.method = if external {
+            MethodChoice::DFlash { proposals: 3 }
+        } else {
+            MethodChoice::Mtp { proposals: 3 }
+        };
+        let factory: Arc<dyn Method> = if external {
+            Arc::new(
+                DFlash::new("fixture", 3)
+                    .unwrap()
+                    .with_budget(budget)
+                    .unwrap(),
+            )
+        } else {
+            Arc::new(Mtp::new("fixture", 3).unwrap().with_budget(budget).unwrap())
+        };
+        let generation = Generation::new_with_method(
+            vec![TokenId(1), TokenId(2)],
+            InputLayout::new(2, vec![]).unwrap(),
+            configured,
+            None,
+            factory,
+        )
+        .unwrap();
+        let (mut generation, operation) = drafting(resident(generation));
+        assert_eq!(head_parts(&operation).3.len(), 3);
+        reconcile_head(&mut generation, &operation, &[(11, 0), (12, 0), (13, 0)]);
+        let verify = start(generation, 4);
+        assert_eq!(verify.round_forward().tokens, [TokenId(10), TokenId(11)]);
+        let (mut generation, effects) = resolve(verify, &[11, 20], Some(feature(2)));
+        assert!(effects.is_empty());
+        assert_eq!(
+            generation.generated(),
+            [TokenId(10), TokenId(11), TokenId(20)]
+        );
+        generation.take(3).unwrap();
+        let (_, operations) = draft(generation, 4);
+        assert_eq!(head_parts(&operations[0]).0, [TokenId(11), TokenId(20)]);
+    }
+}
+
+/// Near the end of a request a fixed budget drafts the widest width of its
+/// prepared ladder that still fits, and verifies all of it.
+#[test]
+fn fixed_draft_fits_its_tail_to_a_prepared_width() {
+    for generation in drafters(&[1, 2], 3) {
+        // The prompt's closing chunk generates one token and the first round
+        // four, leaving three of eight: two proposals fit, and the ladder of
+        // three prepares one.
+        let (mut generation, operation) = drafting(generation);
+        reconcile_head(&mut generation, &operation, &[(11, 0), (12, 0), (13, 0)]);
+        let (mut generation, _) =
+            resolve(start(generation, 4), &[11, 12, 13, 20], Some(feature(2)));
+        generation.take(4).unwrap();
+        let (mut generation, operations) = draft(generation, 4);
+        assert_eq!(head_parts(&operations[0]).3.len(), 1);
+        reconcile_head(&mut generation, &operations[0], &[(21, 0)]);
+        let round = start(generation, 4);
+        assert_eq!(round.round_forward().kind, WorkKind::Verify);
+        assert_eq!(round.round_forward().tokens, [TokenId(20), TokenId(21)]);
+        // The verification commits its proposal and the target's bonus.
+        let (generation, _) = resolve(round, &[21, 22], Some(feature(3)));
+        assert_eq!(
+            generation.generated(),
+            [10, 11, 12, 13, 20, 21, 22].map(TokenId)
+        );
+    }
+}
+
+/// An intermediate checkpoint of a long request may be the last shared row of
+/// a much shorter request. Its head history cannot be pruned for the original
+/// request's distant first draft. This also covers a branch introduced after
+/// the source has already prefetched a chunk.
+#[test]
+fn reusable_draft_prefixes_keep_each_intermediate_history_complete() {
+    let prompt = (1..=16).collect::<Vec<_>>();
+    let generation = resident(dflash_fresh(&prompt, 2));
+    let first = start(generation, 4);
+    assert_eq!(first.round_forward().prime.as_ref().unwrap().draft_from, 4);
+    let [planned] = <[_; 1]>::try_from(first.planned_prefill(RequestId(1), 4, None, 1).unwrap())
+        .unwrap();
+    let Operation::Forward { prime: Some(prime), .. } = planned else {
+        panic!("planned prompt chunk primes the drafter")
+    };
+    assert_eq!(prime.draft_from, 8);
+    let (generation, _) = resolve(first, &[], Some(feature(1)));
+    let (generation, _) = resolve(start(generation, 4), &[], Some(feature(2)));
+    let checkpoint = generation.method_checkpoint().unwrap();
+    let mut branch = dflash_fresh(&[1, 2, 3, 4, 5, 6, 7, 8, 90], 2);
+    branch.resume_at(Some((8, &checkpoint))).unwrap();
+    let branch = start(branch, 1);
+    assert_eq!(branch.round_forward().tokens, [TokenId(90)]);
+    assert_eq!(branch.round_forward().selects.len(), 1);
+}
+
+/// A transient request has no reusable intermediate prefixes, so it may still
+/// omit window rows that its own first draft will never read.
+#[test]
+fn transient_draft_priming_preserves_its_final_prompt_horizon() {
+    let mut generation = dflash_fresh(&(1..=16).collect::<Vec<_>>(), 2);
+    generation.set_prefix_reuse(false).unwrap();
+    generation.resume_at(None).unwrap();
+    assert!(generation.set_prefix_reuse(true).is_err());
+    assert!(generation.method_checkpoint().is_err());
+    let first = start(generation, 4);
+    assert_eq!(first.round_forward().prime.as_ref().unwrap().draft_from, 16);
+    let [planned] = <[_; 1]>::try_from(first.planned_prefill(RequestId(1), 4, None, 1).unwrap())
+        .unwrap();
+    let Operation::Forward { prime: Some(prime), .. } = planned else {
+        panic!("planned prompt chunk primes the drafter")
+    };
+    assert_eq!(prime.draft_from, 16);
+}
+
+#[test]
+fn mtp_cached_prefix_leaves_successor_for_the_resumed_request() {
+    let round = start(mtp_generation(&[1, 2, 3], 2), 2);
+    assert_eq!(primed(&round), Some((vec![TokenId(2)], 0, 2)));
+    let (generation, effects) = resolve(round, &[], Some(feature(8)));
+    assert!(effects.is_empty());
+    let checkpoint = generation.method_checkpoint().unwrap();
+    let MethodCheckpoint::Mtp(state) = &checkpoint else { panic!("MTP checkpoint") };
+    assert_eq!((state.position(), state.target_rows()), (1, 2));
+    assert_eq!(checkpoint.retained_bytes(), 0);
+    let mut resumed = mtp_fresh(&[1, 2, 7], 2);
+    resumed.resume_at(Some((2, &checkpoint))).unwrap();
+    let round = start(resumed, 1);
+    assert_eq!(primed(&round), Some((vec![TokenId(7)], 1, 3)));
+    let (mut resumed, effects) = resolve(round, &[10], Some(feature(9)));
+    assert!(effects.is_empty());
+    resumed.take(4).unwrap();
+    let (_, operations) = draft(resumed, 4);
+    let (tokens, rows, position, _) = head_parts(&operations[0]);
+    assert_eq!((tokens, rows, position), (vec![TokenId(10)], vec![(9, 0)], 2));
+}
+
+#[test]
+fn mtp_single_token_chunks_capture_without_entering_a_future_token() {
+    let first = start(mtp_generation(&[1, 2, 3], 2), 1);
+    assert_eq!(primed(&first), Some((vec![], 0, 1)));
+    let [planned] = <[_; 1]>::try_from(first.planned_prefill(RequestId(1), 1, None, 1).unwrap())
+        .unwrap();
+    let Operation::Forward { prime: Some(prime), .. } = planned else { panic!("planned chunk") };
+    assert_eq!((prime.tokens, prime.position, prime.boundary), (vec![TokenId(2)], 0, true));
+    let (generation, effects) = resolve(first, &[], Some(feature(10)));
+    assert!(effects.is_empty());
+    let checkpoint = generation.method_checkpoint().unwrap();
+    let MethodCheckpoint::Mtp(state) = &checkpoint else { panic!("MTP checkpoint") };
+    assert_eq!((state.position(), state.target_rows()), (0, 1));
+    let next = start(generation, 1);
+    assert_eq!(primed(&next), Some((vec![TokenId(2)], 0, 2)));
+}
+
+#[test]
+fn checkpoint_replaces_a_sampled_anchor_with_the_resumed_successor() {
+    let (source, _) = resolve(start(mtp_generation(&[1, 2], 2), 2), &[10], Some(feature(11)));
+    let checkpoint = source.method_checkpoint().unwrap();
+    let mut resumed = mtp_fresh(&[1, 2, 7], 2);
+    resumed.resume_at(Some((2, &checkpoint))).unwrap();
+    let round = start(resumed, 1);
+    let (mut resumed, operations) = resolve(round, &[20], Some(feature(12)));
+    let (tokens, rows, position, _) = head_parts(&operations[0]);
+    assert_eq!((tokens, rows, position), (vec![TokenId(7)], vec![(11, 1)], 1));
+    reconcile_head(&mut resumed, &operations[0], &[]);
+    resumed.take(4).unwrap();
+    let (_, operations) = draft(resumed, 4);
+    assert_eq!(head_parts(&operations[0]).0, vec![TokenId(20)]);
+}
+
+#[test]
+fn continuing_mtp_chunks_never_read_features_on_the_host() {
+    struct NoRead;
+    impl FeatureReader for NoRead {
+        fn read(&mut self, _: &FeatureSpan) -> Result<FeatureRows, String> {
+            Err("continuing prefill read a device feature on the host".into())
+        }
+    }
+    let mut generation = mtp_generation(&[1, 2, 3, 4, 5], 2);
+    let mut numerical_owners = Vec::new();
+    for id in [18, 19] {
+        let round = start(generation, 2);
+        let features = feature(id);
+        let boundary = FeatureRef::logical(features.domain().clone(), 1, 4).unwrap();
+        numerical_owners.push(boundary.clone());
+        let transition = round.prepare_round_transition(RequestId(1), &[],
+            Some(features.with_boundary(boundary).unwrap()), &mut NoRead).unwrap();
+        let (next, effects) = round.commit(transition);
+        assert!(effects.operations.is_empty());
+        generation = next;
+    }
+    let checkpoint = generation.method_checkpoint().unwrap();
+    let MethodCheckpoint::Mtp(state) = checkpoint else { panic!("MTP checkpoint") };
+    assert_eq!((state.position(), state.target_rows()), (3, 4));
+}
+
+/// An admitted MTP generation whose head reads the target's history, not
+/// yet resident.
+fn reading_fresh(prompt: &[u32], layout: InputLayout, proposals: u8) -> Generation {
+    let mut configured = options();
+    configured.method = MethodChoice::Mtp { proposals };
+    Generation::new_with_method(
+        prompt.iter().copied().map(TokenId).collect(),
+        layout,
+        configured,
+        None,
+        Arc::new(Mtp::reading_target("fixture", usize::from(proposals)).unwrap()),
+    )
+    .unwrap()
+}
+
+fn reading_generation(prompt: &[u32], proposals: u8) -> Generation {
+    resident(reading_fresh(
+        prompt,
+        InputLayout::new(prompt.len(), vec![]).unwrap(),
+        proposals,
+    ))
+}
+
+/// Prefill a reading head's four-row prompt in two chunks; row 4 of the
+/// closing chunk's features (f6.1) selects the anchor 10.
+fn reading_prefilled(generation: Generation) -> Generation {
+    let first = start(generation, 2);
+    assert_eq!(primed(&first), None);
+    assert_eq!(first.round_forward().demand, Demand::NONE);
+    let (generation, effects) = resolve(first, &[], None);
+    assert!(effects.is_empty());
+    let closing = start(generation, 2);
+    assert_eq!(primed(&closing), None);
+    assert_eq!(
+        closing.round_forward().demand,
+        Demand::FEATURES | Demand::SELECT
+    );
+    let (generation, effects) = resolve(closing, &[10], Some(feature(6)));
+    assert!(effects.is_empty());
+    generation
+}
+
+/// A head reading the target's history is never primed. Its draft is the
+/// anchor alone at the anchor's target position, conditioned on the
+/// closing chunk's final feature.
+#[test]
+fn mtp_reading_target_drafts_from_the_closing_feature_without_priming() {
+    use magnitude_generation::{DraftHistory, DraftRoundState};
+    let (head, drafted) = DraftRoundState::new(DraftHistory::Target, 4, 4, 1, false)
+        .unwrap()
+        .proposing(3)
+        .unwrap();
+    let successor = drafted.observed(3).unwrap().successor;
+    let mut generation = reading_prefilled(reading_generation(&[1, 2, 3, 4], 3));
+    assert_eq!(generation.method_reclaimable(), 4);
+    generation.take(4).unwrap();
+    let (mut generation, operations) = draft(generation, 4);
+    let [operation] = operations.as_slice() else {
+        panic!("one drafter transaction")
+    };
+    let Operation::Head { form, phase, .. } = operation else {
+        unreachable!()
+    };
+    assert_eq!(*form, magnitude_executor::DraftForm::Chained);
+    assert_eq!(*phase, magnitude_executor::HeadPhase::Generation);
+    let (tokens, rows, position, proposals) = head_parts(operation);
+    let head = head.unwrap();
+    assert_eq!(
+        (head.entry_rows, head.position, head.generated),
+        (tokens.len(), position, proposals.len())
+    );
+    assert_eq!(
+        (tokens, rows, position),
+        (vec![TokenId(10)], vec![(6, 1)], 4)
+    );
+    assert_eq!(proposals.len(), 3);
+    reconcile_head(&mut generation, operation, &[(11, 0), (12, 0), (13, 0)]);
+    let verify = start(generation, 4);
+    assert_eq!(
+        verify.round_forward().tokens,
+        [TokenId(10), TokenId(11), TokenId(12), TokenId(13)]
+    );
+    // The target accepts 11 and 12 and samples 20: three target rows commit
+    // and the last accepted row's feature f2.2 selected the new anchor.
+    let (mut generation, effects) = resolve(verify, &[11, 12, 20, 30], Some(feature(2)));
+    assert!(effects.is_empty());
+    assert_eq!(generation.resident_position(), 7);
+    assert_eq!(
+        generation.resident_position(),
+        successor.target_position().unwrap()
+    );
+    generation.take(4).unwrap();
+    let (_, operations) = draft(generation, 4);
+    let (tokens, rows, position, _) = head_parts(&operations[0]);
+    assert_eq!(
+        (tokens, rows, position),
+        (vec![TokenId(20)], vec![(2, 2)], 7)
+    );
+    assert_eq!(
+        (position, 1),
+        (successor.position(), successor.pending_rows())
+    );
+}
+
+/// A draft budget sizes a reading head's chained draft as it does an
+/// embedded head's: the verified width bounds the round.
+#[test]
+fn mtp_reading_target_keeps_the_shared_draft_budget() {
+    use magnitude_generation::DraftBudget;
+    let mut configured = options();
+    configured.method = MethodChoice::Mtp { proposals: 3 };
+    let generation = resident(
+        Generation::new_with_method(
+            vec![TokenId(1), TokenId(2), TokenId(3), TokenId(4)],
+            InputLayout::new(4, vec![]).unwrap(),
+            configured,
+            None,
+            Arc::new(
+                Mtp::reading_target("fixture", 3)
+                    .unwrap()
+                    .with_budget(DraftBudget::new(3, 1).unwrap())
+                    .unwrap(),
+            ),
+        )
+        .unwrap(),
+    );
+    let mut generation = reading_prefilled(generation);
+    generation.take(4).unwrap();
+    let (mut generation, operations) = draft(generation, 4);
+    assert_eq!(head_parts(&operations[0]).3.len(), 3);
+    reconcile_head(&mut generation, &operations[0], &[(11, 0), (12, 0), (13, 0)]);
+    assert_eq!(
+        start(generation, 4).round_forward().tokens,
+        [TokenId(10), TokenId(11)]
+    );
+}
+
+/// Media rows enter the target from the projector under placeholder
+/// tokens. A reading head never sees them as tokens: every prompt chunk but
+/// the closing one demands nothing of it. A head embedding prompt tokens
+/// cannot enter them: that request generates without drafting.
+#[test]
+fn mtp_reading_target_admits_media_rows_an_embedding_head_cannot() {
+    let layout = || {
+        InputLayout::new(
+            4,
+            vec![InputSpan {
+                start: 0,
+                end: 2,
+                identity: "image".into(),
+                boundaries: BoundaryRule::Indivisible,
+                language_history: false,
+            }],
+        )
+        .unwrap()
+    };
+    let mut generation = reading_prefilled(resident(reading_fresh(&[1, 1, 3, 4], layout(), 2)));
+    generation.take(4).unwrap();
+    let (_, operations) = draft(generation, 4);
+    let (tokens, rows, position, _) = head_parts(&operations[0]);
+    assert_eq!(
+        (tokens, rows, position),
+        (vec![TokenId(10)], vec![(6, 1)], 4)
+    );
+
+    let mut configured = options();
+    configured.method = MethodChoice::Mtp { proposals: 2 };
+    let embedding = Generation::new_with_method(
+        vec![TokenId(1), TokenId(1), TokenId(3), TokenId(4)],
+        layout(),
+        configured.clone(),
+        None,
+        Arc::new(Mtp::new("fixture", 2).unwrap()),
+    )
+    .expect("a media request beside an embedding head generates");
+    assert_eq!(embedding.method_choice(), MethodChoice::Plain);
+    assert_eq!(embedding.method_identity(), "plain");
+    assert!(!embedding.method_requirements().head);
+    // Every prompt row is entered by target rounds alone, and decoding
+    // drafts nothing.
+    let prompt = start(resident(embedding), 4);
+    assert_eq!(prompt.round_forward().tokens.len(), 4);
+    let (embedding, effects) = resolve(prompt, &[20], None);
+    assert!(effects.is_empty());
+    assert_eq!(embedding.generated(), [TokenId(20)]);
+    assert_eq!(start(embedding, 4).round_forward().tokens, [TokenId(20)]);
+    // A text request on the same load still drafts with the head.
+    assert_eq!(
+        Generation::new_with_method(
+            vec![TokenId(1), TokenId(1), TokenId(3), TokenId(4)],
+            InputLayout::new(4, vec![]).unwrap(),
+            configured.clone(),
+            None,
+            Arc::new(Mtp::new("fixture", 2).unwrap()),
+        )
+        .unwrap()
+        .method_choice(),
+        MethodChoice::Mtp { proposals: 2 }
+    );
+    // The separate draft's history is the target's fused features.
+    configured.method = MethodChoice::DFlash { proposals: 2 };
+    assert!(
+        Generation::new_with_method(
+            vec![TokenId(1), TokenId(1), TokenId(3), TokenId(4)],
+            layout(),
+            configured,
+            None,
+            Arc::new(DFlash::new("fixture", 2).unwrap()),
+        )
+        .is_ok()
+    );
+}
+
+/// A reading head's checkpoint is its target position alone; a request
+/// resuming it drafts from its own closing chunk's feature.
+#[test]
+fn mtp_reading_target_checkpoints_retain_no_feature_rows() {
+    let source = reading_prefilled(reading_generation(&[1, 2, 3, 4], 2));
+    let checkpoint = source.method_checkpoint().unwrap();
+    let MethodCheckpoint::Mtp(state) = &checkpoint else {
+        panic!("MTP checkpoint")
+    };
+    assert_eq!((state.position(), state.target_rows()), (4, 4));
+    assert_eq!(checkpoint.retained_bytes(), 0);
+    // Only a drafting request of the same method resumes it.
+    assert!(checkpoint.resumes(MethodChoice::Mtp { proposals: 2 }));
+    assert!(!checkpoint.resumes(MethodChoice::Plain));
+    assert!(!checkpoint.resumes(MethodChoice::DFlash { proposals: 2 }));
+    let mut resumed = reading_fresh(&[1, 2, 3, 4, 7], InputLayout::new(5, vec![]).unwrap(), 2);
+    resumed.resume_at(Some((4, &checkpoint))).unwrap();
+    let closing = start(resumed, 1);
+    assert_eq!(closing.round_forward().tokens, [TokenId(7)]);
+    let (mut resumed, effects) = resolve(closing, &[20], Some(feature(12)));
+    assert!(effects.is_empty());
+    resumed.take(4).unwrap();
+    let (_, operations) = draft(resumed, 4);
+    let (tokens, rows, position, _) = head_parts(&operations[0]);
+    assert_eq!(
+        (tokens, rows, position),
+        (vec![TokenId(20)], vec![(12, 0)], 5)
+    );
+}
+
+/// Replay re-enters nothing into a reading head. The replayed anchor's
+/// round decodes plainly and its feature selects the next anchor.
+#[test]
+fn mtp_reading_target_replay_resumes_drafting_after_one_decode() {
+    let mut generation = reading_prefilled(reading_generation(&[1, 2, 3, 4], 2));
+    generation.take(4).unwrap();
+    generation.evicted().unwrap();
+    generation.resume_at(None).unwrap();
+    let replay = start(generation, 8);
+    assert_eq!(replay.round_forward().kind, WorkKind::Replay);
+    assert_eq!(replay.round_forward().demand, Demand::NONE);
+    let (generation, effects) = resolve(replay, &[], None);
+    assert!(effects.is_empty());
+    let decode = start(generation, 4);
+    assert_eq!(decode.round_forward().kind, WorkKind::Decode);
+    assert_eq!(decode.round_forward().tokens, [TokenId(10)]);
+    let (mut generation, effects) = resolve(decode, &[11], Some(feature(3)));
+    assert!(effects.is_empty());
+    generation.take(4).unwrap();
+    let (_, operations) = draft(generation, 4);
+    let (tokens, rows, position, _) = head_parts(&operations[0]);
+    assert_eq!(
+        (tokens, rows, position),
+        (vec![TokenId(11)], vec![(3, 0)], 5)
+    );
+}
+
+/// A budget drafting nothing does not erase the history owner's pending
+/// entries, and enters none of them while it holds no more than its catch-up
+/// bound. Any real maintenance transaction must match the method's
+/// transition; target-reading heads never submit that transaction.
+#[test]
+fn plain_round_geometry_matches_history_and_target_reading_execution() {
+    use magnitude_generation::{DraftBudget, DraftHistory, DraftRoundState};
+
+    for history in [DraftHistory::Own, DraftHistory::Target] {
+        let mut configured = options();
+        configured.method = MethodChoice::Mtp { proposals: 2 };
+        let method = match history {
+            DraftHistory::Own => Mtp::new("fixture", 2),
+            DraftHistory::Target => Mtp::reading_target("fixture", 2),
+        }
+        .unwrap()
+        .with_budget(DraftBudget::new(0, 0).unwrap())
+        .unwrap();
+        let generation = resident(
+            Generation::new_with_method(
+                vec![TokenId(1), TokenId(2)],
+                InputLayout::new(2, vec![]).unwrap(),
+                configured,
+                None,
+                Arc::new(method),
+            )
+            .unwrap(),
+        );
+        let (mut generation, effects) = resolve(start(generation, 2), &[10], Some(feature(1)));
+        assert!(effects.is_empty());
+        generation.take(4).unwrap();
+        let mut state = DraftRoundState::new(
+            history,
+            3,
+            if history == DraftHistory::Own { 1 } else { 2 },
+            1,
+            false,
+        )
+        .unwrap();
+        for step in 0..3 {
+            assert_eq!(state.proposing(0), Ok((None, state)));
+            assert_eq!(state.target_position(), Ok(2 + step));
+            let transition = state.observed(1).unwrap();
+            let round = start(generation, 4);
+            assert_eq!(round.round_forward().kind, WorkKind::Decode);
+            assert_eq!(round.round_forward().tokens.len(), 1);
+            let (next, effects) = resolve(round, &[11 + step as u32], Some(feature(2 + step as u64)));
+            generation = next;
+            match (transition.maintenance, effects.as_slice()) {
+                (None, []) => {}
+                (Some(call), [operation]) => {
+                    let (tokens, _, position, proposals) = head_parts(operation);
+                    assert_eq!((position, tokens.len()), (call.position, call.entry_rows));
+                    assert!(proposals.is_empty());
+                    reconcile_head(&mut generation, operation, &[]);
+                }
+                _ => panic!("physical maintenance differs from the method transition"),
+            }
+            state = transition.successor;
+            assert_eq!(generation.resident_position(), state.target_position().unwrap());
+            let MethodCheckpoint::Mtp(checkpoint) = generation.method_checkpoint().unwrap() else {
+                panic!("MTP checkpoint")
+            };
+            assert_eq!(checkpoint.position(), state.position());
+            generation.take(4).unwrap();
+        }
+        // An own history holds its four pairs; a reading head only its anchor.
+        let expected = match history {
+            DraftHistory::Own => (4, 1),
+            DraftHistory::Target => (1, 5),
+        };
+        assert_eq!((state.pending_rows(), state.position()), expected);
+    }
+}
+
+/// Rounds of a drafting load that draft nothing are ordinary one-row
+/// decodes: they publish their row's feature for the drafter, and nothing
+/// else runs for it, so the executor pipelines them as it does plain decodes.
+/// The drafter enters their pairs only when a round drafts again (or past
+/// its catch-up bound), each pair exactly once, in order and at its own
+/// position: the draft that follows reads the history it would have read
+/// had every round drafted.
+#[test]
+fn rounds_that_draft_nothing_defer_the_drafter_until_it_drafts_again() {
+    use magnitude_generation::CATCH_UP_ROWS;
+    const PLAIN: usize = CATCH_UP_ROWS + 6;
+    let methods: [Arc<dyn Method>; 2] = [
+        Arc::new(Mtp::new("fixture", 3).unwrap()),
+        Arc::new(DFlash::new("fixture", 3).unwrap()),
+    ];
+    for method in methods {
+        let mut configured = options();
+        configured.max_tokens = PLAIN + 8;
+        configured.context_limit = PLAIN + 16;
+        configured.method = match method.identity().starts_with("mtp") {
+            true => MethodChoice::Mtp { proposals: 3 },
+            false => MethodChoice::DFlash { proposals: 3 },
+        };
+        let generation = resident(
+            Generation::new_with_method(
+                vec![TokenId(1), TokenId(2)],
+                InputLayout::new(2, vec![]).unwrap(),
+                configured,
+                None,
+                method.clone(),
+            )
+            .unwrap(),
+        );
+        let (mut generation, effects) = resolve(start(generation, 2), &[10], Some(feature(1)));
+        assert!(effects.is_empty());
+        generation.take(4).unwrap();
+        let (MethodCheckpoint::Mtp(primed) | MethodCheckpoint::DFlash(primed)) =
+            generation.method_checkpoint().unwrap()
+        else {
+            panic!("a drafter checkpoint")
+        };
+        // Every pair the drafter must enter: each committed token with the
+        // feature of the row before it.
+        let mut pairs = vec![(TokenId(10), (1, 1))];
+        let mut entered = Vec::new();
+        let mut position = primed.position();
+        // A grant of one row holds no draft: each round is a plain decode.
+        for round in 0..PLAIN {
+            let decode = start(generation, 1);
+            let forward = forward(&decode);
+            assert_eq!(forward.kind, WorkKind::Decode);
+            assert_eq!(forward.tokens, [pairs.last().unwrap().0]);
+            assert_eq!(forward.demand, Demand::SELECT | Demand::FEATURES);
+            assert_eq!((forward.committed, forward.prime), (1, None));
+            let id = 2 + round as u64;
+            let sample = 11 + round as u32;
+            let (next, effects) = resolve(decode, &[sample], Some(feature(id)));
+            generation = next;
+            pairs.push((TokenId(sample), (id as u8, 0)));
+            // Pairs past the catch-up bound enter, keeping the anchor.
+            match effects.as_slice() {
+                [] => {}
+                [operation] => {
+                    let (tokens, rows, at, proposals) = head_parts(operation);
+                    assert_eq!(round + 1, CATCH_UP_ROWS, "{}", method.identity());
+                    assert!(proposals.is_empty());
+                    assert_eq!(at, position);
+                    position += tokens.len();
+                    entered.extend(tokens.into_iter().zip(rows));
+                    reconcile_head(&mut generation, operation, &[]);
+                }
+                _ => panic!("one maintenance transaction at most"),
+            }
+            generation.take(4).unwrap();
+        }
+        assert_eq!(entered.len(), CATCH_UP_ROWS, "{}", method.identity());
+        // The next round that drafts first enters what the plain rounds left.
+        let (mut generation, catch_up) = draft(generation, 4);
+        let [catch_up] = <[Operation; 1]>::try_from(catch_up).unwrap();
+        let (tokens, rows, at, proposals) = head_parts(&catch_up);
+        assert!(proposals.is_empty());
+        assert_eq!(at, position);
+        position += tokens.len();
+        entered.extend(tokens.into_iter().zip(rows));
+        reconcile_head(&mut generation, &catch_up, &[]);
+        // Then it drafts from its anchor alone.
+        let (_, drafted) = draft(generation, 4);
+        let (tokens, rows, at, proposals) = head_parts(&drafted[0]);
+        assert_eq!(proposals.len(), 3);
+        assert_eq!(at, position);
+        entered.extend(tokens.into_iter().zip(rows));
+        assert_eq!(entered, pairs, "{}", method.identity());
+    }
+}
+
+/// A separate draft under the adaptive policy, with `max_tokens` to
+/// generate.
+fn adaptive_generation(max_tokens: usize) -> Generation {
+    let mut configured = options();
+    configured.max_tokens = max_tokens;
+    configured.method = MethodChoice::DFlash { proposals: 3 };
+    resident(
+        Generation::new_with_method(
+            vec![TokenId(1), TokenId(2)],
+            InputLayout::new(2, vec![]).unwrap(),
+            configured,
+            None,
+            Arc::new(DFlash::new("fixture", 3).unwrap().adaptive()),
+        )
+        .unwrap(),
+    )
+}
+
+/// An adaptive round with nothing measured drafts and verifies the whole
+/// width. Rejected drafts are scored from the tokens that commit, and once
+/// the launches are timed a text nothing is accepted on is no longer
+/// drafted.
+#[test]
+fn adaptive_drafting_stops_where_no_draft_is_accepted() {
+    use magnitude_generation::TimedLaunch;
+    use std::time::Duration;
+    let (mut generation, first) = drafting(adaptive_generation(16));
+    assert_eq!(head_parts(&first).3.len(), 3);
+    generation.timed(TimedLaunch::Draft, Some(LaunchDuration::settled(Duration::from_millis(20))), 1, 5);
+    reconcile_head(&mut generation, &first, &[(11, 0), (12, 0), (13, 0)]);
+    let mut verify = start(generation, 4);
+    assert_eq!(
+        verify.round_forward().tokens,
+        [TokenId(10), TokenId(11), TokenId(12), TokenId(13)]
+    );
+    verify.timed(TimedLaunch::Target, Some(LaunchDuration::settled(Duration::from_millis(40))), 1, 4);
+    // The target rejects the first draft.
+    let (mut generation, effects) = resolve(verify, &[21, 30, 31, 32], Some(feature(2)));
+    assert!(effects.is_empty());
+    generation.take(8).unwrap();
+    // Blocks go on being drafted and scored for a few rounds (the width is
+    // kept, and launches not yet measured are tried), none of them
+    // verified. Then nothing is drafted.
+    let mut last = 21;
+    for round in 0.. {
+        assert!(round < 8, "drafting did not stop");
+        generation = match generation.start_round(RequestId(1), 4) {
+            Ok(RoundStart::Target(round)) => {
+                assert_eq!(round.round_forward().tokens, [TokenId(last)]);
+                break;
+            }
+            Ok(RoundStart::Method(mut generation, operations)) => {
+                generation.timed(TimedLaunch::Draft, Some(LaunchDuration::settled(Duration::from_millis(20))), 1, 5);
+                let proposals = head_parts(&operations[0]).3.len();
+                let block = (0..proposals as u32).map(|slot| (50 + slot, 0)).collect::<Vec<_>>();
+                reconcile_head(&mut generation, &operations[0], &block);
+                let mut verify = start(generation, 4);
+                assert_eq!(verify.round_forward().tokens, [TokenId(last)]);
+                verify.timed(TimedLaunch::Target, Some(LaunchDuration::settled(Duration::from_millis(30))), 1, 1);
+                last += 1;
+                let (mut generation, _) = resolve(verify, &[last], Some(feature(3)));
+                generation.take(8).unwrap();
+                generation
+            }
+            Err((_, error)) => panic!("{error}"),
+        };
+    }
+}
+
+/// Near the end of a request an adaptive round drafts the widest width that
+/// still fits.
+#[test]
+fn adaptive_drafting_fits_the_tokens_a_request_has_left() {
+    // The prompt's closing chunk generates one token and the first round
+    // four, leaving two of seven.
+    let (mut generation, first) = drafting(adaptive_generation(7));
+    reconcile_head(&mut generation, &first, &[(11, 0), (12, 0), (13, 0)]);
+    let (mut generation, _) = resolve(start(generation, 4), &[11, 12, 13, 20], Some(feature(2)));
+    generation.take(8).unwrap();
+    let (mut generation, operations) = draft(generation, 4);
+    assert_eq!(head_parts(&operations[0]).3.len(), 1);
+    reconcile_head(&mut generation, &operations[0], &[(21, 0)]);
+    assert_eq!(
+        start(generation, 4).round_forward().tokens,
+        [TokenId(20), TokenId(21)]
+    );
+}
+
+/// Whatever a draft policy generates and verifies, a request commits exactly
+/// the tokens its target selects: a draft only decides how many of them one
+/// round commits. Fixed budgets and the adaptive policy, with the drafter's
+/// confidences or without (a drafter choosing by path scores), produce one
+/// answer.
+#[test]
+fn every_draft_policy_commits_the_targets_own_tokens() {
+    use magnitude_generation::{DraftBudget, TimedLaunch};
+    use std::time::Duration;
+    const TOKENS: usize = 240;
+    // What the target selects at each generated position, and a drafter that
+    // is wrong at every fifth.
+    let target = |position: usize| 10 + (position * 7 % 80) as u32;
+    let drafted = |position: usize| if position % 5 == 0 { 97 } else { target(position) };
+    let answer = (0..TOKENS).map(|position| TokenId(target(position))).collect::<Vec<_>>();
+    // A drafter confident in its right proposals and not in its wrong ones.
+    let confidence = |position: usize| if drafted(position) == target(position) { 0.9 } else { 0.1 };
+    let methods: [(Arc<dyn Method>, bool); 5] = [
+        (Arc::new(DFlash::new("fixture", 3).unwrap()), false),
+        (Arc::new(DFlash::new("fixture", 3).unwrap().with_budget(DraftBudget::new(3, 1).unwrap()).unwrap()), false),
+        (Arc::new(DFlash::new("fixture", 3).unwrap().with_budget(DraftBudget::new(1, 1).unwrap()).unwrap()), false),
+        (Arc::new(DFlash::new("fixture", 3).unwrap().adaptive()), false),
+        (Arc::new(DFlash::new("fixture", 3).unwrap().adaptive()), true),
+    ];
+    let mut launched_rows = Vec::new();
+    for (method, confident) in methods {
+        let mut configured = options();
+        configured.max_tokens = TOKENS;
+        configured.context_limit = 256;
+        configured.method = MethodChoice::DFlash { proposals: 3 };
+        let mut generation = resident(
+            Generation::new_with_method(
+                vec![TokenId(1), TokenId(2)],
+                InputLayout::new(2, vec![]).unwrap(),
+                configured,
+                None,
+                method.clone(),
+            )
+            .unwrap(),
+        );
+        let reconcile = |generation: &mut Generation, operations: &[Operation]| {
+            for operation in operations {
+                let from = generation.generated().len();
+                let slots = 0..head_parts(operation).3.len();
+                let proposals = slots
+                    .clone()
+                    .map(|slot| (drafted(from + slot), 0))
+                    .collect::<Vec<_>>();
+                let confidence =
+                    confident.then(|| slots.map(|slot| confidence(from + slot)).collect());
+                generation.timed(TimedLaunch::Draft, Some(LaunchDuration::settled(Duration::from_millis(2))), 1, 4);
+                reconcile_confident_head(generation, operation, &proposals, confidence);
+            }
+        };
+        let mut rounds = 0;
+        let mut launched = 0;
+        while generation.finish_reason().is_none() {
+            rounds += 1;
+            assert!(rounds < 4 * TOKENS, "{} did not finish", method.identity());
+            generation = match generation.start_round(RequestId(1), 4) {
+                Ok(RoundStart::Method(mut generation, operations)) => {
+                    reconcile(&mut generation, &operations);
+                    generation
+                }
+                Ok(RoundStart::Target(mut round)) => {
+                    // A prompt chunk selects once; a decode or verification
+                    // selects after each of its rows.
+                    let from = round.generation().generated().len();
+                    let rows = round.round_forward().selects.len();
+                    launched += rows;
+                    let samples = (0..rows).map(|row| target(from + row)).collect::<Vec<_>>();
+                    // Each row adds less than a plain step costs, so
+                    // drafting pays.
+                    round.timed(
+                        TimedLaunch::Target,
+                        Some(LaunchDuration::settled(Duration::from_millis(7 + 3 * rows as u64))),
+                        1,
+                        rows,
+                    );
+                    let (mut generation, effects) =
+                        resolve(round, &samples, Some(feature(rounds as u64 % 200)));
+                    reconcile(&mut generation, &effects);
+                    generation.take(8).unwrap();
+                    generation
+                }
+                Err((_, error)) => panic!("{}: {error}", method.identity()),
+            };
+        }
+        assert_eq!(generation.generated(), answer, "{}", method.identity());
+        launched_rows.push(launched);
+    }
+    // The drafter's confidences keep its wrong proposals out of the target's
+    // launches.
+    assert!(launched_rows[4] < launched_rows[3], "{launched_rows:?}");
 }

@@ -6,7 +6,7 @@
 
 use magnitude_executor::{
     Completion, CompletionWake, DomainError, DomainRequirements, GroupKey, HeadFlight, NativeFamily, Operation,
-    PendingOperationOutcome, ProgramFamily, ReservedResources, StateBindings, SubmitFailure,
+    PendingOperationOutcome, PrimingCompletionFlight, TargetContinuation, ProgramFamily, ReservedResources, StateBindings, SubmitFailure,
     TargetFlight, VisionFlight,
 };
 pub use magnitude_executor::{ExecutorDomain, ResumeState};
@@ -115,6 +115,7 @@ pub enum DomainFlight<F: ProgramFamily = NativeFamily> {
     Target(TargetFlight<F>),
     Head(HeadFlight<F>),
     Vision(VisionFlight<F>),
+    Priming(PrimingCompletionFlight<F>),
 }
 
 impl<F: ProgramFamily> DomainFlight<F> {
@@ -123,6 +124,7 @@ impl<F: ProgramFamily> DomainFlight<F> {
             Self::Target(flight) => flight.completion(),
             Self::Head(flight) => flight.completion(),
             Self::Vision(flight) => flight.completion(),
+            Self::Priming(flight) => flight.completion(),
         }
     }
 }
@@ -132,16 +134,17 @@ pub enum FlightOutcomes {
     Target(Vec<PendingOperationOutcome>),
     Head(Vec<PendingOperationOutcome>),
     Vision(PendingOperationOutcome),
+    Priming(magnitude_executor::RequestId, std::time::Duration),
 }
 
 /// Reserve and submit one group. Submission moves the bindings into the
 /// flight and registers `wake` with its completion; a refusal returns them.
 pub fn submit_group<F: ProgramFamily>(
     domain: &mut ExecutorDomain<F>,
-    bindings: StateBindings<F>,
+    bindings: StateBindings,
     group: &OperationGroup,
     wake: CompletionWake,
-) -> Result<DomainFlight<F>, SubmitFailure<F>> {
+) -> Result<DomainFlight<F>, SubmitFailure> {
     let mut flight = submit(domain, bindings, group)?;
     flight.completion().notify(wake);
     Ok(flight)
@@ -149,9 +152,9 @@ pub fn submit_group<F: ProgramFamily>(
 
 fn submit<F: ProgramFamily>(
     domain: &mut ExecutorDomain<F>,
-    mut bindings: StateBindings<F>,
+    mut bindings: StateBindings,
     group: &OperationGroup,
-) -> Result<DomainFlight<F>, SubmitFailure<F>> {
+) -> Result<DomainFlight<F>, SubmitFailure> {
     let operations = group.operations.as_slice();
     let resources = match domain.reserve(&mut bindings, operations) {
         Ok(reservation) => reservation.into_resources(),
@@ -199,30 +202,36 @@ fn submit<F: ProgramFamily>(
     })
 }
 
-/// Finish a completed flight: its outcomes, and the bindings it held.
+/// Finish a completed flight: its outcomes, and the bindings it held. A
+/// target flight that is the prompt chunk `closing` its request's prompt
+/// publishes its result before its drafter entry finishes.
 pub fn finish<F: ProgramFamily>(
     domain: &mut ExecutorDomain<F>,
     flight: DomainFlight<F>,
-) -> Result<(FlightOutcomes, StateBindings<F>), DomainError> {
+    closing: bool,
+) -> Result<(FlightOutcomes, TargetContinuation<F>), DomainError> {
     match flight {
-        DomainFlight::Target(flight) => domain
-            .finish_target(flight)
-            .map(|(outcomes, bindings)| (FlightOutcomes::Target(outcomes), bindings)),
+        DomainFlight::Target(flight) => {
+            domain.finish_target_for_publication(flight, closing)
+                .map(|(outcomes, continuation)| (FlightOutcomes::Target(outcomes), continuation))
+        }
         DomainFlight::Head(flight) => domain
             .finish_head(flight)
-            .map(|(outcomes, bindings)| (FlightOutcomes::Head(outcomes), bindings)),
+            .map(|(outcomes, bindings)| (FlightOutcomes::Head(outcomes), TargetContinuation::Ready(bindings))),
         DomainFlight::Vision(flight) => domain
             .finish_vision(flight)
-            .map(|(outcome, bindings)| (FlightOutcomes::Vision(outcome), bindings)),
+            .map(|(outcome, bindings)| (FlightOutcomes::Vision(outcome), TargetContinuation::Ready(bindings))),
+        DomainFlight::Priming(flight) => domain
+            .finish_priming(flight)
+            .map(|(request, duration, bindings)| (FlightOutcomes::Priming(request, duration), TargetContinuation::Ready(bindings))),
     }
 }
 
 pub fn requirements<F: ProgramFamily>(
     domain: &ExecutorDomain<F>,
-    bindings: &StateBindings<F>,
     group: &OperationGroup,
 ) -> Result<DomainRequirements, DomainError> {
-    domain.requirements(bindings, &group.operations)
+    domain.requirements(&group.operations)
 }
 
 #[cfg(test)]
@@ -238,6 +247,7 @@ mod tests {
             program_identity: ProgramIdentity::new("target").unwrap(),
             executable: ExecutableKind::Target,
             commitment: CommittedClass::AllCommitted,
+            draft: None,
         };
         let operation = |id| Operation::Forward {
             request: RequestId(id),

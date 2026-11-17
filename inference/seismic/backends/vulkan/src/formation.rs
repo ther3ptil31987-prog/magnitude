@@ -3,14 +3,14 @@
 //! module, the `OpFmaKHR` binding of `fma` on devices with
 //! `VK_KHR_shader_fma` (§16.1) and one compute pipeline per entry with its
 //! workgroup size and group-memory views as specialization constants, a
-//! required subgroup size of 32 where the device takes one, and the device's
-//! pipeline cache ([`DirectModule::new`]).
+//! required subgroup size of 32 where the device takes one, and a pipeline
+//! cache of its own, whose data is the program's artifact ([`DirectModule::compile`]).
 
 use crate::device::Device;
-use crate::facts::{SubgroupWidth, SUBGROUP_WIDTH};
+use crate::facts::SUBGROUP_WIDTH;
 use crate::seal::{self, SEAL_VERSION};
 use ash::vk;
-use seismic_native_target::{NativeCompilationError, ProgramEntry};
+use seismic_native_target::{NativeCompilationError, ProgramEntry, ProgramStatistic, StatisticValue};
 use spirv_tools::opt::Optimizer;
 use spirv_tools::val::Validator;
 
@@ -19,12 +19,35 @@ pub const GLSLANG_RELEASE: &str = "glslang 0.8.1+275822a";
 
 /// Everything besides the source that determines a formed module: the
 /// compiler, target, seal passes and the device facts they and the driver
-/// consume (§7.5).
+/// consume (§7.5), and what every pipeline on the device is created with
+/// ([`created_with`]).
 pub(crate) fn formation(device: &Device) -> String {
     format!(
-        "vulkan;{GLSLANG_RELEASE};spirv 1.6;seal {SEAL_VERSION};{}",
-        device.facts().formation_identity()
+        "{};{};create {}",
+        compiler(),
+        device.facts().formation_identity(device.properties()),
+        created_with(device).as_raw()
     )
+}
+
+/// What every pipeline on `device` is created with besides what its
+/// operation adds: statistics capture, where the device reports statistics.
+/// A driver may key a pipeline's cache data by it, so a load creates its
+/// pipelines with it as their compile did, and it is part of the formation
+/// identity, so no load meets data created without it.
+fn created_with(device: &Device) -> vk::PipelineCreateFlags {
+    if device.inner.executables.is_some() {
+        vk::PipelineCreateFlags::CAPTURE_STATISTICS_KHR
+    } else {
+        vk::PipelineCreateFlags::empty()
+    }
+}
+
+/// The part of every formation identity the compiler determines: glslang,
+/// the SPIR-V target and the seal passes. Offline formation, which forms no
+/// pipeline on a device, is identified by this and the formation facts.
+pub fn compiler() -> String {
+    format!("vulkan;{GLSLANG_RELEASE};spirv 1.6;seal {SEAL_VERSION}")
 }
 
 fn toolchain(error: impl std::fmt::Display) -> NativeCompilationError {
@@ -32,7 +55,9 @@ fn toolchain(error: impl std::fmt::Display) -> NativeCompilationError {
 }
 
 /// Compile the launch `kernel` of `source` to SPIR-V sealed for
-/// `environment`, validated and cleaned.
+/// `environment`, validated and cleaned. A module holding a construct the
+/// emitted contract forbids ([`seal::contract`]) is refused, as glslang
+/// refuses invalid source.
 pub fn compile(
     source: &str,
     kernel: &str,
@@ -56,7 +81,22 @@ pub fn compile(
     let sealed = seal::seal(&compiled, environment)
         .map_err(|error| NativeCompilationError::MalformedToolchainOutput(error.0))?;
     validate(&sealed).map_err(NativeCompilationError::MalformedToolchainOutput)?;
-    clean(&sealed)
+    let cleaned = clean(&sealed)?;
+    let violations = seal::contract(&cleaned)
+        .map_err(|error| NativeCompilationError::MalformedToolchainOutput(error.0))?;
+    if !violations.is_empty() {
+        // Written as glslang writes a diagnostic, so readers that keep a
+        // toolchain failure's error lines keep it.
+        return Err(toolchain(format!(
+            "ERROR: `{kernel}` violates the Vulkan kernel contract: {}",
+            violations
+                .iter()
+                .map(|violation| violation.0.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        )));
+    }
+    Ok(cleaned)
 }
 
 /// The glslang options of every formation.
@@ -146,40 +186,121 @@ fn clean(module: &[u32]) -> Result<Vec<u32>, NativeCompilationError> {
 pub struct DirectModule {
     device: Device,
     pipelines: Vec<vk::Pipeline>,
+    /// Each pipeline's executables' statistics, as the driver names them;
+    /// empty where the device reports none (`Facts::pipeline_statistics`).
+    /// Read once every pipeline is held ([`DirectModule::read_statistics`]).
+    statistics: Vec<Vec<ProgramStatistic>>,
 }
 
 impl DirectModule {
-    /// The pipelines of `entries`, each from its sealed SPIR-V, with its
-    /// constants: the workgroup size (ids 0..3), then the rest (ids 3..). A
-    /// pipeline-creation failure is a toolchain failure.
-    pub(crate) fn new(
+    /// The pipelines of `entries`, each from its sealed SPIR-V with its
+    /// constants (the workgroup size, ids 0..3, then the rest), as the
+    /// driver compiled them, and their pipeline cache data, which
+    /// [`DirectModule::load`] may create them from without compiling. A
+    /// pipeline-creation failure is a toolchain failure. Every pipeline's
+    /// statistics are read from the driver, here and on a load alike, so
+    /// the artifact carries none.
+    pub(crate) fn compile(
         device: &Device,
         entries: &[(&[u32], &ProgramEntry)],
-    ) -> Result<Self, NativeCompilationError> {
+    ) -> Result<(Self, Vec<u8>), NativeCompilationError> {
+        let (mut module, data) = Self::created(device, entries, &[], vk::PipelineCreateFlags::empty())?
+            .expect("a creation that may compile never reports that it would have to");
+        module.read_statistics()?;
+        Ok((module, data))
+    }
+
+    /// The pipelines of `entries` from `pipelines`, the data
+    /// [`DirectModule::compile`] made of them on this device and driver,
+    /// or `None` where the driver does not serve one of them from it
+    /// without compiling (`FAIL_ON_PIPELINE_COMPILE_REQUIRED`): the
+    /// pipeline cache is a hint the driver may decline, so a declined load
+    /// is a miss, never a failure.
+    pub(crate) fn load(
+        device: &Device,
+        entries: &[(&[u32], &ProgramEntry)],
+        pipelines: &[u8],
+    ) -> Result<Option<Self>, NativeCompilationError> {
+        let Some((mut module, _)) = Self::created(
+            device,
+            entries,
+            pipelines,
+            vk::PipelineCreateFlags::FAIL_ON_PIPELINE_COMPILE_REQUIRED,
+        )?
+        else {
+            return Ok(None);
+        };
+        module.read_statistics()?;
+        Ok(Some(module))
+    }
+
+    /// The pipelines of `entries`, created in a cache that starts as
+    /// `kept`, and what the cache then holds; `None` where `flags` forbid
+    /// compiling and a pipeline would need it.
+    fn created(
+        device: &Device,
+        entries: &[(&[u32], &ProgramEntry)],
+        kept: &[u8],
+        flags: vk::PipelineCreateFlags,
+    ) -> Result<Option<(Self, Vec<u8>)>, NativeCompilationError> {
         let mut module = Self {
             device: device.clone(),
             pipelines: Vec::with_capacity(entries.len()),
+            statistics: Vec::new(),
         };
+        let vulkan = &device.inner.device;
+        let cache = unsafe {
+            vulkan.create_pipeline_cache(
+                &vk::PipelineCacheCreateInfo::default().initial_data(kept),
+                None,
+            )
+        }
+        .map_err(|error| toolchain(format!("vkCreatePipelineCache failed: {error}")))?;
+        let created = module.create(cache, entries, flags).and_then(|served| {
+            served
+                .then(|| unsafe { vulkan.get_pipeline_cache_data(cache) })
+                .transpose()
+                .map_err(|error| toolchain(format!("vkGetPipelineCacheData failed: {error}")))
+        });
+        unsafe { vulkan.destroy_pipeline_cache(cache, None) };
+        Ok(created?.map(|data| (module, data)))
+    }
+
+    /// Create every pipeline of `entries` in order; `false`, with the
+    /// pipelines created so far held for the module to destroy, at the
+    /// first that `flags` forbid compiling and that would need it.
+    fn create(
+        &mut self,
+        cache: vk::PipelineCache,
+        entries: &[(&[u32], &ProgramEntry)],
+        flags: vk::PipelineCreateFlags,
+    ) -> Result<bool, NativeCompilationError> {
+        let device = self.device.clone();
         for (words, entry) in entries {
             // The `OpFmaKHR` binding follows validation, which the linked
             // validator does not know.
-            let pipeline = if device.facts().shader_fma.float32 {
+            let pipeline = if device.properties().fma_32.holds() {
                 let bound = seal::fma_khr(words)
                     .map_err(|error| NativeCompilationError::MalformedToolchainOutput(error.0))?;
-                module.pipeline(&bound, entry)?
+                self.pipeline(cache, &bound, entry, flags)?
             } else {
-                module.pipeline(words, entry)?
+                self.pipeline(cache, words, entry, flags)?
             };
-            module.pipelines.push(pipeline);
+            let Some(pipeline) = pipeline else {
+                return Ok(false);
+            };
+            self.pipelines.push(pipeline);
         }
-        Ok(module)
+        Ok(true)
     }
 
     fn pipeline(
         &self,
+        cache: vk::PipelineCache,
         words: &[u32],
         entry: &ProgramEntry,
-    ) -> Result<vk::Pipeline, NativeCompilationError> {
+        flags: vk::PipelineCreateFlags,
+    ) -> Result<Option<vk::Pipeline>, NativeCompilationError> {
         let threads = entry.group_size.ok_or_else(|| {
             NativeCompilationError::MalformedToolchainOutput(format!(
                 "`{}` carries no workgroup size",
@@ -212,43 +333,119 @@ impl DirectModule {
         let specialization = vk::SpecializationInfo::default()
             .map_entries(&entries)
             .data(&data);
-        let width = self.device.facts().subgroup_width();
         let mut subgroup = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default()
             .required_subgroup_size(SUBGROUP_WIDTH);
         // Full subgroups are required whenever the X extent allows it (a
         // multiple of the hardware subgroup); smaller groups run one partial
         // subgroup, as a partial CUDA warp does.
-        let flags = if threads[0] % width.lanes() == 0 {
+        let lanes = self.device.properties().subgroup_width.get();
+        let subgroups = if u64::from(threads[0]) % lanes == 0 {
             vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS
         } else {
             vk::PipelineShaderStageCreateFlags::empty()
         };
         let stage = vk::PipelineShaderStageCreateInfo::default()
-            .flags(flags)
+            .flags(subgroups)
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(shader)
             .name(c"main")
             .specialization_info(&specialization);
-        let stage = if width == SubgroupWidth::Required32 {
+        let stage = if self.device.facts().requires_subgroup_size() {
             stage.push_next(&mut subgroup)
         } else {
             stage
         };
         let info = vk::ComputePipelineCreateInfo::default()
+            .flags(flags | created_with(&self.device))
             .stage(stage)
             .layout(inner.layout);
-        let created = unsafe { device.create_compute_pipelines(inner.cache, &[info], None) };
+        let created = {
+            let _creating = crate::device::creating_pipelines();
+            unsafe { device.create_compute_pipelines(cache, &[info], None) }
+        };
         unsafe { device.destroy_shader_module(shader, None) };
-        created.map(|pipelines| pipelines[0]).map_err(|(_, error)| {
-            toolchain(format!(
+        // `PIPELINE_COMPILE_REQUIRED` is a success code: the pipeline
+        // returned with it is null, and nothing was compiled.
+        match created {
+            Ok(pipelines) if pipelines[0] != vk::Pipeline::null() => Ok(Some(pipelines[0])),
+            Ok(_) | Err((_, vk::Result::PIPELINE_COMPILE_REQUIRED)) => Ok(None),
+            Err((_, error)) => Err(toolchain(format!(
                 "vkCreateComputePipelines of `{}` failed: {error}",
                 entry.symbol
-            ))
-        })
+            ))),
+        }
     }
 
     pub(crate) fn pipeline_handle(&self, launch: usize) -> vk::Pipeline {
         self.pipelines[launch]
+    }
+
+    /// The statistics of launch `launch`'s pipeline, as the driver reports
+    /// them.
+    pub fn statistics(&self, launch: usize) -> &[ProgramStatistic] {
+        &self.statistics[launch]
+    }
+
+    /// Read every pipeline's statistics. The module holds its pipelines
+    /// first, so a failure to read them destroys them with it.
+    fn read_statistics(&mut self) -> Result<(), NativeCompilationError> {
+        self.statistics = self
+            .pipelines
+            .iter()
+            .map(|pipeline| self.statistics_of(*pipeline))
+            .collect::<Result<_, _>>()?;
+        Ok(())
+    }
+
+    /// Every statistic of every executable of `pipeline`, named and
+    /// described as the driver reports it (an executable's name prefixes
+    /// the statistic's where the pipeline has more than one); none where
+    /// the device reports no statistics.
+    ///
+    /// The NVIDIA proprietary driver (595, RTX 3090) reports "Register
+    /// Count", "Binary Size", "Stack Size", "Local Memory Size" and "Shared
+    /// Memory Size". Two of them are not values: "Local Memory Size" reads
+    /// 2^36 for every pipeline (a sentinel) and "Stack Size" reads 0 for
+    /// every pipeline. Its spill signal is "Register Count" at the 255
+    /// ceiling: the projection GEMM's 64x64 sub-tiles reach it, with binaries
+    /// 2-3x larger, and run 6-7x slower than the best tile.
+    fn statistics_of(&self, pipeline: vk::Pipeline) -> Result<Vec<ProgramStatistic>, NativeCompilationError> {
+        let Some(executables) = &self.device.inner.executables else {
+            return Ok(Vec::new());
+        };
+        let failed = |error| toolchain(format!("pipeline executable statistics: {error}"));
+        let text = |raw: Result<&std::ffi::CStr, _>| {
+            raw.expect("the driver null-terminates a pipeline executable's text").to_string_lossy().into_owned()
+        };
+        let properties = unsafe {
+            executables.get_pipeline_executable_properties(&vk::PipelineInfoKHR::default().pipeline(pipeline))
+        }
+        .map_err(failed)?;
+        let several = properties.len() > 1;
+        let mut statistics = Vec::new();
+        for (index, executable) in properties.iter().enumerate() {
+            let prefix = if several { format!("{}: ", text(executable.name_as_c_str())) } else { String::new() };
+            let index = u32::try_from(index).expect("a pipeline's executables are counted in u32");
+            let info = vk::PipelineExecutableInfoKHR::default().pipeline(pipeline).executable_index(index);
+            for statistic in unsafe { executables.get_pipeline_executable_statistics(&info) }.map_err(failed)? {
+                // SAFETY: `format` names the union's member the driver wrote.
+                let value = unsafe {
+                    match statistic.format {
+                        vk::PipelineExecutableStatisticFormatKHR::BOOL32 => StatisticValue::Bool(statistic.value.b32 == vk::TRUE),
+                        vk::PipelineExecutableStatisticFormatKHR::INT64 => StatisticValue::Int(statistic.value.i64),
+                        vk::PipelineExecutableStatisticFormatKHR::UINT64 => StatisticValue::Uint(statistic.value.u64),
+                        vk::PipelineExecutableStatisticFormatKHR::FLOAT64 => StatisticValue::Float(statistic.value.f64),
+                        other => panic!("the driver reported pipeline statistic format {other:?}, which the extension does not define"),
+                    }
+                };
+                statistics.push(ProgramStatistic {
+                    name: format!("{prefix}{}", text(statistic.name_as_c_str())),
+                    description: text(statistic.description_as_c_str()),
+                    value,
+                });
+            }
+        }
+        Ok(statistics)
     }
 }
 
@@ -259,5 +456,83 @@ impl Drop for DirectModule {
         for pipeline in &self.pipelines {
             unsafe { self.device.inner.device.destroy_pipeline(*pipeline, None) };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `body` as the launch `probe` of a module with one u64 buffer.
+    fn form(globals: &str, body: &str) -> Result<Vec<u32>, NativeCompilationError> {
+        let source = format!(
+            "#version 460\n\
+             #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require\n\
+             layout(local_size_x = 32) in;\n\
+             layout(set = 0, binding = 0, std430) buffer Output {{ uint64_t x[]; }} data;\n\
+             {globals}\n\
+             void probe() {{ {body} }}\n\
+             void main() {{ SEISMIC_KERNEL(); }}\n"
+        );
+        let environment = seal::Environment {
+            float16: false,
+            rounding_rte_32: true,
+            denorm_preserve_32: false,
+        };
+        compile(&source, "probe", environment)
+    }
+
+    fn refused(globals: &str, body: &str, construct: &str) {
+        match form(globals, body) {
+            Err(NativeCompilationError::ToolchainFailure(message)) => assert!(
+                message.starts_with("ERROR: `probe` violates") && message.contains(construct),
+                "{body}: {message}"
+            ),
+            other => panic!("{body}: expected a contract violation, got {other:?}"),
+        }
+    }
+
+    fn formed(globals: &str, body: &str) {
+        if let Err(error) = form(globals, body) {
+            panic!("{body}: {error}");
+        }
+    }
+
+    const OUT: &str = "data.x[gl_GlobalInvocationID.x]";
+
+    #[test]
+    fn a_64_bit_division_is_refused_wherever_it_runs() {
+        refused(
+            "",
+            &format!("{OUT} = data.x[0] / data.x[1];"),
+            "64-bit OpUDiv",
+        );
+        // A literal divisor still divides at run time.
+        refused(
+            "",
+            &format!("{OUT} = data.x[0] / uint64_t(3);"),
+            "64-bit OpUDiv",
+        );
+        refused(
+            "",
+            &format!("{OUT} = uint64_t(int64_t(data.x[0]) % int64_t(data.x[1]));"),
+            "64-bit OpSMod",
+        );
+        refused(
+            "",
+            &format!(
+                "u64vec2 a = u64vec2(data.x[0], data.x[1]), b = u64vec2(data.x[2], data.x[3]); {OUT} = (a / b).x;"
+            ),
+            "64-bit OpUDiv",
+        );
+    }
+
+    #[test]
+    fn folded_and_32_bit_division_form() {
+        formed("", &format!("{OUT} = uint64_t(123) / uint64_t(3);"));
+        formed(
+            "",
+            &format!("{OUT} = uint64_t(uint(data.x[0]) / uint(data.x[1]) + uint(data.x[2]) % 7u);"),
+        );
     }
 }

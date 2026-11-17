@@ -124,7 +124,7 @@ fn directory_is_bounded_portable_and_preserves_metadata() {
             source: Cursor::new(container(big, &[entry()], &[])),
             read: 0,
         };
-        let directory = gguf::read_directory(&mut source, gguf::DEFAULT_HEADER_LIMIT).unwrap();
+        let directory = gguf::read_directory(&mut source).unwrap();
         assert_eq!(
             directory.byte_order,
             if big {
@@ -134,18 +134,18 @@ fn directory_is_bounded_portable_and_preserves_metadata() {
             }
         );
         assert_eq!(directory.tensor("weight").unwrap().shape, [2, 256]);
-        assert!((source.read as u64) <= directory.data_offset);
+        // The header's read-ahead (the walk's estimate of its rest) stops short of the end of
+        // the tensor storage.
+        let tensor = directory.tensor("weight").unwrap();
+        assert!((source.read as u64) < directory.data_offset + tensor.nbytes);
         assert_eq!(directory.require_execution_byte_order().is_err(), big);
     }
 
-    let directory = gguf::read_directory(
-        &mut Cursor::new(container(
-            false,
-            &[entry()],
-            &[("general.name", 8, string_value("fixture"))],
-        )),
-        gguf::DEFAULT_HEADER_LIMIT,
-    )
+    let directory = gguf::read_directory(&mut Cursor::new(container(
+        false,
+        &[entry()],
+        &[("general.name", 8, string_value("fixture"))],
+    )))
     .unwrap();
     assert_eq!(
         directory.value("general.name"),
@@ -158,8 +158,7 @@ fn header_inspection_accepts_declared_weights_without_payload() {
     let root = temporary_directory("header-only");
     let path = root.join("header.gguf");
     let full = container(false, &[entry()], &[]);
-    let directory =
-        gguf::read_directory(&mut Cursor::new(&full), gguf::DEFAULT_HEADER_LIMIT).unwrap();
+    let directory = gguf::read_directory(&mut Cursor::new(&full)).unwrap();
     std::fs::write(&path, &full[..directory.data_offset as usize]).unwrap();
     let inspected = gguf::inspect_header(&path).unwrap();
     assert_eq!(inspected.tensors, directory.tensors);
@@ -288,25 +287,6 @@ fn hardlinked_components_are_rejected() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
-#[cfg(unix)]
-#[test]
-fn mapped_window_keeps_open_source_after_path_replacement() {
-    let root = temporary_directory("mapped-window");
-    let path = root.join("source.bin");
-    let original = (0..8193).map(|n| (n % 251) as u8).collect::<Vec<_>>();
-    std::fs::write(&path, &original).unwrap();
-    let source = std::sync::Arc::new(magnitude_artifacts::FileSource::open(&path).unwrap());
-    let window = source.map_window(17, 4097).unwrap();
-    assert_eq!(window.data(), &original[17..4114]);
-    assert_eq!(window.as_ref().as_ref().as_ptr() as usize % 4096, 0);
-    assert!(window.mapped_len() >= window.data_offset() + window.data_len());
-    std::fs::write(root.join("replacement.bin"), b"replacement").unwrap();
-    std::fs::rename(root.join("replacement.bin"), &path).unwrap();
-    drop(source);
-    assert_eq!(window.data(), &original[17..4114]);
-    std::fs::remove_dir_all(root).unwrap();
-}
-
 #[test]
 fn open_source_pins_tensor_bytes_and_projector_discovery_is_unambiguous() {
     let root = temporary_directory("ownership");
@@ -339,8 +319,7 @@ fn bf16_is_a_dense_two_byte_container_encoding() {
         &[("weight", vec![4, 2], Encoding::BF16 as u32, 0)],
         &[],
     );
-    let directory =
-        gguf::read_directory(&mut Cursor::new(bytes), gguf::DEFAULT_HEADER_LIMIT).unwrap();
+    let directory = gguf::read_directory(&mut Cursor::new(bytes)).unwrap();
     let tensor = directory.tensor("weight").unwrap();
     assert_eq!(tensor.encoding, Encoding::BF16);
     assert_eq!(tensor.nbytes, 16);
@@ -349,7 +328,7 @@ fn bf16_is_a_dense_two_byte_container_encoding() {
 #[test]
 fn audited_encoding_ids_and_block_geometry_match_pinned_ggml() {
     // Pinned source of truth: ggml/llama.cpp
-    // 5e6c0e18b6b11f109411401239b3b0ef61058dae, specifically
+    // cd959bae99ff4bed22bef2604f45241c09bbb8c8 (v0.9.0), specifically
     // `ggml/include/ggml.h` and `ggml/src/ggml-common.h`.
     let cases = [
         (Encoding::F32, 0, 1, 4),
@@ -386,6 +365,8 @@ fn audited_encoding_ids_and_block_geometry_match_pinned_ggml() {
         (Encoding::Mxfp4, 39, 32, 17),
         (Encoding::Nvfp4, 40, 64, 36),
         (Encoding::Q1_0, 41, 128, 18),
+        (Encoding::Q2_0, 42, 64, 18),
+        (Encoding::F8E4M3, 43, 1, 1),
     ];
     assert_eq!(
         cases.map(|(encoding, ..)| encoding),
@@ -403,25 +384,57 @@ fn audited_encoding_ids_and_block_geometry_match_pinned_ggml() {
             &[("weight", vec![block_elements, 2], type_id, 0)],
             &[],
         );
-        let directory =
-            gguf::read_directory(&mut Cursor::new(bytes), gguf::DEFAULT_HEADER_LIMIT).unwrap();
+        let directory = gguf::read_directory(&mut Cursor::new(bytes)).unwrap();
         let tensor = directory.tensor("weight").unwrap();
         assert_eq!(tensor.encoding, encoding);
         assert_eq!(tensor.nbytes, block_bytes * 2);
     }
 }
 
+/// A removed or unknown type id is a weight type this parser doesn't know, never a damaged header:
+/// it is named with its tensor count, and the rest of the directory is still read.
 #[test]
-fn removed_or_unknown_encoding_ids_are_invalid() {
-    for type_id in [4, 5, 31, 32, 33, 36, 37, 38, 42, u32::MAX] {
-        let error = gguf::read_directory(
-            &mut Cursor::new(container(false, &[("weight", vec![32], type_id, 0)], &[])),
-            gguf::DEFAULT_HEADER_LIMIT,
-        )
+fn removed_or_unknown_encoding_ids_are_reported_with_the_rest_of_the_directory() {
+    for type_id in [4, 5, 31, 32, 33, 36, 37, 38, 44, 200, u32::MAX] {
+        let error = gguf::read_directory(&mut Cursor::new(container(
+            false,
+            &[("weight", vec![32], type_id, 0), ("norm", vec![32], 0, 32)],
+            &[],
+        )))
         .unwrap_err();
-        assert!(
-            matches!(error, Error::Invalid(message) if message == format!("unknown GGUF tensor type {type_id}"))
-        );
+        let Error::UnknownTensorTypes { types, directory } = &error else {
+            panic!("{type_id}: {error:?}");
+        };
+        assert_eq!(types, &[(type_id, 1)]);
+        assert!(directory.tensor("norm").is_some() && directory.tensor("weight").is_none());
+        assert!(!error.unreadable());
+    }
+}
+
+#[test]
+fn a_header_cut_short_is_truncated_and_one_past_the_limit_is_invalid() {
+    let bytes = container(false, &[("weight", vec![32], 0, 0)], &[]);
+    for end in [6, 20, 50] {
+        let error = gguf::read_directory(&mut Cursor::new(bytes[..end].to_vec())).unwrap_err();
+        assert!(matches!(error, Error::Truncated { .. }), "{end}: {error}");
+        assert!(error.unreadable());
+    }
+    // A name whose declared length ends the header exactly at the limit is only cut short; one
+    // byte longer, no header can hold it.
+    let mut bytes = container(
+        false,
+        &[("weight", vec![32], 0, 0)],
+        &[("general.name", 8, string_value(""))],
+    );
+    let Ok(gguf::Walk::Complete(header)) = gguf::walk(&bytes) else {
+        panic!("a whole header");
+    };
+    let text = header.entries[0].head().end;
+    for (length, beyond) in [(gguf::HEADER_LIMIT - text, false), (gguf::HEADER_LIMIT - text + 1, true)] {
+        bytes[text - 8..text].copy_from_slice(&(length as u64).to_le_bytes());
+        let error = gguf::read_directory(&mut Cursor::new(bytes.clone())).unwrap_err();
+        assert_eq!(matches!(error, Error::Invalid(_)), beyond, "{error}");
+        assert_eq!(matches!(error, Error::Truncated { .. }), !beyond, "{error}");
     }
 }
 
@@ -446,8 +459,7 @@ fn shard(
     ];
     all.extend(metadata.iter().cloned());
     let mut bytes = container(false, entries, &all);
-    let directory =
-        gguf::read_directory(&mut Cursor::new(&bytes), gguf::DEFAULT_HEADER_LIMIT).unwrap();
+    let directory = gguf::read_directory(&mut Cursor::new(&bytes)).unwrap();
     for tensor in &directory.tensors {
         let start = (directory.data_offset + tensor.offset) as usize;
         bytes[start..start + tensor.nbytes as usize].fill(fill);
@@ -490,9 +502,7 @@ fn write_split(root: &std::path::Path, header_only: bool) -> Vec<PathBuf> {
         .map(|(index, bytes)| {
             let path = root.join(format!("model-{:05}-of-00003.gguf", index + 1));
             let bytes = if header_only {
-                let directory =
-                    gguf::read_directory(&mut Cursor::new(bytes), gguf::DEFAULT_HEADER_LIMIT)
-                        .unwrap();
+                let directory = gguf::read_directory(&mut Cursor::new(bytes)).unwrap();
                 &bytes[..directory.data_offset as usize]
             } else {
                 &bytes[..]
@@ -533,7 +543,7 @@ fn split_gguf_opens_as_one_component() {
     let package = Package::open_without_projector(&paths[0]).unwrap();
     let manifest = package.manifest();
     assert_eq!(manifest.target.files.len(), 3);
-    assert_eq!(manifest.target.path(), paths[0].canonicalize().unwrap());
+    assert_eq!(manifest.target.path(), std::path::absolute(&paths[0]).unwrap());
     let reopened = Package::open_manifest(&manifest).unwrap();
     assert_eq!(reopened.identity(), package.identity());
     assert_eq!(reopened.manifest(), manifest);
@@ -548,6 +558,37 @@ fn split_gguf_opens_as_one_component() {
         gguf::GgufArtifact::open(&paths[0]),
         Err(Error::Io(_))
     ));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A content-addressed store keeps each shard as a blob and names it by a
+/// link. The package opens through the links and reopens from its manifest,
+/// which keeps the links' split names.
+#[cfg(unix)]
+#[test]
+fn split_gguf_opens_through_linked_blobs() {
+    let root = temporary_directory("split-linked");
+    let blobs = root.join("blobs");
+    let snapshot = root.join("snapshot");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::create_dir_all(&snapshot).unwrap();
+    let links: Vec<PathBuf> = write_split(&root, false)
+        .into_iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let blob = blobs.join(format!("sha256-{index}"));
+            std::fs::rename(&path, &blob).unwrap();
+            let link = snapshot.join(path.file_name().unwrap());
+            std::os::unix::fs::symlink(&blob, &link).unwrap();
+            link
+        })
+        .collect();
+    let package = Package::open_without_projector(&links[0]).unwrap();
+    let manifest = package.manifest();
+    assert_eq!(manifest.target.files.len(), 3);
+    assert_eq!(manifest.target.path(), std::path::absolute(&links[0]).unwrap());
+    let reopened = Package::open_manifest(&manifest).unwrap();
+    assert_eq!(reopened.identity(), package.identity());
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -583,4 +624,76 @@ fn split_gguf_requires_the_split_naming_and_consistent_shards() {
         Err(Error::Invalid(message)) if message.contains("does not declare itself shard 3")
     ));
     std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A header encodes back to the bytes it was read from, every metadata value in its own stored
+/// type, and an edited copy keeps those types.
+#[test]
+fn a_stored_header_encodes_back_to_its_bytes() {
+    let array = |element: u32, count: u64, values: &[u8]| {
+        let mut bytes = element.to_le_bytes().to_vec();
+        bytes.extend(count.to_le_bytes());
+        bytes.extend_from_slice(values);
+        bytes
+    };
+    let metadata = [
+        ("u8", 0, vec![7]),
+        ("i8", 1, vec![0xff]),
+        ("u16", 2, u16_value(513)),
+        ("i16", 3, (-2i16).to_le_bytes().to_vec()),
+        ("u32", 4, 70_000u32.to_le_bytes().to_vec()),
+        ("i32", 5, (-3i32).to_le_bytes().to_vec()),
+        ("f32", 6, 0.1f32.to_le_bytes().to_vec()),
+        ("bool", 7, vec![1]),
+        ("string", 8, string_value("text")),
+        ("u64", 10, u64::MAX.to_le_bytes().to_vec()),
+        ("i64", 11, i64::MIN.to_le_bytes().to_vec()),
+        ("f64", 12, 0.1f64.to_le_bytes().to_vec()),
+        ("u16s", 9, array(2, 2, &[1, 0, 2, 0])),
+        ("f32s", 9, array(6, 1, &1.5f32.to_le_bytes())),
+        (
+            "strings",
+            9,
+            array(8, 2, &[string_value("a"), string_value("")].concat()),
+        ),
+        ("empty", 9, array(8, 0, &[])),
+    ];
+    let bytes = container(
+        false,
+        &[entry(), ("norm", vec![32], Encoding::F32 as u32, 1024)],
+        &metadata,
+    );
+    let header = gguf::StoredHeader::read(&mut Cursor::new(bytes.clone())).unwrap();
+    let encoded = header.encode().unwrap();
+    let directory = gguf::read_header(encoded.clone()).unwrap();
+    assert_eq!(encoded, bytes[..directory.data_offset as usize]);
+    assert_eq!(
+        header.metadata[2].stored,
+        gguf::StoredType::Scalar(gguf::ValueType::U16)
+    );
+
+    let mut edited = header.metadata.clone();
+    edited[2].metadata.value = Value::Scalar(Scalar::Unsigned(9));
+    let laid_out = gguf::StoredHeader::new(
+        3,
+        edited.clone(),
+        header
+            .tensors
+            .iter()
+            .map(|tensor| (tensor.name.clone(), tensor.shape.clone(), tensor.encoding)),
+    )
+    .unwrap();
+    assert_eq!(
+        laid_out
+            .tensors
+            .iter()
+            .map(|tensor| tensor.offset)
+            .collect::<Vec<_>>(),
+        [0, 288]
+    );
+    let reread = gguf::StoredHeader::read(&mut Cursor::new(laid_out.encode().unwrap())).unwrap();
+    assert_eq!(reread.metadata, edited);
+    assert_eq!(reread.tensors, laid_out.tensors);
+    edited[2].metadata.value = Value::Scalar(Scalar::Unsigned(70_000));
+    assert!(gguf::StoredHeader::new(3, edited, []).unwrap().encode().is_err());
 }

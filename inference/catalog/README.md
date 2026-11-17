@@ -1,13 +1,35 @@
 # Release model catalog
 
-`models.json` owns the catalog. `models.lock.json` maps each catalog ID to the immutable Hugging
-Face commit for its target package and, when separately packaged speculative decoding is declared,
-the immutable commit for its draft package.
+`models.json` owns the catalog. A model lists its `sources`: each is one repository's
+publication of it, with the variants it hosts, the projector they share and the license it grants,
+so a model's variants can come from different publishers. A separately packaged speculative draft
+names its own repository. `models.lock.json` maps every repository the catalog resolves from to its
+immutable Hugging Face commit.
+
+`labs` is the table of developers: each lab's `id`, display `name`, ISO 3166-1 alpha-2 `country`
+and the `huggingFaceOrganizations` it publishes under. Every model names its `lab`. The service
+gives every catalog model its lab's developer, and attributes any other model by the organization
+of its Hugging Face repository, else of a base model its GGUF declares, else through the catalog
+model whose shape it has.
+
+`families` lists the model families Magnitude runs: each family's display `name`, its `lab`, the
+GGUF `architectures` its models declare and its `status` (`supported` or `comingSoon`). Every
+target architecture the engine's family registry admits belongs to exactly one family; drafter-only
+architectures belong to none. Clients show the table as what runs in Magnitude, and a model of a
+family that is coming soon is recommended with no chosen quant.
+
+A variant's `format` is its quant name in its repository (for example `UD-Q4_K_XL`), which clients
+show with the repository as the quant's identity and read its bit width from. A model's variants
+are its tested ladder, which recommendations choose a rung from.
 
 Input modality is inspected from the exact target package. Image-capable targets receive a
 projector during generation: a sole repository `mmproj` is selected automatically, while
-repositories with multiple candidates require an exact `projector.path` declaration. The
-projector is locked as a related component of the target package.
+repositories with multiple candidates require an exact `projector.path` declaration on the source.
+The projector is locked as a related component of the target package.
+
+Each variant's primary GGUF is the one file (or first shard) whose path contains its `format`.
+When other repository files also contain that format, such as MTP heads, the variant declares its
+exact `path` instead.
 
 A catalog entry declares no context length. Its serving profile is the target's supported maximum
 context from its GGUF metadata, which is the context the engine resolves, serves and assesses.
@@ -15,12 +37,38 @@ context from its GGUF metadata, which is the context the engine resolves, serves
 ```sh
 cargo run --release -p magnitude-service-catalog-tool -- update-lock ...   # advance the commit map
 cargo run --release -p magnitude-service-catalog-tool -- build-bundle ...  # build the header bundle
+cargo run --release -p magnitude-service-catalog-tool -- headers --output DIR --model-store DIR  # headers for tests
+cargo run --release -p magnitude-service-catalog-tool -- acquire --model qwen3.5-4b:gguf:q4 --model-store DIR
+cargo run --release -p magnitude-service-catalog-tool -- audit --headers DIR --output FILE --model-store DIR  # tensor-type audit
+cargo run --release -p magnitude-service-catalog-tool -- header local PATH  # metadata and tensors
+cargo run --release -p magnitude-service-catalog-tool -- slice --output FILE hub --repository REPO --revision REV --path PATH --model-store DIR
 ```
+
+`fixture-header` and `weight-sample` write the assessment fixtures (see
+`engine/fixtures/assessment/README.md`); `slice` writes a truncated real-weight GGUF of a model too
+large to run whole, with a provenance record beside it. `header`, `weight-sample` and `slice` read
+a `local PATH` or a `hub --repository REPO --revision REV --path PATH --model-store DIR` file; a
+Hub file is read by range requests only, through the model store's Hub client.
+
+`acquire` resolves one catalog model at its locked revisions, downloads into a managed model store
+only the target, drafter and projector files that are missing, verifies them through the service's
+own download path, and prints their absolute paths and SHA-256 digests as JSON (the evaluation
+model-reference contract). Evaluation tools obtain models only through it.
 
 Generation resolves the pinned repositories and writes `model-planner-inputs.bundle`: the exact GGUF
 header (every byte through the aligned tensor-data offset) of every package component, which is
 what the engine's header-only planning and chat-template inspection read before a model is
 downloaded. Repeated references to the same immutable package share one package identity and one
-set of bundled headers. The bundle is derived release output and is not committed. It is the only
+set of bundled headers. Each target also carries its weight sample (a few hundred bytes of its early
+normalization weights, read by range requests), stored as an input of its own that the variants
+of one model share. The bundle is derived release output and is not committed. It is the only
 catalog-related file shipped alongside the service; catalog definitions and pins are compiled into
 the executable.
+
+`headers` builds that bundle under `--output` (only when it is not current for this lock) and
+writes each component's exact header, extended sparsely to its file's size, to `--output/headers/`
+at `<repository>/<revision>/<path>`, with an index naming the lock. Family and assessment tests read
+that export through `MAGNITUDE_CATALOG_HEADERS` and refuse an export of another lock; every
+cargo suite `mrig test` runs has the export of its tree's catalog and the variable set. A header
+a test needs outside the lock is a pinned artifact (`magnitude_artifacts::catalog_headers::artifacts`:
+its repository, revision and path), exported beside the catalog's the same way.

@@ -1,0 +1,189 @@
+import { CommandExecutor, FileSystem, HttpClient, Path } from "@effect/platform"
+import { Context, Effect, Layer, Option, PubSub, Schedule, Stream } from "effect"
+import { homedir } from "node:os"
+import { dirname, join, posix, win32 } from "node:path"
+import {
+  canonicalLocalModelId,
+  HarnessConnectionFailed,
+  localModelProviderModelId,
+  localModelServingProfile,
+  type HarnessConnectOutcome,
+  type HarnessConnectRequest,
+  type HarnessConnectionsSnapshot,
+  type HarnessId,
+  type HarnessSetup,
+  type HarnessSetupRequest,
+  type LocalModelsState,
+} from "@magnitudedev/acn-protocol"
+import type { ProviderModelId } from "@magnitudedev/providers/client"
+import {
+  harnessCommandExecutor,
+  harnessExecutableSearchPath,
+  makeHarnessConnectionService,
+  resolveHarnessConnectionPaths,
+  resolveHarnessEnvironment,
+  HarnessConnectionError,
+} from "@magnitudedev/harness-connections"
+import { BunSqliteDriverLayer } from "@magnitudedev/storage/sqlite/bun"
+import { guardedCommandLayer } from "@magnitudedev/utils/guarded-command"
+import { AcnHost } from "./server-settings"
+import { LocalModels } from "./local-models"
+
+export interface AcnHarnessConnectionsApi {
+  /** Inspects on subscribe, after any connect or disconnect from any client, and every two seconds while observed. */
+  readonly watch: Stream.Stream<HarnessConnectionsSnapshot>
+  readonly connect: (request: HarnessConnectRequest) => Effect.Effect<HarnessConnectOutcome, HarnessConnectionFailed>
+  readonly sync: (harness: Option.Option<HarnessId>) => Effect.Effect<void, HarnessConnectionFailed>
+  readonly disconnect: (harness: HarnessId) => Effect.Effect<void, HarnessConnectionFailed>
+  /** Another device sends the key this service enforces; this computer needs none. */
+  readonly describe: (request: HarnessSetupRequest) => Effect.Effect<HarnessSetup, HarnessConnectionFailed>
+}
+export class AcnHarnessConnections extends Context.Tag("AcnHarnessConnections")<AcnHarnessConnections, AcnHarnessConnectionsApi>() {}
+
+const failed = (error: HarnessConnectionError) => new HarnessConnectionFailed({
+  operation: error.operation,
+  harness: Option.fromNullable(error.harness),
+  message: error.message,
+})
+
+/** The installed layout keeps the protected command helper beside the native host. */
+const commandHelperPath = () => join(dirname(process.env.MAGNITUDE_NATIVE_HOST ?? join(dirname(process.execPath), "desktop-host.node")), "magnitude-command")
+
+const aliasKey = ({ models }: LocalModelsState): string => models
+  .flatMap((model) => model._tag === "Catalog" ? model.catalogData.aliases.map((alias) => `${alias}\0${model.modelId}`) : [])
+  .sort()
+  .join("\n")
+
+/**
+ * What syncing stale connections depends on: the catalog's aliases, and the models a harness can be
+ * synced to, which are the models the service offers for inference (installed and assessed to fit),
+ * each with the context it is served at. Empty while either is empty, so nothing runs: just after an
+ * upgrade the aliases and the installed models are known before the new engine has assessed any
+ * model, and the service offers none until it has.
+ */
+const staleKey = (state: LocalModelsState): string => {
+  const aliases = aliasKey(state)
+  const offered = state.models.flatMap((model) => Option.toArray(localModelProviderModelId(model)).map((id) =>
+    `${id}\0${Option.match(localModelServingProfile(model), { onNone: () => "", onSome: ({ contextLength }) => contextLength })}`))
+    .sort()
+  if (aliases.length === 0 || offered.length === 0) return ""
+  return `${aliases}\n\n${offered.join("\n")}`
+}
+
+/**
+ * Whether this service's profile is not the person's own `~/.magnitude` (a development or test profile),
+ * so harness configuration goes to a separate home. Windows paths compare without regard to case.
+ */
+export const isolatedHarnessHome = (dataDir: string, home: string, platform: NodeJS.Platform): boolean => {
+  const pathApi = platform === "win32" ? win32 : posix
+  const normalized = (path: string) => platform === "win32" ? pathApi.resolve(path).toLowerCase() : pathApi.resolve(path)
+  return normalized(dataDir) !== normalized(pathApi.join(home, ".magnitude"))
+}
+
+/**
+ * Syncs every stale connected harness, through the same reconciliation `connections sync` uses: one
+ * whose selection names an alias moves to the catalog ID, and one written with a context window a model
+ * is no longer served at gets the context it is served at. It runs once the aliases and the offered
+ * models are both known, and again whenever either changes or a model's served context does, in
+ * whichever order they arrive. It changes nothing for harnesses already current. `states` is the current
+ * state followed by every change, so none is missed at start.
+ */
+export const syncStaleHarnessConnections = <E>(
+  states: Stream.Stream<LocalModelsState>,
+  syncStaleConnections: Effect.Effect<ReadonlyArray<HarnessId>, E>,
+): Effect.Effect<void, E> =>
+  states.pipe(
+    Stream.map(staleKey),
+    Stream.changes,
+    Stream.filter((key) => key.length > 0),
+    Stream.runForEach(() => syncStaleConnections),
+  )
+
+export const AcnHarnessConnectionsLive = Layer.scoped(AcnHarnessConnections, Effect.gen(function* () {
+  const host = yield* AcnHost
+  const localModels = yield* LocalModels
+  // A harness selection naming a catalog model's alias (from before an upgrade) moves to the catalog ID.
+  const canonicalModel = (modelId: ProviderModelId) => localModels.state.pipe(
+    Effect.map(({ models, hidden }) => canonicalLocalModelId([...models, ...hidden], modelId)),
+  )
+  const context = yield* Effect.context<FileSystem.FileSystem | Path.Path | CommandExecutor.CommandExecutor | HttpClient.HttpClient>()
+  const changes = yield* PubSub.unbounded<void>()
+  // Harnesses are found through the user's login-shell environment, which a service started by
+  // the desktop or a service manager does not inherit.
+  const environment = yield* resolveHarnessEnvironment().pipe(
+    Effect.provide(guardedCommandLayer(commandHelperPath())),
+    Effect.orElseSucceed(() => Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined))),
+    Effect.cached,
+  )
+  const isolated = isolatedHarnessHome(host.dataDir, homedir(), process.platform)
+  const service = yield* Effect.cached(Effect.gen(function* () {
+    const values = yield* environment
+    const executor = yield* harnessCommandExecutor(values)
+    return yield* makeHarnessConnectionService({
+      canonicalModel,
+      paths: yield* resolveHarnessConnectionPaths(isolated ? join(host.dataDir, "harness-home") : undefined, values),
+      serviceEndpoint: `http://127.0.0.1:${host.port}`,
+      detect: connector => connector.detect(harnessExecutableSearchPath(values.PATH)),
+    }).pipe(Effect.provideService(CommandExecutor.CommandExecutor, executor))
+  }).pipe(Effect.provide(Layer.mergeAll(Layer.succeedContext(context), BunSqliteDriverLayer))))
+  const changed = PubSub.publish(changes, undefined).pipe(Effect.asVoid)
+  // Running as the Linux server's service account, configuration written here would land in its
+  // home, where no one's harnesses read it. People connect harnesses from their own terminal.
+  const serverService = process.env.MAGNITUDE_SERVER_SERVICE === "1"
+  const refuseOnServer = (operation: "connect" | "sync" | "disconnect", harness: Option.Option<HarnessId>) => serverService
+    ? Effect.fail(new HarnessConnectionError({ operation, harness: Option.getOrUndefined(harness), message:
+      "This Magnitude runs as a server. Connect a harness on this machine from your own terminal with `magnitude connections connect <harness>`, or copy its setup to another computer." }))
+    : Effect.void
+
+  if (!serverService) {
+    yield* syncStaleHarnessConnections(localModels.states, service.pipe(
+      Effect.flatMap((connections) => connections.syncStaleConnections),
+      Effect.tap((synced) => synced.length > 0 ? changed : Effect.void),
+      Effect.catchAll((error) => Effect.logWarning(`Syncing stale harness connections failed: ${error.message}`).pipe(Effect.as([]))),
+    )).pipe(Effect.forkScoped)
+  }
+
+  const inspect = service.pipe(
+    Effect.flatMap(connections => connections.inspect),
+    Effect.map((connections): HarnessConnectionsSnapshot => ({ _tag: "Ready", connections })),
+    Effect.catchAll(error => Effect.succeed<HarnessConnectionsSnapshot>({ _tag: "Unavailable", message: error.message })),
+  )
+  return AcnHarnessConnections.of({
+    watch: Stream.concat(Stream.succeed(undefined), Stream.merge(Stream.fromPubSub(changes), Stream.fromSchedule(Schedule.spaced("2 seconds")))).pipe(
+      Stream.mapEffect(() => inspect),
+    ),
+    connect: request => refuseOnServer("connect", Option.some(request.harness)).pipe(Effect.zipRight(service),
+      Effect.flatMap(connections => connections.connect(request.harness, { model: request.model, installSkill: request.installSkill, launchOnStartup: false })),
+      Effect.mapError(failed),
+      Effect.map((result): HarnessConnectOutcome => ({
+        companion: Option.map(result.companion, companion => ({
+          name: companion.name,
+          source: companion.source,
+          securityNotice: companion.securityNotice,
+          status: companion.status,
+          activationInstructions: companion.activationInstructions,
+        })),
+        skillInstalled: result.skillInstalled,
+      })),
+      Effect.ensuring(changed),
+    ),
+    sync: harness => refuseOnServer("sync", harness).pipe(Effect.zipRight(service),
+      Effect.flatMap(connections => connections.sync(Option.getOrUndefined(harness))),
+      Effect.mapError(failed),
+      Effect.asVoid,
+      Effect.ensuring(changed),
+    ),
+    disconnect: harness => refuseOnServer("disconnect", Option.some(harness)).pipe(Effect.zipRight(service),
+      Effect.flatMap(connections => connections.disconnect(harness)),
+      Effect.mapError(failed),
+      Effect.ensuring(changed),
+    ),
+    describe: request => {
+      const key = request.remote ? host.activeNetwork.apiKey : Option.none<string>()
+      return service.pipe(
+        Effect.flatMap(connections => connections.describe({ harness: request.harness, model: request.model, platform: request.platform, origin: request.origin, key })),
+        Effect.mapError(failed),
+      )
+    },
+  })
+}))

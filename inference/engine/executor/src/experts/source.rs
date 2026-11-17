@@ -1,0 +1,861 @@
+//! Demand reads of expert records from the model's files into staging.
+//! Reads run uncached on the read engine
+//! (`seismic_io::Reader`), which aligns, coalesces and
+//! splits them into pieces its workers read in parallel, each landing
+//! straight in its staging record.
+
+use seismic_io::{Reader, CachePolicy, Ended, Ending, Handle, Panic, Range, Want};
+use seismic::Tensor;
+use std::ptr::NonNull;
+use std::sync::Arc;
+use std::time::Instant;
+
+/// Records the host addresses: reads land in them, landings convert into
+/// them, copies and the CPU site read them. Each is a view the host
+/// addresses of at least `bytes` bytes, by record index, or a hole where its
+/// store holds no storage for it: a record's place never matters, so the
+/// records of a store that allows holes are addressed as they are. Shared:
+/// each clone, and each read's request, holds the views they lie in.
+#[derive(Clone)]
+pub(crate) struct Records(Arc<Set>);
+
+struct Set {
+    bytes: u64,
+    records: Vec<Option<Arc<Record>>>,
+}
+
+/// One record's memory: its view, which keeps it alive, and where the host
+/// addresses it.
+struct Record {
+    tensor: Tensor,
+    base: NonNull<u8>,
+    bytes: u64,
+}
+
+// SAFETY: `base` addresses host-shared memory that `tensor`, held beside
+// it, keeps alive; the host writes it only through the read engine's
+// requests (`ExpertSource::request`), landings and record copies
+// (`Records::copy_record`).
+unsafe impl Send for Record {}
+unsafe impl Sync for Record {}
+
+// SAFETY: the record's host-shared bytes from `base`, which the tensor it
+// holds keeps where they are while it lives.
+unsafe impl seismic_io::Destination for Record {
+    fn region(&self) -> (NonNull<u8>, usize) {
+        (self.base, self.bytes as usize)
+    }
+}
+
+impl Record {
+    fn of(tensor: Tensor, bytes: u64) -> Result<Arc<Self>, String> {
+        if tensor.byte_len() < bytes {
+            return Err(format!("a record of {bytes} bytes in a view of {}", tensor.byte_len()));
+        }
+        let base = tensor.shared_address().ok_or_else(|| format!("a record of {bytes} bytes is no memory the host reads into"))?;
+        Ok(Arc::new(Self { tensor, base, bytes }))
+    }
+}
+
+impl Records {
+    /// Records of `bytes` each, `views[r]` record `r`'s (none a hole): each
+    /// refused unless it holds `bytes` and the host addresses it.
+    pub fn new(views: Vec<Option<Tensor>>, bytes: u64) -> Result<Self, String> {
+        let records = views.into_iter().map(|view| view.map(|view| Record::of(view, bytes)).transpose()).collect::<Result<_, _>>()?;
+        Ok(Self(Arc::new(Set { bytes, records })))
+    }
+
+    /// `tensor`'s `count` leading rows as records of `bytes` each, one after
+    /// another from its first byte (a staging pool's, a conveyor's): refused
+    /// unless they are its whole extent and the host addresses it.
+    pub fn rows(tensor: &Tensor, bytes: u64, count: u64) -> Result<Self, String> {
+        if tensor.extents().first() != Some(&count) || tensor.byte_len() != count * bytes {
+            return Err(format!("{} bytes are not {count} records of {bytes}", tensor.byte_len()));
+        }
+        let views = (0..count)
+            .map(|record| tensor.slice_leading(record, record + 1).map(Some).map_err(|error| format!("record {record} of {count}: {error}")))
+            .collect::<Result<Vec<_>, String>>()?;
+        Self::new(views, bytes)
+    }
+
+    /// These records, record `record` (a hole, or past every record) now
+    /// `view`, or a hole where none: a growth's, or an eviction's.
+    pub fn with(&self, record: u64, view: Option<Tensor>) -> Result<Self, String> {
+        let mut records = self.0.records.clone();
+        let index = usize::try_from(record).map_err(|_| "a record index exceeds the host")?;
+        if index >= records.len() {
+            records.resize(index + 1, None);
+        }
+        records[index] = view.map(|view| Record::of(view, self.0.bytes)).transpose()?;
+        Ok(Self(Arc::new(Set { bytes: self.0.bytes, records })))
+    }
+
+    /// The bytes of one record.
+    pub fn bytes(&self) -> u64 {
+        self.0.bytes
+    }
+
+    /// One past the last record, a hole or not.
+    pub fn count(&self) -> u64 {
+        self.0.records.len() as u64
+    }
+
+    /// Whether record `record` is held: no hole.
+    pub fn holds(&self, record: u64) -> bool {
+        self.held(record).is_some()
+    }
+
+    fn held(&self, record: u64) -> Option<&Arc<Record>> {
+        usize::try_from(record).ok().and_then(|record| self.0.records.get(record)).and_then(Option::as_ref)
+    }
+
+    fn at(&self, record: u64) -> &Arc<Record> {
+        self.held(record).unwrap_or_else(|| panic!("record {record} of {} is a hole", self.count()))
+    }
+
+    /// The view record `record` lies in: what a device copy reads or writes.
+    pub fn tensor(&self, record: u64) -> &Tensor {
+        &self.at(record).tensor
+    }
+
+    /// The first `bytes` of record `record`, to read.
+    ///
+    /// # Safety
+    ///
+    /// No read lands in the record, and no device work writes it, while the
+    /// slice lives.
+    pub unsafe fn record(&self, record: u64, bytes: u64) -> &[u8] {
+        let held = self.at(record);
+        assert!(bytes <= held.bytes, "{bytes} bytes of record {record} of {}", held.bytes);
+        // SAFETY: the record lies within the host-shared view `self` keeps
+        // alive, and the caller excludes every writer.
+        unsafe { std::slice::from_raw_parts(held.base.as_ptr(), bytes as usize) }
+    }
+
+    /// Where record `record` begins in host memory: what a writer of part
+    /// of it (one piece of a landing's conversion) writes through.
+    pub fn address(&self, record: u64) -> NonNull<u8> {
+        self.at(record).base
+    }
+
+}
+
+/// One range of a model file read into a record: `bytes` at `offset` of
+/// file `file` (an index of the source's files) into record `record` of
+/// `into`, `within` bytes into it (a record of planar parts, codes then
+/// grid, takes each part's read at its own).
+pub(super) struct Read {
+    file: usize,
+    offset: u64,
+    bytes: usize,
+    into: Records,
+    record: u64,
+    within: u64,
+}
+
+impl Read {
+    /// A read of `bytes` at `offset` of file `file` into record `record` of
+    /// `into` from `within` bytes into it, which holds them: a record of
+    /// `into` and no more than its bytes, as the watcher's geometry
+    /// (checked at its start) gives.
+    pub fn new(file: usize, offset: u64, bytes: u64, into: &Records, record: u64, within: u64) -> Self {
+        assert!(
+            into.holds(record) && within.checked_add(bytes).is_some_and(|end| end <= into.bytes()),
+            "a read of {bytes} bytes {within} into record {record} of {} of {} bytes",
+            into.count(),
+            into.bytes()
+        );
+        Self {
+            file,
+            offset,
+            bytes: bytes as usize,
+            into: into.clone(),
+            record,
+            within,
+        }
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.bytes as u64
+    }
+}
+
+/// How a ticket's reads ended.
+#[derive(Clone, Debug)]
+pub(super) enum Outcome {
+    /// Every read landed in staging.
+    Read,
+    /// A read failed with an I/O error from the source: why.
+    Failed(String),
+    /// A read worker panicked running a request: a defect, which the
+    /// watcher raises as its own.
+    Panicked(Panic),
+}
+
+/// Reads made of the source: one read engine request per model file it
+/// reads, each holding the staging it lands in until it has ended. It owns
+/// its requests until it cancels them ([`Ticket::cancel`]); dropping it
+/// cancels what no worker has taken and waits for what one has, so no read
+/// lands in staging once its ticket is gone.
+pub(super) struct Ticket {
+    /// Each file's request while the ticket owns it, its end, and the reads
+    /// it serves in their order: (the read's index among the ticket's,
+    /// file, offset, bytes).
+    requests: Vec<(Option<Handle>, Ending, Vec<(usize, usize, u64, usize)>)>,
+}
+
+impl Drop for Ticket {
+    fn drop(&mut self) {
+        self.cancel();
+        for (_, ending, _) in &self.requests {
+            ending.wait();
+        }
+    }
+}
+
+impl Ticket {
+    /// The outcome, waiting for it until `deadline`; `None` while a read
+    /// runs. The first failed read is its outcome.
+    pub fn wait_until(&self, deadline: Instant) -> Option<Outcome> {
+        self.outcome(|ending| ending.wait_until(deadline))
+    }
+
+    /// Whether a read of the ticket still runs: it has not ended.
+    pub fn running(&self) -> bool {
+        self.wait_until(Instant::now()).is_none()
+    }
+
+    /// The outcome, waiting for it.
+    pub fn wait(&self) -> Outcome {
+        self.outcome(|ending| Some(ending.wait())).expect("a waited request ends")
+    }
+
+    /// The outcome of the requests as `ended` finds them, none while one
+    /// runs.
+    fn outcome(&self, ended: impl Fn(&Ending) -> Option<Ended>) -> Option<Outcome> {
+        let endeds = self.requests.iter().map(|(_, ending, _)| ended(ending)).collect::<Option<Vec<_>>>()?;
+        let reads = self.requests.iter().map(|(.., reads)| reads.clone()).collect::<Vec<_>>();
+        Some(outcome_of(&endeds, &reads).0)
+    }
+
+    /// Its requests' submissions: the ids their read timeline events carry.
+    pub fn requests(&self) -> impl Iterator<Item = u64> + '_ {
+        self.requests.iter().filter_map(|(handle, ..)| handle.as_ref().map(Handle::id))
+    }
+
+    /// Run `hook` with the outcome, and the indices of the ticket's reads
+    /// that failed (every one after a panic), once every request has ended,
+    /// on the thread that ends the last (a read worker, or the canceller),
+    /// or at once where every one has: after every request's end is set, so
+    /// whatever the hook wakes finds the ticket no longer running. It must
+    /// not wait for a read.
+    pub fn on_end(&self, hook: impl FnOnce(Outcome, &[usize]) + Send + 'static) {
+        type Hook = Box<dyn FnOnce(Outcome, &[usize]) + Send>;
+        struct Ends {
+            ended: Vec<Option<Ended>>,
+            hook: Option<Hook>,
+        }
+        if self.requests.is_empty() {
+            return hook(Outcome::Read, &[]);
+        }
+        let reads = std::sync::Arc::new(self.requests.iter().map(|(.., reads)| reads.clone()).collect::<Vec<_>>());
+        let ending = std::sync::Arc::new(std::sync::Mutex::new(Ends {
+            ended: vec![None; self.requests.len()],
+            hook: Some(Box::new(hook)),
+        }));
+        for (index, (_, request, _)) in self.requests.iter().enumerate() {
+            let (ending, reads) = (ending.clone(), reads.clone());
+            request.on_end(move |ended| {
+                let mut ending = ending.lock().expect("a ticket's end");
+                ending.ended[index] = Some(ended.clone());
+                let Some(ended) = ending.ended.iter().cloned().collect::<Option<Vec<_>>>() else {
+                    return;
+                };
+                let hook = ending.hook.take().expect("a ticket ends once");
+                drop(ending);
+                let (outcome, failed) = outcome_of(&ended, &reads);
+                hook(outcome, &failed);
+            });
+        }
+    }
+
+    /// When a worker takes each request's first piece, each set then
+    /// (`seismic_io::Ending::started`): the ticket's reads start at the
+    /// earliest.
+    pub fn started(&self) -> Vec<std::sync::Arc<std::sync::OnceLock<Instant>>> {
+        self.requests.iter().map(|(_, ending, _)| ending.started()).collect()
+    }
+
+    /// Order the reads not yet taken by `want` from now
+    /// (`seismic_io::Handle::reprice`): none once cancelled.
+    pub fn reprice(&self, want: Want) {
+        for handle in self.requests.iter().filter_map(|(handle, ..)| handle.as_ref()) {
+            handle.reprice(want);
+        }
+    }
+
+    /// Cancel the reads no worker has taken: they read nothing and the
+    /// reads they serve fail as cancelled (`seismic_io::Error::Cancelled`);
+    /// those in flight read on, and the ticket observes their end.
+    pub fn cancel(&mut self) {
+        for (handle, ..) in &mut self.requests {
+            drop(handle.take());
+        }
+    }
+
+    /// Whether it was cancelled.
+    pub fn cancelled(&self) -> bool {
+        self.requests.iter().any(|(handle, ..)| handle.is_none())
+    }
+}
+
+/// The outcome of a ticket whose requests ended as `ended`, each serving
+/// `reads` (index among the ticket's, file, offset, bytes) in its order:
+/// the first failed read in request order, or a panic; and the indices of
+/// the ticket's reads that failed.
+fn outcome_of(ended: &[Ended], reads: &[Vec<(usize, usize, u64, usize)>]) -> (Outcome, Vec<usize>) {
+    let mut outcome = Outcome::Read;
+    let mut failed_reads = Vec::new();
+    for (ended, reads) in ended.iter().zip(reads) {
+        match ended {
+            Ended::Read { failed } => {
+                if let (Outcome::Read, Some((index, error))) = (&outcome, failed.first()) {
+                    let (_, file, offset, bytes) = reads[*index];
+                    outcome = Outcome::Failed(format!(
+                        "expert record at {offset} of {bytes} bytes in model file {file}: {error}"
+                    ));
+                }
+                failed_reads.extend(failed.iter().map(|(index, _)| reads[*index].0));
+            }
+            Ended::Panicked(panic) => return (Outcome::Panicked(panic.clone()), reads.iter().map(|read| read.0).collect()),
+        }
+    }
+    (outcome, failed_reads)
+}
+
+/// The model's files, opened for reads that bypass the file cache.
+pub(super) struct ExpertSource {
+    files: Vec<Reader>,
+}
+
+impl ExpertSource {
+    /// The model's `files`, read for decode requests of `urgent`.
+    pub fn open(files: &[std::path::PathBuf], urgent: &seismic_io::Urgent) -> Result<Self, String> {
+        let files = files
+            .iter()
+            .map(|path| {
+                Reader::open_urgent(path, CachePolicy::Uncached, urgent)
+                    .map_err(|error| format!("expert source {}: {error}", path.display()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { files })
+    }
+
+    /// The volumes its files lie on, each once, whose counts the scheduler
+    /// keeps (`seismic_io::accounting`).
+    pub fn volumes(&self) -> Vec<seismic_io::Volume> {
+        let mut volumes = Vec::new();
+        for volume in self.files.iter().map(Reader::volume) {
+            if !volumes.contains(&volume) {
+                volumes.push(volume);
+            }
+        }
+        volumes
+    }
+
+    /// Its reads of the read engine now (whether any is submitted and not
+    /// yet ended, and the engine's work), as a check that reads only the
+    /// read engine's counts, never an owner's lock: the exchange's
+    /// watchdog's (`crate::watched::HostClock`).
+    pub(crate) fn reads(&self) -> impl Fn() -> crate::watched::Reads + Send + 'static {
+        let outstanding = self.files.iter().map(Reader::outstanding).collect::<Vec<_>>();
+        move || crate::watched::Reads {
+            outstanding: outstanding.iter().any(|reader| reader.requests() > 0),
+            engine: seismic_io::engine_work(),
+        }
+    }
+
+    /// The bytes in flight at which its widest volume's link reads at its
+    /// full rate (`Reader::knee`): below them the link lacks work.
+    pub fn knee(&self) -> u64 {
+        self.files.iter().map(Reader::knee).max().expect("a model has a file")
+    }
+
+    /// Request `reads` of the read engine for `want`: due now for a step's
+    /// misses, at its layer's estimated start for a hint. Fails only when the
+    /// engine takes no request.
+    pub fn request(&self, reads: Vec<Read>, want: Want) -> Result<Ticket, String> {
+        assert!(reads.iter().all(|read| read.file < self.files.len()), "a read of a file the source has not open");
+        // Each file's ranges, each landing in the records its read holds,
+        // and the reads they serve.
+        let mut by_file = (0..self.files.len()).map(|_| (Vec::new(), Vec::new())).collect::<Vec<_>>();
+        for (at, read) in reads.into_iter().enumerate() {
+            let (ranges, served) = &mut by_file[read.file];
+            served.push((at, read.file, read.offset, read.bytes));
+            let into: Arc<dyn seismic_io::Destination> = read.into.at(read.record).clone();
+            ranges.push(Range { offset: read.offset, length: read.bytes, into, at: read.within as usize });
+        }
+        let mut requests = Vec::new();
+        for (file, (ranges, served)) in self.files.iter().zip(by_file) {
+            if ranges.is_empty() {
+                continue;
+            }
+            // SAFETY: each staging record is the read's alone while its
+            // request runs: the device reads it only after the watcher
+            // publishes it, once the request has ended, which the ticket
+            // observes however it is cancelled or dropped.
+            let handle = unsafe { file.request(ranges, want) }
+                .map_err(|error| format!("expert source: {error}"))?;
+            let ending = handle.ending();
+            requests.push((Some(handle), ending, served));
+        }
+        Ok(Ticket { requests })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use seismic::{BackendName, Element};
+
+    /// Each read lands its range in its staging record; a range outside
+    /// the file fails its request, and the requests after it read.
+    #[test]
+    fn reads_land_in_staging_and_a_failed_one_fails_its_request_alone() {
+        let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), BackendName::Cpu)
+            .unwrap();
+        let path = std::env::temp_dir().join(format!("expert-source-{}", std::process::id()));
+        let bytes = (0..64 * 1024).map(|index| (index % 251) as u8).collect::<Vec<_>>();
+        std::fs::write(&path, &bytes).unwrap();
+        let source = ExpertSource::open(std::slice::from_ref(&path), &seismic_io::Urgent { parts: vec![128], records: 2 }).unwrap();
+        let staging = Tensor::shared(&device, Element::i32(), &[2, 32]).unwrap();
+        let records = Records::rows(&staging, 128, 2).unwrap();
+        let read = |offset: u64, record: u64| Read::new(0, offset, 128, &records, record, 0);
+        let demand = Want::now();
+        let failed = source.request(vec![read(bytes.len() as u64 - 64, 0)], demand).unwrap();
+        let landed = source.request(vec![read(1000, 0), read(40_000, 1)], demand).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        assert!(matches!(failed.wait_until(deadline), Some(Outcome::Failed(_))));
+        assert!(matches!(landed.wait_until(deadline), Some(Outcome::Read)));
+        let mut host = vec![0u8; 256];
+        unsafe { staging.read_shared(0, &mut host) }.unwrap();
+        assert_eq!(&host[..128], &bytes[1000..1128]);
+        assert_eq!(&host[128..], &bytes[40_000..40_128]);
+        // Records that are not their tensor's whole extent are refused when
+        // made, before anything is read.
+        assert!(Records::rows(&staging, 128, 3).is_err());
+        drop((failed, landed));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// Where a CUDA device reserves its device storage in host memory (GB10,
+    /// whose memory is the host's), the uncached reads land in a bank's
+    /// reserved records in place, as prompt groups read into the conveyor
+    /// lent from them: two 2 MiB records of a 4 MiB file, each read whole,
+    /// hold the file's bytes. Each record is a view of its own, as a bank's
+    /// records are. A CUDA device across a link reserves its device storage
+    /// in its own memory, which the host never addresses: there the records
+    /// are refused. Run on a CUDA host with `--ignored`.
+    #[test]
+    #[ignore]
+    fn uncached_reads_land_in_a_host_reserved_bank_in_place() {
+        let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+        let topology = catalog.topology();
+        let unified = seismic::testing::selected(&topology, BackendName::Cuda)
+            .is_some_and(|executor| topology.shared_ranges_lie_in_device_memory(executor));
+        let device = crate::test_support::open_backend(&catalog, BackendName::Cuda).expect("a CUDA device opens");
+        const RECORD: u64 = 2 << 20;
+        // The host addresses each record through its slab's region, as a bank's views do.
+        let pooled = pooled(&device, 2, RECORD);
+        let views = || pooled.views.iter().cloned().map(Some).collect::<Vec<_>>();
+        if !unified {
+            let refused = Records::new(views(), RECORD).err();
+            assert!(refused.as_deref().is_some_and(|why| why.contains("no memory the host reads into")), "a linked device's reserved records are refused: {refused:?}");
+            return;
+        }
+        let records = Records::new(views(), RECORD).expect("the host addresses the device's reserved storage");
+        let path = std::env::temp_dir().join(format!("expert-source-reserved-{}", std::process::id()));
+        let bytes = (0..2 * RECORD).map(|index| (index % 251) as u8 ^ (index >> 20) as u8).collect::<Vec<_>>();
+        std::fs::write(&path, &bytes).unwrap();
+        let source = ExpertSource::open(std::slice::from_ref(&path), &seismic_io::Urgent { parts: vec![128], records: 2 }).unwrap();
+        // Reversed: record 0 takes the file's second half.
+        let landed = source
+            .request(vec![Read::new(0, RECORD, RECORD, &records, 0, 0), Read::new(0, 0, RECORD, &records, 1, 0)], Want::now())
+            .unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        assert!(matches!(landed.wait_until(deadline), Some(Outcome::Read)));
+        // SAFETY: the job has ended, and no device work touches the records.
+        assert!(unsafe { records.record(0, RECORD) } == &bytes[RECORD as usize..], "record 0 holds the file's second half");
+        assert!(unsafe { records.record(1, RECORD) } == &bytes[..RECORD as usize], "record 1 holds its first half");
+        drop(landed);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// A prompt's cold experts on the model file `MAGNITUDE_ARTIFACTS`
+    /// names: each routed layer's expert stacks (offset, bytes an expert),
+    /// the experts a layer has, the experts a prompt reads of each (`read`)
+    /// and the widest layer's expert record, as `read_depth`'s
+    /// `a_prompt_reads_at_the_volumes_rate` takes them.
+    struct PromptExperts {
+        path: String,
+        layers: Vec<Vec<(u64, u64)>>,
+        experts: u64,
+        read: usize,
+        record: u64,
+    }
+
+    /// A prompt's reads: each layer's experts, each its ranges (offset, bytes).
+    type PromptReads = Vec<Vec<Vec<(u64, usize)>>>;
+
+    impl PromptExperts {
+        fn acquired() -> Self {
+            let artifacts = std::env::var_os("MAGNITUDE_ARTIFACTS").expect("set MAGNITUDE_ARTIFACTS");
+            let acquisition: serde_json::Value = serde_json::from_slice(&std::fs::read(&artifacts).unwrap()).unwrap();
+            let path = acquisition["target"].as_str().unwrap().to_owned();
+            let artifact = magnitude_artifacts::gguf::GgufArtifact::open(&path).unwrap();
+            let size = std::fs::metadata(&path).unwrap().len();
+            let mut stacks = std::collections::BTreeMap::<u64, std::collections::BTreeMap<String, (u64, u64)>>::new();
+            let mut experts = 0;
+            for name in artifact.directory().tensors.iter().map(|tensor| tensor.name.clone()).collect::<Vec<_>>() {
+                let Some((layer, tensor)) = name.strip_prefix("blk.").and_then(|rest| rest.split_once('.')) else { continue };
+                if tensor.ends_with("_exps.weight") {
+                    let slice = artifact.tensor(&name).unwrap();
+                    experts = *slice.shape.last().unwrap();
+                    stacks.entry(layer.parse().unwrap()).or_default().insert(tensor.to_owned(), (slice.offset, slice.nbytes / experts));
+                }
+            }
+            let layers = stacks
+                .into_values()
+                .map(|stacks| stacks.into_values().collect::<Vec<_>>())
+                .filter(|stacks| stacks.iter().all(|&(offset, per)| offset + per * experts <= size))
+                .collect::<Vec<_>>();
+            let read = (experts * 3 / 4).min(190) as usize;
+            let record = layers.iter().map(|layer| layer.iter().map(|&(_, per)| per).sum::<u64>()).max().unwrap().next_multiple_of(4096);
+            Self { path, layers, experts, read, record }
+        }
+
+        fn urgent(&self) -> seismic_io::Urgent {
+            seismic_io::Urgent { parts: self.layers[0].iter().map(|&(_, per)| per).collect(), records: 1 }
+        }
+
+        /// A prompt's reads: every layer's `read` distinct experts, drawn from `seed`.
+        fn draw(&self, seed: &mut u64) -> PromptReads {
+            self.layers
+                .iter()
+                .map(|layer| {
+                    let mut order = (0..self.experts).collect::<Vec<_>>();
+                    for at in (1..order.len()).rev() {
+                        order.swap(at, (xorshift(seed) % (at as u64 + 1)) as usize);
+                    }
+                    order[..self.read].iter().map(|&expert| layer.iter().map(|&(offset, per)| (offset + expert * per, per as usize)).collect()).collect()
+                })
+                .collect()
+        }
+
+        /// Two layers' records of a CUDA device's bank, claimed from its
+        /// pool as a load claims them, each its slab's region, as a bank's
+        /// views address them.
+        /// The records, and their store, held while they are.
+        fn bank(&self, device: &seismic::Device) -> (Records, crate::experts::PooledRecords) {
+            let pooled = pooled(device, 2 * self.read as u64, self.record);
+            let records = Records::new(pooled.views.iter().cloned().map(Some).collect(), self.record).expect("the host addresses the device's pooled storage");
+            (records, pooled)
+        }
+    }
+
+    /// `records` records of `bytes` each claimed as a bank claims its own
+    /// (`experts::pooled_records`), each its slab's view.
+    fn pooled(device: &seismic::Device, records: u64, bytes: u64) -> crate::experts::PooledRecords {
+        let contract = crate::planning::BankTier::Bank.contract_on(device);
+        crate::experts::pooled_records(device, contract, Element::i32(), &[bytes / 4], records, records).unwrap()
+    }
+
+    /// Memory a test frees only once every job reading into it has ended.
+    struct Held(NonNull<u8>, usize);
+
+    // SAFETY: the test's memory, written only by the jobs it waits out.
+    unsafe impl Send for Held {}
+    unsafe impl Sync for Held {}
+
+    // SAFETY: the test frees the bytes only after every job reading them ended.
+    unsafe impl seismic_io::Destination for Held {
+        fn region(&self) -> (NonNull<u8>, usize) {
+            (self.0, self.1)
+        }
+    }
+
+    /// `length` bytes at `base` as a destination ([`Held`]).
+    fn held(base: *mut u8, length: usize) -> Arc<dyn seismic_io::Destination> {
+        Arc::new(Held(NonNull::new(base).expect("a destination's bytes"), length))
+    }
+
+    fn xorshift(seed: &mut u64) -> u64 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        *seed
+    }
+
+    fn cuda() -> seismic::Device {
+        let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+        crate::test_support::open_backend(&catalog, BackendName::Cuda).expect("a CUDA device opens")
+    }
+
+    /// `layers` read as a prompt's conveyor reads them: one demand job per
+    /// expert into its slot of `sink` (two layers' slots, `read` a layer),
+    /// two layers in flight, each job's end running `ended` on the worker
+    /// that ends it. Bytes a second.
+    fn prompt_rate(reader: &Reader, sink: &[usize], read: usize, layers: &PromptReads, ended: impl Fn() + Clone + Send + 'static) -> f64 {
+        let bytes: usize = layers.iter().flatten().flatten().map(|&(_, length)| length).sum();
+        let began = Instant::now();
+        let mut behind: Vec<Handle> = Vec::new();
+        for (index, layer) in layers.iter().enumerate() {
+            let jobs = layer
+                .iter()
+                .enumerate()
+                .map(|(expert, ranges)| {
+                    let base = sink[index % 2 * read + expert] as *mut u8;
+                    let mut at = 0;
+                    let ranges = ranges
+                        .iter()
+                        .map(|&(offset, length)| {
+                            // SAFETY: within the slot's record, which holds the widest layer's expert.
+                            let into = held(unsafe { base.add(at) }, length);
+                            at += length;
+                            Range { offset, length, into, at: 0 }
+                        })
+                        .collect();
+                    // SAFETY: the slot is this job's alone until the layer two on waits on it.
+                    let job = unsafe { reader.request(ranges, Want::now()) }.unwrap();
+                    let ended = ended.clone();
+                    job.on_end(move |_| ended());
+                    job
+                })
+                .collect::<Vec<_>>();
+            for job in std::mem::replace(&mut behind, jobs) {
+                assert!(matches!(job.wait(), Ended::Read { failed } if failed.is_empty()));
+            }
+        }
+        for job in behind {
+            assert!(matches!(job.wait(), Ended::Read { failed } if failed.is_empty()));
+        }
+        bytes as f64 / began.elapsed().as_secs_f64()
+    }
+
+    /// A prompt's cold experts read into a bank's reserved records, as a
+    /// load lands them, against the same reads into heap sinks: whether the
+    /// memory reads land in is what holds a served prompt's reads below the
+    /// volume's rate ([`prompt_rate`]); then the host's copy of 128 KiB
+    /// pieces into each, as a worker's unaligned pieces end.
+    #[test]
+    #[ignore = "times reads into a CUDA device's reserved bank on a real model file (`MAGNITUDE_ARTIFACTS`)"]
+    fn a_prompts_reads_land_in_a_reserved_bank_at_the_heaps_rate() {
+        let model = PromptExperts::acquired();
+        let reader = Reader::open_urgent(&model.path, CachePolicy::Uncached, &model.urgent()).unwrap();
+        let mut seed = 0x9a0bu64;
+        let device = cuda();
+        let (bank, _pooled) = model.bank(&device);
+        let (slots, record) = (2 * model.read as u64, model.record);
+        let layout = std::alloc::Layout::from_size_align((slots * record) as usize, 4096).unwrap();
+        // SAFETY: a nonzero layout; freed below with it.
+        let heap = NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) }).unwrap();
+        // Each sink's slots' addresses.
+        let sinks = [
+            ("heap", (0..slots).map(|slot| heap.as_ptr() as usize + (slot * record) as usize).collect::<Vec<_>>()),
+            ("bank", (0..slots).map(|slot| bank.address(slot).as_ptr() as usize).collect()),
+        ];
+        for round in 0..2 {
+            for (name, sink) in &sinks {
+                let layers = model.draw(&mut seed);
+                reader.evict_cached().unwrap();
+                eprintln!("round {round}, reads into the {name}: {:.2} GB/s", prompt_rate(&reader, sink, model.read, &layers, || ()) / 1e9);
+            }
+        }
+
+        // The host's copy of 128 KiB pieces from a worker's buffer into
+        // each, `threads` at once, every slot's record once.
+        const PIECE: usize = 128 << 10;
+        for threads in [1, 8] {
+            for (name, sink) in &sinks {
+                let next = std::sync::atomic::AtomicU64::new(0);
+                let per = record.div_ceil(PIECE as u64);
+                let began = Instant::now();
+                std::thread::scope(|scope| {
+                    for _ in 0..threads {
+                        scope.spawn(|| {
+                            let from = vec![7u8; PIECE];
+                            loop {
+                                let piece = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if piece >= slots * per {
+                                    break;
+                                }
+                                let at = piece % per * PIECE as u64;
+                                let to = (sink[(piece / per) as usize] + at as usize) as *mut u8;
+                                // SAFETY: within the slot's record, no read in flight.
+                                unsafe { std::ptr::copy_nonoverlapping(from.as_ptr(), to, PIECE.min((record - at) as usize)) };
+                            }
+                        });
+                    }
+                });
+                let rate = (slots * record) as f64 / began.elapsed().as_secs_f64() / 1e9;
+                eprintln!("{threads} threads copying into the {name}: {rate:.2} GB/s");
+            }
+        }
+        // SAFETY: allocated above with `layout`; no read or copy addresses it now.
+        unsafe { std::alloc::dealloc(heap.as_ptr(), layout) };
+    }
+
+    /// What a served prompt's process does beside its reads, each alone and
+    /// all at once, against the reads alone ([`prompt_rate`], into the
+    /// bank's records):
+    /// - the watcher's two threads on the load's events, which every read's
+    ///   end wakes ([`super::super::events::Events`]): the request service,
+    ///   at most 20 µs apart while a step runs, its timer slack 1 ns, and
+    ///   residency, on every event, each holding one lock for a turn of
+    ///   work (20 and 10 µs, as a pass over 40 layers and a tend may);
+    /// - each job's end holding its last piece's window through 180 µs of
+    ///   work on the read worker, as a decode landing's conversion does;
+    /// - another reader of the volume, a covering tier's cover: one expert a
+    ///   job, in layer and expert-index order, at [`Want::undated(0.)`], 8
+    ///   queued at all times.
+    #[test]
+    #[ignore = "times reads into a CUDA device's reserved bank beside a served prompt's host work, on a real model file (`MAGNITUDE_ARTIFACTS`)"]
+    fn a_prompts_reads_beside_a_served_prompts_host_work() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+        let model = Arc::new(PromptExperts::acquired());
+        let reader = Arc::new(Reader::open_urgent(&model.path, CachePolicy::Uncached, &model.urgent()).unwrap());
+        let device = cuda();
+        let (bank, _pooled) = model.bank(&device);
+        let sink = (0..2 * model.read as u64).map(|slot| bank.address(slot).as_ptr() as usize).collect::<Vec<_>>();
+        let spin = |length: Duration| {
+            let began = Instant::now();
+            while began.elapsed() < length {
+                std::hint::spin_loop();
+            }
+        };
+
+        // The watcher's threads, until `stop`: whether a read ended since a
+        // pass is the service's progress, a pass that progressed an event.
+        let watcher = |events: Arc<super::super::events::Events>, ends: Arc<AtomicU64>, stop: Arc<AtomicBool>| {
+            let lock = Arc::new(Mutex::new(()));
+            let service = {
+                let (events, lock, stop) = (events.clone(), lock.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    seismic_io::waited_on();
+                    let mut settled = 0;
+                    while !stop.load(Ordering::Acquire) {
+                        let seen = events.seen();
+                        let progressed = {
+                            let _held = lock.lock().unwrap();
+                            spin(Duration::from_micros(20));
+                            let now = ends.load(Ordering::Acquire);
+                            std::mem::replace(&mut settled, now) != now
+                        };
+                        if progressed {
+                            events.notify();
+                        } else {
+                            events.wait_at_most(seen, Duration::from_micros(20));
+                        }
+                    }
+                })
+            };
+            let residency = {
+                let (events, stop) = (events.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    // The count taken before `stop` is read: the event that
+                    // follows `stop` wakes it.
+                    loop {
+                        let seen = events.seen();
+                        if stop.load(Ordering::Acquire) {
+                            return;
+                        }
+                        drop(lock.lock().map(|_held| spin(Duration::from_micros(10))));
+                        events.wait(seen);
+                    }
+                })
+            };
+            [service, residency]
+        };
+
+        // A cover's reads, until `stop`: what it read, a second.
+        let cover = |stop: Arc<AtomicBool>| {
+            let (model, reader) = (model.clone(), reader.clone());
+            std::thread::spawn(move || {
+                const QUEUED: usize = 8;
+                let layout = std::alloc::Layout::from_size_align(QUEUED * model.record as usize, 4096).unwrap();
+                // SAFETY: a nonzero layout; freed below with it, every job waited on.
+                let records = NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) }).unwrap();
+                let experts = model.experts;
+                let order = (0..model.layers.len()).flat_map(|layer| (0..experts).map(move |expert| (layer, expert)));
+                let (mut bytes, mut jobs) = (0usize, std::collections::VecDeque::new());
+                let began = Instant::now();
+                for (slot, (layer, expert)) in (0..QUEUED).cycle().zip(order.cycle()) {
+                    if jobs.len() == QUEUED {
+                        let job: Handle = jobs.pop_front().unwrap();
+                        assert!(matches!(job.wait(), Ended::Read { failed } if failed.is_empty()));
+                    }
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let mut at = slot * model.record as usize;
+                    let ranges = model.layers[layer]
+                        .iter()
+                        .map(|&(offset, per)| {
+                            // SAFETY: within the slot's record.
+                            let into = held(unsafe { records.as_ptr().add(at) }, per as usize);
+                            at += per as usize;
+                            bytes += per as usize;
+                            Range { offset: offset + expert * per, length: per as usize, into, at: 0 }
+                        })
+                        .collect();
+                    // SAFETY: the slot is this job's alone until the slot's next turn waits on it.
+                    jobs.push_back(unsafe { reader.request(ranges, Want::undated(0.)) }.unwrap());
+                }
+                for job in jobs {
+                    job.wait();
+                }
+                // SAFETY: allocated above with `layout`; every job that addressed it ended.
+                unsafe { std::alloc::dealloc(records.as_ptr(), layout) };
+                bytes as f64 / began.elapsed().as_secs_f64()
+            })
+        };
+
+        let mut seed = 0x9a0bu64;
+        let variants = [
+            ("alone", false, false, false),
+            ("beside the watcher's threads", true, false, false),
+            ("each end holding its window 180 us", false, true, false),
+            ("beside a cover", false, false, true),
+            ("beside all three", true, true, true),
+        ];
+        for round in 0..2 {
+            for &(name, watching, holding, covering) in &variants {
+                let layers = model.draw(&mut seed);
+                reader.evict_cached().unwrap();
+                let (events, ends, stop) = (Arc::new(super::super::events::Events::default()), Arc::new(AtomicU64::new(0)), Arc::new(AtomicBool::new(false)));
+                let watchers = if watching { watcher(events.clone(), ends.clone(), stop.clone()).into() } else { Vec::new() };
+                let coverer = covering.then(|| cover(stop.clone()));
+                let ended = {
+                    let (events, ends) = (events.clone(), ends.clone());
+                    move || {
+                        if holding {
+                            spin(Duration::from_micros(180));
+                        }
+                        ends.fetch_add(1, Ordering::AcqRel);
+                        events.notify();
+                    }
+                };
+                let rate = prompt_rate(&reader, &sink, model.read, &layers, ended);
+                stop.store(true, Ordering::Release);
+                events.notify();
+                for thread in watchers {
+                    thread.join().unwrap();
+                }
+                let covered = coverer.map(|thread| format!(", the cover {:.2} GB/s", thread.join().unwrap() / 1e9));
+                eprintln!("round {round}, reads {name}: {:.2} GB/s{}", rate / 1e9, covered.unwrap_or_default());
+            }
+        }
+    }
+}

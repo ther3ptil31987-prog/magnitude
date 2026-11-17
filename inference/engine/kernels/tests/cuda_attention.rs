@@ -1,12 +1,11 @@
 //! The CUDA `attention_decode` / `attention_prefill` in Qwen's form against
 //! the same cases, host model and portable-body pin as the Metal tests
-//! (included verbatim; their Metal tests skip without a Metal device), plus
-//! timings.
+//! (included verbatim; their Metal tests skip without a Metal device).
 
 include!("attention.rs");
 
 fn cuda() -> Option<Device> {
-    DeviceCatalog::discover()
+    seismic::Devices::discover(&[])
         .ok()?
         .open_backend(BackendName::Cuda)
         .ok()
@@ -17,16 +16,18 @@ fn cuda_decode(
     geometry: Geometry,
     (parts, warps, slices): (u64, u64, u64),
 ) -> seismic::NativeKernel<attention_decode::Entry> {
-    attention_decode::native_for_device_with(
+    declared::prepared(
         device,
-        attention_decode::Elements { A: Element::bf16() },
-        &qwen_form(statics(geometry), geometry)
+        &attention_decode::native_entry_with(attention_decode::Elements { A: Element::bf16() }),
+        &dense_statics(qwen_form(statics(geometry), geometry))
+            .with_static("SK", 0)
             .with_param("PARTS", parts)
             .with_param("WARPS", warps)
             .with_param("SLICES", slices)
             .with_param("MATRIX", 0)
             .with_param("STAGES", 2)
-            .with_param("COLUMNS", 1),
+            .with_param("COLUMNS", 1)
+            .with_param("QREG", 0),
     )
     .unwrap()
 }
@@ -36,10 +37,11 @@ fn cuda_prefill(
     geometry: Geometry,
     (warps, split_groups): (u64, u64),
 ) -> seismic::NativeKernel<attention_prefill::Entry> {
-    attention_prefill::native_for_device_with(
+    declared::prepared(
         device,
-        attention_prefill::Elements { A: Element::bf16() },
-        &qwen_form(statics(geometry), geometry)
+        &attention_prefill::native_entry_with(attention_prefill::Elements { A: Element::bf16() }),
+        &visible_prefill(device, dense_statics(qwen_form(statics(geometry), geometry)))
+            .with_static("SK", 0)
             .with_param("WARPS", warps)
             .with_param("SPLIT_GROUPS", split_groups)
             .with_param("STAGES", 2)
@@ -74,8 +76,8 @@ fn cuda_decode_matches_portable_body() {
     }
 }
 
-/// Visible spans crossing slab edges (the device measurement's binding: one
-/// span over several slabs) at every decode configuration.
+/// Visible spans crossing slab edges (one span over several slabs) at every
+/// decode configuration.
 #[test]
 fn cuda_decode_reads_spans_crossing_history_slabs() {
     let Some(device) = cuda() else { return };
@@ -99,7 +101,7 @@ fn cuda_decode_reads_spans_crossing_history_slabs() {
         let kernel = cuda_decode(&device, SMALL, config);
         // A reused middle slab puts consecutive slabs at unrelated addresses.
         for reused in [false, true] {
-            let mut bound = Bound::new_with_options(&device, &case, 32, reused);
+            let mut bound = Bound::new_with_options(&device, &case, 32, reused, Element::bf16());
             let gated = run_decode(&kernel, &mut bound, &case);
             check(
                 &format!("cuda crossing-span decode {config:?} reused={reused}"),
@@ -219,74 +221,6 @@ fn cuda_eight_query_group_decode_and_prefill_match_host_model() {
                 &gated,
                 &bound,
                 &expected,
-            );
-        }
-    }
-}
-
-/// Device time per call at the 4B geometry: decode of one row at contexts
-/// 256 / 4k / 16k and a 128-row prefill chunk after 1k of history. Each
-/// rotation entry owns its histories, so rotations exceed the 24 MiB L2 at
-/// long contexts.
-#[test]
-#[ignore = "timing; run explicitly on the measurement host"]
-fn cuda_attention_timings() {
-    let Some(device) = cuda() else { return };
-    let options = seismic::MeasureOptions {
-        samples: 15,
-        min_sample_seconds: 0.002,
-    };
-    for context in [256usize, 4096, 16384] {
-        let rows = vec![Row {
-            spans: vec![(0, context as i32 - 1)],
-            fresh: (0, 1),
-            destination: context as i32 - 1,
-            position: context as i32 - 1,
-        }];
-        let case = Case::new(QWEN, context, 1, &rows, 3);
-        let rotation = if context >= 4096 { 3 } else { 1 };
-        let mut bounds = (0..rotation)
-            .map(|_| Bound::new(&device, &case))
-            .collect::<Vec<_>>();
-        for config in DECODE_CONFIGS {
-            let kernel = cuda_decode(&device, QWEN, config);
-            let args = bounds
-                .iter_mut()
-                .map(|bound| args!(attention_decode, bound, case))
-                .collect();
-            let measured = kernel.measure(args, &options).unwrap();
-            let bytes = (context * QWEN.kv * QWEN.w() * 2 * 2) as f64;
-            println!(
-                "decode context {context} PARTS,WARPS,SLICES {config:?}: {:.1} us, KV read {:.0} GB/s",
-                measured.median * 1e6,
-                bytes / measured.median / 1e9
-            );
-        }
-    }
-    for (rows, history) in [(128usize, 1024i32), (128, 0)] {
-        let spans = if history > 0 {
-            vec![(0, history)]
-        } else {
-            vec![]
-        };
-        let rows_spec = (0..rows)
-            .map(|row| Row {
-                spans: spans.clone(),
-                fresh: (0, row as i32 + 1),
-                destination: history + row as i32,
-                position: history + row as i32,
-            })
-            .collect::<Vec<_>>();
-        let case = Case::new(QWEN, history as usize + rows, 1, &rows_spec, 9);
-        let mut bound = Bound::new(&device, &case);
-        for config in PREFILL_CONFIGS {
-            let kernel = cuda_prefill(&device, QWEN, config);
-            let measured = kernel
-                .measure(vec![args!(attention_prefill, bound, case)], &options)
-                .unwrap();
-            println!(
-                "prefill {rows} rows after {history} history WARPS,SPLIT_GROUPS {config:?}: {:.1} us",
-                measured.median * 1e6
             );
         }
     }

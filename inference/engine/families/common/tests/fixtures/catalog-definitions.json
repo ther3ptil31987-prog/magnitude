@@ -1,80 +1,196 @@
 {
-  "bonsai-8b-q1__target-gguf_q1-qat.json": "unrecognized",
-  "deepseek-v4-flash__target-gguf_q4-allshards.json": "unrecognized",
-  "deepseek-v4-flash__target-gguf_q8-allshards.json": "unrecognized",
-  "gemma-4-12b-it-qat__target-gguf_q4.json": "9882dcc4e4f43ea336284ef742156390db4cb25a0d82335caa268c98bc43545a",
-  "gemma-4-26b-a4b-it-qat__target-gguf_q4.json": "5fd7d65e6c131897fa2749796c3c8c39d6dfdd83949dff71e9c70189f3947e04",
-  "gemma-4-31b-it-qat__target-gguf_q4.json": "b94fc225625c35566b2cd19696abc9d74e92cc38fe73374d5391ca533ded8b54",
-  "gemma-4-e2b-it-qat__target-gguf_q4.json": "5b08dfdda054b0db44543a32645067c00b7c0a958a72115f847a3c663115dcbd",
-  "gemma-4-e4b-it-qat__target-gguf_q4.json": "bc0170c0d576c4b8c276fc19f3b69220cd5b8ebbaa16d049a82eaaaa0f7f7c90",
-  "glm-5.2__target-gguf_q4-allshards.json": "unrecognized",
-  "glm-5.2__target-gguf_q5-allshards.json": "unrecognized",
-  "glm-5.2__target-gguf_q6-allshards.json": "unrecognized",
-  "glm-5.2__target-gguf_q8-allshards.json": "unrecognized",
-  "laguna-s-2.1__target-gguf_q4-allshards.json": "unrecognized",
-  "laguna-s-2.1__target-gguf_q6-allshards.json": "unrecognized",
-  "laguna-s-2.1__target-gguf_q8-allshards.json": "unrecognized",
-  "lfm2.5-2.6b__draft.json@lfm2.5-2.6b__target-gguf_q4.json": "0c36f17fecc6fe24d55af218be5d341829c7ffe078a70e3582b64c52580dd344",
-  "lfm2.5-2.6b__draft.json@lfm2.5-2.6b__target-gguf_q5.json": "0c36f17fecc6fe24d55af218be5d341829c7ffe078a70e3582b64c52580dd344",
-  "lfm2.5-2.6b__draft.json@lfm2.5-2.6b__target-gguf_q6.json": "0c36f17fecc6fe24d55af218be5d341829c7ffe078a70e3582b64c52580dd344",
-  "lfm2.5-2.6b__draft.json@lfm2.5-2.6b__target-gguf_q8.json": "0c36f17fecc6fe24d55af218be5d341829c7ffe078a70e3582b64c52580dd344",
-  "lfm2.5-2.6b__target-gguf_q4.json": "8827a637dc5f5c0ea9e3bfd36b6ffddbb982cf4ce023acb22367a8a4a3f9c639",
-  "lfm2.5-2.6b__target-gguf_q5.json": "8827a637dc5f5c0ea9e3bfd36b6ffddbb982cf4ce023acb22367a8a4a3f9c639",
-  "lfm2.5-2.6b__target-gguf_q6.json": "8827a637dc5f5c0ea9e3bfd36b6ffddbb982cf4ce023acb22367a8a4a3f9c639",
-  "lfm2.5-2.6b__target-gguf_q8.json": "8827a637dc5f5c0ea9e3bfd36b6ffddbb982cf4ce023acb22367a8a4a3f9c639",
-  "lfm2.5-8b-a1b__draft.json@lfm2.5-8b-a1b__target-gguf_q4.json": "09b993e58ae6b5b1033bdf17c8115ff92b019f4dc6210f9b433fe6d655144e86",
-  "lfm2.5-8b-a1b__draft.json@lfm2.5-8b-a1b__target-gguf_q5.json": "09b993e58ae6b5b1033bdf17c8115ff92b019f4dc6210f9b433fe6d655144e86",
-  "lfm2.5-8b-a1b__draft.json@lfm2.5-8b-a1b__target-gguf_q6.json": "09b993e58ae6b5b1033bdf17c8115ff92b019f4dc6210f9b433fe6d655144e86",
-  "lfm2.5-8b-a1b__draft.json@lfm2.5-8b-a1b__target-gguf_q8.json": "09b993e58ae6b5b1033bdf17c8115ff92b019f4dc6210f9b433fe6d655144e86",
-  "lfm2.5-8b-a1b__target-gguf_q4.json": "1a5132b47f896d2d5e7e2084d1b3c9c9aab33f8cab136ceb7487cf62e2006839",
-  "lfm2.5-8b-a1b__target-gguf_q5.json": "1a5132b47f896d2d5e7e2084d1b3c9c9aab33f8cab136ceb7487cf62e2006839",
-  "lfm2.5-8b-a1b__target-gguf_q6.json": "1a5132b47f896d2d5e7e2084d1b3c9c9aab33f8cab136ceb7487cf62e2006839",
-  "lfm2.5-8b-a1b__target-gguf_q8.json": "1a5132b47f896d2d5e7e2084d1b3c9c9aab33f8cab136ceb7487cf62e2006839",
-  "minicpm5-2b__draft.json@minicpm5-2b__target-gguf_q4.json": "a9ed42dd5848ad5aa811e5e9fac0f19ad7975e3612d20976dd0f719bc523493f",
-  "minicpm5-2b__draft.json@minicpm5-2b__target-gguf_q8.json": "a9ed42dd5848ad5aa811e5e9fac0f19ad7975e3612d20976dd0f719bc523493f",
-  "minicpm5-2b__target-gguf_q4.json": "36cf2029fb8f30af543af2c1d21f43839f28ad6ca76d402d43a2919c094336a2",
-  "minicpm5-2b__target-gguf_q8.json": "36cf2029fb8f30af543af2c1d21f43839f28ad6ca76d402d43a2919c094336a2",
-  "muse-glimmer-30b__draft.json@muse-glimmer-30b__target-gguf_q4.json": "dd30c8f39ba438555a6652bfde896b05df4021d7145e1716b4bd9192137b61aa",
-  "muse-glimmer-30b__draft.json@muse-glimmer-30b__target-gguf_q5.json": "dd30c8f39ba438555a6652bfde896b05df4021d7145e1716b4bd9192137b61aa",
-  "muse-glimmer-30b__draft.json@muse-glimmer-30b__target-gguf_q6.json": "dd30c8f39ba438555a6652bfde896b05df4021d7145e1716b4bd9192137b61aa",
-  "muse-glimmer-30b__draft.json@muse-glimmer-30b__target-gguf_q8.json": "dd30c8f39ba438555a6652bfde896b05df4021d7145e1716b4bd9192137b61aa",
-  "muse-glimmer-30b__target-gguf_q4.json": "672221ea110baf8a00c6783db408218b52e934c72afc9eae76342c7b3a9c0a75",
-  "muse-glimmer-30b__target-gguf_q5.json": "672221ea110baf8a00c6783db408218b52e934c72afc9eae76342c7b3a9c0a75",
-  "muse-glimmer-30b__target-gguf_q6.json": "672221ea110baf8a00c6783db408218b52e934c72afc9eae76342c7b3a9c0a75",
-  "muse-glimmer-30b__target-gguf_q8.json": "672221ea110baf8a00c6783db408218b52e934c72afc9eae76342c7b3a9c0a75",
-  "nemotron-3-super-120b-a12b__target-gguf_mxfp4-allshards.json": "c708e2832c790c2b9e9f5e0fb9d5305b4c4ee161b7997e0f93b058ce143760eb",
-  "nemotron-3-super-120b-a12b__target-gguf_q4-allshards.json": "c708e2832c790c2b9e9f5e0fb9d5305b4c4ee161b7997e0f93b058ce143760eb",
-  "nemotron-3-ultra-550b-a55b__target-gguf_mxfp4-allshards.json": "feb39f1846c1114cd5af9f7f68be3e4c8b28096911bf083adb6a07cb44443465",
-  "nemotron-3.5-lightning-30b-a3b__draft.json@nemotron-3.5-lightning-30b-a3b__target-gguf_nvfp4-qat.json": "7f8767000e248aa5be14aedd59bf91ef18d1fd0fdd513af871d31a8f6250486a",
-  "nemotron-3.5-lightning-30b-a3b__draft.json@nemotron-3.5-lightning-30b-a3b__target-gguf_q4.json": "7f8767000e248aa5be14aedd59bf91ef18d1fd0fdd513af871d31a8f6250486a",
-  "nemotron-3.5-lightning-30b-a3b__draft.json@nemotron-3.5-lightning-30b-a3b__target-gguf_q8.json": "7f8767000e248aa5be14aedd59bf91ef18d1fd0fdd513af871d31a8f6250486a",
-  "nemotron-3.5-lightning-30b-a3b__target-gguf_nvfp4-qat.json": "945b8e9030702e7ea88f4fc2786cecb53c43d4a043000dcd671df88addd3f470",
-  "nemotron-3.5-lightning-30b-a3b__target-gguf_q4.json": "e439d11a8b1e743b8cd0cc7e710ecc850b783ad0b09c4abee4899a3dfa53b9a9",
-  "nemotron-3.5-lightning-30b-a3b__target-gguf_q8.json": "e439d11a8b1e743b8cd0cc7e710ecc850b783ad0b09c4abee4899a3dfa53b9a9",
-  "qwen3.5-122b-a10b__target-gguf_q4-allshards.json": "b02a5e61f666a03ed63f689ce07d9d94a8cd681cb165aae1dcd2210080134acc",
-  "qwen3.5-122b-a10b__target-gguf_q5-allshards.json": "b02a5e61f666a03ed63f689ce07d9d94a8cd681cb165aae1dcd2210080134acc",
-  "qwen3.5-122b-a10b__target-gguf_q6-allshards.json": "b02a5e61f666a03ed63f689ce07d9d94a8cd681cb165aae1dcd2210080134acc",
-  "qwen3.5-122b-a10b__target-gguf_q8-allshards.json": "b02a5e61f666a03ed63f689ce07d9d94a8cd681cb165aae1dcd2210080134acc",
-  "qwen3.5-4b__target-gguf_q4.json": "1482193a5677b267c6096b504cdcbb6710103fff77ce520cd24f42f524dfd200",
-  "qwen3.5-4b__target-gguf_q5.json": "1482193a5677b267c6096b504cdcbb6710103fff77ce520cd24f42f524dfd200",
-  "qwen3.5-4b__target-gguf_q6.json": "1482193a5677b267c6096b504cdcbb6710103fff77ce520cd24f42f524dfd200",
-  "qwen3.5-4b__target-gguf_q8.json": "1482193a5677b267c6096b504cdcbb6710103fff77ce520cd24f42f524dfd200",
-  "qwen3.5-9b__target-gguf_q4.json": "b8a55bedd2d102a44634c62d8de5345023a36e63b0dd42a3000bd740c09cf39d",
-  "qwen3.5-9b__target-gguf_q5.json": "b8a55bedd2d102a44634c62d8de5345023a36e63b0dd42a3000bd740c09cf39d",
-  "qwen3.5-9b__target-gguf_q6.json": "b8a55bedd2d102a44634c62d8de5345023a36e63b0dd42a3000bd740c09cf39d",
-  "qwen3.5-9b__target-gguf_q8.json": "b8a55bedd2d102a44634c62d8de5345023a36e63b0dd42a3000bd740c09cf39d",
-  "qwen3.6-35b-a3b__draft.json@qwen3.6-35b-a3b__target-gguf_q4.json": "fc6454518b093e16ae9d86e114a90089efac91b03ecc20efbc7231cfde44f907",
-  "qwen3.6-35b-a3b__draft.json@qwen3.6-35b-a3b__target-gguf_q5.json": "fc6454518b093e16ae9d86e114a90089efac91b03ecc20efbc7231cfde44f907",
-  "qwen3.6-35b-a3b__draft.json@qwen3.6-35b-a3b__target-gguf_q6.json": "fc6454518b093e16ae9d86e114a90089efac91b03ecc20efbc7231cfde44f907",
-  "qwen3.6-35b-a3b__draft.json@qwen3.6-35b-a3b__target-gguf_q8.json": "fc6454518b093e16ae9d86e114a90089efac91b03ecc20efbc7231cfde44f907",
-  "qwen3.6-35b-a3b__target-gguf_q4.json": "7f400004b764dd7b0739735fa511de411645811db7214728b357018e21062a41",
-  "qwen3.6-35b-a3b__target-gguf_q5.json": "7f400004b764dd7b0739735fa511de411645811db7214728b357018e21062a41",
-  "qwen3.6-35b-a3b__target-gguf_q6.json": "7f400004b764dd7b0739735fa511de411645811db7214728b357018e21062a41",
-  "qwen3.6-35b-a3b__target-gguf_q8.json": "7f400004b764dd7b0739735fa511de411645811db7214728b357018e21062a41",
-  "qwen3.8-27b__target-gguf_q4.json": "861a87a01ad9d68443f09e8a2af310193ca94ea4601b57c83dda56138ea306f3",
-  "qwen3.8-27b__target-gguf_q6.json": "861a87a01ad9d68443f09e8a2af310193ca94ea4601b57c83dda56138ea306f3",
-  "qwen3.8-27b__target-gguf_q8.json": "861a87a01ad9d68443f09e8a2af310193ca94ea4601b57c83dda56138ea306f3",
-  "qwen3.8-flash-next__target-gguf_q4-allshards.json": "unrecognized",
-  "qwen3.8-flash-next__target-gguf_q6-allshards.json": "unrecognized",
-  "qwen3.8-flash-next__target-gguf_q8-allshards.json": "unrecognized"
+  "bonsai-8b-q1:gguf:q1-qat": {
+    "target": "unrecognized"
+  },
+  "deepseek-v4.1-flash:gguf:mxfp4": {
+    "target": "rejected"
+  },
+  "gemma-4-12b-it-qat:gguf:q4": {
+    "target": "33bf12f14680728ab17545918f108ebb6ef53c65be6b34c7423b4f73146558f0",
+    "draft": "rejected"
+  },
+  "gemma-4-26b-a4b-it-qat:gguf:q4": {
+    "target": "c1922cfae4b4fac4eeae8d76770a853529568c70191f22e79263cdc2d88113a1",
+    "draft": "rejected"
+  },
+  "gemma-4-31b-it-qat:gguf:q4": {
+    "target": "e663afb88223a8d71e29f8246bcc73f6028fd819431fa236b8f1e6de8a3902a6",
+    "draft": "rejected"
+  },
+  "gemma-4-e4b-it-qat:gguf:q4": {
+    "target": "e4527262286a49c84047970b84879ab954baba71803c59be95aea28c040210b4",
+    "draft": "rejected"
+  },
+  "glm-5.2:gguf:q4": {
+    "target": "unrecognized"
+  },
+  "glm-5.2:gguf:q5": {
+    "target": "unrecognized"
+  },
+  "glm-5.2:gguf:q6": {
+    "target": "unrecognized"
+  },
+  "glm-5.2:gguf:q8": {
+    "target": "unrecognized"
+  },
+  "glm-5.3-flash:gguf:fp8": {
+    "target": "c3776689a5d8d52bbe527f1b41153b064e6767b970bfe0bbde1e533d09c89867"
+  },
+  "laguna-s-2.1:gguf:q4": {
+    "target": "unrecognized"
+  },
+  "laguna-s-2.1:gguf:q6": {
+    "target": "unrecognized"
+  },
+  "laguna-s-2.1:gguf:q8": {
+    "target": "unrecognized"
+  },
+  "lfm2.5-24b-a2b:gguf:q4": {
+    "target": "810080bfc9dadcb410f3139a1cf70cc31f86683d4f49344416a169902ab86c5b"
+  },
+  "lfm2.5-24b-a2b:gguf:q6": {
+    "target": "810080bfc9dadcb410f3139a1cf70cc31f86683d4f49344416a169902ab86c5b"
+  },
+  "lfm2.5-24b-a2b:gguf:q8": {
+    "target": "810080bfc9dadcb410f3139a1cf70cc31f86683d4f49344416a169902ab86c5b"
+  },
+  "lfm3-1.7b:gguf:q4-qat": {
+    "target": "9edeedc264001f618a76f76a5cc42c021114cbe02dd8e3910efbf7f0765077c9"
+  },
+  "lfm3-1.7b:gguf:q8": {
+    "target": "9edeedc264001f618a76f76a5cc42c021114cbe02dd8e3910efbf7f0765077c9"
+  },
+  "muse-glimmer-30b:gguf:q4": {
+    "target": "54a78c4267ace2123bd5450fa1fc4f8d9ec05e67524bea2b22d6d92867ddd04c",
+    "draft": "f2e36db88b406b1e8cc01fcc06351a8a47f138a3f1bbac24dec9919bdfbaf0cb"
+  },
+  "muse-glimmer-30b:gguf:q5": {
+    "target": "54a78c4267ace2123bd5450fa1fc4f8d9ec05e67524bea2b22d6d92867ddd04c",
+    "draft": "f2e36db88b406b1e8cc01fcc06351a8a47f138a3f1bbac24dec9919bdfbaf0cb"
+  },
+  "muse-glimmer-30b:gguf:q6": {
+    "target": "54a78c4267ace2123bd5450fa1fc4f8d9ec05e67524bea2b22d6d92867ddd04c",
+    "draft": "f2e36db88b406b1e8cc01fcc06351a8a47f138a3f1bbac24dec9919bdfbaf0cb"
+  },
+  "muse-glimmer-30b:gguf:q8": {
+    "target": "54a78c4267ace2123bd5450fa1fc4f8d9ec05e67524bea2b22d6d92867ddd04c",
+    "draft": "f2e36db88b406b1e8cc01fcc06351a8a47f138a3f1bbac24dec9919bdfbaf0cb"
+  },
+  "nemotron-3-super-120b-a12b:gguf:mxfp4": {
+    "target": "c01ed713c1b3418e8ab08c4f93d9d49c2e4302c9431dc1ea5765106298fae7b8"
+  },
+  "nemotron-3-super-120b-a12b:gguf:q4": {
+    "target": "c01ed713c1b3418e8ab08c4f93d9d49c2e4302c9431dc1ea5765106298fae7b8"
+  },
+  "nemotron-3-ultra-550b-a55b:gguf:mxfp4": {
+    "target": "7026aee74a08168e90b27dfe14f1af3408f7626ea968625264fea7053bfc7fd0"
+  },
+  "nemotron-3.5-bolt-74b-a9b:gguf:iq2-qat": {
+    "target": "0d169e37e266e30956264b1e229598e5263e5028650d95084c211f8f15c92d9f",
+    "draft": "98be6c7fdbbe2579088bb0d387fc3e3664bb0331f180022a53819c2600f74dbb"
+  },
+  "nemotron-3.5-super-vl-120b-a12b:gguf:q2": {
+    "target": "e669ff8c85de75639e7dfac72e1f732ec4c9ce40837b740d70edd661862f5938",
+    "draft": "ffa40e8fdd0640680e328f2895490a865dda50ac42f30e7222d45fb516563367"
+  },
+  "nemotron-3.5-super-vl-120b-a12b:gguf:q3": {
+    "target": "e669ff8c85de75639e7dfac72e1f732ec4c9ce40837b740d70edd661862f5938",
+    "draft": "ffa40e8fdd0640680e328f2895490a865dda50ac42f30e7222d45fb516563367"
+  },
+  "nemotron-3.5-super-vl-120b-a12b:gguf:q4": {
+    "target": "e669ff8c85de75639e7dfac72e1f732ec4c9ce40837b740d70edd661862f5938",
+    "draft": "ffa40e8fdd0640680e328f2895490a865dda50ac42f30e7222d45fb516563367"
+  },
+  "nemotron-3.5-super-vl-120b-a12b:gguf:q6": {
+    "target": "e669ff8c85de75639e7dfac72e1f732ec4c9ce40837b740d70edd661862f5938",
+    "draft": "ffa40e8fdd0640680e328f2895490a865dda50ac42f30e7222d45fb516563367"
+  },
+  "qwen3.5-122b-a10b:gguf:q4": {
+    "target": "fd32a1466a8fc14d61282588aed922183b845e6bc8a04a63d23cf5bbd8f703be"
+  },
+  "qwen3.5-122b-a10b:gguf:q5": {
+    "target": "fd32a1466a8fc14d61282588aed922183b845e6bc8a04a63d23cf5bbd8f703be"
+  },
+  "qwen3.5-122b-a10b:gguf:q6": {
+    "target": "fd32a1466a8fc14d61282588aed922183b845e6bc8a04a63d23cf5bbd8f703be"
+  },
+  "qwen3.5-122b-a10b:gguf:q8": {
+    "target": "fd32a1466a8fc14d61282588aed922183b845e6bc8a04a63d23cf5bbd8f703be"
+  },
+  "qwen3.5-4b:gguf:q4": {
+    "target": "71ec3cadbd66c73e886962fb761ffc8ca97215b29a3003531f9d43b72f1a75af",
+    "draft": "d733a79d2af57bd2a1418babc5d31a61a88b941e656d2bded19844242b3e6f63"
+  },
+  "qwen3.5-4b:gguf:q5": {
+    "target": "71ec3cadbd66c73e886962fb761ffc8ca97215b29a3003531f9d43b72f1a75af",
+    "draft": "d733a79d2af57bd2a1418babc5d31a61a88b941e656d2bded19844242b3e6f63"
+  },
+  "qwen3.5-4b:gguf:q6": {
+    "target": "71ec3cadbd66c73e886962fb761ffc8ca97215b29a3003531f9d43b72f1a75af",
+    "draft": "d733a79d2af57bd2a1418babc5d31a61a88b941e656d2bded19844242b3e6f63"
+  },
+  "qwen3.5-4b:gguf:q8": {
+    "target": "71ec3cadbd66c73e886962fb761ffc8ca97215b29a3003531f9d43b72f1a75af",
+    "draft": "d733a79d2af57bd2a1418babc5d31a61a88b941e656d2bded19844242b3e6f63"
+  },
+  "qwen3.5-9b:gguf:q4": {
+    "target": "0460bf948ef690493498fb0cc519798bd8647a9be5045a7807b81ed8b2d01861",
+    "draft": "f39d3a881e0f6ae155c3030fde3d5d786a5f74333f5ede4b2ff519ed35264ec2"
+  },
+  "qwen3.5-9b:gguf:q6": {
+    "target": "0460bf948ef690493498fb0cc519798bd8647a9be5045a7807b81ed8b2d01861",
+    "draft": "f39d3a881e0f6ae155c3030fde3d5d786a5f74333f5ede4b2ff519ed35264ec2"
+  },
+  "qwen3.5-9b:gguf:q8": {
+    "target": "0460bf948ef690493498fb0cc519798bd8647a9be5045a7807b81ed8b2d01861",
+    "draft": "f39d3a881e0f6ae155c3030fde3d5d786a5f74333f5ede4b2ff519ed35264ec2"
+  },
+  "qwen3.6-35b-a3b:gguf:q2": {
+    "target": "c09de800783dfaccf553bd9d753ad1fe5a23556631aba0c21b58f53bc22081c4",
+    "draft": "8e188bacf5cf67de9ba5483b61fe0b0f993fbf2ea9a8e35886f308c07205f90d"
+  },
+  "qwen3.6-35b-a3b:gguf:q3": {
+    "target": "c09de800783dfaccf553bd9d753ad1fe5a23556631aba0c21b58f53bc22081c4",
+    "draft": "8e188bacf5cf67de9ba5483b61fe0b0f993fbf2ea9a8e35886f308c07205f90d"
+  },
+  "qwen3.6-35b-a3b:gguf:q4": {
+    "target": "c09de800783dfaccf553bd9d753ad1fe5a23556631aba0c21b58f53bc22081c4",
+    "draft": "8e188bacf5cf67de9ba5483b61fe0b0f993fbf2ea9a8e35886f308c07205f90d"
+  },
+  "qwen3.6-35b-a3b:gguf:q6": {
+    "target": "c09de800783dfaccf553bd9d753ad1fe5a23556631aba0c21b58f53bc22081c4",
+    "draft": "8e188bacf5cf67de9ba5483b61fe0b0f993fbf2ea9a8e35886f308c07205f90d"
+  },
+  "qwen3.8-27b:gguf:iq3": {
+    "target": "3c7a778b1101e042e05e2a6990cb3caeeb043c12bc52aa50374f9abb2881f013",
+    "draft": "973dec0577494a5b214326d50d6e117e234086bd7ae1bd712c0ab8fe6af6b4b3"
+  },
+  "qwen3.8-27b:gguf:q3": {
+    "target": "3c7a778b1101e042e05e2a6990cb3caeeb043c12bc52aa50374f9abb2881f013",
+    "draft": "973dec0577494a5b214326d50d6e117e234086bd7ae1bd712c0ab8fe6af6b4b3"
+  },
+  "qwen3.8-27b:gguf:q4": {
+    "target": "3c7a778b1101e042e05e2a6990cb3caeeb043c12bc52aa50374f9abb2881f013",
+    "draft": "973dec0577494a5b214326d50d6e117e234086bd7ae1bd712c0ab8fe6af6b4b3"
+  },
+  "qwen3.8-27b:gguf:q6": {
+    "target": "3c7a778b1101e042e05e2a6990cb3caeeb043c12bc52aa50374f9abb2881f013",
+    "draft": "973dec0577494a5b214326d50d6e117e234086bd7ae1bd712c0ab8fe6af6b4b3"
+  },
+  "qwen3.8-flash-next:gguf:iq3": {
+    "target": "071d631e7bc0fb5979511208a3b4d862b0660f5c71891312c2cefbbf1fa96b8d",
+    "draft": "rejected"
+  },
+  "qwen3.8-flash-next:gguf:q2": {
+    "target": "071d631e7bc0fb5979511208a3b4d862b0660f5c71891312c2cefbbf1fa96b8d",
+    "draft": "rejected"
+  },
+  "qwen3.8-flash-next:gguf:q4": {
+    "target": "071d631e7bc0fb5979511208a3b4d862b0660f5c71891312c2cefbbf1fa96b8d",
+    "draft": "rejected"
+  },
+  "qwen3.8-flash-next:gguf:q6": {
+    "target": "071d631e7bc0fb5979511208a3b4d862b0660f5c71891312c2cefbbf1fa96b8d",
+    "draft": "rejected"
+  }
 }

@@ -4,18 +4,19 @@
 //! row op that normalizes each row first (`post_norm_residual`), since the
 //! norm spans a whole output row that a column-tiled epilogue cannot form.
 
-use crate::programs::graph::{draft::GraphDraft, GraphError};
-use crate::programs::native_target_graph::ScaledWeight;
-use crate::native::{PostNormKernels, SublayerOutput};
+use crate::native::{PostNormKernels, RangedKernels, SublayerOutput};
+use crate::programs::graph::facts::Numbers;
+use crate::programs::graph::{GraphError, draft::GraphDraft};
+use crate::programs::native_target_graph::{PackedWeight, WeightOperands};
 use magnitude_kernels::{post_norm_residual, project_rows};
 use seismic::{
-    Element, Entry, NativeGraph, NativeGraphMetadata, NativeKernel, WorkflowTensor,
-    WorkflowTensorRef,
+    Argument, Dim, Element, Entry, NativeGraph, NativeGraphMetadata, WorkflowTensor, WorkflowTensorRef,
 };
 
-/// A sublayer's output entries, with `E` the operator's own output entry.
+/// A sublayer's output entries, with `E` the operator's own output entry;
+/// each projection's by row range.
 pub(crate) enum TailEntries<'a, G: GraphDraft + 'a, E: Entry + 'a> {
-    Residual(G::Binding<'a, E>),
+    Residual(G::Ranged<'a, E>),
     PostNorm(PostNormEntries<'a, G>),
 }
 
@@ -27,7 +28,7 @@ impl<'a, G: GraphDraft + 'a, E: Entry + 'a> Clone for TailEntries<'a, G, E> {
 }
 
 pub(crate) struct PostNormEntries<'a, G: GraphDraft + 'a> {
-    pub project: G::Binding<'a, project_rows::Entry>,
+    pub project: G::Ranged<'a, project_rows::Entry>,
     pub residual: G::Binding<'a, post_norm_residual::Entry>,
 }
 
@@ -38,8 +39,10 @@ impl<'a, G: GraphDraft + 'a> Clone for PostNormEntries<'a, G> {
     }
 }
 
-impl<'a, E: Entry + 'a> From<&'a SublayerOutput<NativeKernel<E>>> for TailEntries<'a, NativeGraph, E> {
-    fn from(output: &'a SublayerOutput<NativeKernel<E>>) -> Self {
+impl<'a, E: Entry + 'a> From<&'a SublayerOutput<RangedKernels<E>>>
+    for TailEntries<'a, NativeGraph, E>
+{
+    fn from(output: &'a SublayerOutput<RangedKernels<E>>) -> Self {
         match output {
             SublayerOutput::Residual(kernel) => Self::Residual(kernel),
             SublayerOutput::PostNorm(PostNormKernels { project, residual }) => {
@@ -51,6 +54,7 @@ impl<'a, E: Entry + 'a> From<&'a SublayerOutput<NativeKernel<E>>> for TailEntrie
 
 /// Entry element assignments of a post-norm tail from the program binding:
 /// the output projection's weight and activation elements, and the norm's.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CheckedPostNormEntries {
     project: [(&'static str, Element); 3],
     residual: [(&'static str, Element); 1],
@@ -75,20 +79,20 @@ impl CheckedPostNormEntries {
 /// One post-norm tail over `source` (`[rows, K]` activation rows) with the
 /// `[N, K]` output projection `weight` (and its accumulator-scale port):
 /// the `out_rows` rows of `residual`
-/// plus the normalized projection, times `scale` (1, or the layer's output
-/// scale of `OutputForm::ScaledPostNorm`), as `[out, N]` F32 rows.
+/// plus the normalized projection under `post_norm`'s epsilon, times its
+/// scale (1, or the layer's output scale of `OutputForm::ScaledPostNorm`),
+/// as `[out, N]` F32 rows.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn post_norm<'a, G: GraphDraft + 'a>(
+pub(crate) fn post_norm<'a, G: GraphDraft + 'a, D: Into<Dim>>(
     graph: &mut G,
     entries: PostNormEntries<'a, G>,
     residual: &WorkflowTensor,
     source: WorkflowTensorRef<'_>,
-    weight: &ScaledWeight,
+    weight: &PackedWeight,
     norm: &WorkflowTensor,
     out_rows: &WorkflowTensor,
-    shape: PostNormShape,
-    epsilon: f32,
-    scale: f32,
+    shape: PostNormShape<D>,
+    post_norm: &PostNorm,
 ) -> Result<WorkflowTensor, GraphError> {
     let PostNormShape {
         rows,
@@ -96,52 +100,86 @@ pub(crate) fn post_norm<'a, G: GraphDraft + 'a>(
         inputs,
         outputs,
     } = shape;
+    let [rows, out, inputs, outputs] = [rows, out, inputs, outputs].map(Into::<Dim>::into);
+    let PackedWeight {
+        weight,
+        operands:
+            WeightOperands {
+                scale: weight_scale,
+                bound: weight_bound,
+            },
+    } = weight;
     let projected = graph
         .enqueue(
-            entries.project,
-            &[("M", out), ("K", inputs), ("N", outputs), ("WS", weight.extent)],
+            G::pick(entries.project, &out),
+            &[
+                ("M", &out),
+                ("G", &Dim::from(1)),
+                ("K", &inputs),
+                ("N", &outputs),
+                ("WS", &weight_scale.extent),
+                ("WB", &weight_bound.extent),
+            ],
             project_rows::WorkflowArgs {
                 source,
-                weight: (&weight.weight).into(),
-                weight_scale: (&weight.scale).into(),
+                weight: weight.into(),
+                weight_scale: (&weight_scale.tensor).into(),
+                weight_bound: (&weight_bound.tensor).into(),
             },
         )?
         .value;
     Ok(graph
         .enqueue(
             entries.residual,
-            &[("M", rows), ("O", out), ("D", outputs)],
+            &[("M", &rows), ("O", &out), ("D", &outputs)],
             post_norm_residual::WorkflowArgs {
                 residual: residual.into(),
                 projected: (&projected).into(),
                 norm: norm.into(),
                 out_rows: out_rows.into(),
-                epsilon,
-                scale,
+                epsilon: post_norm.epsilon.f32(),
+                scale: post_norm.scale.f32(),
             },
         )?
         .value)
 }
 
+/// A post-norm tail's reals: its norm's epsilon and its output scale (1,
+/// or the layer's output scale). A sublayer without a post-norm tail has
+/// none (`Option<PostNorm>`). Its reals `R`: the model's (`f64`), a key's
+/// (`RealIndex`), or its builder's arguments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct PostNorm<R = Argument<f64>> {
+    pub epsilon: R,
+    pub scale: R,
+}
+
+impl<R> Numbers<R> for PostNorm<R> {
+    type Of<E> = PostNorm<E>;
+    fn map<E>(self, f: &mut impl FnMut(R) -> E) -> PostNorm<E> {
+        PostNorm { epsilon: f(self.epsilon), scale: f(self.scale) }
+    }
+}
+
 /// The extents of one post-norm tail: residual rows, output rows (the rows
 /// `source` holds), and the projection's input and output widths.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct PostNormShape {
-    pub rows: u64,
-    pub out: u64,
-    pub inputs: u64,
-    pub outputs: u64,
+pub(crate) struct PostNormShape<D = Dim> {
+    pub rows: D,
+    pub out: D,
+    pub inputs: D,
+    pub outputs: D,
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::assessment::demand::DecodeDemand;
-    use crate::planning::tests::{fixture_definition, fixture_manifest};
+    use crate::assessment::demand::tests::demand_on;
+    use crate::planning::fixtures::{fixture_definition, fixture_manifest};
     use crate::programs::native_target_graph::checked_target_family_storage;
     use crate::{
-        resident_layout, ComponentSelection, ExecutionPath, FeedForwardProgramSlot,
-        MixerProgramSlot, ModelLoadPlan, PlannedMethod, ResourceCapacity, ResourceLimits,
-        ResourcePlanner, SublayerTail,
+        ComponentSelection, ExecutionPath, FeedForwardProgramSlot, MixerProgramSlot, ModelLoadPlan,
+        PlannedMethod, ResourceCapacity, ResourceLimits, ResourcePlanner, SublayerTail,
+        resident_layout,
     };
     use magnitude_family_contracts::{
         ModelDefinition, OutputForm, RmsNorm, UnweightedRms, WeightDescriptor,
@@ -154,7 +192,11 @@ mod tests {
     fn sandwich() -> ModelDefinition {
         let mut definition = fixture_definition();
         let hidden = definition.decoder.hidden;
-        for (index, sublayer) in definition.decoder.blocks[0].sublayers.iter_mut().enumerate() {
+        for (index, sublayer) in definition.decoder.blocks[0]
+            .sublayers
+            .iter_mut()
+            .enumerate()
+        {
             sublayer.output = OutputForm::PostNorm(RmsNorm {
                 weight: WeightDescriptor::stored(format!("post_norm_{index}"), [hidden]),
                 epsilon: 1e-8,
@@ -179,6 +221,8 @@ mod tests {
             max_images_per_request: 1,
             max_image_cells: 0,
             lookahead: false,
+            chain_capacity: std::num::NonZeroUsize::MIN,
+            conversations: std::num::NonZeroUsize::MIN,
         };
         for backend in [
             BackendName::Cpu,
@@ -194,6 +238,8 @@ mod tests {
                     vision: false,
                 },
                 resident_layout(ExecutionPath::Native, backend),
+                crate::PlannedMethod::Plain,
+                crate::planning::fixtures::LIMITS,
             )
             .unwrap();
             let plan = load.program_plan(&definition, KvCodec::Dense).unwrap();
@@ -216,6 +262,7 @@ mod tests {
                 ResourceCapacity {
                     domain_bytes: 1024 * 1024 * 1024,
                     tensor_operations: crate::TensorOperations::Absent,
+                    allocations: seismic::NativeAllocations::EXACT,
                 },
             )
             .unwrap();
@@ -229,9 +276,9 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
             // Each post-norm tail is a projection into F32 rows and a row
-            // op: two sublayers add two launches to the plain fixture's nine.
-            let demand = DecodeDemand::from_model(&definition, &load, KvCodec::Dense).unwrap();
-            assert_eq!(demand.launches, 11);
+            // op: two sublayers add two calls to the plain fixture's nine.
+            let demand = demand_on(&definition, &load, KvCodec::Dense, backend).unwrap();
+            assert_eq!(demand.calls.len(), 11);
         }
     }
 
@@ -256,6 +303,8 @@ mod tests {
                 vision: false,
             },
             resident_layout(ExecutionPath::Native, BackendName::Cpu),
+            crate::PlannedMethod::Plain,
+            crate::planning::fixtures::LIMITS,
         )
         .unwrap();
         assert!(load.weights().any(|weight| weight.role.kind

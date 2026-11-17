@@ -17,7 +17,7 @@ use magnitude_engine::{
     options::{ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection},
 };
 use magnitude_executor::{
-    platform::{DeviceRequest, MemoryReserves},
+    platform::{DeviceRequest, ReleaseRate},
     Demand, ExecutionPath, ExecutorDomain, Operation, Outcome, PhysicalDecision, RequestId,
     ReservedResources, StateBindings, TokenId, WorkKind,
 };
@@ -30,7 +30,7 @@ use magnitude_scheduler::{
     prefix_cache::{PrefixCacheCapacity, PrefixRetention, MIN_PREFIX_HIT},
     ServiceLimits,
 };
-use magnitude_state::{KvCodec, ShrinkPolicy};
+use magnitude_state::KvCodec;
 use owner_host::Host;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -55,19 +55,21 @@ fn resolved(projector: bool) -> ResolvedEngineConfiguration {
             draft: None,
         },
         model: ModelPolicy {
+            draft_policy: None,
             method: ModelMethod::Plain,
             mtp_proposals: None,
-            kv_codec: KvCodec::AffineK8V4,
+            kv_codec: Some(KvCodec::AffineK8V4),
             lookahead: false,
             exported_logits_rows: 512,
-            error_classes: Vec::new(),
+            numerical_profile: None,
+            weight_bound: None,
         },
         context_tokens: Some(CONTEXT),
         service: limits(),
         path: ExecutionPath::Native,
         device: DeviceRequest::Automatic,
         kernel_cache: std::env::var_os("MAGNITUDE_TEST_KERNEL_CACHE").map(PathBuf::from),
-        reserves: MemoryReserves::standard(),
+        release: ReleaseRate::of_machine(None),
     }
     .resolve()
     .unwrap()
@@ -79,6 +81,7 @@ fn limits() -> ServiceLimits {
         decode_tokens: 32,
         decode_share: 0.5,
         locality_seconds: 1.0,
+        conversations: std::num::NonZeroUsize::MIN,
     }
 }
 
@@ -95,7 +98,10 @@ fn owner() -> (Host, usize, std::sync::Arc<ByteBpeTokenizer>) {
             domain,
             bindings,
             limits(),
-            PrefixCacheCapacity { max_entries: 64 },
+            PrefixCacheCapacity {
+                max_entries: 64,
+                workload_state_bytes: u64::MAX,
+            },
             wakes,
         )
     });
@@ -259,7 +265,84 @@ fn conversation_turns_resume_at_the_previous_reply() {
         prompt = path(&done);
         prompt.extend(text(&tokenizer, 100 + turn, 40));
     }
-    assert_eq!(host.owner().reconcile_memory_charge().unwrap().unattributed, 0);
+    host.owner().reconcile_memory_charge().unwrap();
+}
+
+/// The prefixes a growing conversation leaves cached never take the state
+/// stores past the workload state the plan charges (one conversation at the
+/// fit depth with its three checkpoints), while every turn still resumes at
+/// the previous reply. A recurrent model pins one bank per cached prefix, so
+/// without the bound each turn would hold two more.
+#[test]
+#[ignore = "requires a Metal or CUDA device and MAGNITUDE_TEST_GGUF"]
+fn a_growing_conversation_stays_within_the_charged_workload_state() {
+    let resolved = resolved(false);
+    let vocabulary = resolved.manifest.definition.decoder.vocabulary as usize;
+    let tokenizer = resolved.host.shared_tokenizer();
+    let (domain, bindings, plan) =
+        build_native_domain(&resolved.manifest, resolved.host.shared_package()).unwrap();
+    let workload = plan.capacity().workload_state_bytes;
+    let mut host = Host::new(|wakes| Owner::with_resource_plan(domain, bindings, limits(), &plan, wakes));
+    let mut prompt = text(&tokenizer, 1, 300);
+    let mut previous: Option<usize> = None;
+    for turn in 0..12 {
+        let [done] = run(&mut host, vocabulary, &[prompt.clone()], 12)
+            .try_into()
+            .ok()
+            .unwrap();
+        if let Some(end) = previous {
+            assert_eq!(done.cached, end, "turn {turn} resumes at the last reply");
+        }
+        let charge = host.owner().reconcile_memory_charge().unwrap();
+        let occupied = charge.target_state.occupied()
+            + charge.head_state.map_or(0, |head| head.occupied());
+        eprintln!(
+            "turn {turn}: prompt={} cached={} prefixes={} occupied={occupied} workload={workload}",
+            done.prompt.len(),
+            done.cached,
+            host.owner().cached_prefixes(),
+        );
+        assert!(occupied <= workload, "turn {turn} occupies {occupied} of {workload}");
+        previous = Some(done.prompt.len() + done.output.len());
+        prompt = path(&done);
+        prompt.extend(text(&tokenizer, 100 + turn, 300));
+    }
+}
+
+/// Distinct conversations, each retaining its own checkpoints (a recurrent
+/// model pins a bank per cached prefix), never make the state stores commit
+/// more than the workload state the plan charges: once retained prefixes
+/// fill it, a new conversation takes the backing of the least recently used
+/// ones instead of growing beside them. Holding only what holders occupy
+/// within it is not enough: the slabs a new conversation grew while the
+/// retained prefixes stood stay committed after its own caching releases
+/// them.
+#[test]
+#[ignore = "requires a Metal or CUDA device and MAGNITUDE_TEST_GGUF"]
+fn distinct_conversations_commit_no_state_beyond_the_charged_workload() {
+    let resolved = resolved(false);
+    let vocabulary = resolved.manifest.definition.decoder.vocabulary as usize;
+    let tokenizer = resolved.host.shared_tokenizer();
+    let (domain, bindings, plan) =
+        build_native_domain(&resolved.manifest, resolved.host.shared_package()).unwrap();
+    let workload = plan.capacity().workload_state_bytes;
+    let mut host = Host::new(|wakes| Owner::with_resource_plan(domain, bindings, limits(), &plan, wakes));
+    let mut released = false;
+    for conversation in 0..24 {
+        let prompt = text(&tokenizer, 200 + conversation, 600);
+        run(&mut host, vocabulary, &[prompt], 12);
+        let charge = host.owner().reconcile_memory_charge().unwrap();
+        let committed =
+            charge.target_state.total() + charge.head_state.map_or(0, |head| head.total());
+        let prefixes = host.owner().cached_prefixes();
+        released |= prefixes < 2 * (conversation as usize + 1);
+        eprintln!("conversation {conversation}: prefixes={prefixes} committed={committed} workload={workload}");
+        assert!(
+            committed <= workload,
+            "conversation {conversation} commits {committed} of {workload}"
+        );
+    }
+    assert!(released, "the conversations filled the workload state");
 }
 
 /// A template that rewrites the previous reply (dropping reasoning, say)
@@ -282,6 +365,52 @@ fn a_rewritten_reply_resumes_at_the_previous_prompt() {
         .ok()
         .unwrap();
     assert_eq!(next.cached, first.len() - 1);
+}
+
+/// Short turns of a conversation whose template renders the previous reply
+/// unlike the generation prompt it followed (an empty reasoning block the
+/// history omits): each prompt declares where its last message opens and
+/// where its next turn leaves it, as chat preparation does. Every turn is far
+/// shorter than the minimum branch gain, yet each resumes where the previous
+/// turn left its prompt, rather than all at the first turn's last message.
+#[test]
+#[ignore = "requires a Metal or CUDA device and MAGNITUDE_TEST_GGUF"]
+fn short_rewritten_turns_resume_where_the_previous_turn_left_its_prompt() {
+    let (mut host, vocabulary, tokenizer) = owner();
+    let suffix = tokenizer
+        .encode(" Reply in one word.", SpecialTokens::Literal)
+        .unwrap();
+    let mut history = text(&tokenizer, 41, 400);
+    let mut previous: Option<usize> = None;
+    for turn in 0..6 {
+        let opened = history.len();
+        history.extend(text(&tokenizer, 50 + turn, 20));
+        let left = history.len();
+        let mut prompt = history.clone();
+        prompt.extend(&suffix);
+        let [done] =
+            run_with_cache_points(&mut host, vocabulary, &[(prompt, vec![opened, left])], 4)
+                .try_into()
+                .ok()
+                .unwrap();
+        eprintln!(
+            "turn {turn}: prompt={} cached={}",
+            done.prompt.len(),
+            done.cached
+        );
+        match previous {
+            None => assert_eq!(done.cached, 0),
+            Some(left) => assert_eq!(
+                done.cached, left,
+                "turn {turn} resumes where the last turn left"
+            ),
+        }
+        previous = Some(left);
+        let reply = text(&tokenizer, 60 + turn, 3);
+        assert_ne!(reply[0], suffix[0]);
+        history.extend(reply);
+    }
+    host.owner().reconcile_memory_charge().unwrap();
 }
 
 /// A long system prompt, then a last message that changes on every request,
@@ -323,7 +452,7 @@ fn a_changed_last_message_resumes_at_its_declared_start() {
         cached.push(done.cached);
     }
     assert_eq!(cached, [0, system.len(), system.len()]);
-    assert_eq!(host.owner().reconcile_memory_charge().unwrap().unattributed, 0);
+    host.owner().reconcile_memory_charge().unwrap();
 }
 
 /// Without a declared cache point, a changed last message diverges below
@@ -425,7 +554,7 @@ fn arbitrary_request_sequences_resume_from_their_deepest_cached_prefix() {
             assert!(turn.cached < turn.prompt.len());
         }
         finished.extend(turns);
-        assert_eq!(host.owner().reconcile_memory_charge().unwrap().unattributed, 0);
+        host.owner().reconcile_memory_charge().unwrap();
     }
 }
 
@@ -545,25 +674,28 @@ fn vision_claims_its_slots_on_an_image_and_releases_them_at_idle() {
     let input = image_prompt(&resolved.host);
     let (mut domain, mut bindings, _) =
         build_native_domain(&resolved.manifest, resolved.host.shared_package()).unwrap();
-    let charged = |domain: &ExecutorDomain| domain.resources().device().memory_usage().charged;
+    let charged = |domain: &ExecutorDomain| {
+        let device = domain.resources().device();
+        device.allocated()
+    };
     let mut cycles = Vec::new();
     for request in [RequestId(1), RequestId(2)] {
         domain.install_input(request, input.clone()).unwrap();
-        let encodes = domain.open_state(&mut bindings, request, None).unwrap();
+        let encodes = domain.open_served(&mut bindings, request, None).unwrap();
         assert_eq!(encodes.len(), 1);
         let opened = charged(&domain);
         bindings = encode(&mut domain, bindings, encodes);
         let encoded = charged(&domain);
         assert!(encoded > opened, "the image claimed no vision storage");
         domain.close(request).unwrap();
-        let released = domain
-            .shrink_state(&mut bindings, ShrinkPolicy::Idle)
-            .unwrap();
+        // Vision's free slots release on the load's release thread: the
+        // charge falls by what it released once the boundary that finds it
+        // ended records it.
+        let released = magnitude_executor::fixtures::shrink_settled(&mut domain, &mut bindings);
         let idle = charged(&domain);
         assert_eq!(encoded - idle, released);
         assert!(released > 0, "idle released no vision storage");
-        let accounted = domain.reconcile_memory_charge(&[]).unwrap();
-        assert_eq!(accounted.unattributed, 0, "{accounted:?}");
+        domain.reconcile_memory_charge(&[]).unwrap();
         eprintln!(
             "vision cycle: opened={opened} encoded={encoded} idle={idle} released={released}"
         );
@@ -605,11 +737,10 @@ fn image_conditioning_survives_eviction_and_cached_resumption() {
     // Uninterrupted: encode, the image chunk, then the rest.
     let reference = RequestId(1);
     domain.install_input(reference, input.clone()).unwrap();
-    let encodes = domain.open_state(&mut bindings, reference, None).unwrap();
+    let encodes = domain.open_served(&mut bindings, reference, None).unwrap();
     assert_eq!(encodes.len(), 1);
     bindings = encode(&mut domain, bindings, encodes);
-    let encoded = domain.reconcile_memory_charge(&[]).unwrap();
-    assert_eq!(encoded.unattributed, 0, "{encoded:?}");
+    domain.reconcile_memory_charge(&[]).unwrap();
     bindings = forward(&mut domain, bindings, reference, &input, 0..split).1;
     let after_image = domain.resume_state(reference).unwrap();
     let (expected, next) = forward(&mut domain, bindings, reference, &input, split..end);
@@ -620,11 +751,11 @@ fn image_conditioning_survives_eviction_and_cached_resumption() {
     // Becoming resident again re-encodes the image for the replay.
     let evicted = RequestId(2);
     domain.install_input(evicted, input.clone()).unwrap();
-    let encodes = domain.open_state(&mut bindings, evicted, None).unwrap();
+    let encodes = domain.open_served(&mut bindings, evicted, None).unwrap();
     bindings = encode(&mut domain, bindings, encodes);
     bindings = forward(&mut domain, bindings, evicted, &input, 0..split).1;
     domain.release_state(&[evicted]).unwrap();
-    let encodes = domain.open_state(&mut bindings, evicted, None).unwrap();
+    let encodes = domain.open_served(&mut bindings, evicted, None).unwrap();
     assert_eq!(encodes.len(), 1, "replay re-encodes the released image");
     bindings = encode(&mut domain, bindings, encodes);
     bindings = forward(&mut domain, bindings, evicted, &input, 0..split).1;
@@ -637,16 +768,14 @@ fn image_conditioning_survives_eviction_and_cached_resumption() {
     let resumed = RequestId(3);
     domain.install_input(resumed, input.clone()).unwrap();
     let encodes = domain
-        .open_state(&mut bindings, resumed, Some(&after_image))
+        .open_served(&mut bindings, resumed, Some(&after_image))
         .unwrap();
     assert!(encodes.is_empty(), "an image before the resume position is not re-encoded");
     let (continued, _) = forward(&mut domain, bindings, resumed, &input, split..end);
     assert_eq!(bits(&continued), bits(&expected));
     domain.close(resumed).unwrap();
 
-    let held = domain.reconcile_memory_charge(&[&after_image]).unwrap();
-    assert_eq!(held.unattributed, 0, "{held:?}");
+    domain.reconcile_memory_charge(&[&after_image]).unwrap();
     drop(after_image);
-    let released = domain.reconcile_memory_charge(&[]).unwrap();
-    assert_eq!(released.unattributed, 0, "{released:?}");
+    domain.reconcile_memory_charge(&[]).unwrap();
 }

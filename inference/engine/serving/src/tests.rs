@@ -13,7 +13,9 @@ use magnitude_chat::output::{
     Completion, GenerationTimings, OutputEvent, Progress, Termination, TimingSnapshot, TokenUsage,
 };
 use magnitude_chat::reasoning::{EffortDomain, EffortMapping, ReasoningProfile};
-use magnitude_chat::request::{Entry, OutputFormat, PromptCache, ToolCall, UserPart};
+use magnitude_chat::request::{
+    Entry, OutputFormat, PromptCache, SamplingControls, ToolCall, UserPart,
+};
 use magnitude_chat::{ChatError, ChatInput, EndOfGeneration, GenerationRequest, ReasoningIntent, ToolChoice};
 use magnitude_engine::chat::{AppliedTemplate, ModelProperties};
 use magnitude_engine::error::RequestError;
@@ -44,6 +46,8 @@ struct Script {
     hang: bool,
     /// Leading prompt tokens the completion reports as restored from cache.
     cached_input_tokens: u64,
+    /// `None` derives the termination from the output.
+    termination: Option<Termination>,
 }
 
 impl Script {
@@ -63,6 +67,7 @@ impl Script {
             failure: None,
             hang: false,
             cached_input_tokens: 0,
+            termination: None,
         }
     }
 
@@ -74,25 +79,23 @@ impl Script {
     }
 }
 
-fn completion(
-    output: &[(OutputEvent, Option<TimingSnapshot>)],
-    cached_input_tokens: u64,
-) -> Completion {
-    let tools = output
+fn completion(script: &Script) -> Completion {
+    let tools = script
+        .output
         .iter()
         .any(|(event, _)| matches!(event, OutputEvent::ToolCallFinished { .. }));
     Completion {
         usage: TokenUsage {
             input_tokens: 11,
-            cached_input_tokens,
+            cached_input_tokens: script.cached_input_tokens,
             output_tokens: 7,
             reasoning_output_tokens: 1,
         },
-        termination: if tools {
+        termination: script.termination.clone().unwrap_or(if tools {
             Termination::ToolCalls
         } else {
             Termination::Natural
-        },
+        }),
         timings: GenerationTimings {
             prompt_ms: 2.0,
             decode_ms: 3.0,
@@ -194,12 +197,9 @@ impl ModelInvocation for ScriptedInvocation {
                 observed.cancelled.store(true, Ordering::Release);
                 return;
             }
-            send(match script.failure {
+            send(match script.failure.clone() {
                 Some(error) => GenerationEvent::Failed(error),
-                None => GenerationEvent::Completed(completion(
-                    &script.output,
-                    script.cached_input_tokens,
-                )),
+                None => GenerationEvent::Completed(completion(&script)),
             })
             .await;
         });
@@ -234,6 +234,7 @@ impl ServedModels for Scripted {
                 progress(ModelLoadProgress {
                     stage: ModelLoadStage::LoadingWeights,
                     fraction: 0.5,
+                    details: None,
                 });
             }
             if self.pending {
@@ -698,6 +699,44 @@ fn chat_accepts_empty_assistant_content_when_tool_calls_are_present() {
     let turn = assistant(&request, 1);
     assert!(turn.text.is_none());
     assert_eq!(turn.tool_calls.len(), 1);
+}
+
+// Results sent out of call order pair with their calls by id and render in
+// call order, the order GLM's template restores by id.
+#[test]
+fn chat_renders_tool_results_in_call_order() {
+    let request = chat_request(json!({
+        "model": "test-model",
+        "messages": [
+            { "role": "user", "content": "weather and search" },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    { "id": "call_b", "type": "function",
+                      "function": { "name": "get_weather", "arguments": "{\"city\":\"Paris\"}" } },
+                    { "id": "call_A", "type": "function",
+                      "function": { "name": "search", "arguments": "{\"query\":\"x\"}" } }
+                ]
+            },
+            { "role": "tool", "tool_call_id": "call_A", "content": "found" },
+            { "role": "tool", "tool_call_id": "call_b", "content": "sunny" }
+        ]
+    }))
+    .unwrap();
+    let rendered = request.input.render(0, None).unwrap().request.messages;
+    let results = rendered
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .map(|message| (message["tool_call_id"].clone(), message["content"].clone()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results,
+        [
+            (json!("call_b"), json!("sunny")),
+            (json!("call_A"), json!("found")),
+        ]
+    );
 }
 
 #[test]
@@ -1355,8 +1394,60 @@ fn preserves_model_defaults_when_optional_controls_are_omitted() {
     assert!(request.controls.stops.is_empty());
     assert_eq!(request.controls.prompt_cache, PromptCache::Allowed);
     assert_eq!(request.controls.end_of_generation, EndOfGeneration::Stop);
-    assert_eq!(request.controls.sampling.temperature, 0.8);
+    assert_eq!(request.controls.sampling.temperature, 1.0);
     assert_eq!(request.controls.sampling.top_p, 0.95);
+    assert_eq!(request.controls.sampling.top_k, 20);
+}
+
+// Every protocol samples with the same defaults, and each keeps the fields
+// its request sets.
+#[test]
+fn every_protocol_samples_with_the_same_defaults() {
+    let chat = |fields: Value| {
+        let mut body = json!({
+            "model": "test-model",
+            "messages": [{ "role": "user", "content": "hello" }]
+        });
+        body.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
+        chat_request(body).unwrap().controls.sampling
+    };
+    let responses = |fields: Value| {
+        let mut body = json!({ "model": "test-model", "input": "hello" });
+        body.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
+        responses::adapt(serde_json::from_value(body).unwrap())
+            .unwrap()
+            .request
+            .controls
+            .sampling
+    };
+    let anthropic = |fields: Value| {
+        let mut body = json!({
+            "model": "test-model",
+            "max_tokens": 16,
+            "messages": [{ "role": "user", "content": "hello" }]
+        });
+        body.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
+        anthropic::adapt(serde_json::from_value(body).unwrap())
+            .unwrap()
+            .request
+            .controls
+            .sampling
+    };
+    for sampled in [
+        &chat as &dyn Fn(Value) -> SamplingControls,
+        &responses,
+        &anthropic,
+    ] {
+        let defaults = sampled(json!({}));
+        assert_eq!(
+            (defaults.temperature, defaults.top_p, defaults.top_k),
+            (1.0, 0.95, 20)
+        );
+        let set = sampled(json!({ "temperature": 0.5, "top_p": 0.75 }));
+        assert_eq!((set.temperature, set.top_p, set.top_k), (0.5, 0.75, 20));
+    }
+    assert_eq!(chat(json!({ "top_k": 5 })).top_k, 5);
+    assert_eq!(anthropic(json!({ "top_k": 5 })).top_k, 5);
 }
 
 // Without a caller seed, identical requests sample anew instead of repeating
@@ -1821,7 +1912,6 @@ async fn streaming_context_overflow_uses_protocol_native_http_errors() {
 async fn engine_admission_refusals_map_to_integration_error_codes() {
     for (error, status, code) in [
         (RequestError::Overloaded, StatusCode::SERVICE_UNAVAILABLE, "overloaded"),
-        (RequestError::MemoryReclaim, StatusCode::SERVICE_UNAVAILABLE, "memory_pressure"),
         (
             RequestError::InsufficientMemory(magnitude_engine::error::InsufficientMemory {
                 required: 2,
@@ -2176,16 +2266,17 @@ async fn anthropic_count_tokens_is_host_only() {
 }
 
 #[tokio::test]
-async fn anthropic_requires_the_supported_protocol_version() {
-    let reply = send(
-        app(Scripted::new(Script::text("hello"))),
-        "/anthropic/v1/messages",
-        &[("anthropic-version", "2024-01-01")],
-        json!({ "model": "test-model", "max_tokens": 32, "messages": [{ "role": "user", "content": "hi" }] }),
-    )
-    .await;
-    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
-    assert!(reply.body.contains("unsupported anthropic-version"));
+async fn anthropic_accepts_any_protocol_version_or_none() {
+    for headers in [&[("anthropic-version", "2026-10-21")][..], &[]] {
+        let reply = send(
+            app(Scripted::new(Script::text("hello"))),
+            "/anthropic/v1/messages",
+            headers,
+            json!({ "model": "test-model", "max_tokens": 32, "messages": [{ "role": "user", "content": "hi" }] }),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+    }
 }
 
 #[tokio::test]
@@ -2421,4 +2512,160 @@ async fn template_application_and_properties_are_host_only() {
     assert_eq!(body["template_capabilities"]["enable_thinking"], true);
     assert!(body.get("execution").is_none());
     assert_eq!(observed.invocations.load(Ordering::Relaxed), 0);
+}
+
+/// Generation that stopped at `max_tokens` inside a call's arguments: one
+/// complete call, then one cut off mid-arguments.
+fn cut_off_tool_call() -> Script {
+    let mut script = Script::output(vec![
+        OutputEvent::TextDelta("writing".into()),
+        OutputEvent::ToolCallStarted {
+            index: 0,
+            id: "call-1".into(),
+            name: "lookup".into(),
+        },
+        OutputEvent::ToolInputDelta {
+            index: 0,
+            fragment: "{}".into(),
+        },
+        OutputEvent::ToolCallFinished { index: 0 },
+        OutputEvent::ToolCallStarted {
+            index: 1,
+            id: "call-2".into(),
+            name: "write_file".into(),
+        },
+        OutputEvent::ToolInputDelta {
+            index: 1,
+            fragment: "{\"path\":\"story.txt\",\"content\":\"Once".into(),
+        },
+    ]);
+    script.termination = Some(Termination::OutputLimit);
+    script
+}
+
+/// A call cut off by the output limit once failed the non-streaming
+/// response with a 500 while the stream reported `tool_calls`. Both modes now
+/// end with a length termination, and the complete response holds only the
+/// calls that completed.
+#[tokio::test]
+async fn chat_ends_a_call_cut_off_by_the_output_limit_with_length_in_both_modes() {
+    let (status, body) = post_chat(
+        Scripted::new(cut_off_tool_call()),
+        json!({ "model": "test-model", "messages": [{"role": "user", "content": "hi"}] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let body: Value = serde_json::from_str(&body).unwrap();
+    let choice = &body["choices"][0];
+    assert_eq!(choice["finish_reason"], "length");
+    assert_eq!(choice["message"]["content"], "writing");
+    let calls = choice["message"]["tool_calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["id"], "call-1");
+
+    let (status, body) = post_chat(Scripted::new(cut_off_tool_call()), minimal_request()).await;
+    assert_eq!(status, StatusCode::OK);
+    let chunks = stream_json(&body);
+    let finishes = chunks
+        .iter()
+        .filter_map(|chunk| chunk["choices"][0]["finish_reason"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(finishes, ["length"]);
+}
+
+#[tokio::test]
+async fn anthropic_ends_a_call_cut_off_by_the_output_limit_with_max_tokens_in_both_modes() {
+    let request = json!({
+        "model": "test-model", "max_tokens": 32,
+        "messages": [{ "role": "user", "content": "hi" }]
+    });
+    let reply = send(
+        app(Scripted::new(cut_off_tool_call())),
+        "/anthropic/v1/messages",
+        ANTHROPIC,
+        request.clone(),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    let body: Value = serde_json::from_str(&reply.body).unwrap();
+    assert_eq!(body["stop_reason"], "max_tokens");
+    let kinds = body["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|block| block["type"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(kinds, ["text", "tool_use"]);
+    assert_eq!(body["content"][1]["id"], "call-1");
+
+    let mut streaming = request;
+    streaming["stream"] = json!(true);
+    let reply = send(
+        app(Scripted::new(cut_off_tool_call())),
+        "/anthropic/v1/messages",
+        ANTHROPIC,
+        streaming,
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.body.matches("event: content_block_start").count(), 3);
+    assert_eq!(reply.body.matches("event: content_block_stop").count(), 3);
+    assert!(reply.body.contains("\"stop_reason\":\"max_tokens\""));
+    assert!(!reply.body.contains("\"stop_reason\":\"tool_use\""));
+}
+
+#[tokio::test]
+async fn responses_end_a_call_cut_off_by_the_output_limit_incomplete_in_both_modes() {
+    let reply = send(
+        app(Scripted::new(cut_off_tool_call())),
+        "/v1/responses",
+        &[],
+        json!({ "model": "test-model", "input": "hi" }),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    let complete: Value = serde_json::from_str(&reply.body).unwrap();
+    assert_eq!(complete["status"], "incomplete");
+    assert_eq!(complete["incomplete_details"]["reason"], "max_output_tokens");
+    let types = |output: &Value| {
+        output
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["type"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(types(&complete["output"]), ["message", "function_call"]);
+    assert_eq!(complete["output"][1]["call_id"], "call-1");
+
+    let mut stream = start_response(cut_off_tool_call()).await;
+    let mut done = Vec::new();
+    let mut terminal = Value::Null;
+    while let Some(event) = stream.events.recv().await {
+        match event["type"].as_str().unwrap() {
+            "response.output_item.done" => done.push(event["item"].clone()),
+            "response.function_call_arguments.done" => {
+                assert_eq!(event["output_index"], 1, "only the complete call is done");
+            }
+            "response.incomplete" => terminal = event["response"].clone(),
+            "response.completed" => panic!("a cut-off response is incomplete"),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        done.iter()
+            .map(|item| (item["type"].as_str().unwrap(), item["status"].as_str().unwrap()))
+            .collect::<Vec<_>>(),
+        [
+            ("message", "completed"),
+            ("function_call", "completed"),
+            ("function_call", "incomplete"),
+        ]
+    );
+    assert_eq!(terminal["incomplete_details"]["reason"], "max_output_tokens");
+    assert_eq!(types(&terminal["output"]), types(&complete["output"]));
+    assert_eq!(
+        Value::Array(stream.concluded.await.unwrap()),
+        terminal["output"]
+    );
 }

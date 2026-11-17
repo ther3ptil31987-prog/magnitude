@@ -12,24 +12,30 @@
 //! bound and shape-checked in full but not emitted: its hidden input is the
 //! target's normalized final row, which the contract's head block does not
 //! express, and the catalog drafts these models with DFlash instead.
+//!
+//! A Nemotron Omni projector (`nemotron_omni`) adds image input
+//! ([`projector`], [`inputs`]).
 
 mod family;
+pub mod inputs;
+pub mod projector;
 
 pub use family::NemotronHFamily;
 
 use magnitude_artifacts::{
+    PackageIdentity, UnsupportedReason,
     gguf::{Directory, Value},
-    PackageIdentity,
 };
 use magnitude_family_common::{HeaderError, Metadata, Tensors};
 use magnitude_family_contracts::{
-    checked_product, ActivationDType, RouteNormalization, ActivationFunction, Attention, AttentionGate, Block, Decoder,
-    DefinitionError, DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm, ExpertSelection,
-    FamilyId, FeedForwardUp, Head, HeadBlock, HeadNorm, HistoryDomain, HistoryReads,
-    ImportTransform, InputNorm, InputSemantics, KeyValue, LatentExperts, LayerNorm,
-    MediaRowAttention, ModelDefinition, Operator, OutputForm, ResidualForm, RmsNorm, Rotary,
-    RoutedFfn, Router, RouterInput, ScoreFunction, SharedExpert, SharedExpertGate,
-    StateSpace, Sublayer, ValueNorm, ValueSource, WeightDescriptor,
+    ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder, DefinitionError,
+    DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm, ExpertSelection, FamilyId,
+    FeedForwardUp, Head, HeadBlock, HeadChain, HeadComponent, HeadHistory, HeadInput, HeadNorm,
+    HeadReadout, HistoryRows, HistorySource, ImportTransform, InputNorm, InputSemantics,
+    LatentExperts, ProjectedRows, RowProducer, RowRounding, TokenDomain, LayerNorm, MediaRowAttention, ModelDefinition, Operator, OutputForm,
+    OutputProjection, QueryKeys, QueryProjection, ResidualForm, RmsNorm, Rotary, RouteNormalization, RoutedFfn, Router, RouterInput,
+    ScoreFunction, SharedExpert, SharedExpertGate, StateSpace, Sublayer, ValueNorm, ValueSource,
+    VocabularyProjection, WeightDescriptor, FamilyError, checked_product,
 };
 use std::{error, fmt};
 
@@ -62,6 +68,7 @@ const KNOWN_KEYS: &[&str] = &[
     "expert_used_count",
     "expert_group_count",
     "expert_group_used_count",
+    "expert_gating_func",
     "expert_feed_forward_length",
     "expert_shared_feed_forward_length",
     "expert_shared_count",
@@ -76,12 +83,23 @@ const KNOWN_KEYS: &[&str] = &[
 pub enum Error {
     /// The artifact is not a `nemotron_h_moe` target.
     Architecture(String),
-    /// Missing, malformed or unknown metadata.
+    /// A required architecture key the header omits.
+    MissingMetadata(String),
+    /// Malformed or contradictory metadata.
     Metadata(String),
-    /// A missing, misshapen or unbound tensor.
+    /// Every architecture key the family does not interpret.
+    UnknownMetadata(Vec<String>),
+    /// A missing or misshapen tensor.
     Weight(String),
+    /// Every stored tensor no role binds.
+    UnboundWeights(Vec<String>),
     /// A layer sequence the family cannot form into blocks.
     Structure(String),
+    /// A projector the family does not interpret.
+    Projector(String),
+    /// A header given as a projector that is not a Nemotron Omni projector
+    /// of the target's width.
+    ProjectorIdentity(magnitude_family_common::ProjectorIdentityError),
     /// The assembled definition failed contract validation.
     Definition(String),
 }
@@ -93,12 +111,56 @@ impl fmt::Display for Error {
             | Self::Metadata(message)
             | Self::Weight(message)
             | Self::Structure(message)
+            | Self::Projector(message)
             | Self::Definition(message) => formatter.write_str(message),
+            Self::ProjectorIdentity(error) => error.fmt(formatter),
+            Self::MissingMetadata(key) => write!(formatter, "missing metadata {key}"),
+            Self::UnknownMetadata(keys) => write!(formatter, "unknown Nemotron-H metadata {keys:?}"),
+            Self::UnboundWeights(names) => write!(
+                formatter,
+                "Nemotron-H artifact contains unbound weight roles {names:?}"
+            ),
         }
     }
 }
 
 impl error::Error for Error {}
+
+impl Error {
+    /// The unsupported features this error names; a header missing a key
+    /// names it, one missing a weight the family needs, or whose values or
+    /// layers contradict each other, is `Unreadable`, as is a Nemotron Omni
+    /// projector the family cannot interpret; another model's projector
+    /// disagrees with the target.
+    pub fn reasons(&self) -> Vec<UnsupportedReason> {
+        match self {
+            Self::MissingMetadata(key) => {
+                vec![UnsupportedReason::MissingMetadata { key: key.clone() }]
+            }
+            Self::UnknownMetadata(keys) => keys
+                .iter()
+                .map(|key| UnsupportedReason::UnrecognizedMetadata { key: key.clone() })
+                .collect(),
+            Self::UnboundWeights(names) => names
+                .iter()
+                .map(|name| UnsupportedReason::UnrecognizedTensor { name: name.clone() })
+                .collect(),
+            Self::Architecture(_)
+            | Self::Metadata(_)
+            | Self::Weight(_)
+            | Self::Structure(_)
+            | Self::Projector(_)
+            | Self::Definition(_) => vec![UnsupportedReason::Unreadable],
+            Self::ProjectorIdentity(error) => error.reasons(),
+        }
+    }
+}
+
+impl From<Error> for FamilyError {
+    fn from(error: Error) -> Self {
+        FamilyError::unsupported(error.reasons(), error.to_string())
+    }
+}
 
 impl From<DefinitionError> for Error {
     fn from(error: DefinitionError) -> Self {
@@ -109,9 +171,8 @@ impl From<DefinitionError> for Error {
 impl From<HeaderError> for Error {
     fn from(error: HeaderError) -> Self {
         match error {
-            HeaderError::UnknownMetadata(key) => {
-                metadata_error(format!("unknown Nemotron-H metadata {key:?}"))
-            }
+            HeaderError::UnknownMetadata(keys) => Self::UnknownMetadata(keys),
+            HeaderError::MissingMetadata(key) => Self::MissingMetadata(key),
             HeaderError::MissingWeight(name) => {
                 Self::Weight(format!("missing Nemotron-H weight {name:?}"))
             }
@@ -122,17 +183,15 @@ impl From<HeaderError> for Error {
             } => Self::Weight(format!(
                 "Nemotron-H weight {name:?}: expected {expected:?}, received {received:?}"
             )),
-            HeaderError::UnboundWeight(name) => Self::Weight(format!(
-                "Nemotron-H artifact contains unbound weight role {name:?}"
-            )),
+            HeaderError::UnboundWeights(names) => Self::UnboundWeights(names),
             HeaderError::Definition(error) => error.into(),
             error @ (HeaderError::NotMatrix { .. } | HeaderError::CompanionScale { .. }) => {
                 Self::Weight(error.to_string())
             }
-            error @ (HeaderError::MissingMetadata(_)
-            | HeaderError::MetadataType { .. }
+            error @ (HeaderError::MetadataType { .. }
             | HeaderError::Rotary { .. }
-            | HeaderError::Yarn) => metadata_error(error.to_string()),
+            | HeaderError::Yarn
+            | HeaderError::Payload { .. }) => metadata_error(error.to_string()),
         }
     }
 }
@@ -185,10 +244,13 @@ struct StateSpaceGeometry {
     convolution_width: u64,
 }
 
+/// Routed-expert geometry. Each routed layer stores its own expert count
+/// (its router's rows), at most `count`; its selected count and expert width
+/// are per layer, uniform in Lightning and Super and heterogeneous in Bolt.
 struct Experts {
     count: u64,
-    selected: u64,
-    intermediate: u64,
+    selected: Vec<u64>,
+    intermediate: Vec<u64>,
     shared: Option<u64>,
     normalize: bool,
     scale: f64,
@@ -227,26 +289,31 @@ impl Geometry {
             heads: self.attention_heads,
             kv_heads,
             width,
-            query: binder.bind(&format!("{prefix}attn_q.weight"), &[query_rows, hidden])?,
+            query: QueryProjection::Full(
+                binder.bind(&format!("{prefix}attn_q.weight"), &[query_rows, hidden])?,
+            ),
+            query_keys: QueryKeys::Direct,
             gate: AttentionGate::None,
             query_norm: HeadNorm::None,
-            key_value: KeyValue::Owned {
-                key: binder.bind(&format!("{prefix}attn_k.weight"), &[key_rows, hidden])?,
-                value: ValueSource::Projected(
-                    binder.bind(&format!("{prefix}attn_v.weight"), &[key_rows, hidden])?,
-                ),
-                key_norm: HeadNorm::None,
-                value_norm: ValueNorm::None,
-                domain: HistoryDomain::Token,
-            },
-            rotary: Rotary::None,
-            scale: 1.0 / (width as f64).sqrt(),
-            reads: HistoryReads::Visible,
+            history: vec![HistorySource::visible(HistoryRows::Own(RowProducer::Projected(
+                ProjectedRows {
+                    key: binder.bind(&format!("{prefix}attn_k.weight"), &[key_rows, hidden])?,
+                    value: ValueSource::Projected(
+                        binder.bind(&format!("{prefix}attn_v.weight"), &[key_rows, hidden])?,
+                    ),
+                    key_norm: HeadNorm::None,
+                    value_norm: ValueNorm::None,
+                    domain: TokenDomain::Token,
+                    rounding: RowRounding::None,
+                },
+            )))],
+            rotary: Rotary::None,            scale: 1.0 / (width as f64).sqrt(),
             media_rows: MediaRowAttention::Causal,
-            output: binder.bind(
+            sinks: None,
+            output: OutputProjection::Full(binder.bind(
                 &format!("{prefix}attn_output.weight"),
                 &[hidden, query_rows],
-            )?,
+            )?),
         })))
     }
 
@@ -271,7 +338,8 @@ impl Geometry {
             state: g.state,
             groups: g.groups,
             convolution_width: g.convolution_width,
-            projection: binder.bind(&format!("{prefix}ssm_in.weight"), &[projected, hidden])?,
+            projection: binder
+                .bind_scaled(&format!("{prefix}ssm_in.weight"), &[projected, hidden])?,
             convolution: binder.bind(
                 &format!("{prefix}ssm_conv1d.weight"),
                 &[channels, g.convolution_width],
@@ -294,7 +362,7 @@ impl Geometry {
                 vec![ImportTransform::Flatten],
             )?),
             norm_group,
-            output: binder.bind(&format!("{prefix}ssm_out.weight"), &[hidden, g.inner])?,
+            output: binder.bind_scaled(&format!("{prefix}ssm_out.weight"), &[hidden, g.inner])?,
         })))
     }
 
@@ -303,10 +371,11 @@ impl Geometry {
     fn feed_forward(
         &self,
         binder: &mut Tensors,
-        prefix: &str,
+        layer: u64,
         intermediate: u64,
     ) -> Result<Operator, Error> {
         let hidden = self.hidden;
+        let prefix = format!("blk.{layer}.");
         let router = format!("{prefix}ffn_gate_inp.weight");
         if !binder.contains(&router) {
             return Ok(Operator::DenseFfn(Box::new(DenseFfn {
@@ -323,10 +392,20 @@ impl Geometry {
         let e = self.experts.as_ref().ok_or_else(|| {
             metadata_error(format!("routed layer {prefix} without expert metadata"))
         })?;
-        if intermediate != e.intermediate {
+        let index = layer as usize;
+        if intermediate != e.intermediate[index] {
             return Err(Error::Structure(format!(
-                "routed layer {prefix} declares width {intermediate}, experts have {}",
-                e.intermediate
+                "routed layer {layer} declares width {intermediate}, its experts have {}",
+                e.intermediate[index]
+            )));
+        }
+        let experts = binder.rows(&router)?;
+        let selected = e.selected[index];
+        if experts > e.count || selected == 0 || selected > experts {
+            return Err(Error::Structure(format!(
+                "routed layer {layer} selects {selected} of {experts} experts, \
+                 with at most {} declared",
+                e.count
             )));
         }
         let expert_hidden = e.latent.unwrap_or(hidden);
@@ -337,8 +416,7 @@ impl Geometry {
                     width,
                     down: binder
                         .bind(&format!("{prefix}ffn_latent_down.weight"), &[width, hidden])?,
-                    up: binder
-                        .bind(&format!("{prefix}ffn_latent_up.weight"), &[hidden, width])?,
+                    up: binder.bind(&format!("{prefix}ffn_latent_up.weight"), &[hidden, width])?,
                 })
             })
             .transpose()?;
@@ -349,26 +427,31 @@ impl Geometry {
                     intermediate: shared,
                     up: FeedForwardUp::Plain {
                         activation: ActivationFunction::ReluSquared,
-                        up: binder
-                            .bind_scaled(&format!("{prefix}ffn_up_shexp.weight"), &[shared, hidden])?,
+                        up: binder.bind_scaled(
+                            &format!("{prefix}ffn_up_shexp.weight"),
+                            &[shared, hidden],
+                        )?,
                     },
-                    down: binder
-                        .bind_scaled(&format!("{prefix}ffn_down_shexp.weight"), &[hidden, shared])?,
+                    down: binder.bind_scaled(
+                        &format!("{prefix}ffn_down_shexp.weight"),
+                        &[hidden, shared],
+                    )?,
                     gate: SharedExpertGate::None,
                 })
             })
             .transpose()?;
         Ok(Operator::RoutedFfn(Box::new(RoutedFfn {
-            experts: e.count,
-            selected: e.selected,
+            experts,
+            selected,
             intermediate,
             router: Router {
-                weight: binder.bind(&router, &[e.count, hidden])?,
+                weight: binder.bind(&router, &[experts, hidden])?,
                 input: RouterInput::Operator,
                 score: ScoreFunction::Sigmoid,
                 selection: ExpertSelection::TopK {
-                    bias: Some(binder.bind(&format!("{prefix}exp_probs_b.bias"), &[e.count])?),
+                    bias: Some(binder.bind(&format!("{prefix}exp_probs_b.bias"), &[experts])?),
                 },
+                media_bias: None,
                 // The released model divides by `sum + 1e-20` (llama.cpp
                 // clamps the sum at 6.1e-5 instead); the model definition
                 // governs.
@@ -383,12 +466,12 @@ impl Geometry {
                 activation: ActivationFunction::ReluSquared,
                 up: binder.bind_scaled(
                     &format!("{prefix}ffn_up_exps.weight"),
-                    &[e.count, intermediate, expert_hidden],
+                    &[experts, intermediate, expert_hidden],
                 )?,
             },
             expert_down: binder.bind_scaled(
                 &format!("{prefix}ffn_down_exps.weight"),
-                &[e.count, expert_hidden, intermediate],
+                &[experts, expert_hidden, intermediate],
             )?,
             expert_scale: None,
             latent,
@@ -407,7 +490,7 @@ impl Geometry {
             LayerKind::StateSpace => self.state_space(binder, &prefix)?,
             LayerKind::Attention { kv_heads } => self.attention(binder, &prefix, kv_heads)?,
             LayerKind::FeedForward { intermediate } => {
-                self.feed_forward(binder, &prefix, intermediate)?
+                self.feed_forward(binder, layer, intermediate)?
             }
         };
         Ok(Sublayer {
@@ -445,11 +528,6 @@ pub fn inspect_components(
     identity: PackageIdentity,
 ) -> Result<ModelDefinition, Error> {
     recognize(directory)?;
-    if projector.is_some() {
-        return Err(Error::Structure(
-            "Nemotron-H has no vision projector".into(),
-        ));
-    }
     let m = Metadata::new(directory, ARCHITECTURE, KNOWN_KEYS)?;
     let block_count = m.integer("block_count")?;
     let head_layers = m.optional_count("nextn_predict_layers")?.unwrap_or(0);
@@ -495,13 +573,21 @@ pub fn inspect_components(
                 _ => {
                     return Err(metadata_error(
                         "Nemotron-H supports at most one shared expert",
-                    ))
+                    ));
                 }
             };
+            // llama.cpp's gating enumeration: 1 softmax, 2 sigmoid. Absent,
+            // the architecture's sigmoid applies.
+            if m.optional_count("expert_gating_func")?.is_some_and(|gating| gating != 2) {
+                return Err(metadata_error(
+                    "Nemotron-H experts are gated only by a sigmoid",
+                ));
+            }
             Some(Experts {
                 count: m.integer("expert_count")?,
-                selected: m.integer("expert_used_count")?,
-                intermediate: m.integer("expert_feed_forward_length")?,
+                selected: m.uniform_or_layer_counts("expert_used_count", block_count)?,
+                intermediate: m
+                    .uniform_or_layer_counts("expert_feed_forward_length", block_count)?,
                 shared,
                 normalize: m.flag("expert_weights_norm")?,
                 scale: m.number("expert_weights_scale")?,
@@ -509,9 +595,15 @@ pub fn inspect_components(
             })
         }
     };
+    // Converters since Nemotron 3.5 write only `layer_norm_epsilon`, which
+    // llama.cpp then uses for the RMS norms too.
+    let epsilon = match m.optional_number("attention.layer_norm_rms_epsilon")? {
+        Some(epsilon) => epsilon,
+        None => m.number("attention.layer_norm_epsilon")?,
+    };
     let geometry = Geometry {
         hidden,
-        epsilon: m.number("attention.layer_norm_rms_epsilon")?,
+        epsilon,
         attention_heads: m.integer("attention.head_count")?,
         attention_width,
         state_space: StateSpaceGeometry {
@@ -570,7 +662,6 @@ pub fn inspect_components(
             scale: EmbeddingScale::Unit,
             norm: None,
             per_layer: None,
-            hash_routing: None,
         },
         blocks,
         exit: ExitForm {
@@ -579,9 +670,7 @@ pub fn inspect_components(
             softcap: None,
         },
     };
-    let inputs = InputSemantics {
-        coordinate_axes: 1,
-    };
+    let inputs = InputSemantics { coordinate_axes: 1 };
 
     if head_layers > 0 {
         let head = Head {
@@ -598,18 +687,23 @@ pub fn inspect_components(
                     head_block(&geometry, &mut binder, layer, kv_heads, intermediate, epsilon)
                 })
                 .collect::<Result<Vec<_>, _>>()?,
+            history: HeadHistory::Own,
+            component: HeadComponent::Target,
         };
         // Bound and checked, then deliberately not emitted (module docs).
         head.validate(&decoder, inputs.coordinate_axes)?;
     }
     binder.finish()?;
+    let vision = projector
+        .map(|projector| projector::describe_projector(projector, hidden))
+        .transpose()?;
     let definition = ModelDefinition {
         family: FamilyId(ARCHITECTURE.into()),
         artifact_identity: identity,
         inputs,
         decoder,
         head: None,
-        vision: None,
+        vision,
         draft: None,
     };
     definition.validate()?;
@@ -642,10 +736,13 @@ fn head_block(
         epsilon: layer_norm_epsilon,
     });
     Ok(HeadBlock {
-        embedding_norm,
-        hidden_norm,
-        combine,
-        block: Block {
+        residual: magnitude_family_contracts::ResidualForm::Single,
+        input: HeadInput::Combine {
+            embedding_norm,
+            hidden_norm,
+            combine,
+        },
+        blocks: vec![Block {
             sublayers: vec![
                 Sublayer {
                     input: InputNorm::Rms(attention_norm),
@@ -654,11 +751,13 @@ fn head_block(
                 },
                 Sublayer {
                     input: InputNorm::Rms(feed_forward_norm),
-                    op: geometry.feed_forward(binder, &prefix, intermediate)?,
+                    op: geometry.feed_forward(binder, layer, intermediate)?,
                     output: OutputForm::Residual,
                 },
             ],
-        },
+        }],
         output_norm,
+        readout: HeadReadout::full(VocabularyProjection::Target),
+        chain: HeadChain::Output,
     })
 }

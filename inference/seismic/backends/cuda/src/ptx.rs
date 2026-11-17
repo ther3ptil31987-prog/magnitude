@@ -2,9 +2,9 @@
 //! PTX is emitted only after physical legality is frozen; this module does
 //! not choose algorithms, reinterpret storage, or reject a legal plan.
 
+use crate::Cuda;
 use crate::capability::CudaIntrinsic;
 use crate::profile::CudaFacts;
-use crate::Cuda;
 use seismic_ir::kernel::ops::*;
 use seismic_ir::kernel::{BlockId, Kernel};
 use seismic_ir::physical_target::{
@@ -14,8 +14,8 @@ use seismic_ir::physical_target::{
 use seismic_ir::storage::LaunchLocalKind;
 use seismic_lang::intrinsics::{AtomicOp, MathOp, ReduceOp};
 use seismic_lang::registry::{
-    CodeInterpretation, DecodeStep, FloatCodeFormat, PlaneEncoding, PlaneInfo, PlaneRepackRecipe,
-    RepackExpr,
+    CodeInterpretation, DecodeStep, FloatCodeFormat, GridCodes, GridSigns, LookupTable,
+    PlaneEncoding, PlaneInfo, PlaneRepackRecipe, RepackExpr,
 };
 use seismic_lang::types::DType;
 use seismic_native_target::{DeviceDescription, NativeCompilationError};
@@ -72,32 +72,24 @@ impl AddressGeometry for ReadableRepresentationGeometry {
 fn repack_expression_nodes(expression: &RepackExpr) -> u64 {
     match expression {
         RepackExpr::SourceBits { .. } => 1,
-        RepackExpr::ShiftLeft { value, .. }
-        | RepackExpr::OffsetI32 { value, .. }
-        | RepackExpr::F16ToF32(value)
-        | RepackExpr::I32ToF32(value) => 1 + repack_expression_nodes(value),
-        RepackExpr::BitOr(left, right) | RepackExpr::MultiplyF32(left, right) => {
-            1 + repack_expression_nodes(left) + repack_expression_nodes(right)
+        RepackExpr::F16ToF32(value) | RepackExpr::ScaleF32 { value, .. } => {
+            1 + repack_expression_nodes(value)
         }
         RepackExpr::Lookup { index, .. } => 1 + repack_expression_nodes(index),
     }
 }
 
 /// Every lookup table `expression` reads, in first-use order.
-fn repack_lookup_tables(expression: &RepackExpr, tables: &mut Vec<&'static [i32]>) {
+fn repack_lookup_tables(expression: &RepackExpr, tables: &mut Vec<LookupTable>) {
     match expression {
         RepackExpr::SourceBits { .. } => {}
-        RepackExpr::ShiftLeft { value, .. }
-        | RepackExpr::OffsetI32 { value, .. }
-        | RepackExpr::F16ToF32(value)
-        | RepackExpr::I32ToF32(value) => repack_lookup_tables(value, tables),
-        RepackExpr::BitOr(left, right) | RepackExpr::MultiplyF32(left, right) => {
-            repack_lookup_tables(left, tables);
-            repack_lookup_tables(right, tables);
+        RepackExpr::F16ToF32(value) | RepackExpr::ScaleF32 { value, .. } => {
+            repack_lookup_tables(value, tables)
         }
         RepackExpr::Lookup { index, table } => {
             repack_lookup_tables(index, tables);
-            if !tables.iter().any(|known| std::ptr::eq(*known, *table)) {
+            let table = LookupTable::Repack(*table);
+            if !tables.contains(&table) {
                 tables.push(table);
             }
         }
@@ -134,7 +126,7 @@ struct Emitter<'a> {
     temp_bound: u64,
     uses_nvfp4: bool,
     /// Module-scope constant tables the kernel's conversions look up.
-    lookup_tables: Vec<&'static [i32]>,
+    lookup_tables: Vec<LookupTable>,
 }
 
 impl<'a> Emitter<'a> {
@@ -236,6 +228,25 @@ impl<'a> Emitter<'a> {
                         }
                     }
                 }
+                // A read of vector codes reads its grid's magnitudes.
+                Op::Read { representation, .. } | Op::VectorRead { representation, .. } => {
+                    let info = seismic_lang::registry::representation_info(*representation);
+                    let grids =
+                        seismic_lang::registry::decode_recipe(*representation, info.decoded)
+                            .into_iter()
+                            .flat_map(|recipe| recipe.steps().to_vec())
+                            .filter_map(|step| match step {
+                                DecodeStep::InterpretGridCode { grid, .. } => {
+                                    Some(LookupTable::Grid(grid))
+                                }
+                                _ => None,
+                            });
+                    for table in grids {
+                        if !self.lookup_tables.contains(&table) {
+                            self.lookup_tables.push(table);
+                        }
+                    }
+                }
                 Op::Branch {
                     then, otherwise, ..
                 } => {
@@ -254,6 +265,7 @@ impl<'a> Emitter<'a> {
         }
         self.raw(".extern .shared .align 16 .b8 seismic_shared[];");
         for (index, table) in self.lookup_tables.clone().into_iter().enumerate() {
+            let table = table.values();
             let values = table
                 .iter()
                 .map(i32::to_string)
@@ -332,6 +344,7 @@ impl<'a> Emitter<'a> {
         match op {
             Op::Read { index, .. } => 28 + index.len() as u64 * 4,
             Op::ReadPlaneField { index, .. }
+            | Op::ReadPlaneLane { index, .. }
             | Op::ReadPlane { index, .. }
             | Op::Write { index, .. }
             | Op::Atomic { index, .. } => 64 + index.len() as u64 * 4,
@@ -598,6 +611,18 @@ impl<'a> Emitter<'a> {
                         self.v(out.value)
                     ));
                 }
+                ClosedOpView::ReadPlaneLane {
+                    out,
+                    place,
+                    plane_info,
+                    indices,
+                    ..
+                } => {
+                    let index = indices.iter().map(|v| v.value()).collect::<Vec<_>>();
+                    let (_, _, logical) = self.address(&place, &index);
+                    let lane = self.plane_lane(&logical, plane_info.group);
+                    self.line(format!("mov.u32 {}, {lane};", self.v(out.value)));
+                }
                 ClosedOpView::ReadPlane {
                     out,
                     place,
@@ -709,6 +734,7 @@ impl<'a> Emitter<'a> {
             ConstantValue::F16(v) | ConstantValue::BF16(v) => v.to_string(),
             ConstantValue::I32(v) => v.to_string(),
             ConstantValue::U32(v) => v.to_string(),
+            ConstantValue::U64(v) => v.to_string(),
             ConstantValue::Bool(v) => u8::from(v).to_string(),
             ConstantValue::Index(v) => v.to_string(),
         };
@@ -723,6 +749,8 @@ impl<'a> Emitter<'a> {
         b: ErasedValue,
     ) {
         let floating = matches!(ty, ValueType::Scalar(d) if d.is_float());
+        // Index and U64 words are 64-bit registers.
+        let wide = matches!(ty, ValueType::Index | ValueType::Scalar(DType::U64));
         let mnemonic = match (op, floating, ty == ValueType::Scalar(DType::I32)) {
             (BinaryOp::Add, true, _) => "add.rn.f32",
             (BinaryOp::Sub, true, _) => "sub.rn.f32",
@@ -731,21 +759,21 @@ impl<'a> Emitter<'a> {
             (BinaryOp::Min, true, _) => "min.f32",
             (BinaryOp::Max, true, _) => "max.f32",
             (BinaryOp::Add, false, _) => {
-                if ty == ValueType::Index {
+                if wide {
                     "add.u64"
                 } else {
                     "add.u32"
                 }
             }
             (BinaryOp::Sub, false, _) => {
-                if ty == ValueType::Index {
+                if wide {
                     "sub.u64"
                 } else {
                     "sub.u32"
                 }
             }
             (BinaryOp::Mul, false, _) => {
-                if ty == ValueType::Index {
+                if wide {
                     "mul.lo.u64"
                 } else {
                     "mul.lo.u32"
@@ -753,7 +781,7 @@ impl<'a> Emitter<'a> {
             }
             (BinaryOp::Div, false, true) => "div.s32",
             (BinaryOp::Div, false, _) => {
-                if ty == ValueType::Index {
+                if wide {
                     "div.u64"
                 } else {
                     "div.u32"
@@ -761,7 +789,7 @@ impl<'a> Emitter<'a> {
             }
             (BinaryOp::Rem, false, true) => "rem.s32",
             (BinaryOp::Rem, false, _) => {
-                if ty == ValueType::Index {
+                if wide {
                     "rem.u64"
                 } else {
                     "rem.u32"
@@ -770,14 +798,14 @@ impl<'a> Emitter<'a> {
             (BinaryOp::Min, false, true) => "min.s32",
             (BinaryOp::Max, false, true) => "max.s32",
             (BinaryOp::Min, false, _) => {
-                if ty == ValueType::Index {
+                if wide {
                     "min.u64"
                 } else {
                     "min.u32"
                 }
             }
             (BinaryOp::Max, false, _) => {
-                if ty == ValueType::Index {
+                if wide {
                     "max.u64"
                 } else {
                     "max.u32"
@@ -853,6 +881,15 @@ impl<'a> Emitter<'a> {
             };
             self.line(format!("{instruction} {bits}, {bits}, {mask};"));
             self.line(format!("mov.b32 {out}, {bits};"));
+        } else if dtype == DType::U64 {
+            // A 64-bit register: negation wraps, and an unsigned word is its
+            // own magnitude.
+            match op {
+                UnaryOp::Neg => self.line(format!("neg.s64 {out}, {value};")),
+                UnaryOp::Abs => self.line(format!("mov.b64 {out}, {value};")),
+            }
+        } else if dtype == DType::U32 && op == UnaryOp::Abs {
+            self.line(format!("mov.b32 {out}, {value};"));
         } else {
             self.line(format!(
                 "{}.s32 {out}, {value};",
@@ -864,32 +901,30 @@ impl<'a> Emitter<'a> {
         }
     }
     fn bit(&mut self, op: BitOp, out: ErasedValue, ty: ValueType, a: ErasedValue, b: ErasedValue) {
-        let m = match op {
-            BitOp::And => "and.b32",
-            BitOp::Or => "or.b32",
-            BitOp::Xor => "xor.b32",
-            BitOp::Shl => {
-                if ty == ValueType::Index {
-                    "shl.b64"
-                } else {
-                    "shl.b32"
-                }
-            }
-            BitOp::Shr if ty == ValueType::Scalar(DType::I32) => "shr.s32",
-            BitOp::Shr => {
-                if ty == ValueType::Index {
-                    "shr.u64"
-                } else {
-                    "shr.u32"
-                }
-            }
+        // Index and U64 words are 64-bit registers.
+        let wide = matches!(ty, ValueType::Index | ValueType::Scalar(DType::U64));
+        let m = match (op, wide) {
+            (BitOp::And, false) => "and.b32",
+            (BitOp::Or, false) => "or.b32",
+            (BitOp::Xor, false) => "xor.b32",
+            (BitOp::And, true) => "and.b64",
+            (BitOp::Or, true) => "or.b64",
+            (BitOp::Xor, true) => "xor.b64",
+            (BitOp::Shl, true) => "shl.b64",
+            (BitOp::Shl, false) => "shl.b32",
+            (BitOp::Shr, _) if ty == ValueType::Scalar(DType::I32) => "shr.s32",
+            (BitOp::Shr, true) => "shr.u64",
+            (BitOp::Shr, false) => "shr.u32",
         };
-        self.line(format!(
-            "{m} {}, {}, {};",
-            self.v(out),
-            self.v(a),
+        // A shift count is a .u32 operand at every width.
+        let count = if wide && matches!(op, BitOp::Shl | BitOp::Shr) {
+            let count = self.t32();
+            self.line(format!("cvt.u32.u64 {count}, {};", self.v(b)));
+            count
+        } else {
             self.v(b)
-        ));
+        };
+        self.line(format!("{m} {}, {}, {count};", self.v(out), self.v(a)));
     }
 
     fn vector_binary(&mut self, op: BinaryOp, out: ClosedValue, a: ClosedValue, b: ClosedValue) {
@@ -1082,6 +1117,7 @@ impl<'a> Emitter<'a> {
         let destination = self.numeric_destination(dtype, &self.v(out));
         match op {
             MathOp::Sqrt => self.line(format!("sqrt.rn.f32 {}, {};", destination, argument)),
+            MathOp::Rint => self.line(format!("cvt.rni.f32.f32 {}, {};", destination, argument)),
             MathOp::Rsqrt => self.line(format!("rsqrt.approx.f32 {}, {};", destination, argument)),
             MathOp::Abs => self.line(format!("abs.f32 {}, {};", destination, argument)),
             MathOp::Exp => {
@@ -1089,6 +1125,7 @@ impl<'a> Emitter<'a> {
                 self.line(format!("mul.rn.f32 {scaled}, {}, 0f3fb8aa3b;", argument));
                 self.line(format!("ex2.approx.f32 {}, {scaled};", destination));
             }
+            MathOp::Exp2 => self.line(format!("ex2.approx.f32 {}, {};", destination, argument)),
             MathOp::Log => self.line(format!("lg2.approx.f32 {}, {};", destination, argument)),
             MathOp::Sin => self.line(format!("sin.approx.f32 {}, {};", destination, argument)),
             MathOp::Cos => self.line(format!("cos.approx.f32 {}, {};", destination, argument)),
@@ -1121,7 +1158,7 @@ impl<'a> Emitter<'a> {
                 "setp.ne{} {p}, {}, {};",
                 if ff {
                     ".f32"
-                } else if from == ValueType::Index {
+                } else if matches!(from, ValueType::Index | ValueType::Scalar(DType::U64)) {
                     ".u64"
                 } else {
                     ".u32"
@@ -1135,7 +1172,7 @@ impl<'a> Emitter<'a> {
         } else if ff {
             self.line(format!(
                 "cvt.rzi{}{}.f32 {}, {};",
-                if to == ValueType::Index {
+                if matches!(to, ValueType::Index | ValueType::Scalar(DType::U64)) {
                     ".u64"
                 } else if to == ValueType::Scalar(DType::I32) {
                     ".s32"
@@ -1151,7 +1188,7 @@ impl<'a> Emitter<'a> {
                 "cvt.rn.f32{} {}, {};",
                 if from == ValueType::Scalar(DType::I32) {
                     ".s32"
-                } else if from == ValueType::Index {
+                } else if matches!(from, ValueType::Index | ValueType::Scalar(DType::U64)) {
                     ".u64"
                 } else {
                     ".u32"
@@ -1159,7 +1196,11 @@ impl<'a> Emitter<'a> {
                 destination,
                 source
             ));
-        } else if fb || to == ValueType::Index || from == ValueType::Index {
+        } else if fb
+            || matches!(to, ValueType::Index | ValueType::Scalar(DType::U64))
+            || matches!(from, ValueType::Index | ValueType::Scalar(DType::U64))
+        {
+            // Zero extension, or the low word of a 64-bit register.
             self.line(format!(
                 "cvt{}{} {}, {};",
                 suffix(to),
@@ -1202,7 +1243,7 @@ impl<'a> Emitter<'a> {
         let class = match ty {
             ValueType::Scalar(d) if d.is_float() => "f32",
             ValueType::Scalar(DType::I32) => "s32",
-            ValueType::Index => "u64",
+            ValueType::Index | ValueType::Scalar(DType::U64) => "u64",
             _ => "u32",
         };
         self.line(format!("setp.{cmp}.{class} {p}, {}, {};", left, right));
@@ -1243,7 +1284,7 @@ impl<'a> Emitter<'a> {
     fn scalar_arg(&mut self, out: ErasedValue, index: u32, kind: seismic_ir::repr::ScalarKind) {
         let raw = self.word(self.layout.words.scalar_first + index);
         match kind {
-            seismic_ir::repr::ScalarKind::Nat64 => {
+            seismic_ir::repr::ScalarKind::Nat64 | seismic_ir::repr::ScalarKind::Scalar(DType::U64) => {
                 self.line(format!("mov.u64 {}, {raw};", self.v(out)))
             }
             seismic_ir::repr::ScalarKind::Scalar(DType::F32) => {
@@ -1532,7 +1573,47 @@ impl<'a> Emitter<'a> {
                             bits,
                             interpretation,
                             ..
-                        } => self.interpret(&temps[recipe.ordinal(*raw)], *bits, interpretation),
+                        } => {
+                            // The low `bits` bits of a wider read.
+                            let read = &temps[recipe.ordinal(*raw)];
+                            let low = if *bits < recipe.read_bits(*raw) {
+                                let low = self.t32();
+                                self.line(format!(
+                                    "and.b32 {low}, {read}, {};",
+                                    u32::MAX >> (32 - bits)
+                                ));
+                                low
+                            } else {
+                                read.clone()
+                            };
+                            self.interpret(&low, *bits, interpretation)
+                        }
+                        DecodeStep::SignedCode { code, raw, bit, .. } => {
+                            let code = &temps[recipe.ordinal(*code)];
+                            let sign = self.t32();
+                            self.line(format!(
+                                "shr.b32 {sign}, {}, {bit};",
+                                temps[recipe.ordinal(*raw)]
+                            ));
+                            self.line(format!("and.b32 {sign}, {sign}, 1;"));
+                            let negated = self.t32();
+                            self.line(format!("neg.s32 {negated}, {code};"));
+                            let negative = self.pred();
+                            self.line(format!("setp.ne.u32 {negative}, {sign}, 0;"));
+                            let value = self.t32();
+                            self.line(format!("selp.s32 {value}, {negated}, {code}, {negative};"));
+                            value
+                        }
+                        DecodeStep::ReadPlaneLane { plane, .. } => {
+                            self.plane_lane(&logical, layout.planes[*plane as usize].group)
+                        }
+                        DecodeStep::InterpretGridCode {
+                            raw, lane, grid, ..
+                        } => self.grid_code(
+                            &temps[recipe.ordinal(*raw)],
+                            &temps[recipe.ordinal(*lane)],
+                            grid,
+                        ),
                         DecodeStep::DecodeFloatCode { raw, format, .. } => {
                             self.decode_float_code(&temps[recipe.ordinal(*raw)], *format)
                         }
@@ -1552,6 +1633,15 @@ impl<'a> Emitter<'a> {
                                 ));
                             }
                             value
+                        }
+                        DecodeStep::Constant { value, .. } => {
+                            let constant = self.f32();
+                            let bits = match value {
+                                seismic_lang::reference_math::ReferenceScalar::F32(bits) => *bits,
+                                other => unreachable!("a decode constant is f32, not {other:?}"),
+                            };
+                            self.line(format!("mov.f32 {constant}, 0f{bits:08X};"));
+                            constant
                         }
                         DecodeStep::Multiply { left, right, .. } => {
                             let value = self.f32();
@@ -1670,6 +1760,7 @@ impl<'a> Emitter<'a> {
         packet: ErasedValue,
     ) {
         let source_layout = &source.geometry.layout;
+        assert!(source_layout.planes.is_none(), "{}", seismic_lang::registry::PLANAR_SOURCE_IS_CONVERSION_ONLY);
         let destination_layout = &destination.geometry.layout;
         let source_base = self.buffer(source.buffer_ordinal as usize);
         let source_packet = self.t64();
@@ -1696,7 +1787,12 @@ impl<'a> Emitter<'a> {
                     for (destination_byte, byte_routes) in routes.chunks_exact(8).enumerate() {
                         let byte = self.t32();
                         self.line(format!("mov.u32 {byte}, 0;"));
-                        for (destination_bit, source_bit) in byte_routes.iter().copied().enumerate()
+                        for (destination_bit, source_bit) in byte_routes
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(destination_bit, source_bit)| {
+                                source_bit.map(|source_bit| (destination_bit, source_bit))
+                            })
                         {
                             let bit = self.source_bits(&source_packet, source_bit, 1);
                             let shifted = self.t32();
@@ -1790,36 +1886,6 @@ impl<'a> Emitter<'a> {
             RepackExpr::SourceBits { bit, width } => {
                 RepackValue::Integer(self.source_bits(source_packet, *bit, *width))
             }
-            RepackExpr::ShiftLeft { value, bits } => {
-                let RepackValue::Integer(value) = self.repack_expression(source_packet, value)
-                else {
-                    panic!("closed CUDA repack shifts a floating value")
-                };
-                let output = self.t32();
-                self.line(format!("shl.b32 {output}, {value}, {bits};"));
-                RepackValue::Integer(output)
-            }
-            RepackExpr::BitOr(left, right) => {
-                let RepackValue::Integer(left) = self.repack_expression(source_packet, left) else {
-                    panic!("closed CUDA repack OR has a floating left operand")
-                };
-                let RepackValue::Integer(right) = self.repack_expression(source_packet, right)
-                else {
-                    panic!("closed CUDA repack OR has a floating right operand")
-                };
-                let output = self.t32();
-                self.line(format!("or.b32 {output}, {left}, {right};"));
-                RepackValue::Integer(output)
-            }
-            RepackExpr::OffsetI32 { value, offset } => {
-                let RepackValue::Integer(value) = self.repack_expression(source_packet, value)
-                else {
-                    panic!("closed CUDA repack offsets a floating value")
-                };
-                let output = self.t32();
-                self.line(format!("add.s32 {output}, {value}, {offset};"));
-                RepackValue::Integer(output)
-            }
             RepackExpr::F16ToF32(value) => {
                 let RepackValue::Integer(value) = self.repack_expression(source_packet, value)
                 else {
@@ -1831,24 +1897,15 @@ impl<'a> Emitter<'a> {
                 self.line(format!("cvt.f32.f16 {output}, {half};"));
                 RepackValue::Float(output)
             }
-            RepackExpr::I32ToF32(value) => {
-                let RepackValue::Integer(value) = self.repack_expression(source_packet, value)
-                else {
-                    panic!("closed CUDA repack converts an already-floating i32 value")
+            RepackExpr::ScaleF32 { value, exponent } => {
+                let RepackValue::Float(value) = self.repack_expression(source_packet, value) else {
+                    panic!("closed CUDA repack scales a non-floating value")
                 };
                 let output = self.f32();
-                self.line(format!("cvt.rn.f32.s32 {output}, {value};"));
-                RepackValue::Float(output)
-            }
-            RepackExpr::MultiplyF32(left, right) => {
-                let RepackValue::Float(left) = self.repack_expression(source_packet, left) else {
-                    panic!("closed CUDA repack multiply has a non-floating left operand")
-                };
-                let RepackValue::Float(right) = self.repack_expression(source_packet, right) else {
-                    panic!("closed CUDA repack multiply has a non-floating right operand")
-                };
-                let output = self.f32();
-                self.line(format!("mul.rn.f32 {output}, {left}, {right};"));
+                self.line(format!(
+                    "mul.rn.f32 {output}, {value}, 0f{:08X};",
+                    2f32.powi(i32::from(*exponent)).to_bits()
+                ));
                 RepackValue::Float(output)
             }
             RepackExpr::Lookup { index, table } => {
@@ -1859,7 +1916,7 @@ impl<'a> Emitter<'a> {
                 let ordinal = self
                     .lookup_tables
                     .iter()
-                    .position(|known| std::ptr::eq(*known, *table))
+                    .position(|known| *known == LookupTable::Repack(*table))
                     .expect("every lookup table is collected before emission");
                 let base = self.t64();
                 self.line(format!("mov.u64 {base}, seismic_lookup{ordinal};"));
@@ -1948,7 +2005,11 @@ impl<'a> Emitter<'a> {
                     self.load_temp(&address, *storage)
                 }
             }
-            PlaneEncoding::Packed { bits, .. } => self.packed_field(&base, &entry, *bits),
+            PlaneEncoding::Packed { .. }
+            | PlaneEncoding::Grid(_)
+            | PlaneEncoding::SignedLocal { .. } => {
+                self.packed_field(&base, &entry, plane.entry_bits)
+            }
             PlaneEncoding::FloatCode { format } => self.packed_field(&base, &entry, format.bits()),
         }
     }
@@ -1999,7 +2060,12 @@ impl<'a> Emitter<'a> {
             CodeInterpretation::Offset(offset) => {
                 self.line(format!("add.s32 {out}, {raw}, {};", -*offset))
             }
-            CodeInterpretation::Table(table) => {
+            CodeInterpretation::Odd(offset) => self.line(format!(
+                "mad.lo.u32 {out}, {raw}, 2, {};",
+                (1 - 2 * *offset) as u32
+            )),
+            CodeInterpretation::Table(codebook) => {
+                let table = codebook.values;
                 self.line(format!("mov.s32 {out}, {};", table[0]));
                 for (index, value) in table.iter().copied().enumerate().skip(1) {
                     let p = self.pred();
@@ -2008,6 +2074,97 @@ impl<'a> Emitter<'a> {
                 }
             }
         }
+        out
+    }
+    /// The code of the value at logical position `logical` of vector-code
+    /// entry `raw` (`GridCodes::code`), its magnitude read from the grid's
+    /// collected constant table.
+    /// The U32 lane of the element at packing position `logical` among the
+    /// `group` elements one plane entry covers (a plane group divides the
+    /// packet group).
+    fn plane_lane(&mut self, logical: &str, group: u32) -> String {
+        let wide = self.t64();
+        self.line(format!("rem.u64 {wide}, {logical}, {group};"));
+        let lane = self.t32();
+        self.line(format!("cvt.u32.u64 {lane}, {wide};"));
+        lane
+    }
+
+    fn grid_code(&mut self, raw: &str, lane: &str, grid: &'static GridCodes) -> String {
+        let ordinal = self
+            .lookup_tables
+            .iter()
+            .position(|known| *known == LookupTable::Grid(grid))
+            .expect("every grid table is collected before emission");
+        let shift = self.t32();
+        self.line(format!(
+            "shr.b32 {shift}, {lane}, {};",
+            grid.lanes().trailing_zeros()
+        ));
+        self.line(format!("mul.lo.u32 {shift}, {shift}, {};", grid.index_bits()));
+        let index = self.t32();
+        self.line(format!("shr.b32 {index}, {raw}, {shift};"));
+        self.line(format!(
+            "and.b32 {index}, {index}, {};",
+            (1u32 << grid.index_bits()) - 1
+        ));
+        let sub = self.t32();
+        self.line(format!("and.b32 {sub}, {lane}, {};", grid.lanes() - 1));
+        let slot = self.t32();
+        self.line(format!(
+            "mad.lo.u32 {slot}, {index}, {}, {sub};",
+            grid.lanes()
+        ));
+        let base = self.t64();
+        self.line(format!("mov.u64 {base}, seismic_lookup{ordinal};"));
+        let address = self.t64();
+        self.line(format!("mad.wide.u32 {address}, {slot}, 4, {base};"));
+        let magnitude = self.t32();
+        self.line(format!("ld.const.s32 {magnitude}, [{address}];"));
+        // The table holds the points' signed values where entries have no
+        // signs.
+        let value = match grid.signs {
+            GridSigns::None => magnitude,
+            GridSigns::ParityPlus7 | GridSigns::Explicit8 => {
+                let bits = grid.signs.bits();
+                let signs = self.t32();
+                self.line(format!("shr.b32 {signs}, {raw}, {};", grid.sign_bit()));
+                self.line(format!("and.b32 {signs}, {signs}, {};", (1u32 << bits) - 1));
+                if grid.signs == GridSigns::ParityPlus7 {
+                    let parity = self.t32();
+                    self.line(format!("popc.b32 {parity}, {signs};"));
+                    self.line(format!("and.b32 {parity}, {parity}, 1;"));
+                    self.line(format!("shl.b32 {parity}, {parity}, {bits};"));
+                    self.line(format!("or.b32 {signs}, {signs}, {parity};"));
+                }
+                let bit = self.t32();
+                self.line(format!("shr.b32 {bit}, {signs}, {lane};"));
+                self.line(format!("and.b32 {bit}, {bit}, 1;"));
+                let negated = self.t32();
+                self.line(format!("neg.s32 {negated}, {magnitude};"));
+                let negative = self.pred();
+                self.line(format!("setp.ne.u32 {negative}, {bit}, 0;"));
+                let out = self.t32();
+                self.line(format!(
+                    "selp.s32 {out}, {negated}, {magnitude}, {negative};"
+                ));
+                out
+            }
+        };
+        // `2^e v ± 1`: minus where the delta bit is set.
+        let Some(exponent) = grid.delta else {
+            return value;
+        };
+        let delta = self.t32();
+        self.line(format!("shr.b32 {delta}, {raw}, {};", grid.delta_bit()));
+        self.line(format!("and.b32 {delta}, {delta}, 1;"));
+        let minus = self.pred();
+        self.line(format!("setp.ne.u32 {minus}, {delta}, 0;"));
+        let step = self.t32();
+        self.line(format!("selp.s32 {step}, -1, 1, {minus};"));
+        let out = self.t32();
+        self.line(format!("shl.b32 {out}, {value}, {exponent};"));
+        self.line(format!("add.s32 {out}, {out}, {step};"));
         out
     }
     /// E8M0: the exponent byte is the F32 exponent field (2^(raw - 127));
@@ -2142,6 +2299,11 @@ impl<'a> Emitter<'a> {
                 ));
                 v
             }
+            DType::U64 => {
+                let v = self.t64();
+                self.line(format!("ld.global.u64 {v}, [{address}];"));
+                v
+            }
             DType::Bool => {
                 let v = self.t32();
                 self.line(format!("ld.global.u8 {v}, [{address}];"));
@@ -2173,6 +2335,7 @@ impl<'a> Emitter<'a> {
         match geometry.dtype {
             DType::F32 => self.line(format!("st.global.f32 [{address}], {value};")),
             DType::I32 | DType::U32 => self.line(format!("st.global.u32 [{address}], {value};")),
+            DType::U64 => self.line(format!("st.global.u64 [{address}], {value};")),
             DType::Bool => self.line(format!("st.global.u8 [{address}], {value};")),
             DType::F16 | DType::BF16 => {
                 let bits = self.h16();
@@ -2286,7 +2449,8 @@ impl<'a> Emitter<'a> {
         let p = self.pred();
         self.line(format!("setp.eq.u64 {p}, %linear_thread, 0;"));
         match kind {
-            seismic_ir::repr::ScalarKind::Nat64 => self.line(format!(
+            seismic_ir::repr::ScalarKind::Nat64
+            | seismic_ir::repr::ScalarKind::Scalar(DType::U64) => self.line(format!(
                 "@{p} st.global.u64 [%results+{}], {};",
                 slot * 8,
                 self.v(value.value)
@@ -3528,7 +3692,7 @@ impl<'a> Emitter<'a> {
 fn ptx_type(ty: ValueType) -> &'static str {
     match ty {
         ValueType::Scalar(DType::F32) => ".f32",
-        ValueType::Index => ".u64",
+        ValueType::Index | ValueType::Scalar(DType::U64) => ".u64",
         ValueType::Scalar(DType::I32) => ".s32",
         ValueType::Scalar(_) | ValueType::Bool => ".u32",
         ValueType::Vector { .. } => {
@@ -3540,6 +3704,8 @@ fn ptx_type(ty: ValueType) -> &'static str {
 fn scalar_ptx_type(dtype: DType) -> &'static str {
     if dtype == DType::F32 {
         ".f32"
+    } else if dtype == DType::U64 {
+        ".u64"
     } else if dtype == DType::I32 {
         ".s32"
     } else {
@@ -3549,6 +3715,8 @@ fn scalar_ptx_type(dtype: DType) -> &'static str {
 fn scalar_suffix(dtype: DType) -> &'static str {
     if dtype == DType::F32 {
         ".f32"
+    } else if dtype == DType::U64 {
+        ".u64"
     } else if dtype == DType::I32 {
         ".s32"
     } else {
@@ -3571,7 +3739,7 @@ fn vector_shape(ty: ValueType) -> (DType, u16) {
 fn suffix(ty: ValueType) -> &'static str {
     match ty {
         ValueType::Scalar(DType::F32) => ".f32",
-        ValueType::Index => ".u64",
+        ValueType::Index | ValueType::Scalar(DType::U64) => ".u64",
         ValueType::Scalar(DType::I32) => ".s32",
         _ => ".u32",
     }
@@ -3583,6 +3751,7 @@ fn dtype_suffix(dtype: DType) -> &'static str {
         DType::BF16 => ".bf16",
         DType::I32 => ".s32",
         DType::U32 => ".u32",
+        DType::U64 => ".u64",
         DType::Bool => ".u8",
     }
 }
@@ -3643,7 +3812,9 @@ fn op_values<B: seismic_ir::physical_target::PhysicalDialect>(op: &Op<B>) -> Vec
             values.extend(index);
             values
         }
-        Op::Read { out, index, .. } | Op::ReadPlaneField { out, index, .. } => {
+        Op::Read { out, index, .. }
+        | Op::ReadPlaneField { out, index, .. }
+        | Op::ReadPlaneLane { out, index, .. } => {
             let mut v = vec![*out];
             v.extend(index);
             v
@@ -3819,6 +3990,46 @@ mod tests {
         }
     }
 
+    /// A one-multiprocessor device's attributes, with or without
+    /// cooperative launch.
+    struct Attributes {
+        cooperative_launch: bool,
+    }
+
+    impl seismic_lang::device::cuda::Queries for Attributes {
+        fn multiprocessor_count(&self) -> Option<u64> {
+            Some(1)
+        }
+        fn warp_size(&self) -> Option<u64> {
+            Some(32)
+        }
+        fn max_threads_per_block(&self) -> Option<u64> {
+            Some(1024)
+        }
+        fn max_threads_per_multiprocessor(&self) -> Option<u64> {
+            Some(2048)
+        }
+        fn max_shared_memory_per_block_optin(&self) -> Option<u64> {
+            Some(49152)
+        }
+        fn l2_cache_size(&self) -> Option<u64> {
+            Some(1024)
+        }
+        fn cooperative_launch(&self) -> Option<bool> {
+            Some(self.cooperative_launch)
+        }
+        fn max_registers_per_thread(&self) -> Option<u64> {
+            Some(255)
+        }
+        fn max_registers_per_block(&self) -> Option<u64> {
+            Some(65536)
+        }
+    }
+
+    fn properties(cooperative_launch: bool) -> crate::profile::Properties {
+        seismic_lang::device::cuda::describe(&Attributes { cooperative_launch }, &Default::default()).unwrap()
+    }
+
     fn facts() -> CudaFacts {
         use crate::profile::{ComputeCapability, DriverApiVersion, PtxTarget, TensorMemory};
         CudaFacts {
@@ -3827,19 +4038,9 @@ mod tests {
             driver_api: DriverApiVersion::MINIMUM,
             ptx: PtxTarget::BASELINE,
             tensor_memory: TensorMemory::Unavailable,
-            warp_size: 32,
-            multiprocessors: 1,
-            max_threads_per_multiprocessor: 2048,
-            max_blocks_per_multiprocessor: 32,
-            registers_per_block: 65536,
-            registers_per_multiprocessor: 65536,
-            max_registers_per_thread: 255,
+            properties: properties(true),
             codegen_registers_per_thread: 64,
-            shared_bytes_per_multiprocessor: 65536,
-            shared_bytes_per_block: 49152,
-            l2_cache_bytes: 1024,
             global_memory_bytes: 1048576,
-            cooperative_launch: true,
             kernel_parameter_bytes: 4096,
         }
     }
@@ -3998,13 +4199,13 @@ mod tests {
             schedule::{Launch, LaunchParticipation},
         };
         let mut facts = facts();
-        facts.cooperative_launch = false;
+        facts.properties = properties(false);
         assert_eq!(
             Cuda::launch_for_participation(&facts, LaunchParticipation::CooperativeGrid),
             None
         );
         assert_eq!(Cuda::ordinary_launch(), crate::CudaLaunchMode::Independent);
-        facts.cooperative_launch = true;
+        facts.properties = properties(true);
         let cooperative =
             Cuda::launch_for_participation(&facts, LaunchParticipation::CooperativeGrid).unwrap();
         let mut arena = seismic_lang::expr::ExprArena::new();

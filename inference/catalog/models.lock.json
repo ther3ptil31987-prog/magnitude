@@ -1,40 +1,36 @@
 {
-  "bonsai-8b-q1": { "target": "48516770dd04643643e9f9019a2a349cf26c5dbd" },
-  "deepseek-v4-flash": { "target": "fbbb5b93fb787c21338159b0af3318bb3f4d9768", "speculativeDraft": "fbbb5b93fb787c21338159b0af3318bb3f4d9768" },
-  "gemma-4-12b-it-qat": { "target": "980b060c40a8539ac159e0501a3e0f66a6365af3" },
-  "gemma-4-26b-a4b-it-qat": { "target": "7b92b5b28818151e8669af2e45e88d6086f490dd" },
-  "gemma-4-31b-it-qat": { "target": "43cc1aeb31adf47ec06a854507ce552cd9862e6f" },
-  "gemma-4-e2b-it-qat": { "target": "66a399f68ddd113b06dff02fca9523e55465d11d" },
-  "gemma-4-e4b-it-qat": { "target": "8c5a9e4fd5482e2be20fe0bf013b4c262a8f4265" },
-  "glm-5.2": { "target": "abc55e72527792c6e77069c99b4cb7de16fa9f23" },
-  "laguna-s-2.1": { "target": "750f92f90cf54159c4d7a610cb7b3e74498e75c6" },
-  "lfm2.5-2.6b": {
-    "target": "b421ad1d549afeda6a0fb2ad3a697cb5a7879adc",
-    "speculativeDraft": "60103108e36ef66c2591c2b1ea3e6530a4e2c3b0"
-  },
-  "lfm2.5-8b-a1b": {
-    "target": "dfd5fdcad7a1c0d31473fb4ca443b8befbacddf0",
-    "speculativeDraft": "0e2ce447c266c98603073cf9927a56130b9dca43"
-  },
-  "minicpm5-1b": { "target": "3d55fac80935ae6456986ad2384b5cbcc4d6c948" },
-  "minicpm5-2b": {
-    "target": "2079a22f3beaa4e306449978533478fe0522f4b3",
-    "speculativeDraft": "fbc306afa97f19283820af3089f9306f7b2051cb"
-  },
-  "muse-glimmer-30b": { "target": "1afeb8e879f60116d206cf724425dbe1e1a2f7f5", "speculativeDraft": "40434dabff898ca2dda99f88a02b422a03715d67" },
-  "nemotron-3-super-120b-a12b": { "target": "036038fb30334a2d56a146c6f0d4871ab5edccbb" },
-  "nemotron-3-ultra-550b-a55b": { "target": "2fb7d5b3f4eae7aedb18b4839b6a6300111e46f6" },
-  "nemotron-3.5-lightning-30b-a3b": {
-    "target": "88d7ce0b0fa385c5108866ce5d33690927531a37",
-    "speculativeDraft": "4f5b414b9388a4543dcc4b24758e09d68140a6fe"
-  },
-  "qwen3.5-122b-a10b": { "target": "907becb33103ab66b23da06a2dc74a5fca0583bd" },
-  "qwen3.5-4b": { "target": "86835bf9949e4d14d6860f7910b1340ad4f271a9" },
-  "qwen3.5-9b": { "target": "9716a636ee4bddc3fed678220b7a33dd2a4160ae" },
-  "qwen3.6-35b-a3b": {
-    "target": "5bc3e238d916f48a861bac2f8a1990a0e9b7e98d",
-    "speculativeDraft": "69e4642852bd025abbce700eb04ed2befae6d6e1"
-  },
-  "qwen3.8-27b": { "target": "27af057ecb382ddfea5d12837360a8980560e3ed", "speculativeDraft": "ead2a051a43bf91e8982e00d2c060efb3b984cb5" },
-  "qwen3.8-flash-next": { "target": "83cadfda58d30be06c110518208d1bb918b33f10" }
+  "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "ed59f92082b1e93c0e96d60a8b11aab089b52f09",
+  "LiquidAI/LFM2.5-24B-A2B-GGUF": "0912d33141f77e10705345a6732bfd83f0252fdc",
+  "LiquidAI/LFM3-1.7B-GGUF": "b3f2ae5d73cd3c91bf40e8ba752c648aa05dffdf",
+  "magnitudedev/DeepSeek-V4.1-Flash-1017-GGUF": "689503584971b7b96545821d712a9a71d8f7ac31",
+  "magnitudedev/GLM-5.3-Flash-GGUF": "244e6041783cc31981cb561b1a57c534e37b7d81",
+  "magnitudedev/Muse-Glimmer-30B-DFlash-GGUF": "40434dabff898ca2dda99f88a02b422a03715d67",
+  "magnitudedev/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr-GGUF": "341de320b3c2802b22c1a633c97ce78d51512bc6",
+  "magnitudedev/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4-LiLiCorr-GGUF": "8602acac5a96c69bf094ce83d941341944b2789d",
+  "magnitudedev/Qwen3.5-4B-DFlash-GGUF": "0094e74a88676605d53b79c7c3d26096335c9746",
+  "magnitudedev/Qwen3.5-9B-DFlash-GGUF": "58b69e4e18f40906a95320507b802899d50e5292",
+  "magnitudedev/Qwen3.6-35B-A3B-DFlash-GGUF": "4f5e4df8dc4520256bdc0bc8752c7010bbfb1eec",
+  "magnitudedev/Qwen3.8-27B-DFlash2-GGUF": "ead2a051a43bf91e8982e00d2c060efb3b984cb5",
+  "magnitudedev/gemma-4-12B-it-qat-MTP-GGUF": "628fa4b14a6f0defce5f107f5770250e05b4e035",
+  "magnitudedev/gemma-4-26B-A4B-it-qat-MTP-GGUF": "20d79f403bf11c19d71f6957e5c9600cedb28d19",
+  "magnitudedev/gemma-4-31B-it-qat-MTP-GGUF": "c9bc80a3f8893739dd1453a98c69ffb696afb2c1",
+  "magnitudedev/gemma-4-E4B-it-qat-MTP-GGUF": "ca8128d445bfaf9f2210f8c62d1c4986439ee4fb",
+  "nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF": "e0fecb69cb3e5e4c5e8a056fa2aec98c78e91246",
+  "prism-ml/Bonsai-8B-gguf": "48516770dd04643643e9f9019a2a349cf26c5dbd",
+  "unsloth/GLM-5.2-GGUF": "abc55e72527792c6e77069c99b4cb7de16fa9f23",
+  "unsloth/Laguna-S-2.1-GGUF": "750f92f90cf54159c4d7a610cb7b3e74498e75c6",
+  "unsloth/Muse-Glimmer-30B-GGUF": "1afeb8e879f60116d206cf724425dbe1e1a2f7f5",
+  "unsloth/NVIDIA-Nemotron-3-Super-120B-A12B-GGUF": "036038fb30334a2d56a146c6f0d4871ab5edccbb",
+  "unsloth/NVIDIA-Nemotron-3-Ultra-550B-A55B-GGUF": "2fb7d5b3f4eae7aedb18b4839b6a6300111e46f6",
+  "unsloth/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GGUF": "75a5829055f69a0359085ae6bbd0a81b60bc05c6",
+  "unsloth/Qwen3.5-122B-A10B-MTP-GGUF": "907becb33103ab66b23da06a2dc74a5fca0583bd",
+  "unsloth/Qwen3.5-4B-MTP-GGUF": "86835bf9949e4d14d6860f7910b1340ad4f271a9",
+  "unsloth/Qwen3.5-9B-MTP-GGUF": "9716a636ee4bddc3fed678220b7a33dd2a4160ae",
+  "unsloth/Qwen3.6-35B-A3B-MTP-GGUF": "5bc3e238d916f48a861bac2f8a1990a0e9b7e98d",
+  "unsloth/Qwen3.8-27B-GGUF": "4ca720788d1e01f1bff70c033e0d0028fd02e502",
+  "unsloth/Qwen3.8-Flash-Next-GGUF": "084c631ac221016019d6e0a863afe92d90edd3b0",
+  "unsloth/gemma-4-12B-it-qat-GGUF": "980b060c40a8539ac159e0501a3e0f66a6365af3",
+  "unsloth/gemma-4-26B-A4B-it-qat-GGUF": "7b92b5b28818151e8669af2e45e88d6086f490dd",
+  "unsloth/gemma-4-31B-it-qat-GGUF": "43cc1aeb31adf47ec06a854507ce552cd9862e6f",
+  "unsloth/gemma-4-E4B-it-qat-GGUF": "8c5a9e4fd5482e2be20fe0bf013b4c262a8f4265"
 }

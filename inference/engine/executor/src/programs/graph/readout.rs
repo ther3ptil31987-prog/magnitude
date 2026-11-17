@@ -10,26 +10,34 @@
 //! When a separate draft drafts, the features are its conditioning instead:
 //! the fusion of the target taps (`project_rows` over the draft input rows
 //! the tapped blocks wrote) gathered through `out_rows` (`feature_rows`).
+//! Such a load also holds the drafter-free readout's projecting classes
+//! (`readout_sources`): a readout none of whose rows demands features runs
+//! one of them, as a load without the drafter does, and fuses nothing.
 
 use super::GraphError;
 use crate::{
-    native::{AttestedTarget, ReadoutHeadKernels},
-    programs::graph::draft::GraphDraft,
     DeviceError, InvariantError, ModelLoadPlan, ResidentOutput, ResidentTarget, ResourceLimits,
     SubmitError,
+    native::{AttestedTarget, ReadoutHeadKernels},
+    operators::InputForm,
+    programs::graph::draft::{Certified, GraphDraft},
+    programs::graph::facts::Numbers,
+    programs::native_target_graph::PlannedWeights,
 };
 use magnitude_batching::TargetBatchUpload;
 use magnitude_family_contracts::{
-    Decoder, ExitNorm, ProgressivePlane, WeightKind, WeightRole, WeightScope,
+    Decoder, ExitNorm, ProgressiveCodeDepth, ProgressivePlane, WeightKind, WeightRole, WeightScope,
 };
 use magnitude_kernels::{
     feature_rows, project_rows, readout_exact_rows, readout_features_rows, readout_head_rows,
-    readout_planes_rows, readout_refine_rows, readout_top_rows, sample_rows, shape_rows,
+    readout_planes_rows, readout_project_rows, readout_refine_rows, readout_top_rows, sample_rows,
+    shape_rows, token_confidence,
 };
 use seismic::{
-    BackendName, BoundNativeGraphPlan, Device, Element, Entry, NativeGraphClassSlice,
-    NativeGraphFamily, NativeGraphLayout, NativeGraphMetadata, NativeGraphPlan,
+    Argument, BackendName, BoundNativeGraphPlan, Device, Dim, Element, Entry, NativeGraphClassSlice,
+    LaunchGraphs, LaunchedGraph, NativeGraphFamily, NativeGraphLayout, NativeGraphMetadata, NativeGraphPlan,
     NativeGraphStorageBytes, NativePort, WorkflowTensor, WorkflowTensorMut, WorkflowTensorRef,
+    WorkflowTensorView,
 };
 use std::collections::BTreeMap;
 
@@ -38,6 +46,32 @@ const HISTORY_TOKENS: u64 = 64;
 
 fn error(error: impl std::fmt::Display) -> String {
     error.to_string()
+}
+
+/// The target readout's norm: the decoder's exit norm weight when the
+/// readout normalizes its input (`InputForm::exit`); none when it sums a
+/// hyper-connection exit site's partials.
+pub(crate) fn target_readout_norm<'l>(
+    load: &'l ModelLoadPlan,
+    geometry: &Decoder,
+) -> Result<Option<&'l crate::WeightPlan>, String> {
+    if !InputForm::exit(geometry).normalized {
+        return Ok(None);
+    }
+    let role = WeightRole {
+        scope: WeightScope::Target,
+        kind: WeightKind::OutputNorm,
+    };
+    load.weights()
+        .find(|weight| weight.role == role)
+        .map(Some)
+        .ok_or_else(|| "readout output norm weight is absent".into())
+}
+
+/// The element of a readout's norm port: its weight's, or F32 for the empty
+/// port of an absent norm (`final_row_ports`).
+fn norm_element(norm: Option<&crate::WeightPlan>) -> Element {
+    norm.map_or(Element::f32(), |norm| norm.resident)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -75,66 +109,235 @@ pub(crate) fn reads_progressive_heads(backend: BackendName) -> Result<bool, Stri
 /// The most selected rows a certified selection class serves on `backend`:
 /// the row counts whose levels take less time than the full pass. Metal's
 /// batched projection is bound by its matrix arithmetic, not the bytes it
-/// reads, so only a single row gains; CUDA's levels gain to four rows. Zero
-/// on a backend without the levels.
+/// reads, so only a single row gains. CUDA's top level at its declared
+/// configuration reads one row slower than the full pass (RTX 3090,
+/// Qwen3.6-35B-A3B: 2.09 against 0.70 ms), so it certifies none and reads
+/// the full pass. Zero on a backend without the levels.
 pub(crate) fn certified_rows(backend: BackendName) -> u64 {
     match backend {
         BackendName::Metal => 1,
-        BackendName::Cuda => 4,
-        BackendName::Cpu | BackendName::Vulkan => 0,
+        BackendName::Cuda | BackendName::Cpu | BackendName::Vulkan => 0,
     }
 }
 
-/// The planned vocabulary projection of a readout.
-#[derive(Clone, Copy)]
+/// The planned vocabulary projection of a readout: its stored form, the
+/// topology a graph's builder branches on. Its extents are read from the
+/// load's weights (`PlannedWeights`) where the graph binds them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum HeadPlans<'p> {
-    /// The output projection.
-    Packed(&'p crate::WeightPlan),
-    /// Its progressive planes, in `ProgressivePlane::ALL` order.
-    Progressive([&'p crate::WeightPlan; 5]),
+    /// The output projection of `scope`, resident as `weight`.
+    Packed { scope: WeightScope, weight: Element },
+    /// The planes of a scope a reader selected, which is stored as them
+    /// alone (`ModelLoadPlan::finalize_readout`). `rows` are the classes of
+    /// the reader in question that run the certified levels; its other
+    /// classes read the planes' full pass.
+    Qualified {
+        scope: WeightScope,
+        depth: ProgressiveCodeDepth,
+        rows: &'p [u64],
+    },
 }
 
 impl<'p> HeadPlans<'p> {
-    pub(crate) fn of(load: &'p ModelLoadPlan) -> Result<Self, String> {
+    /// The stored form of `scope`'s projection. A scope has one: its planes
+    /// when a reader selected a class, the output projection otherwise.
+    pub(crate) fn of(load: &'p ModelLoadPlan, scope: WeightScope) -> Result<Self, String> {
         let weight = |kind| {
-            load.weights().find(|weight| {
-                weight.role
-                    == WeightRole {
-                        scope: WeightScope::Target,
-                        kind,
-                    }
-            })
+            load.weights()
+                .find(|weight| weight.role == WeightRole { scope, kind })
         };
-        if let Some(output) = weight(WeightKind::Output) {
-            return Ok(Self::Packed(output));
-        }
-        let [top, bit3, rest, scales, radius] = ProgressivePlane::ALL.map(|plane| {
-            weight(WeightKind::OutputPlane(plane)).ok_or("readout output projection weight is absent")
+        let Some(choice) = load
+            .readout_choices()
+            .iter()
+            .find(|choice| choice.scope == scope)
+        else {
+            return Ok(Self::Packed {
+                scope,
+                weight: weight(WeightKind::Output)
+                    .ok_or("canonical readout output projection weight is absent")?
+                    .resident,
+            });
+        };
+        let mut depths = ProgressivePlane::ALL.map(|plane| {
+            weight(WeightKind::OutputPlane(plane))
+                .ok_or("qualified readout projection plane is absent")
+                .map(|plan| plan.progressive_depth())
         });
-        Ok(Self::Progressive([top?, bit3?, rest?, scales?, radius?]))
+        let depth = std::mem::replace(&mut depths[0], Ok(None))?
+            .ok_or("progressive projection has no code depth")?;
+        for plane in depths {
+            plane?;
+        }
+        Ok(Self::Qualified {
+            scope,
+            depth,
+            rows: &choice.rows,
+        })
     }
 
-    /// The most selected rows its certified classes serve on `backend`:
-    /// none for a packed head.
-    fn certified_rows(self, backend: BackendName) -> u64 {
+    /// The stored form is shared by scope; a reader's own choice, which
+    /// also identifies its normalization and whether its canonical input was
+    /// already prepared, says which of its classes run the certified
+    /// levels. A reader with no choice of its own follows its scope's form
+    /// and certifies no class.
+    pub(crate) fn for_recipe(
+        load: &'p ModelLoadPlan,
+        scope: WeightScope,
+        norm_scope: WeightScope,
+        prepared: bool,
+    ) -> Result<Self, String> {
+        let physical = Self::of(load, scope)?;
+        let Self::Qualified { depth, .. } = physical else {
+            return Ok(physical);
+        };
+        Ok(Self::Qualified {
+            scope,
+            depth,
+            rows: load
+                .readout_choices()
+                .iter()
+                .find(|choice| {
+                    choice.scope == scope
+                        && choice.norm_scope == norm_scope
+                        && choice.prepared == prepared
+                })
+                .map_or(&[], |choice| &choice.rows),
+        })
+    }
+
+    /// The form a class reads: a qualified scope's planes, certified or not.
+    /// It borrows nothing, so a topology key holds it.
+    pub(crate) fn selected(self) -> StoredHead {
         match self {
-            Self::Packed(_) => 0,
-            Self::Progressive(_) => certified_rows(backend),
+            Self::Packed { scope, weight } => StoredHead::Packed { scope, weight },
+            Self::Qualified { scope, depth, .. } => StoredHead::Progressive { scope, depth },
         }
     }
 
-    fn plane(planes: &[&'p crate::WeightPlan; 5], plane: ProgressivePlane) -> &'p crate::WeightPlan {
-        planes[plane as usize]
+    pub(crate) fn certifies(self, rows: u64) -> bool {
+        match self {
+            Self::Qualified { rows: classes, .. } => classes.contains(&rows),
+            Self::Packed { .. } => false,
+        }
+    }
+
+    /// The most selected rows its certified classes serve: none for a
+    /// packed head.
+    fn certified_rows(self) -> u64 {
+        match self {
+            Self::Packed { .. } => 0,
+            Self::Qualified { rows, .. } => rows.iter().copied().max().unwrap_or(0),
+        }
+    }
+}
+
+/// The form a readout class reads its head in: its scope's output
+/// projection, or its planes ([`HeadPlans::selected`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum StoredHead {
+    /// The output projection of `scope`, resident as `weight`.
+    Packed { scope: WeightScope, weight: Element },
+    /// The progressive planes of `scope`, retaining codes of `depth`.
+    Progressive {
+        scope: WeightScope,
+        depth: ProgressiveCodeDepth,
+    },
+}
+
+impl StoredHead {
+    pub(crate) fn scope(self) -> WeightScope {
+        match self {
+            Self::Packed { scope, .. } | Self::Progressive { scope, .. } => scope,
+        }
+    }
+
+    /// The planes a progressive projection reads: every plane through the
+    /// certified levels, all but the radii through the full pass.
+    fn read_planes(certified: bool) -> impl Iterator<Item = ProgressivePlane> {
+        ProgressivePlane::ALL
+            .into_iter()
+            .filter(move |plane| certified || *plane != ProgressivePlane::Radius)
+    }
+
+    pub(crate) fn depth(self) -> Option<ProgressiveCodeDepth> {
+        match self {
+            Self::Packed { .. } => None,
+            Self::Progressive { depth, .. } => Some(depth),
+        }
+    }
+
+    /// The head's projection ports: which weights it reads (the packed
+    /// projection and its per-tensor scale, or the planes `certified` reads,
+    /// [`StoredHead::read_planes`]), each port made by its reader's own
+    /// `binding`. Every entry that reads the scale admits only a per-tensor
+    /// one (`WS <= 1`: `readout_head_rows`, `readout_project_rows`,
+    /// `project_rows`).
+    pub(crate) fn ports<G: GraphDraft>(
+        self,
+        graph: &mut G,
+        certified: bool,
+        binding: &mut impl ProjectionBinding<G>,
+    ) -> Result<ProjectionPorts, GraphError> {
+        let scope = self.scope();
+        Ok(match self {
+            Self::Packed { .. } => {
+                let role = WeightRole { scope, kind: WeightKind::Output };
+                let weight = binding.weight(graph, role)?;
+                let (scale, scale_extent) = binding.scale(graph, role)?;
+                ProjectionPorts::Packed { weight, scale, scale_extent }
+            }
+            Self::Progressive { depth, .. } => ProjectionPorts::Progressive {
+                depth,
+                planes: StoredHead::read_planes(certified)
+                    .map(|plane| {
+                        Ok((plane, binding.weight(graph, WeightRole { scope, kind: WeightKind::OutputPlane(plane) })?))
+                    })
+                    .collect::<Result<_, GraphError>>()?,
+            },
+        })
+    }
+}
+
+/// How a reader of a head projection makes its ports ([`StoredHead::ports`]):
+/// the choice of ports is the projection's, their binding the reader's.
+pub(crate) trait ProjectionBinding<G: GraphDraft> {
+    /// The port of the weight of `role`.
+    fn weight(&mut self, graph: &mut G, role: WeightRole) -> Result<NativePort, GraphError>;
+    /// The port of the per-tensor scale of `role`'s weight, and its extent
+    /// (0 without one).
+    fn scale(&mut self, graph: &mut G, role: WeightRole) -> Result<(NativePort, Dim), GraphError>;
+}
+
+/// Plain ports at the extents its weights give them, which their graph's
+/// binder binds by role.
+pub(crate) struct PlannedPorts<'w, W: PlannedWeights + ?Sized>(pub &'w W);
+
+impl<G: GraphDraft, W: PlannedWeights + ?Sized> ProjectionBinding<G> for PlannedPorts<'_, W> {
+    fn weight(&mut self, graph: &mut G, role: WeightRole) -> Result<NativePort, GraphError> {
+        let weight = self.0.weight(role)?;
+        graph.port::<Dim>(weight.resident, &weight.shape)
+    }
+
+    fn scale(&mut self, graph: &mut G, role: WeightRole) -> Result<(NativePort, Dim), GraphError> {
+        let extent = self.0.weight(role)?.scale.unwrap_or_else(|| Dim::from(0));
+        Ok((graph.port::<Dim>(Element::f32(), std::slice::from_ref(&extent))?, extent))
     }
 }
 
 /// A readout graph's head weight ports, by its `HeadPlans`.
 #[derive(Clone)]
-pub(crate) enum HeadPorts {
+pub(crate) enum ProjectionPorts {
     /// The output projection and its accumulator-scale port.
-    Packed { weight: NativePort, scale: NativePort },
+    Packed {
+        weight: NativePort,
+        scale: NativePort,
+        scale_extent: Dim,
+    },
     /// The planes the graph reads.
-    Progressive(Vec<(ProgressivePlane, NativePort)>),
+    Progressive {
+        depth: ProgressiveCodeDepth,
+        planes: Vec<(ProgressivePlane, NativePort)>,
+    },
 }
 
 /// Whether `shape_rows` changes a row with these shaping parameters
@@ -143,7 +346,16 @@ pub(crate) enum HeadPorts {
 /// at temperature 0 (greedy) and at temperature 1 with no top-k, top-p or
 /// min-p cut.
 pub(crate) fn shapes(parameters: &[f32; 8]) -> bool {
-    let [temperature, top_k, top_p, min_p, repetition, presence, frequency, _] = *parameters;
+    let [
+        temperature,
+        top_k,
+        top_p,
+        min_p,
+        repetition,
+        presence,
+        frequency,
+        _,
+    ] = *parameters;
     let penalized = repetition != 1.0 || presence != 0.0 || frequency != 0.0;
     let cut = top_k > 0.0 || top_p < 1.0 || min_p > 0.0;
     penalized || (temperature != 0.0 && (temperature != 1.0 || cut))
@@ -154,7 +366,16 @@ pub(crate) fn shapes(parameters: &[f32; 8]) -> bool {
 /// always keeps the largest logit), so shaping is at most a temperature,
 /// which the certified levels apply to their bounds.
 pub(crate) fn certifies(parameters: &[f32; 8]) -> bool {
-    let [temperature, top_k, top_p, min_p, repetition, presence, frequency, _] = *parameters;
+    let [
+        temperature,
+        top_k,
+        top_p,
+        min_p,
+        repetition,
+        presence,
+        frequency,
+        _,
+    ] = *parameters;
     let penalized = repetition != 1.0 || presence != 0.0 || frequency != 0.0;
     let cut = top_k > 0.0 || top_p < 1.0 || min_p > 0.0;
     !penalized && (temperature == 0.0 || !cut)
@@ -164,11 +385,7 @@ pub(crate) fn certifies(parameters: &[f32; 8]) -> bool {
 /// temperature, or 1 for a greedy row (temperature 0), whose score is its
 /// logit.
 fn score_divisor(temperature: f32) -> f32 {
-    if temperature > 0.0 {
-        temperature
-    } else {
-        1.0
-    }
+    if temperature > 0.0 { temperature } else { 1.0 }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -183,31 +400,78 @@ pub(crate) struct ReadoutClass {
 /// Where a readout's features come from.
 #[derive(Clone, Copy)]
 enum FeatureSource<'p> {
+    Residual {
+        width: u64,
+    },
     /// The final norm of the hidden rows.
     Output,
     /// A separate draft's fused taps: `fusion` projects the draft input rows.
-    Taps { fusion: &'p crate::WeightPlan },
+    Taps {
+        fusion: &'p crate::WeightPlan,
+    },
 }
 
 impl<'p> FeatureSource<'p> {
     /// The draft's taps when its fusion is planned with the target.
     fn of(load: &'p ModelLoadPlan) -> Self {
-        let role = WeightRole {
-            scope: WeightScope::Draft,
-            kind: WeightKind::DraftFusion,
-        };
-        match load.target().iter().find(|weight| weight.role == role) {
+        if let Some(width) = load.residual_conditioning() {
+            return Self::Residual { width };
+        }
+        match load.draft_fusion() {
             Some(fusion) => Self::Taps { fusion },
             None => Self::Output,
         }
     }
 }
 
+/// One source a load's readout prepares classes from.
+#[derive(Clone, Copy)]
+struct ReadoutSource<'p> {
+    features: FeatureSource<'p>,
+    /// Whether its classes fuse a separate draft's taps.
+    fuses: bool,
+    /// Whether it prepares the features classes, or the projecting ones
+    /// alone.
+    features_classes: bool,
+}
+
+impl<'p> ReadoutSource<'p> {
+    /// Every class from `features`.
+    fn whole(features: FeatureSource<'p>) -> Self {
+        Self { features, fuses: matches!(features, FeatureSource::Taps { .. }), features_classes: true }
+    }
+
+    /// Its classes of `classes`.
+    fn classes(self, classes: Vec<ReadoutClass>) -> Vec<ReadoutClass> {
+        classes
+            .into_iter()
+            .filter(|class| self.features_classes || class.kind != ReadoutKind::Features)
+            .collect()
+    }
+}
+
+/// The sources `load`'s readout prepares classes from: its own
+/// ([`FeatureSource::of`]), every class; and where that fuses a separate
+/// draft's taps, also the same target's without its drafter
+/// ([`FeatureSource::Output`]), its projecting classes, which a readout none
+/// of whose rows demands features runs (`BoundTargetReadoutGraphs::class`):
+/// what a drafter-free load's readout runs, fusing nothing. A features class
+/// is demanded features, so it has no drafter-free one.
+fn readout_sources(load: &ModelLoadPlan) -> Vec<ReadoutSource<'_>> {
+    let own = ReadoutSource::whole(FeatureSource::of(load));
+    match own.fuses {
+        true => vec![own, ReadoutSource { features: FeatureSource::Output, fuses: false, features_classes: false }],
+        false => vec![own],
+    }
+}
+
 /// The feature entries of a readout graph, by its feature source.
 enum FeatureEntries<'a, G: GraphDraft + 'a> {
+    Residual(G::Binding<'a, feature_rows::Entry>),
     Output(G::Binding<'a, readout_features_rows::Entry>),
     Taps {
-        fusion: G::Binding<'a, project_rows::Entry>,
+        /// The taps' fusion, by row range.
+        fusion: G::Ranged<'a, project_rows::Entry>,
         features: G::Binding<'a, feature_rows::Entry>,
     },
 }
@@ -220,16 +484,20 @@ pub(crate) struct ReadoutTapPorts {
     pub taps: NativePort,
     pub fusion: NativePort,
     pub fusion_scale: NativePort,
+    /// The fusion's packing bound port (`WeightPlan::bound`; empty where
+    /// the plan has none).
+    pub fusion_bound: NativePort,
 }
 
 #[derive(Clone)]
 pub(crate) struct PreparedTargetReadoutGraph {
+    pub residual: Option<NativePort>,
     pub plan: NativeGraphPlan,
     /// Absent for a tapped readout's feature-only classes.
     pub final_rows: Option<FinalRowPorts>,
     pub taps: Option<ReadoutTapPorts>,
     /// The vocabulary projection's ports, in projecting classes.
-    pub head: Option<HeadPorts>,
+    pub head: Option<ProjectionPorts>,
     /// Hidden rows of the feature outputs.
     pub out_rows: NativePort,
     /// Hidden rows of the projected outputs, selected outputs first.
@@ -243,15 +511,36 @@ pub(crate) struct PreparedTargetReadoutGraph {
 
 #[derive(Clone)]
 pub struct PreparedTargetReadoutGraphs {
-    classes: BTreeMap<ReadoutClass, PreparedTargetReadoutGraph>,
+    pub(crate) residual_width: Option<u64>,
+    /// Each class, by whether it fuses the draft's taps
+    /// (`readout_sources`).
+    classes: BTreeMap<(bool, ReadoutClass), PreparedTargetReadoutGraph>,
+    /// Whether the load's own feature source fuses a separate draft's taps.
+    fuses: bool,
+    /// Every class: any launch's readout runs in its slots.
     family: NativeGraphFamily,
+    /// The classes a prompt chunk's readout runs ([`chunk_holds`]), whose
+    /// slots hold no more than it exports.
+    chunk_family: NativeGraphFamily,
     max_projected_rows: usize,
-    certified_rows: u64,
+    certified_classes: Vec<u64>,
 }
 
 pub(crate) struct BoundTargetReadoutGraphs {
-    pub prepared: PreparedTargetReadoutGraphs,
-    bound: BTreeMap<ReadoutClass, BoundNativeGraphPlan>,
+    /// The prepared graphs these bind: the load's one copy, shared with
+    /// its attested programs.
+    pub prepared: std::sync::Arc<PreparedTargetReadoutGraphs>,
+    /// By whether the class fuses the draft's taps, and the class.
+    bound: BTreeMap<(bool, ReadoutClass), BoundNativeGraphPlan>,
+}
+
+/// Whether a readout projecting `projected` rows is of a prompt chunk's
+/// classes: at most its final row (`domain::projected_rows`). Such a
+/// readout's slots come from the chunk family, and its class's layout is of
+/// a regime of its own (`readout_regime`), both sized by what such a
+/// readout exports, not by the load's widest export.
+pub(crate) fn chunk_holds(projected: u64) -> bool {
+    projected <= 1
 }
 
 /// Whether the load's projecting readout classes export their logits: only
@@ -273,14 +562,34 @@ pub(crate) fn max_projected_rows(limits: ResourceLimits) -> usize {
 }
 
 /// The most selected rows a load's certified selection classes serve: the
-/// head's bound on `backend` for a served load, none for a diagnostic load,
-/// whose selections read the logits it exports.
-fn load_certified_rows(limits: ResourceLimits, head: HeadPlans<'_>, backend: BackendName) -> u64 {
+/// head's for a served load, none for a diagnostic load, whose selections
+/// read the logits it exports.
+fn load_certified_rows(limits: ResourceLimits, head: HeadPlans<'_>) -> u64 {
     if exports_logits(limits) {
         0
     } else {
-        head.certified_rows(backend)
+        head.certified_rows()
     }
+}
+
+fn qualified_readout_classes(
+    limits: ResourceLimits,
+    head: HeadPlans<'_>,
+) -> Result<Vec<ReadoutClass>, String> {
+    Ok(
+        readout_classes(limits, load_certified_rows(limits, head))?
+            .into_iter()
+            .filter(|class| {
+                !matches!(
+                    class.kind,
+                    ReadoutKind::Selection {
+                        certified: true,
+                        ..
+                    }
+                ) || head.certifies(class.selected)
+            })
+            .collect(),
+    )
 }
 
 /// A served load's classes are its features and its selections, whose
@@ -289,7 +598,10 @@ fn load_certified_rows(limits: ResourceLimits, head: HeadPlans<'_>, backend: Bac
 /// unshaped selection of its leading rows, since shaping must not rewrite
 /// the logits it exports. A served load also has certified selections of up
 /// to `certified_rows` rows.
-fn readout_classes(limits: ResourceLimits, certified_rows: u64) -> Result<Vec<ReadoutClass>, String> {
+fn readout_classes(
+    limits: ResourceLimits,
+    certified_rows: u64,
+) -> Result<Vec<ReadoutClass>, String> {
     let row_classes = magnitude_batching::row_classes(limits.max_launch_rows);
     if row_classes.is_empty() {
         return Err(format!(
@@ -369,55 +681,59 @@ impl PreparedTargetReadoutGraphs {
         geometry: &Decoder,
         limits: ResourceLimits,
     ) -> Result<Self, String> {
-        let role = |kind| WeightRole {
-            scope: WeightScope::Target,
-            kind,
-        };
-        let norm = load
-            .weights()
-            .find(|weight| weight.role == role(WeightKind::OutputNorm))
-            .ok_or("readout output norm weight is absent")?;
-        let head = HeadPlans::of(load)?;
-        let source = FeatureSource::of(load);
-        let regimes =
-            certify_readout_regimes(device.backend(), geometry, norm, head, source, limits)
-                .map_err(error)?;
+        let norm = target_readout_norm(load, geometry)?;
+        let head = HeadPlans::for_recipe(load, WeightScope::Target, WeightScope::Target, false)?;
+        let (regimes, qualified) = load_readout_regimes::<NativeGraphLayout>(device.backend(), load, geometry, norm, head, limits).map_err(error)?;
         let mut classes = BTreeMap::new();
         let mut plans = Vec::new();
-        let mut add = |class: ReadoutClass| -> Result<(), String> {
+        let mut chunk_plans = Vec::new();
+        for &(source, class) in &qualified {
             let layout = regimes
-                .get(&readout_regime(class))
+                .get(&(source.fuses, readout_regime(class)))
                 .ok_or("readout class has no resource regime")?;
             let variant = PreparedTargetReadoutGraph::prepare(
                 device,
                 target,
                 geometry,
                 norm,
-                head,
-                source,
+                (head, load),
+                source.features,
                 class,
                 exports_logits(limits),
                 layout,
             )?;
-            plans.push(variant.plan.clone());
-            classes.insert(class, variant);
-            Ok(())
-        };
-        let certified_rows = load_certified_rows(limits, head, device.backend());
-        for class in readout_classes(limits, certified_rows)? {
-            add(class)?;
+            plans.push((readout_decodes(class, limits), variant.plan.clone()));
+            if chunk_holds(class.projected) {
+                chunk_plans.push((readout_decodes(class, limits), variant.plan.clone()));
+            }
+            classes.insert((source.fuses, class), variant);
         }
-        let family = NativeGraphFamily::new(&plans).map_err(|error| error.to_string())?;
+        let family = super::serial_family("readout", plans, &readout_graphs(&regimes, &qualified, limits, false).map_err(error)?)
+            .map_err(|error| error.to_string())?;
+        let chunk_family = super::serial_family("chunk readout", chunk_plans, &readout_graphs(&regimes, &qualified, limits, true).map_err(error)?)
+            .map_err(|error| error.to_string())?;
         Ok(Self {
+            residual_width: load.residual_conditioning(),
             classes,
+            fuses: qualified.iter().any(|(source, _)| source.fuses),
             family,
+            chunk_family,
             max_projected_rows: max_projected_rows(limits),
-            certified_rows,
+            certified_classes: magnitude_batching::row_classes(limits.max_selected_rows)
+                .into_iter()
+                .map(|rows| rows as u64)
+                .filter(|&rows| head.certifies(rows) && !exports_logits(limits))
+                .collect(),
         })
     }
 
     pub fn family(&self) -> &NativeGraphFamily {
         &self.family
+    }
+    /// The family of the classes a prompt chunk's readout runs
+    /// ([`chunk_holds`]).
+    pub fn chunk_family(&self) -> &NativeGraphFamily {
+        &self.chunk_family
     }
     pub fn workspace_bytes(&self) -> u64 {
         self.family.workspace_bytes()
@@ -433,32 +749,46 @@ impl PreparedTargetReadoutGraphs {
         self.max_projected_rows
     }
 
-    /// The most selected rows the family's certified selection classes
-    /// serve (none without them).
-    pub(crate) fn certified_rows(&self) -> u64 {
-        self.certified_rows
+    pub(crate) fn certifies(&self, rows: u64) -> bool {
+        self.certified_classes.contains(&rows)
     }
 
     pub(crate) fn bind_weights(
-        self,
+        self: &std::sync::Arc<Self>,
         resident: &ResidentTarget,
     ) -> Result<BoundTargetReadoutGraphs, String> {
         let mut bound = BTreeMap::new();
-        for (class, graph) in &self.classes {
+        for ((fuses, class), graph) in &self.classes {
             let mut fixed = Vec::new();
             let absent_scale = seismic::Tensor::from_host(
-                &resident.output_norm.tensor().device(), Element::f32(), &[0], &[],
-            ).map_err(|error| error.to_string())?;
+                &resident.embedding.tensor().device(),
+                Element::f32(),
+                &[0],
+                &[],
+            )
+            .map_err(|error| error.to_string())?;
             if let Some(rows) = &graph.final_rows {
-                fixed.push((&rows.norm, resident.output_norm.tensor()));
+                // A hyper-connection exit's partials have no norm: the
+                // port is empty.
+                let norm = resident
+                    .output_norm
+                    .as_ref()
+                    .map_or(&absent_scale, |norm| norm.tensor());
+                fixed.push((&rows.norm, norm));
             }
             match (&graph.head, &resident.output) {
                 (None, _) => {}
-                (Some(HeadPorts::Packed { weight, scale }), ResidentOutput::Packed(output)) => {
+                (
+                    Some(ProjectionPorts::Packed { weight, scale, .. }),
+                    ResidentOutput::Packed(output),
+                ) => {
                     fixed.push((weight, output.tensor()));
                     fixed.push((scale, output.scale().unwrap_or(&absent_scale)));
                 }
-                (Some(HeadPorts::Progressive(ports)), ResidentOutput::Progressive(planes)) => {
+                (
+                    Some(ProjectionPorts::Progressive { planes: ports, .. }),
+                    ResidentOutput::Progressive(planes),
+                ) => {
                     for (plane, port) in ports {
                         fixed.push((port, planes.plane(*plane).tensor()));
                     }
@@ -475,9 +805,13 @@ impl PreparedTargetReadoutGraphs {
                     &taps.fusion_scale,
                     fusion.projection.scale().unwrap_or(&absent_scale),
                 ));
+                fixed.push((
+                    &taps.fusion_bound,
+                    fusion.projection.bound().unwrap_or(&absent_scale),
+                ));
             }
             bound.insert(
-                *class,
+                (*fuses, *class),
                 graph
                     .plan
                     .bind_static(&fixed)
@@ -485,26 +819,32 @@ impl PreparedTargetReadoutGraphs {
             );
         }
         Ok(BoundTargetReadoutGraphs {
-            prepared: self,
+            prepared: self.clone(),
             bound,
         })
     }
 }
 
 impl BoundTargetReadoutGraphs {
+    /// The graph of `class` for a readout whose rows demand features or
+    /// not (`features`): on a load whose readout fuses a draft's taps, the
+    /// fusing class where some row demands features, the drafter-free one
+    /// otherwise (`readout_sources`); a load's one source else.
     pub(crate) fn class(
         &self,
         class: ReadoutClass,
+        features: bool,
     ) -> Result<(&PreparedTargetReadoutGraph, &BoundNativeGraphPlan), String> {
+        let fuses = self.prepared.fuses && features;
         let graph = self
             .prepared
             .classes
-            .get(&class)
-            .ok_or_else(|| format!("readout graph class {class:?} was not sealed"))?;
+            .get(&(fuses, class))
+            .ok_or_else(|| format!("readout graph class {class:?} (fusing taps: {fuses}) was not sealed"))?;
         let bound = self
             .bound
-            .get(&class)
-            .ok_or_else(|| format!("readout graph class {class:?} was not bound"))?;
+            .get(&(fuses, class))
+            .ok_or_else(|| format!("readout graph class {class:?} (fusing taps: {fuses}) was not bound"))?;
         Ok((graph, bound))
     }
 }
@@ -537,24 +877,30 @@ impl PreparedTargetReadoutGraph {
         device: &Device,
         target: &AttestedTarget,
         geometry: &Decoder,
-        norm_plan: &crate::WeightPlan,
-        head_plans: HeadPlans<'_>,
+        norm_plan: Option<&crate::WeightPlan>,
+        (head_plans, weights): (HeadPlans<'_>, &(impl PlannedWeights + ?Sized)),
         source: FeatureSource<'_>,
         class: ReadoutClass,
         export: bool,
         layout: &NativeGraphLayout,
     ) -> Result<Self, String> {
         let entries = match (source, &target.taps) {
+            (FeatureSource::Residual { .. }, _) => FeatureEntries::Residual(
+                target
+                    .residual_features
+                    .as_ref()
+                    .ok_or("residual features entry is absent")?,
+            ),
             (FeatureSource::Output, _) => FeatureEntries::Output(&target.readout.features),
             (FeatureSource::Taps { .. }, Some(taps)) => FeatureEntries::Taps {
                 fusion: &taps.fusion,
                 features: &taps.features,
             },
             (FeatureSource::Taps { .. }, None) => {
-                return Err("a tapped readout has no tap entries".into())
+                return Err("a tapped readout has no tap entries".into());
             }
         };
-        let (mut graph, final_rows, out_rows, features, taps) = feature_topology(
+        let (mut graph, final_rows, out_rows, features, taps, residual) = feature_topology(
             device.native_graph_with_layout(layout),
             entries,
             geometry,
@@ -572,21 +918,45 @@ impl PreparedTargetReadoutGraph {
             let rows = final_rows
                 .as_ref()
                 .ok_or("a projecting readout has no final rows")?;
-            let entries = match &target.readout.head {
-                ReadoutHeadKernels::Packed { head, .. } => HeadEntries::Packed(head),
-                ReadoutHeadKernels::Progressive(kernels) => HeadEntries::Progressive {
-                    top: &kernels.top,
-                    refine: &kernels.refine,
-                    exact: &kernels.exact,
-                    planes: &kernels.planes,
-                },
+            let (packed, progressive) = match &target.readout.head {
+                ReadoutHeadKernels::Packed { head, .. } => (Some(head), None),
+                ReadoutHeadKernels::Qualified {
+                    packed,
+                    progressive,
+                    ..
+                } => {
+                    let ReadoutHeadKernels::Packed { head, .. } = packed.as_ref() else {
+                        return Err(
+                            "qualified target readout has no canonical packed kernel".into()
+                        );
+                    };
+                    (Some(head), Some(progressive))
+                }
+            };
+            // A class reads the form its scope is stored in: a qualified
+            // scope's planes, through the certified levels or the full pass.
+            let stored = head_plans.selected();
+            let entries = match stored {
+                StoredHead::Packed { .. } => {
+                    HeadEntries::Packed(packed.ok_or("target readout has no packed recipe")?)
+                }
+                StoredHead::Progressive { .. } => {
+                    let kernels = progressive
+                        .ok_or("a readout of a scope stored as planes has no kernels for them")?;
+                    HeadEntries::Progressive {
+                        top: &kernels.top,
+                        refine: &kernels.refine,
+                        exact: &kernels.exact,
+                        planes: &kernels.planes,
+                    }
+                }
             };
             let projected = head_topology(
                 graph,
                 entries,
                 (&target.shape, &target.sample),
                 geometry,
-                head_plans,
+                (stored, weights),
                 class,
                 export,
                 rows,
@@ -604,6 +974,7 @@ impl PreparedTargetReadoutGraph {
             plan,
             final_rows,
             taps,
+            residual,
             head,
             out_rows,
             logit_rows,
@@ -624,6 +995,7 @@ type FeaturePrefix<G> = (
     NativePort,
     WorkflowTensor,
     Option<ReadoutTapPorts>,
+    Option<NativePort>,
 );
 
 /// The decoder's final hidden rows (bound per run) and final norm.
@@ -636,17 +1008,22 @@ pub(crate) struct FinalRowPorts {
 fn final_row_ports<G: GraphDraft>(
     graph: &mut G,
     geometry: &Decoder,
-    norm_plan: &crate::WeightPlan,
+    norm_plan: Option<&crate::WeightPlan>,
     class: ReadoutClass,
 ) -> Result<FinalRowPorts, GraphError> {
+    let form = InputForm::exit(geometry);
     Ok(FinalRowPorts {
         hidden: graph.port_with_class_extent(
             Element::f32(),
-            &[class.rows, geometry.hidden],
+            &[class.rows, form.parts * geometry.hidden],
             0,
             "M",
         )?,
-        norm: graph.port(norm_plan.resident, &norm_plan.shape)?,
+        // An absent norm (`NM = 0`) is an empty port.
+        norm: match norm_plan {
+            Some(norm) => graph.port(norm.resident, &norm.shape)?,
+            None => graph.port(norm_element(None), &[0])?,
+        },
     })
 }
 
@@ -656,16 +1033,41 @@ fn feature_topology<'a, G: GraphDraft + 'a>(
     mut graph: G,
     entries: FeatureEntries<'a, G>,
     geometry: &Decoder,
-    norm_plan: &crate::WeightPlan,
+    norm_plan: Option<&crate::WeightPlan>,
     source: FeatureSource<'_>,
     class: ReadoutClass,
 ) -> Result<FeaturePrefix<G>, GraphError> {
+    let [parts, normalized] = InputForm::exit(geometry).dimensions(geometry.hidden);
     let dimensions = [
         ("M", class.rows),
         ("O", class.outputs),
         ("D", geometry.hidden),
+        parts,
+        normalized,
     ];
+    let mut residual = None;
     let (final_rows, out_rows, features, taps) = match (entries, source) {
+        (FeatureEntries::Residual(entry), FeatureSource::Residual { width }) => {
+            let port =
+                graph.port_with_class_extent(Element::f32(), &[class.rows, width], 0, "M")?;
+            let dims = [("M", class.rows), ("O", class.outputs), ("D", width)];
+            let out_rows = graph.input_for(entry, "out_rows", &dims)?;
+            let features = graph
+                .enqueue(
+                    entry,
+                    &dims,
+                    feature_rows::WorkflowArgs {
+                        fused: port.tensor().into(),
+                        out_rows: out_rows.tensor().into(),
+                    },
+                )?
+                .value;
+            residual = Some(port);
+            let final_rows = (class.kind != ReadoutKind::Features)
+                .then(|| final_row_ports(&mut graph, geometry, norm_plan, class))
+                .transpose()?;
+            (final_rows, out_rows, features, None)
+        }
         (FeatureEntries::Output(entry), FeatureSource::Output) => {
             let final_rows = final_row_ports(&mut graph, geometry, norm_plan, class)?;
             let (hidden, norm) = (&final_rows.hidden, &final_rows.norm);
@@ -675,10 +1077,15 @@ fn feature_topology<'a, G: GraphDraft + 'a>(
                     entry,
                     &dimensions,
                     readout_features_rows::WorkflowArgs {
-                        hidden: hidden.tensor().into(),
+                        hidden: (&hidden.tensor().reshape(&[
+                            class.rows,
+                            InputForm::exit(geometry).parts,
+                            geometry.hidden,
+                        ]))
+                            .into(),
                         norm: norm.tensor().into(),
                         out_rows: out_rows.tensor().into(),
-                        epsilon: readout_epsilon(geometry)?,
+                        epsilon: readout_epsilon(geometry)?.into(),
                     },
                 )?
                 .value;
@@ -697,19 +1104,24 @@ fn feature_topology<'a, G: GraphDraft + 'a>(
             // The fusion's resident second-level scale, or an absent scale.
             let scale_extent = plan.scale_extent();
             let fusion_scale = graph.port(Element::f32(), &[scale_extent])?;
+            // Its packing bound (`WeightPlan::bound`), or an absent one.
+            let fusion_bound = graph.port(Element::f32(), &[plan.bound])?;
             let fused = graph
                 .enqueue::<project_rows::Entry>(
-                    fusion,
+                    G::pick(fusion, &Dim::from(class.rows)),
                     &[
                         ("M", class.rows),
+                        ("G", 1),
                         ("K", width),
                         ("N", geometry.hidden),
                         ("WS", scale_extent),
+                        ("WB", plan.bound),
                     ],
                     project_rows::WorkflowArgs {
                         source: taps.tensor().into(),
                         weight: weight.tensor().into(),
                         weight_scale: fusion_scale.tensor().into(),
+                        weight_bound: fusion_bound.tensor().into(),
                     },
                 )?
                 .value;
@@ -736,18 +1148,20 @@ fn feature_topology<'a, G: GraphDraft + 'a>(
                     taps,
                     fusion: weight,
                     fusion_scale,
+                    fusion_bound,
                 }),
             )
         }
         _ => return Err("readout feature entries disagree with their source".into()),
     };
     graph.export(&features)?;
-    Ok((graph, final_rows, out_rows, features, taps))
+    Ok((graph, final_rows, out_rows, features, taps, residual))
 }
 
-/// The head entries of a readout graph, by its head plans.
+/// The head entries of a readout graph, by its head plans; the packed
+/// projection's by row range.
 enum HeadEntries<'a, G: GraphDraft + 'a> {
-    Packed(G::Binding<'a, readout_head_rows::Entry>),
+    Packed(G::Ranged<'a, readout_head_rows::Entry>),
     Progressive {
         top: G::Binding<'a, readout_top_rows::Entry>,
         refine: G::Binding<'a, readout_refine_rows::Entry>,
@@ -766,6 +1180,7 @@ pub(crate) struct ProgressiveEntries<'a, G: GraphDraft + 'a> {
 
 /// The planes a progressive projection reads: the radii only when certified.
 pub(crate) struct ProgressivePorts<'p> {
+    pub depth: ProgressiveCodeDepth,
     pub top: &'p WorkflowTensor,
     pub bit3: &'p WorkflowTensor,
     pub rest: &'p WorkflowTensor,
@@ -779,30 +1194,332 @@ pub(crate) struct ProgressivePorts<'p> {
 pub(crate) struct ProgressiveRows<'p> {
     pub hidden: &'p WorkflowTensor,
     pub norm: &'p WorkflowTensor,
+    pub form: InputForm,
     pub out_rows: &'p WorkflowTensor,
-    pub rows: u64,
-    pub projected: u64,
-    pub selected: u64,
+    pub rows: Dim,
+    pub projected: Dim,
+    pub selected: Dim,
+}
+
+/// Feature semantics are independent of the table's owner and representation.
+pub(crate) enum ReadoutInput<'p> {
+    RawRms {
+        hidden: &'p WorkflowTensor,
+        norm: &'p WorkflowTensor,
+        form: InputForm,
+        out_rows: &'p WorkflowTensor,
+        epsilon: Argument<f32>,
+    },
+    PreparedFeatures {
+        features: &'p WorkflowTensor,
+        canonical_rows: Option<&'p WorkflowTensor>,
+    },
+}
+
+/// A vocabulary projection's entries; a packed projection's by the range of
+/// the rows it projects.
+pub(crate) enum ProjectionEntries<'a, G: GraphDraft + 'a> {
+    RawPacked(G::Ranged<'a, readout_head_rows::Entry>),
+    PreparedPacked(G::Ranged<'a, readout_project_rows::Entry>),
+    Progressive(ProgressiveEntries<'a, G>),
+    Qualified {
+        packed: Box<ProjectionEntries<'a, G>>,
+        progressive: ProgressiveEntries<'a, G>,
+    },
+}
+
+impl<'a, G: GraphDraft + 'a> ProjectionEntries<'a, G> {
+    /// Host-selected row indices are owned upload inputs of the raw recipe
+    /// `ports` select: the packed projection's, or the planes' full pass,
+    /// even when its scope is stored as planes.
+    pub(crate) fn raw_out_rows<D: Clone + Into<Dim>>(
+        &self,
+        graph: &mut G,
+        ports: &ProjectionPorts,
+        dimensions: &[(&str, D)],
+    ) -> Result<NativePort, GraphError> {
+        match (self, ports) {
+            (Self::RawPacked(entry), ProjectionPorts::Packed { .. }) => {
+                graph.input_for::<readout_head_rows::Entry>(G::first(*entry), "out_rows", dimensions)
+            }
+            (Self::Qualified { packed, .. }, ProjectionPorts::Packed { .. }) => {
+                packed.raw_out_rows(graph, ports, dimensions)
+            }
+            (
+                Self::Qualified { progressive, .. } | Self::Progressive(progressive),
+                ProjectionPorts::Progressive { .. },
+            ) => graph
+                .input_for::<readout_planes_rows::Entry>(progressive.planes, "out_rows", dimensions),
+            _ => Err("raw row indices require a raw projection of their representation".into()),
+        }
+    }
+
+    pub(crate) fn borrowed(&self) -> Self {
+        match self {
+            Self::RawPacked(entry) => Self::RawPacked(*entry),
+            Self::PreparedPacked(entry) => Self::PreparedPacked(*entry),
+            Self::Qualified {
+                packed,
+                progressive,
+            } => Self::Qualified {
+                packed: Box::new(packed.borrowed()),
+                progressive: ProgressiveEntries {
+                    top: progressive.top,
+                    refine: progressive.refine,
+                    exact: progressive.exact,
+                    planes: progressive.planes,
+                },
+            },
+            Self::Progressive(entries) => Self::Progressive(ProgressiveEntries {
+                top: entries.top,
+                refine: entries.refine,
+                exact: entries.exact,
+                planes: entries.planes,
+            }),
+        }
+    }
+}
+
+impl<'a> ProjectionEntries<'a, seismic::NativeGraph> {
+    pub(crate) fn prepared(kernels: &'a crate::native::ProjectionKernels) -> Self {
+        match kernels {
+            crate::native::ProjectionKernels::RawPacked(kernel) => Self::RawPacked(kernel),
+            crate::native::ProjectionKernels::PreparedPacked(kernel) => {
+                Self::PreparedPacked(kernel)
+            }
+            crate::native::ProjectionKernels::Qualified {
+                packed,
+                progressive,
+                ..
+            } => Self::Qualified {
+                packed: Box::new(Self::prepared(packed)),
+                progressive: ProgressiveEntries {
+                    top: &progressive.top,
+                    refine: &progressive.refine,
+                    exact: &progressive.exact,
+                    planes: &progressive.planes,
+                },
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum CheckedProjectionEntries {
+    RawPacked([(&'static str, Element); 3]),
+    PreparedPacked([(&'static str, Element); 2]),
+    Qualified {
+        packed: Box<CheckedProjectionEntries>,
+        normalized: [(&'static str, Element); 2],
+        activation: [(&'static str, Element); 1],
+    },
+}
+impl CheckedProjectionEntries {
+    pub(crate) fn new(
+        head: crate::ReadoutHead,
+        norm: Element,
+        activation: Element,
+        prepared_features: bool,
+    ) -> Self {
+        match head {
+            crate::ReadoutHead::Qualified {
+                weight,
+                weight_scale,
+            } => Self::Qualified {
+                packed: Box::new(Self::new(
+                    crate::ReadoutHead::Packed {
+                        weight,
+                        weight_scale,
+                    },
+                    norm,
+                    activation,
+                    prepared_features,
+                )),
+                normalized: [("NW", norm), ("A", activation)],
+                activation: [("A", activation)],
+            },
+            crate::ReadoutHead::Packed { weight, .. } if prepared_features => {
+                Self::PreparedPacked([("OW", weight), ("A", activation)])
+            }
+            crate::ReadoutHead::Packed { weight, .. } => {
+                Self::RawPacked([("NW", norm), ("OW", weight), ("A", activation)])
+            }
+        }
+    }
+    pub(crate) fn entries(&self) -> ProjectionEntries<'_, NativeGraphMetadata> {
+        match self {
+            Self::RawPacked(elements) => ProjectionEntries::RawPacked(&elements[..]),
+            Self::PreparedPacked(elements) => ProjectionEntries::PreparedPacked(&elements[..]),
+            Self::Qualified {
+                packed,
+                normalized,
+                activation,
+            } => ProjectionEntries::Qualified {
+                packed: Box::new(packed.entries()),
+                progressive: ProgressiveEntries {
+                    top: &normalized[..],
+                    refine: &activation[..],
+                    exact: &activation[..],
+                    planes: &normalized[..],
+                },
+            },
+        }
+    }
+}
+
+/// A projection's extents: `projected` of `rows` hidden rows of width
+/// `hidden`, the first `selected` of which a certified projection selects,
+/// onto `columns` of a `vocabulary`-row table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ProjectionGeometry<D = Dim> {
+    pub rows: D,
+    pub projected: D,
+    pub selected: D,
+    pub vocabulary: D,
+    pub hidden: D,
+    pub columns: D,
+}
+
+impl<D> Numbers<D> for ProjectionGeometry<D> {
+    type Of<E> = ProjectionGeometry<E>;
+    fn map<E>(self, f: &mut impl FnMut(D) -> E) -> ProjectionGeometry<E> {
+        ProjectionGeometry {
+            rows: f(self.rows),
+            projected: f(self.projected),
+            selected: f(self.selected),
+            vocabulary: f(self.vocabulary),
+            hidden: f(self.hidden),
+            columns: f(self.columns),
+        }
+    }
+}
+
+/// A vocabulary projection's logits, and a certified projection's own
+/// selection inputs and whole-vocabulary view.
+pub(crate) struct Readout {
+    /// The projected rows' logits: exact, or a certified projection's exact
+    /// logits at its survivors and −inf elsewhere.
+    pub logits: WorkflowTensor,
+    pub certified: Option<CertifiedReadout>,
+}
+
+pub(crate) struct CertifiedReadout {
+    /// The sampler inputs its levels read, score divisors included.
+    pub selecting: SelectionInputs,
+    /// Its first level's logits of every vocabulary row, each within its
+    /// radius of the exact logit: the only logits of the whole vocabulary a
+    /// certified projection computes.
+    pub view: WorkflowTensor,
+}
+
+/// One authority for normalization, canonical token mapping, coefficient
+/// scaling, capping, and physical vocabulary projection. Proposal policies
+/// consume the result; they do not own a private projection recipe.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn project_readout<'a, G: GraphDraft + 'a>(
+    graph: &mut G,
+    entries: ProjectionEntries<'a, G>,
+    ports: &ProjectionPorts,
+    input: ReadoutInput<'_>,
+    geometry: ProjectionGeometry,
+    softcap: Argument<f32>,
+    sampler: Option<G::Binding<'a, sample_rows::Entry>>,
+    constants: &mut Vec<crate::programs::native_constants::GraphConstant>,
+) -> Result<Readout, GraphError> {
+    if let ProjectionEntries::Qualified {
+        packed,
+        progressive,
+    } = entries
+    {
+        let chosen = match ports {
+            ProjectionPorts::Packed { .. } => *packed,
+            ProjectionPorts::Progressive { .. } => ProjectionEntries::Progressive(progressive),
+        };
+        return project_readout(
+            graph, chosen, ports, input, geometry, softcap, sampler, constants,
+        );
+    }
+
+    match (input, entries, ports) {
+        (ReadoutInput::RawRms { hidden, norm, form, out_rows, epsilon }, ProjectionEntries::RawPacked(entry),
+            ProjectionPorts::Packed { weight, scale, scale_extent }) => {
+            if !geometry.columns.equals(&geometry.vocabulary) { return Err("raw packed full projection columns disagree with its table".into()); }
+            let [parts, normalized] = form.dimensions(geometry.hidden.clone());
+            // A projection's kernel is the range of the rows it projects.
+            let entry = G::pick(entry, &geometry.projected);
+            let dims = [("M", geometry.rows), ("O", geometry.projected), ("V", geometry.vocabulary),
+                ("D", geometry.hidden), parts, normalized, ("WS", scale_extent.clone())];
+            Ok(Readout { logits: graph.enqueue(entry, &dims, readout_head_rows::WorkflowArgs {
+                hidden: hidden.into(), norm: norm.into(), weight: weight.tensor().into(),
+                out_rows: out_rows.into(), weight_scale: scale.tensor().into(), epsilon, softcap,
+            })?.value, certified: None })
+        }
+        (ReadoutInput::PreparedFeatures { features, canonical_rows }, ProjectionEntries::PreparedPacked(entry),
+            ProjectionPorts::Packed { weight, scale, scale_extent }) => {
+            let entry = G::pick(entry, &geometry.projected);
+            let operands = [geometry.projected.clone(), Dim::from(u64::from(canonical_rows.is_some())), geometry.columns.clone()];
+            let empty = if canonical_rows.is_none() {
+                let constant = crate::programs::native_constants::GraphConstant::i32(graph, &[])?;
+                let rows = constant.port().tensor().reshape(&operands);
+                constants.push(constant); Some(rows)
+            } else { None };
+            let indexed = canonical_rows.map(|rows| rows.reshape(&operands));
+            let [projected, indexes, columns] = operands;
+            let dims = [("O", projected), ("V", geometry.vocabulary), ("D", geometry.hidden),
+                ("S", columns), ("I", indexes), ("WS", scale_extent.clone())];
+            let token_rows = match indexed.as_ref() { Some(rows) => rows.into(),
+                None => empty.as_ref().expect("implicit canonical rows own an empty operand").into() };
+            Ok(Readout { logits: graph.enqueue(entry, &dims, readout_project_rows::WorkflowArgs {
+                features: features.into(), weight: weight.tensor().into(), token_rows,
+                weight_scale: scale.tensor().into(), softcap,
+            })?.value, certified: None })
+        }
+        (ReadoutInput::RawRms { hidden, norm, form, out_rows, epsilon }, ProjectionEntries::Progressive(entries),
+            ProjectionPorts::Progressive { depth, planes }) => {
+            if !geometry.columns.equals(&geometry.vocabulary) { return Err("progressive full projection columns disagree with its table".into()); }
+            let plane = |requested| planes.iter().find(|(kind, _)| *kind == requested).map(|(_, port)| port.tensor());
+            let missing = || "progressive projection plane is absent".to_owned();
+            progressive_projection(graph, entries, sampler.ok_or("progressive projection requires selection score authority")?,
+                ProgressivePorts { depth: *depth,
+                    top: plane(ProgressivePlane::Top).ok_or_else(missing)?,
+                    bit3: plane(ProgressivePlane::Next).ok_or_else(missing)?,
+                    rest: plane(ProgressivePlane::Rest).ok_or_else(missing)?,
+                    scales: plane(ProgressivePlane::Scales).ok_or_else(missing)?,
+                    radius: plane(ProgressivePlane::Radius) },
+                ProgressiveRows { hidden, norm, form, out_rows, rows: geometry.rows, projected: geometry.projected, selected: geometry.selected },
+                (geometry.vocabulary, geometry.hidden), epsilon, softcap)
+        }
+        _ => Err("readout feature semantics, physical representation, and projection capability disagree".into()),
+    }
 }
 
 /// The projection of `rows` onto a progressive head of `[vocabulary,
 /// hidden]`: with the radii, a certified selection's three levels (logits
-/// exact at its survivors, -inf elsewhere) and the sampler inputs they read,
-/// score divisors included; otherwise the full exact pass.
+/// exact at its survivors, -inf elsewhere), the sampler inputs they read,
+/// score divisors included, and the first level's view; otherwise the full
+/// exact pass.
 pub(crate) fn progressive_projection<'a, G: GraphDraft + 'a>(
     graph: &mut G,
     entries: ProgressiveEntries<'a, G>,
     sampler: G::Binding<'a, sample_rows::Entry>,
     planes: ProgressivePorts<'_>,
     rows: ProgressiveRows<'_>,
-    (vocabulary, hidden): (u64, u64),
-    epsilon: f32,
-) -> Result<(WorkflowTensor, Option<SelectionInputs>), GraphError> {
+    (vocabulary, hidden): (Dim, Dim),
+    epsilon: Argument<f32>,
+    softcap: Argument<f32>,
+) -> Result<Readout, GraphError> {
+    let [parts, normalized] = rows.form.dimensions(hidden.clone());
+    // The entries read the rows as their `[M, PT, D]` parts.
+    let partials = rows.hidden.reshape(&[rows.rows.clone(), Dim::from(rows.form.parts), hidden.clone()]);
+    let depth = Dim::from(u64::from(planes.depth.rest_planes()));
     let dimensions = [
         ("M", rows.rows),
-        ("O", rows.projected),
-        ("V", vocabulary),
-        ("D", hidden),
+        ("O", rows.projected.clone()),
+        ("V", vocabulary.clone()),
+        ("D", hidden.clone()),
+        parts,
+        normalized,
+        ("P", depth.clone()),
     ];
     let Some(radius) = planes.radius else {
         let logits = graph
@@ -810,7 +1527,8 @@ pub(crate) fn progressive_projection<'a, G: GraphDraft + 'a>(
                 entries.planes,
                 &dimensions,
                 readout_planes_rows::WorkflowArgs {
-                    hidden: rows.hidden.into(),
+                    softcap,
+                    hidden: (&partials).into(),
                     norm: rows.norm.into(),
                     top: planes.top.into(),
                     bit3: planes.bit3.into(),
@@ -821,11 +1539,14 @@ pub(crate) fn progressive_projection<'a, G: GraphDraft + 'a>(
                 },
             )?
             .value;
-        return Ok((logits, None));
+        return Ok(Readout {
+            logits,
+            certified: None,
+        });
     };
     let selecting = SelectionInputs {
         temperature: Some(graph.input_for(entries.top, "temperature", &dimensions)?),
-        ..selection_inputs(graph, sampler, rows.selected, vocabulary)?
+        ..selection_inputs(graph, sampler, &rows.selected, &vocabulary)?
     };
     let (draws, temperature, mask, constrained) = (
         selecting.draws.tensor(),
@@ -841,7 +1562,8 @@ pub(crate) fn progressive_projection<'a, G: GraphDraft + 'a>(
         entries.top,
         &dimensions,
         readout_top_rows::WorkflowArgs {
-            hidden: rows.hidden.into(),
+            softcap,
+            hidden: (&partials).into(),
             norm: rows.norm.into(),
             top: planes.top.into(),
             bit3: planes.bit3.into(),
@@ -856,11 +1578,17 @@ pub(crate) fn progressive_projection<'a, G: GraphDraft + 'a>(
             epsilon,
         },
     )?;
-    let levels = [("O", rows.projected), ("V", vocabulary), ("D", hidden)];
+    let levels = [
+        ("O", rows.projected),
+        ("V", vocabulary),
+        ("D", hidden),
+        ("P", depth),
+    ];
     let second = graph.enqueue::<readout_refine_rows::Entry>(
         entries.refine,
         &levels,
         readout_refine_rows::WorkflowArgs {
+            softcap,
             features: (&first.r2).into(),
             top: planes.top.into(),
             bit3: planes.bit3.into(),
@@ -881,6 +1609,7 @@ pub(crate) fn progressive_projection<'a, G: GraphDraft + 'a>(
             entries.exact,
             &levels,
             readout_exact_rows::WorkflowArgs {
+                softcap,
                 features: (&first.r2).into(),
                 top: planes.top.into(),
                 bit3: planes.bit3.into(),
@@ -897,13 +1626,19 @@ pub(crate) fn progressive_projection<'a, G: GraphDraft + 'a>(
             },
         )?
         .value;
-    Ok((logits, Some(selecting)))
+    Ok(Readout {
+        logits,
+        certified: Some(CertifiedReadout {
+            selecting,
+            view: first.r0,
+        }),
+    })
 }
 
 /// A projecting readout's head and selection suffix.
 struct Projected<G> {
     graph: G,
-    head: HeadPorts,
+    head: ProjectionPorts,
     /// Hidden rows of the projected outputs.
     rows: NativePort,
     /// The logits, exported by a diagnostic load (`export`).
@@ -926,20 +1661,33 @@ fn head_topology<'a, G: GraphDraft + 'a>(
         G::Binding<'a, sample_rows::Entry>,
     ),
     geometry: &Decoder,
-    plans: HeadPlans<'_>,
+    (plans, weights): (StoredHead, &(impl PlannedWeights + ?Sized)),
     class: ReadoutClass,
     export: bool,
     final_rows: &FinalRowPorts,
 ) -> Result<Projected<G>, GraphError> {
     let (hidden, norm) = (&final_rows.hidden, &final_rows.norm);
-    let epsilon = readout_epsilon(geometry)?;
-    let vocabulary = geometry.vocabulary;
-    let dimensions = [
-        ("M", class.rows),
-        ("O", class.projected),
-        ("V", vocabulary),
-        ("D", geometry.hidden),
+    let epsilon = Argument::from(readout_epsilon(geometry)?);
+    let vocabulary = Dim::from(geometry.vocabulary);
+    let width = Dim::from(geometry.hidden);
+    let (rows_dim, projected, selected) = (
+        Dim::from(class.rows),
+        Dim::from(class.projected),
+        Dim::from(class.selected),
+    );
+    let form = InputForm::exit(geometry);
+    let [parts, normalized] = form.dimensions(width.clone());
+    let mut dimensions = vec![
+        ("M", rows_dim.clone()),
+        ("O", projected.clone()),
+        ("V", vocabulary.clone()),
+        ("D", width.clone()),
+        parts,
+        normalized,
     ];
+    if let Some(depth) = plans.depth() {
+        dimensions.push(("P", Dim::from(u64::from(depth.rest_planes()))));
+    }
     let certified = matches!(
         class.kind,
         ReadoutKind::Selection {
@@ -947,37 +1695,16 @@ fn head_topology<'a, G: GraphDraft + 'a>(
             ..
         }
     );
-    let mut inputs = None;
-    let (head, rows, logits) = match (entries, plans) {
-        (HeadEntries::Packed(entry), HeadPlans::Packed(plan)) if !certified => {
-            let weight = graph.port(plan.resident, &plan.shape)?;
-            // The weight's resident second-level scale, or an absent scale.
-            let extent = plan.scale_extent();
-            let scale = graph.port(Element::f32(), &[extent])?;
-            let dimensions = [
-                ("M", class.rows),
-                ("O", class.projected),
-                ("V", vocabulary),
-                ("D", geometry.hidden),
-                ("WS", extent),
-            ];
-            let rows = graph.input_for(entry, "out_rows", &dimensions)?;
-            let logits = graph
-                .enqueue::<readout_head_rows::Entry>(
-                    entry,
-                    &dimensions,
-                    readout_head_rows::WorkflowArgs {
-                        hidden: hidden.tensor().into(),
-                        norm: norm.tensor().into(),
-                        weight: weight.tensor().into(),
-                        out_rows: rows.tensor().into(),
-                        epsilon,
-                        softcap: readout_softcap(geometry),
-                        weight_scale: scale.tensor().into(),
-                    },
-                )?
-                .value;
-            (HeadPorts::Packed { weight, scale }, rows, logits)
+    let head = plans.ports(&mut graph, certified, &mut PlannedPorts(weights))?;
+    let (rows, projection_entries) = match (entries, &head) {
+        (HeadEntries::Packed(entry), ProjectionPorts::Packed { scale_extent, .. })
+            if !certified =>
+        {
+            dimensions.push(("WS", scale_extent.clone()));
+            (
+                graph.input_for(G::first(entry), "out_rows", &dimensions)?,
+                ProjectionEntries::RawPacked(entry),
+            )
         }
         (
             HeadEntries::Progressive {
@@ -986,59 +1713,48 @@ fn head_topology<'a, G: GraphDraft + 'a>(
                 exact,
                 planes,
             },
-            HeadPlans::Progressive(plans),
+            ProjectionPorts::Progressive { .. },
         ) => {
-            let mut ports = Vec::new();
-            let mut port = |graph: &mut G, plane| -> Result<NativePort, GraphError> {
-                let plan = HeadPlans::plane(&plans, plane);
-                let port = graph.port(plan.resident, &plan.shape)?;
-                ports.push((plane, port.clone()));
-                Ok(port)
-            };
-            let top_plane = port(&mut graph, ProgressivePlane::Top)?;
-            let bit3 = port(&mut graph, ProgressivePlane::Bit3)?;
-            let rest = port(&mut graph, ProgressivePlane::Rest)?;
-            let scales = port(&mut graph, ProgressivePlane::Scales)?;
-            let radius = certified
-                .then(|| port(&mut graph, ProgressivePlane::Radius))
-                .transpose()?;
             let rows = if certified {
                 graph.input_for(top, "out_rows", &dimensions)?
             } else {
                 graph.input_for(planes, "out_rows", &dimensions)?
             };
-            let (logits, selecting) = progressive_projection(
-                &mut graph,
-                ProgressiveEntries {
+            (
+                rows,
+                ProjectionEntries::Progressive(ProgressiveEntries {
                     top,
                     refine,
                     exact,
                     planes,
-                },
-                sampler,
-                ProgressivePorts {
-                    top: top_plane.tensor(),
-                    bit3: bit3.tensor(),
-                    rest: rest.tensor(),
-                    scales: scales.tensor(),
-                    radius: radius.as_ref().map(NativePort::tensor),
-                },
-                ProgressiveRows {
-                    hidden: hidden.tensor(),
-                    norm: norm.tensor(),
-                    out_rows: rows.tensor(),
-                    rows: class.rows,
-                    projected: class.projected,
-                    selected: class.selected,
-                },
-                (vocabulary, geometry.hidden),
-                epsilon,
-            )?;
-            inputs = selecting;
-            (HeadPorts::Progressive(ports), rows, logits)
+                }),
+            )
         }
-        _ => return Err("readout head entries disagree with the head plans".into()),
+        _ => return Err("readout head entries disagree with the physical projection".into()),
     };
+    let Readout { logits, certified } = project_readout(
+        &mut graph,
+        projection_entries,
+        &head,
+        ReadoutInput::RawRms {
+            hidden: hidden.tensor(),
+            norm: norm.tensor(),
+            form,
+            out_rows: rows.tensor(),
+            epsilon,
+        },
+        ProjectionGeometry {
+            rows: rows_dim,
+            projected,
+            selected: selected.clone(),
+            vocabulary: vocabulary.clone(),
+            hidden: width,
+            columns: vocabulary.clone(),
+        },
+        readout_softcap(geometry).into(),
+        Some(sampler),
+        &mut Vec::new(),
+    )?;
     if export {
         graph.export(&logits)?;
     }
@@ -1053,23 +1769,23 @@ fn head_topology<'a, G: GraphDraft + 'a>(
             selected: None,
         });
     };
-    let inputs = match inputs {
-        Some(inputs) => inputs,
-        None => selection_inputs(&mut graph, sampler, class.selected, vocabulary)?,
+    let inputs = match certified {
+        Some(certified) => certified.selecting,
+        None => selection_inputs(&mut graph, sampler, &selected, &vocabulary)?,
     };
     let mut result = graph.local_for(
         sampler,
         "result",
-        &[("M", class.selected), ("V", vocabulary)],
+        &[("M", selected.clone()), ("V", vocabulary.clone())],
     )?;
-    let mut leading = logits.slice_leading(0, class.selected);
+    let mut leading = logits.slice_leading(0, &selected);
     let ports = sample(
         &mut graph,
         shape,
         sampler,
-        vocabulary,
+        &vocabulary,
         &mut leading,
-        class.selected,
+        &selected,
         shaped,
         inputs,
         result.tensor_mut().into(),
@@ -1087,10 +1803,16 @@ fn head_topology<'a, G: GraphDraft + 'a>(
 }
 
 /// The epsilon of the decoder's final normalization, which the readout
-/// entries fuse (`operators::admit` admits only an RMS exit norm).
+/// entries fuse, and the decoder's one epsilon (`operators::admit`).
 pub(crate) fn readout_epsilon(geometry: &Decoder) -> Result<f32, String> {
     match &geometry.exit.norm {
         ExitNorm::Rms(norm) => Ok(norm.epsilon as f32),
+        // A low-rank exit site mixes the streams in the last block with its
+        // norm, and the readout sums its partials and normalizes nothing; a
+        // Sinkhorn exit's collapse the readout normalizes by the exit norm.
+        ExitNorm::HyperConnectionHead(exit) => crate::operators::ExitMix::of(exit)
+            .map(|exit| exit.epsilon() as f32)
+            .map_err(|error| error.to_string()),
         _ => Err("readout requires an RMS final normalization".into()),
     }
 }
@@ -1102,11 +1824,11 @@ pub(crate) fn readout_softcap(geometry: &Decoder) -> f32 {
 }
 
 #[cfg(test)]
-fn checked_readout_class_storage(
+fn checked_readout_class_storage<W: PlannedWeights + ?Sized>(
     backend: BackendName,
     geometry: &Decoder,
-    norm_plan: &crate::WeightPlan,
-    head: Option<HeadPlans<'_>>,
+    norm_plan: Option<&crate::WeightPlan>,
+    head: Option<(HeadPlans<'_>, &W)>,
     class: ReadoutClass,
     export: bool,
 ) -> Result<NativeGraphStorageBytes, GraphError> {
@@ -1122,11 +1844,11 @@ fn checked_readout_class_storage(
     .seal()?)
 }
 
-fn checked_readout_class_draft(
+fn checked_readout_class_draft<W: PlannedWeights + ?Sized>(
     graph: NativeGraphMetadata,
     geometry: &Decoder,
-    norm_plan: &crate::WeightPlan,
-    head: Option<HeadPlans<'_>>,
+    norm_plan: Option<&crate::WeightPlan>,
+    head: Option<(HeadPlans<'_>, &W)>,
     source: FeatureSource<'_>,
     class: ReadoutClass,
     export: bool,
@@ -1135,9 +1857,10 @@ fn checked_readout_class_draft(
         magnitude_family_contracts::ActivationDType::F16 => Element::f16(),
         magnitude_family_contracts::ActivationDType::BF16 => Element::bf16(),
     };
-    let feature_elements = [("NW", norm_plan.resident), ("A", activation)];
+    let norm = norm_element(norm_plan);
+    let feature_elements = [("NW", norm), ("A", activation)];
     let fusion_elements = match source {
-        FeatureSource::Output => Vec::new(),
+        FeatureSource::Output | FeatureSource::Residual { .. } => Vec::new(),
         FeatureSource::Taps { fusion } => vec![
             ("A", activation),
             ("W", fusion.resident),
@@ -1145,33 +1868,32 @@ fn checked_readout_class_draft(
         ],
     };
     let tap_feature_elements = [("A", activation)];
+    let residual_elements = [("A", Element::f32())];
     let entries = match source {
+        FeatureSource::Residual { .. } => FeatureEntries::Residual(&residual_elements[..]),
         FeatureSource::Output => FeatureEntries::Output(&feature_elements[..]),
         FeatureSource::Taps { .. } => FeatureEntries::Taps {
             fusion: &fusion_elements[..],
             features: &tap_feature_elements[..],
         },
     };
-    let (graph, final_rows, _, _, _) =
+    let (graph, final_rows, _, _, _, _) =
         feature_topology(graph, entries, geometry, norm_plan, source, class)?;
     if class.kind == ReadoutKind::Features {
         return Ok(graph);
     }
     let rows = final_rows.ok_or("a projecting readout has no final rows")?;
-    let head = head.ok_or("projected readout weight is absent")?;
+    let (head, weights) = head.ok_or("projected readout weight is absent")?;
+    let head = head.selected();
     let packed_elements = match head {
-        HeadPlans::Packed(weight) => vec![
-            ("NW", norm_plan.resident),
-            ("OW", weight.resident),
-            ("A", activation),
-        ],
-        HeadPlans::Progressive(_) => Vec::new(),
+        StoredHead::Packed { weight, .. } => vec![("NW", norm), ("OW", weight), ("A", activation)],
+        StoredHead::Progressive { .. } => Vec::new(),
     };
-    let normed_elements = [("NW", norm_plan.resident), ("A", activation)];
+    let normed_elements = [("NW", norm), ("A", activation)];
     let level_elements = [("A", activation)];
     let entries = match head {
-        HeadPlans::Packed(_) => HeadEntries::Packed(&packed_elements[..]),
-        HeadPlans::Progressive(_) => HeadEntries::Progressive {
+        StoredHead::Packed { .. } => HeadEntries::Packed(&packed_elements[..]),
+        StoredHead::Progressive { .. } => HeadEntries::Progressive {
             top: &normed_elements[..],
             refine: &level_elements[..],
             exact: &level_elements[..],
@@ -1184,7 +1906,7 @@ fn checked_readout_class_draft(
         entries,
         (&sample_elements[..], &sample_elements[..]),
         geometry,
-        head,
+        (head, weights),
         class,
         export,
         &rows,
@@ -1196,8 +1918,8 @@ fn checked_readout_class_draft(
 pub(crate) fn checked_projected_graph_storage(
     backend: BackendName,
     geometry: &Decoder,
-    norm_plan: &crate::WeightPlan,
-    weight_plan: &crate::WeightPlan,
+    norm_plan: Option<&crate::WeightPlan>,
+    load: &ModelLoadPlan,
     rows: u64,
     outputs: u64,
     projected: u64,
@@ -1206,7 +1928,7 @@ pub(crate) fn checked_projected_graph_storage(
         backend,
         geometry,
         norm_plan,
-        Some(HeadPlans::Packed(weight_plan)),
+        Some((HeadPlans::of(load, WeightScope::Target)?, load)),
         ReadoutClass {
             rows,
             outputs,
@@ -1223,8 +1945,8 @@ pub(crate) fn checked_projected_graph_storage(
 pub(crate) fn checked_selection_graph_storage(
     backend: BackendName,
     geometry: &Decoder,
-    norm_plan: &crate::WeightPlan,
-    weight_plan: &crate::WeightPlan,
+    norm_plan: Option<&crate::WeightPlan>,
+    load: &ModelLoadPlan,
     rows: u64,
     outputs: u64,
     selected: u64,
@@ -1234,7 +1956,7 @@ pub(crate) fn checked_selection_graph_storage(
         backend,
         geometry,
         norm_plan,
-        Some(HeadPlans::Packed(weight_plan)),
+        Some((HeadPlans::of(load, WeightScope::Target)?, load)),
         ReadoutClass {
             rows,
             outputs,
@@ -1255,74 +1977,135 @@ pub(crate) fn checked_readout_family_storage(
     geometry: &Decoder,
     limits: ResourceLimits,
 ) -> Result<NativeGraphStorageBytes, GraphError> {
-    let weight = |kind| {
-        load.weights()
-            .find(|weight| {
-                weight.role
-                    == WeightRole {
-                        scope: WeightScope::Target,
-                        kind,
-                    }
-            })
-            .ok_or_else(|| format!("readout {kind:?} weight is absent"))
-    };
-    let norm = weight(WeightKind::OutputNorm)?;
-    let head = HeadPlans::of(load)?;
-    let regimes = certify_readout_regimes(
-        backend,
-        geometry,
-        norm,
-        head,
-        FeatureSource::of(load),
-        limits,
-    )?;
-    regimes
-        .values()
-        .map(NativeGraphLayout::storage_bytes)
-        .reduce(|previous, bytes| NativeGraphStorageBytes {
-            workspace: previous.workspace.max(bytes.workspace),
-            output: previous.output.max(bytes.output),
-            upload: previous.upload.max(bytes.upload),
-        })
-        .ok_or_else(|| "readout graph family has no classes".into())
+    let (family, _) = checked_readout_storage(backend, load, geometry, limits)?;
+    Ok(family)
 }
 
-/// The structure a readout class selects: its kind and, for a selection,
-/// the selected-row count its sampling view is built from.
-type ReadoutRegime = (ReadoutKind, u64);
+/// The readout family's storage ([`checked_readout_family_storage`]) and
+/// what its graphs hold ([`readout_graphs`]): what a load commits of its
+/// readout. A prompt chunk's family is charged by the class a group claims
+/// as it opens, from the pools themselves, never here.
+pub(crate) fn checked_readout_storage(
+    backend: BackendName,
+    load: &ModelLoadPlan,
+    geometry: &Decoder,
+    limits: ResourceLimits,
+) -> Result<(NativeGraphStorageBytes, LaunchGraphs), GraphError> {
+    let norm = target_readout_norm(load, geometry)?;
+    let head = HeadPlans::for_recipe(load, WeightScope::Target, WeightScope::Target, false)?;
+    let (regimes, classes) = load_readout_regimes::<seismic::NativeGraphOutline>(backend, load, geometry, norm, head, limits)?;
+    let most = |layouts: &mut dyn Iterator<Item = &seismic::NativeGraphOutline>| {
+        layouts.map(Certified::storage_bytes).reduce(NativeGraphStorageBytes::most)
+    };
+    let family = most(&mut regimes.values()).ok_or("readout graph family has no classes")?;
+    Ok((family, readout_graphs(&regimes, &classes, limits, false)?))
+}
+
+/// A readout regime of one of a load's sources: whether that source fuses a
+/// separate draft's taps (`ReadoutSource::fuses`), and the regime. A fusing
+/// source's graphs and its drafter-free source's are distinct graphs of one
+/// family, each certified, sealed and charged as its own.
+type SourcedRegime = (bool, ReadoutRegime);
+
+/// Every regime `load`'s readout certifies, from each of its sources
+/// ([`readout_sources`]), with every class it prepares by its source: the
+/// one account of a load's readout graphs, for the sealer
+/// (`PreparedTargetReadoutGraphs::prepare`) and the planner's charge
+/// ([`checked_readout_storage`]) alike.
+fn load_readout_regimes<'p, L: Certified>(
+    backend: BackendName,
+    load: &'p ModelLoadPlan,
+    geometry: &Decoder,
+    norm: Option<&crate::WeightPlan>,
+    head: HeadPlans<'_>,
+    limits: ResourceLimits,
+) -> Result<(BTreeMap<SourcedRegime, L>, Vec<(ReadoutSource<'p>, ReadoutClass)>), GraphError> {
+    let qualified = qualified_readout_classes(limits, head)?;
+    let (mut regimes, mut classes) = (BTreeMap::new(), Vec::new());
+    for source in readout_sources(load) {
+        regimes.extend(
+            certify_readout_regimes(backend, geometry, norm, (head, load), source, limits)?
+                .into_iter()
+                .map(|(regime, layout)| ((source.fuses, regime), layout)),
+        );
+        classes.extend(source.classes(qualified.clone()).into_iter().map(|class| (source, class)));
+    }
+    Ok((regimes, classes))
+}
+
+/// The structure a readout class selects: its kind; for a selection, the
+/// selected-row count its sampling view is built from; and whether it is a
+/// prompt chunk's class ([`chunk_holds`]). A regime's classes share the
+/// layout of its widest, so a chunk's classes form regimes of their own:
+/// the chunk family's slots hold what a chunk exports.
+type ReadoutRegime = (ReadoutKind, u64, bool);
+
+/// Whether a decode step's launch may read out `class`: one of no more than
+/// its rows (`ResourceLimits::decode_rows`).
+fn readout_decodes(class: ReadoutClass, limits: ResourceLimits) -> bool {
+    class.rows <= limits.decode_rows()
+}
+
+/// What the readout family of `classes` holds (`seismic::LaunchGraphs::of`),
+/// each launch one run of its class's regime's graph, those of a class a
+/// decode step's launch reads out ([`readout_decodes`]) kept live; or, with
+/// `chunk`, the chunk family's, of its classes ([`chunk_holds`]), whose
+/// slots a decode step's readout of one row takes where they are free
+/// (`AllocatedResources::readout_pool`).
+fn readout_graphs(
+    regimes: &BTreeMap<SourcedRegime, impl Certified>,
+    classes: &[(ReadoutSource<'_>, ReadoutClass)],
+    limits: ResourceLimits,
+    chunk: bool,
+) -> Result<LaunchGraphs, GraphError> {
+    let mut decodes = BTreeMap::<SourcedRegime, bool>::new();
+    for &(source, class) in classes.iter().filter(|(_, class)| !chunk || chunk_holds(class.projected)) {
+        *decodes.entry((source.fuses, readout_regime(class))).or_default() |= readout_decodes(class, limits);
+    }
+    let graphs = decodes
+        .into_iter()
+        .map(|(regime, decodes)| {
+            let layout = regimes.get(&regime).ok_or("readout class has no resource regime")?;
+            Ok(LaunchedGraph { graph: layout.storage_bytes().recorded, pinned_runs: u64::from(decodes), runs: 1 })
+        })
+        .collect::<Result<Vec<_>, GraphError>>()?;
+    Ok(LaunchGraphs::of(graphs, Vec::new()).ok_or("readout graph census overflows")?)
+}
 
 fn readout_regime(class: ReadoutClass) -> ReadoutRegime {
+    let chunk = chunk_holds(class.projected);
     match class.kind {
-        ReadoutKind::Selection { .. } => (class.kind, class.selected),
-        kind => (kind, 0),
+        ReadoutKind::Selection { .. } => (class.kind, class.selected, chunk),
+        kind => (kind, 0, chunk),
     }
 }
 
-fn certify_readout_regimes(
+/// The layouts of the classes a readout prepares from `source`, by regime.
+fn certify_readout_regimes<L: Certified>(
     backend: BackendName,
     geometry: &Decoder,
-    norm: &crate::WeightPlan,
-    head: HeadPlans<'_>,
-    source: FeatureSource<'_>,
+    norm: Option<&crate::WeightPlan>,
+    (head, weights): (HeadPlans<'_>, &(impl PlannedWeights + ?Sized)),
+    source: ReadoutSource<'_>,
     limits: ResourceLimits,
-) -> Result<BTreeMap<ReadoutRegime, NativeGraphLayout>, GraphError> {
+) -> Result<BTreeMap<ReadoutRegime, L>, GraphError> {
     // The entry whose `O` is the class's feature outputs.
-    let features_entry = match source {
+    let features_entry = match source.features {
         FeatureSource::Output => readout_features_rows::Entry::NAME,
-        FeatureSource::Taps { .. } => feature_rows::Entry::NAME,
+        FeatureSource::Taps { .. } | FeatureSource::Residual { .. } => feature_rows::Entry::NAME,
     };
     let mut regimes: BTreeMap<ReadoutRegime, Vec<ReadoutClass>> = BTreeMap::new();
     // The entries whose `O` is the class's projected rows.
     let projecting: &[&'static str] = match head {
-        HeadPlans::Packed(_) => &[readout_head_rows::Entry::NAME],
-        HeadPlans::Progressive(_) => &[readout_planes_rows::Entry::NAME],
+        HeadPlans::Packed { .. } => &[readout_head_rows::Entry::NAME],
+        HeadPlans::Qualified { .. } => &[readout_planes_rows::Entry::NAME],
     };
     let certifying = [
         readout_top_rows::Entry::NAME,
         readout_refine_rows::Entry::NAME,
         readout_exact_rows::Entry::NAME,
     ];
-    for class in readout_classes(limits, load_certified_rows(limits, head, backend))? {
+    for class in source.classes(qualified_readout_classes(limits, head)?) {
         regimes
             .entry(readout_regime(class))
             .or_default()
@@ -1330,7 +2113,8 @@ fn certify_readout_regimes(
     }
     regimes
         .into_iter()
-        .map(|((kind, selected), classes)| {
+        .map(|(regime, classes)| {
+            let (kind, selected, _) = regime;
             let largest = |field: fn(&ReadoutClass) -> u64| {
                 classes
                     .iter()
@@ -1361,10 +2145,16 @@ fn certify_readout_regimes(
                         ReadoutKind::Logits => scoped(slice, projecting),
                         ReadoutKind::Selection {
                             certified: true, ..
-                        } => scoped(slice, &certifying)
-                            .scoped(sample_rows::Entry::NAME, "M", [class.selected]),
-                        ReadoutKind::Selection { .. } => scoped(slice, projecting)
-                            .scoped(sample_rows::Entry::NAME, "M", [class.selected]),
+                        } => scoped(slice, &certifying).scoped(
+                            sample_rows::Entry::NAME,
+                            "M",
+                            [class.selected],
+                        ),
+                        ReadoutKind::Selection { .. } => scoped(slice, projecting).scoped(
+                            sample_rows::Entry::NAME,
+                            "M",
+                            [class.selected],
+                        ),
                     }
                 })
                 .collect::<Vec<_>>();
@@ -1372,14 +2162,14 @@ fn certify_readout_regimes(
                 NativeGraphMetadata::new_template(backend),
                 geometry,
                 norm,
-                Some(head),
-                source,
+                Some((head, weights)),
+                source.features,
                 template,
                 exports_logits(limits),
             )?
             .seal_template()
-            .and_then(|template| template.certify(&slices))?;
-            Ok(((kind, selected), layout))
+            .and_then(|template| L::of(&template, &slices))?;
+            Ok((regime, layout))
         })
         .collect()
 }
@@ -1388,7 +2178,7 @@ fn certify_readout_regimes(
 pub(crate) fn checked_features_graph_storage(
     backend: BackendName,
     geometry: &Decoder,
-    norm_plan: &crate::WeightPlan,
+    norm_plan: Option<&crate::WeightPlan>,
     rows: u64,
     outputs: u64,
 ) -> Result<NativeGraphStorageBytes, GraphError> {
@@ -1396,7 +2186,7 @@ pub(crate) fn checked_features_graph_storage(
         backend,
         geometry,
         norm_plan,
-        None,
+        None::<(HeadPlans<'_>, &ModelLoadPlan)>,
         ReadoutClass {
             rows,
             outputs,
@@ -1421,10 +2211,10 @@ pub(crate) struct SelectionInputs {
 pub(crate) fn selection_inputs<'a, G: GraphDraft + 'a>(
     graph: &mut G,
     sample: G::Binding<'a, sample_rows::Entry>,
-    rows: u64,
-    vocabulary: u64,
+    rows: &Dim,
+    vocabulary: &Dim,
 ) -> Result<SelectionInputs, GraphError> {
-    let dimensions = [("M", rows), ("V", vocabulary)];
+    let dimensions = [("M", rows.clone()), ("V", vocabulary.clone())];
     Ok(SelectionInputs {
         mask: graph.input_for(sample, "mask", &dimensions)?,
         constrained: graph.input_for(sample, "constrained", &dimensions)?,
@@ -1443,9 +2233,9 @@ pub(crate) fn sample<'a, G, L>(
     graph: &mut G,
     shape: G::Binding<'a, shape_rows::Entry>,
     sample: G::Binding<'a, sample_rows::Entry>,
-    vocabulary: u64,
+    vocabulary: &Dim,
     logits: &mut L,
-    rows: u64,
+    rows: &Dim,
     shaped: bool,
     inputs: SelectionInputs,
     result: WorkflowTensorMut<'_>,
@@ -1455,7 +2245,7 @@ where
     for<'x> &'x L: Into<WorkflowTensorRef<'x>>,
     for<'x> &'x mut L: Into<WorkflowTensorMut<'x>>,
 {
-    let sample_dims = [("M", rows), ("V", vocabulary)];
+    let sample_dims = [("M", rows.clone()), ("V", vocabulary.clone())];
     let SelectionInputs {
         mask,
         constrained,
@@ -1464,7 +2254,11 @@ where
     } = inputs;
     // Shaping rewrites the logits in place, so sampling reads the same rows.
     let shaping = if shaped {
-        let shape_dims = [("Sx", rows), ("V", vocabulary), ("Hn", HISTORY_TOKENS)];
+        let shape_dims = [
+            ("Sx", rows.clone()),
+            ("V", vocabulary.clone()),
+            ("Hn", Dim::from(HISTORY_TOKENS)),
+        ];
         let parameters = graph.input_for(shape, "params", &shape_dims)?;
         let history = graph.input_for(shape, "history", &shape_dims)?;
         graph.enqueue::<shape_rows::Entry>(
@@ -1503,6 +2297,88 @@ where
         draws,
         temperature,
     })
+}
+
+/// Each of `selected` selections' probability under the whole vocabulary's
+/// logits it was selected from (`token_confidence`), into `confidence`:
+/// selection `m` reads row `rows[m]` of `logits`' `projected` rows. Those
+/// are a projection's exact logits as its sampler read them (shaped in
+/// place when shaped), or a certified projection's first view
+/// ([`CertifiedReadout::view`]), whose exact logits are only its
+/// survivors'. Every drafter that samples its proposals takes it through
+/// [`select`], from the logits it sampled.
+#[allow(clippy::too_many_arguments)]
+fn confidence<'a, G: GraphDraft + 'a>(
+    graph: &mut G,
+    entry: G::Binding<'a, token_confidence::Entry>,
+    logits: &WorkflowTensor,
+    rows: &WorkflowTensor,
+    selection: WorkflowTensorRef<'_>,
+    confidence: WorkflowTensorMut<'_>,
+    (selected, projected, vocabulary): (&Dim, &Dim, &Dim),
+) -> Result<(), GraphError> {
+    graph.enqueue::<token_confidence::Entry>(
+        entry,
+        &[("M", selected), ("N", projected), ("V", vocabulary)],
+        token_confidence::WorkflowArgs {
+            logits: logits.into(),
+            rows: rows.into(),
+            selection,
+            confidence,
+        },
+    )?;
+    Ok(())
+}
+
+/// The entries of a drafter's selection: shaping, sampling and confidence.
+pub(crate) struct SelectionEntries<'a, G: GraphDraft + 'a> {
+    pub shape: G::Binding<'a, shape_rows::Entry>,
+    pub sample: G::Binding<'a, sample_rows::Entry>,
+    pub confidence: G::Binding<'a, token_confidence::Entry>,
+}
+
+/// A drafter's selection of `rows` logits rows: sampling into `result`
+/// ([`sample`]), then each selection's confidence under the very logits it
+/// was drawn from, as shaping left them, into `confidence` ([`confidence`]):
+/// selection `s` was drawn from logits row `s` (`identity`, `0..rows`). A
+/// certified projection's confidence reads its first view instead (`view`),
+/// the only logits of its whole vocabulary it computes. Both come from one
+/// operand, so no drafter rates a proposal by logits it did not draw it from.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn select<'a, G: GraphDraft + 'a>(
+    graph: &mut G,
+    entries: SelectionEntries<'a, G>,
+    vocabulary: &Dim,
+    logits: &mut WorkflowTensor,
+    view: Option<&WorkflowTensor>,
+    identity: &WorkflowTensor,
+    rows: &Dim,
+    shaped: bool,
+    inputs: SelectionInputs,
+    result: &mut WorkflowTensorView,
+    confidences: &mut WorkflowTensorView,
+) -> Result<SelectionPorts, GraphError> {
+    let ports = sample(
+        graph,
+        entries.shape,
+        entries.sample,
+        vocabulary,
+        logits,
+        rows,
+        shaped,
+        inputs,
+        (&mut *result).into(),
+    )?;
+    confidence(
+        graph,
+        entries.confidence,
+        view.unwrap_or(&*logits),
+        identity,
+        (&*result).into(),
+        confidences.into(),
+        (rows, rows, vocabulary),
+    )?;
+    Ok(ports)
 }
 
 /// Selection controls of a padded selection class from a pass's packed
@@ -1617,14 +2493,181 @@ pub(crate) fn write_selection_rows(
 mod resource_regime_tests {
     use super::*;
     use crate::ComponentSelection;
-    use seismic::Layout;
+
+    /// Every reader of a scope stored as planes reads them. The reader that
+    /// selected a class runs the certified levels at that class and the
+    /// planes' full pass at its others; a reader of the same projection
+    /// with no choice of its own (an embedded head's block) certifies no
+    /// class; and a row whose sampling cuts or penalizes is never certified.
+    #[test]
+    fn readers_of_a_scope_stored_as_planes_read_the_planes() {
+        let definition = crate::planning::fixtures::fixture_definition();
+        let mut manifest = crate::planning::fixtures::fixture_manifest(&definition);
+        let output = manifest
+            .target
+            .tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == definition.decoder.exit.output.name)
+            .unwrap();
+        output.encoding = magnitude_artifacts::gguf::Encoding::Q8_0;
+        output.nbytes = output.shape.iter().product::<u64>() / 32 * 34;
+        let backend = BackendName::Metal;
+        let load = ModelLoadPlan::derive(
+            &manifest,
+            &definition,
+            ComponentSelection {
+                head: false,
+                vision: false,
+            },
+            crate::planning::resident_layout(crate::ExecutionPath::Native, backend),
+            crate::PlannedMethod::Plain,
+            crate::planning::fixtures::LIMITS,
+        )
+        .unwrap()
+        .with_readout_candidates(&definition)
+        .unwrap()
+        .finalize_readout(&[crate::planning::ReadoutClassChoice {
+            scope: WeightScope::Target,
+            norm_scope: WeightScope::Target,
+            prepared: false,
+            rows: vec![1],
+        }])
+        .unwrap();
+        let selecting =
+            HeadPlans::for_recipe(&load, WeightScope::Target, WeightScope::Target, false).unwrap();
+        assert!(selecting.certifies(1));
+        assert!(!selecting.certifies(2));
+        let following =
+            HeadPlans::for_recipe(&load, WeightScope::Target, WeightScope::HeadBlock(0), true)
+                .unwrap();
+        assert!(!following.certifies(1));
+        for reader in [selecting, following] {
+            assert!(matches!(reader.selected(), StoredHead::Progressive { .. }));
+        }
+        // The class of two selected rows, which no reader selected, seals
+        // over the planes' full pass.
+        let limits = ResourceLimits {
+            max_launch_rows: 8,
+            max_launch_slots: 8,
+            max_selected_rows: 2,
+            max_drafting_slots: 2,
+            exported_logits_rows: 0,
+            max_images_per_request: 0,
+            max_image_cells: 0,
+            lookahead: false,
+            chain_capacity: std::num::NonZeroUsize::MIN,
+            conversations: std::num::NonZeroUsize::MIN,
+        };
+        let norm = target_readout_norm(&load, &definition.decoder).unwrap();
+        let classes = qualified_readout_classes(limits, selecting).unwrap();
+        let uncertified = classes
+            .iter()
+            .copied()
+            .find(|class| {
+                class.selected == 2
+                    && matches!(
+                        class.kind,
+                        ReadoutKind::Selection {
+                            certified: false,
+                            ..
+                        }
+                    )
+            })
+            .unwrap();
+        assert!(!classes.iter().any(|class| class.selected == 2
+            && matches!(
+                class.kind,
+                ReadoutKind::Selection {
+                    certified: true,
+                    ..
+                }
+            )));
+        checked_readout_class_draft(
+            NativeGraphMetadata::new(backend),
+            &definition.decoder,
+            norm,
+            Some((selecting, &load)),
+            FeatureSource::Output,
+            uncertified,
+            false,
+        )
+        .unwrap();
+        // Top-p, and a repetition penalty, at a sampling temperature.
+        assert!(!certifies(&[1.0, 0.0, 0.9, 0.0, 1.0, 0.0, 0.0, 0.0]));
+        assert!(!certifies(&[1.0, 0.0, 1.0, 0.0, 1.1, 0.0, 0.0, 0.0]));
+        assert!(certifies(&[1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0]));
+    }
+
+    /// A load whose readout fuses a separate draft's taps also holds the
+    /// readout of the same target without its drafter: every projecting
+    /// class, certified into exactly the layouts a drafter-free load's
+    /// readout certifies, and no features class, which only rows demanding
+    /// features run.
+    #[test]
+    fn a_tapped_load_holds_the_drafter_free_readouts_projecting_classes() {
+        use crate::planning::fixtures::{separate_draft_fixture, LIMITS};
+        let (definition, manifest) = separate_draft_fixture(false);
+        let (mut plain_definition, mut plain_manifest) = (definition.clone(), manifest.clone());
+        plain_definition.draft = None;
+        plain_manifest.draft = None;
+        let load = |definition: &magnitude_family_contracts::ModelDefinition, manifest, method| {
+            ModelLoadPlan::derive(
+                manifest,
+                definition,
+                ComponentSelection { head: method != crate::PlannedMethod::Plain, vision: false },
+                seismic::Layout::Rows16,
+                method,
+                LIMITS,
+            )
+            .unwrap()
+        };
+        let drafting = crate::PlannedMethod::DFlash { proposals: 3, widths: crate::DraftWidths::Adaptive };
+        let tapped = load(&definition, &manifest, drafting);
+        let alone = load(&plain_definition, &plain_manifest, crate::PlannedMethod::Plain);
+        let shape = |sources: Vec<ReadoutSource<'_>>| {
+            sources
+                .iter()
+                .map(|source| (matches!(source.features, FeatureSource::Taps { .. }), source.fuses, source.features_classes))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shape(readout_sources(&tapped)), [(true, true, true), (false, false, false)]);
+        assert_eq!(shape(readout_sources(&alone)), [(false, false, true)]);
+        let unfused = readout_sources(&tapped)[1];
+        for backend in [BackendName::Cpu, BackendName::Metal, BackendName::Cuda, BackendName::Vulkan] {
+            let regimes = |load: &ModelLoadPlan, source| {
+                let head = HeadPlans::for_recipe(load, WeightScope::Target, WeightScope::Target, false).unwrap();
+                let norm = target_readout_norm(load, &definition.decoder).unwrap();
+                certify_readout_regimes::<NativeGraphLayout>(backend, &definition.decoder, norm, (head, load), source, LIMITS).unwrap()
+            };
+            let unfused = regimes(&tapped, unfused);
+            let drafter_free = regimes(&alone, readout_sources(&alone)[0]);
+            // The planner charges each source's graphs as its own, a fused
+            // regime and its drafter-free one alike: every graph of both,
+            // none of one in place of the other's.
+            let fused = regimes(&tapped, readout_sources(&tapped)[0]);
+            let (_, charged) = checked_readout_storage(backend, &tapped, &definition.decoder, LIMITS).unwrap();
+            let recorded = fused.values().chain(unfused.values()).map(|layout| layout.storage_bytes().recorded.graphs).sum::<u64>();
+            assert_eq!(charged.union.graphs, recorded, "{backend:?}");
+            assert!(unfused.keys().all(|(kind, ..)| *kind != ReadoutKind::Features), "{backend:?}");
+            let projecting = drafter_free
+                .iter()
+                .filter(|((kind, ..), _)| *kind != ReadoutKind::Features)
+                .map(|(regime, layout)| (*regime, layout.storage_bytes()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                unfused.iter().map(|(regime, layout)| (*regime, layout.storage_bytes())).collect::<Vec<_>>(),
+                projecting,
+                "{backend:?}"
+            );
+        }
+    }
 
     #[test]
     fn every_readout_class_fits_its_shared_regime_layout() {
         // A Q8_0 head, so a backend that reads progressive heads places it
         // in planes and certifies selection classes.
-        let definition = crate::planning::tests::fixture_definition();
-        let mut manifest = crate::planning::tests::fixture_manifest(&definition);
+        let definition = crate::planning::fixtures::fixture_definition();
+        let mut manifest = crate::planning::fixtures::fixture_manifest(&definition);
         let output = manifest
             .target
             .tensors
@@ -1642,6 +2685,8 @@ mod resource_regime_tests {
             max_images_per_request: 0,
             max_image_cells: 0,
             lookahead: false,
+            chain_capacity: std::num::NonZeroUsize::MIN,
+            conversations: std::num::NonZeroUsize::MIN,
         };
         let diagnostic = ResourceLimits {
             exported_logits_rows: 64,
@@ -1662,29 +2707,47 @@ mod resource_regime_tests {
                     vision: false,
                 },
                 layout,
+                crate::PlannedMethod::Plain,
+                crate::planning::fixtures::LIMITS,
             )
             .unwrap();
             let progressive = reads_progressive_heads(backend).unwrap();
             let load = if progressive {
-                load.with_progressive_head(&definition).unwrap()
+                load.with_readout_candidates(&definition)
+                    .unwrap()
+                    .finalize_readout(&[crate::planning::ReadoutClassChoice {
+                        scope: WeightScope::Target,
+                        norm_scope: WeightScope::Target,
+                        prepared: false,
+                        rows: magnitude_batching::row_classes(served.max_selected_rows)
+                            .into_iter()
+                            .map(|rows| rows as u64)
+                            .collect(),
+                    }])
+                    .unwrap()
             } else {
                 load
             };
-            let head = HeadPlans::of(&load).unwrap();
-            assert_eq!(head.certified_rows(backend) > 0, progressive, "{backend:?}");
-            let norm = load
-                .weights()
-                .find(|weight| {
-                    weight.role
-                        == WeightRole {
-                            scope: WeightScope::Target,
-                            kind: WeightKind::OutputNorm,
-                        }
-                })
-                .unwrap();
+            let head =
+                HeadPlans::for_recipe(&load, WeightScope::Target, WeightScope::Target, false)
+                    .unwrap();
+            assert_eq!(head.certified_rows() > 0, progressive, "{backend:?}");
+            // One stored form: a selected scope places its planes and not
+            // its output projection, which stays planned.
+            let output = WeightRole {
+                scope: WeightScope::Target,
+                kind: WeightKind::Output,
+            };
+            assert_eq!(
+                load.weights().any(|weight| weight.role == output),
+                !progressive,
+                "{backend:?}"
+            );
+            assert!(load.planned_output(WeightScope::Target).is_some());
+            let norm = target_readout_norm(&load, &definition.decoder).unwrap();
             for limits in [served, diagnostic] {
                 let classes =
-                    readout_classes(limits, load_certified_rows(limits, head, backend)).unwrap();
+                    readout_classes(limits, load_certified_rows(limits, head)).unwrap();
                 // A diagnostic load's selections read the logits it exports.
                 assert_eq!(
                     classes.iter().any(|class| matches!(
@@ -1697,12 +2760,12 @@ mod resource_regime_tests {
                     progressive && !exports_logits(limits),
                     "{backend:?}"
                 );
-                let regimes = certify_readout_regimes(
+                let regimes = certify_readout_regimes::<NativeGraphLayout>(
                     backend,
                     &definition.decoder,
                     norm,
-                    head,
-                    FeatureSource::Output,
+                    (head, &load),
+                    ReadoutSource::whole(FeatureSource::Output),
                     limits,
                 )
                 .unwrap();
@@ -1712,7 +2775,7 @@ mod resource_regime_tests {
                         NativeGraphMetadata::new(backend),
                         &definition.decoder,
                         norm,
-                        Some(head),
+                        Some((head, &load)),
                         FeatureSource::Output,
                         class,
                         exports_logits(limits),
@@ -1723,6 +2786,104 @@ mod resource_regime_tests {
                     assert_eq!(bytes, layout.storage_bytes(), "{backend:?} {class:?}");
                 }
             }
+        }
+    }
+
+    /// A hyper-connection exit has no output norm: its readout sums the exit
+    /// site's partials (`PT = S`, `NM = 0`) over an empty norm port, and
+    /// every class of its readout graph family builds and seals at its
+    /// certified regime layout on Metal (progressive head) and CPU.
+    #[test]
+    fn a_hyper_connection_exit_certifies_its_readout_graphs_without_a_norm() {
+        let definition = crate::planning::fixtures::hyper_connection_fixture_definition();
+        let decoder = &definition.decoder;
+        let mut manifest = crate::planning::fixtures::fixture_manifest(&definition);
+        let output = manifest
+            .target
+            .tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == decoder.exit.output.name)
+            .unwrap();
+        output.encoding = magnitude_artifacts::gguf::Encoding::Q8_0;
+        output.nbytes = output.shape.iter().product::<u64>() / 32 * 34;
+        let limits = ResourceLimits {
+            max_launch_rows: 8,
+            max_launch_slots: 8,
+            max_selected_rows: 4,
+            max_drafting_slots: 4,
+            exported_logits_rows: 0,
+            max_images_per_request: 0,
+            max_image_cells: 0,
+            lookahead: false,
+            chain_capacity: std::num::NonZeroUsize::MIN,
+            conversations: std::num::NonZeroUsize::MIN,
+        };
+        for backend in [BackendName::Metal, BackendName::Cpu] {
+            let load = ModelLoadPlan::derive(
+                &manifest,
+                &definition,
+                ComponentSelection {
+                    head: false,
+                    vision: false,
+                },
+                crate::planning::resident_layout(crate::ExecutionPath::Native, backend),
+                crate::PlannedMethod::Plain,
+                crate::planning::fixtures::LIMITS,
+            )
+            .unwrap();
+            let progressive = reads_progressive_heads(backend).unwrap();
+            let load = if progressive {
+                load.with_readout_candidates(&definition)
+                    .unwrap()
+                    .finalize_readout(&[crate::planning::ReadoutClassChoice {
+                        scope: WeightScope::Target,
+                        norm_scope: WeightScope::Target,
+                        prepared: false,
+                        rows: vec![1, 2],
+                    }])
+                    .unwrap()
+            } else {
+                load
+            };
+            assert_eq!(target_readout_norm(&load, decoder), Ok(None), "{backend:?}");
+            assert!(
+                !load
+                    .weights()
+                    .any(|weight| weight.role.kind == WeightKind::OutputNorm),
+                "{backend:?}"
+            );
+            let head =
+                HeadPlans::for_recipe(&load, WeightScope::Target, WeightScope::Target, false)
+                    .unwrap();
+            assert_eq!(head.certified_rows() > 0, progressive, "{backend:?}");
+            let regimes = certify_readout_regimes::<NativeGraphLayout>(
+                backend,
+                decoder,
+                None,
+                (head, &load),
+                ReadoutSource::whole(FeatureSource::Output),
+                limits,
+            )
+            .unwrap();
+            for class in
+                readout_classes(limits, load_certified_rows(limits, head)).unwrap()
+            {
+                let layout = &regimes[&readout_regime(class)];
+                let bytes = checked_readout_class_draft(
+                    NativeGraphMetadata::new(backend),
+                    decoder,
+                    None,
+                    Some((head, &load)),
+                    FeatureSource::Output,
+                    class,
+                    false,
+                )
+                .unwrap()
+                .seal_with_layout(layout)
+                .unwrap();
+                assert_eq!(bytes, layout.storage_bytes(), "{backend:?} {class:?}");
+            }
+            checked_readout_family_storage(backend, &load, decoder, limits).unwrap();
         }
     }
 
@@ -1737,22 +2898,35 @@ mod resource_regime_tests {
             max_images_per_request: 0,
             max_image_cells: 0,
             lookahead: false,
+            chain_capacity: std::num::NonZeroUsize::MIN,
+            conversations: std::num::NonZeroUsize::MIN,
         };
         let classes = readout_classes(limits, 4).unwrap();
-        assert!(classes
-            .iter()
-            .all(|class| class.kind != ReadoutKind::Logits));
+        assert!(
+            classes
+                .iter()
+                .all(|class| class.kind != ReadoutKind::Logits)
+        );
         assert!(classes.iter().all(|class| class.selected <= 32));
-        assert!(classes
-            .iter()
-            .all(|class| class.projected == class.selected));
-        assert!(classes
-            .iter()
-            .any(|class| matches!(class.kind, ReadoutKind::Selection { shaped: true, .. })));
+        assert!(
+            classes
+                .iter()
+                .all(|class| class.projected == class.selected)
+        );
+        assert!(
+            classes
+                .iter()
+                .any(|class| matches!(class.kind, ReadoutKind::Selection { shaped: true, .. }))
+        );
         // Certified selections serve at most the bound's rows.
         assert!(classes.iter().all(|class| {
-            !matches!(class.kind, ReadoutKind::Selection { certified: true, .. })
-                || class.selected <= 4
+            !matches!(
+                class.kind,
+                ReadoutKind::Selection {
+                    certified: true,
+                    ..
+                }
+            ) || class.selected <= 4
         }));
         let diagnostic = readout_classes(
             ResourceLimits {
@@ -1766,8 +2940,206 @@ mod resource_regime_tests {
         // certifies.
         assert!(diagnostic.iter().all(|class| !matches!(
             class.kind,
-            ReadoutKind::Selection { shaped: true, .. } | ReadoutKind::Selection { certified: true, .. }
+            ReadoutKind::Selection { shaped: true, .. }
+                | ReadoutKind::Selection {
+                    certified: true,
+                    ..
+                }
         )));
         assert!(diagnostic.iter().all(|class| class.projected <= 64));
+    }
+}
+
+#[cfg(test)]
+mod select_tests {
+    use super::{SelectionEntries, select, selection_inputs};
+    use crate::programs::graph::draft::GraphDraft;
+    use magnitude_kernels::{sample_rows, shape_rows, token_confidence};
+    use seismic::{BackendName, Dim, Element, NativeSpecialization, Tensor};
+
+    /// The specialization of an entry whose implementation lists `statics`,
+    /// each fixed from `extents`, at its defaults for the rest.
+    fn specialization(
+        statics: &[String],
+        defaults: impl Fn(&NativeSpecialization) -> NativeSpecialization,
+        extents: &[(&str, u64)],
+    ) -> NativeSpecialization {
+        defaults(&statics.iter().fold(NativeSpecialization::new(), |fixed, name| {
+            let (_, value) = extents
+                .iter()
+                .find(|(extent, _)| extent == name)
+                .unwrap_or_else(|| panic!("static {name} has no extent"));
+            fixed.with_static(name.clone(), *value)
+        }))
+    }
+
+    fn f32_bytes(values: &[f32]) -> Vec<u8> {
+        values.iter().flat_map(|value| value.to_le_bytes()).collect()
+    }
+
+    fn words(bytes: &[u8]) -> impl Iterator<Item = [u8; 4]> + '_ {
+        bytes.chunks_exact(4).map(|word| word.try_into().unwrap())
+    }
+
+    fn softmax_at(line: &[f32], token: usize) -> f32 {
+        let maximum = line.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let total = line.iter().map(|logit| (logit - maximum).exp()).sum::<f32>();
+        (line[token] - maximum).exp() / total
+    }
+
+    /// A drafter whose selection reads logits biased past its readout (as
+    /// DSpark's Markov chain biases its readout's) is confident in each
+    /// proposal by its probability under those biased logits, the ones it
+    /// drew it from, not under the readout's.
+    #[test]
+    fn a_selection_is_confident_by_the_logits_it_was_drawn_from() {
+        let catalog = seismic::Devices::discover(&[]).unwrap();
+        let device = crate::test_support::open_backend(&catalog, BackendName::Cpu).unwrap();
+        let (rows, vocabulary) = (2u64, 300u64);
+        let extents = [
+            ("M", rows),
+            ("N", rows),
+            ("Sx", rows),
+            ("V", vocabulary),
+            ("Hn", super::HISTORY_TOKENS),
+        ];
+        let sample_implementation = sample_rows::native_implementation(&device).unwrap().unwrap();
+        let sample = sample_rows::native_for_device(
+            &device,
+            &specialization(
+                &sample_implementation.statics,
+                |fixed| sample_implementation.default_specialization(fixed).unwrap(),
+                &extents,
+            ),
+        )
+        .unwrap();
+        let shape_implementation = shape_rows::native_implementation(&device).unwrap().unwrap();
+        let shape = shape_rows::native_for_device(
+            &device,
+            &specialization(
+                &shape_implementation.statics,
+                |fixed| shape_implementation.default_specialization(fixed).unwrap(),
+                &extents,
+            ),
+        )
+        .unwrap();
+        let confidence_implementation =
+            token_confidence::native_implementation(&device).unwrap().unwrap();
+        let confidence = token_confidence::native_for_device(
+            &device,
+            &specialization(
+                &confidence_implementation.statics,
+                |fixed| confidence_implementation.default_specialization(fixed).unwrap(),
+                &extents,
+            ),
+        )
+        .unwrap();
+        // The readout's logits, and a bias that makes token 7 + 100 r row
+        // r's largest, which the readout alone rates far lower.
+        let readout = (0..rows * vocabulary)
+            .map(|index| ((index * 37 % 101) as f32 - 50.0) / 16.0)
+            .collect::<Vec<_>>();
+        let chosen = |row: u64| (7 + 100 * row) as usize;
+        let biased = readout
+            .iter()
+            .enumerate()
+            .map(|(index, logit)| {
+                let (row, token) = (index as u64 / vocabulary, index % vocabulary as usize);
+                logit + if token == chosen(row) { 12.0 } else { 0.0 }
+            })
+            .collect::<Vec<_>>();
+
+        let mut graph = device.native_graph();
+        let logits_port = GraphDraft::port(&mut graph, Element::f32(), &[rows, vocabulary]).unwrap();
+        let identity_port = GraphDraft::port(&mut graph, Element::i32(), &[rows]).unwrap();
+        let inputs =
+            selection_inputs(&mut graph, &sample, &Dim::from(rows), &Dim::from(vocabulary)).unwrap();
+        let (mask, constrained, draws) =
+            (inputs.mask.clone(), inputs.constrained.clone(), inputs.draws.clone());
+        let result_port = GraphDraft::local_for(
+            &mut graph,
+            &sample,
+            "result",
+            &[("M", rows), ("V", vocabulary)],
+        )
+        .unwrap();
+        let confidence_port = GraphDraft::local_for(
+            &mut graph,
+            &confidence,
+            "confidence",
+            &[("M", rows), ("N", rows), ("V", vocabulary)],
+        )
+        .unwrap();
+        let mut logits = logits_port.tensor().clone();
+        let mut result = result_port.tensor().slice_leading(0, rows);
+        let mut confidences = confidence_port.tensor().slice_leading(0, rows);
+        select(
+            &mut graph,
+            SelectionEntries {
+                shape: &shape,
+                sample: &sample,
+                confidence: &confidence,
+            },
+            &Dim::from(vocabulary),
+            &mut logits,
+            None,
+            identity_port.tensor(),
+            &Dim::from(rows),
+            false,
+            inputs,
+            &mut result,
+            &mut confidences,
+        )
+        .unwrap();
+        GraphDraft::export(&mut graph, result_port.tensor()).unwrap();
+        GraphDraft::export(&mut graph, confidence_port.tensor()).unwrap();
+        let plan = GraphDraft::seal(graph).unwrap();
+
+        let tensor = |element: Element, extents: &[u64], bytes: Vec<u8>| {
+            Tensor::from_host(&device, element, extents, &bytes).unwrap()
+        };
+        let mask_words = vocabulary.div_ceil(32);
+        let mut bindings = plan.bindings();
+        let bound = [
+            (&logits_port, tensor(Element::f32(), &[rows, vocabulary], f32_bytes(&biased))),
+            (
+                &identity_port,
+                tensor(Element::i32(), &[rows], (0..rows as i32).flat_map(i32::to_le_bytes).collect()),
+            ),
+        ];
+        for (port, tensor) in &bound {
+            bindings.set(port, tensor).unwrap();
+        }
+        // The sampler's inputs are written into the run's slot, as a
+        // drafter's are: no row constrained, zero draws select greedily.
+        let mut slot = plan.new_slot().unwrap();
+        slot.write_input(&mask, &vec![0; (rows * mask_words * 4) as usize]).unwrap();
+        slot.write_input(&constrained, &vec![0; (rows * 4) as usize]).unwrap();
+        slot.write_input(&draws, &vec![0; (rows * 6 * 4) as usize]).unwrap();
+        let (outputs, completion) = slot
+            .attach(bindings, plan.new_outputs().unwrap())
+            .unwrap()
+            .submit()
+            .unwrap();
+        completion.wait().unwrap();
+        let selected = words(&outputs.exported(result_port.tensor()).unwrap().read_to_host().unwrap())
+            .map(i32::from_le_bytes)
+            .collect::<Vec<_>>();
+        let confident = words(&outputs.exported(confidence_port.tensor()).unwrap().read_to_host().unwrap())
+            .map(f32::from_le_bytes)
+            .collect::<Vec<_>>();
+        for row in 0..rows {
+            let token = chosen(row);
+            assert_eq!(selected[2 * row as usize..][..2], [token as i32, 0], "row {row}");
+            let line = |logits: &[f32]| logits[(row * vocabulary) as usize..][..vocabulary as usize].to_vec();
+            let expected = softmax_at(&line(&biased), token);
+            let unbiased = softmax_at(&line(&readout), token);
+            let actual = confident[row as usize];
+            assert!(
+                (actual - expected).abs() <= 1e-5 + 1e-4 * expected,
+                "row {row}: confidence {actual} against the biased logits' {expected}"
+            );
+            assert!(expected - unbiased > 0.5, "row {row}: the bias decides ({expected} against {unbiased})");
+        }
     }
 }

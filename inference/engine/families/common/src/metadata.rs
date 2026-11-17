@@ -3,7 +3,41 @@
 //! its reader admits.
 
 use crate::HeaderError;
-use magnitude_artifacts::gguf::{Directory, Scalar, Value};
+use magnitude_artifacts::gguf::{self, Directory, Element, Scalar, Value};
+
+/// Every metadata entry in `architecture`'s own namespace, with its name
+/// within that namespace.
+///
+/// Only that namespace configures a model, so it is the only one a family
+/// reads strictly (the chat layer reads `tokenizer.*` strictly). Every other
+/// namespace configures nothing: `general.*` describes the model, and
+/// container and uploader namespaces (`split.*`, `quantize.*`, `imatrix.*`,
+/// `mradermacher.*`, `unsloth.*`, ...) record how the file was made. A family
+/// may read a named key there, but never refuses one it does not know.
+pub fn architecture_keys<'a>(
+    directory: &'a Directory,
+    architecture: &str,
+) -> impl Iterator<Item = (&'a str, &'a gguf::Metadata)> + 'a {
+    let prefix = format!("{architecture}.");
+    directory
+        .metadata
+        .iter()
+        .filter_map(move |entry| entry.name.strip_prefix(&prefix).map(|key| (key, entry)))
+}
+
+/// The elements of the metadata array named `key`: the one reading of an
+/// array's payload a family makes, a payload that doesn't read or decode
+/// (text that isn't UTF-8, a payload shorter than its elements) being
+/// [`HeaderError::Payload`].
+pub fn array_elements<'a>(
+    key: &str,
+    values: &'a gguf::Array,
+) -> Result<&'a gguf::Elements, HeaderError> {
+    values.elements().map_err(|error| HeaderError::Payload {
+        key: key.to_owned(),
+        detail: error.to_string(),
+    })
+}
 
 pub struct Metadata<'a> {
     directory: &'a Directory,
@@ -11,22 +45,23 @@ pub struct Metadata<'a> {
 }
 
 impl<'a> Metadata<'a> {
-    /// Reads `architecture.*` keys, rejecting any outside `keys`.
+    /// Reads `architecture.*` keys, rejecting every one outside `keys`.
     pub fn new(
         directory: &'a Directory,
         architecture: &str,
         keys: &[&str],
     ) -> Result<Self, HeaderError> {
-        let prefix = format!("{architecture}.");
-        if let Some(unknown) = directory.metadata.iter().find(|entry| {
-            entry
-                .name
-                .strip_prefix(&prefix)
-                .is_some_and(|key| !keys.contains(&key))
-        }) {
-            return Err(HeaderError::UnknownMetadata(unknown.name.clone()));
+        let unknown = architecture_keys(directory, architecture)
+            .filter(|(key, _)| !keys.contains(key))
+            .map(|(_, entry)| entry.name.clone())
+            .collect::<Vec<_>>();
+        if !unknown.is_empty() {
+            return Err(HeaderError::UnknownMetadata(unknown));
         }
-        Ok(Self { directory, prefix })
+        Ok(Self {
+            directory,
+            prefix: format!("{architecture}."),
+        })
     }
 
     /// The full metadata name of `key`.
@@ -128,58 +163,109 @@ impl<'a> Metadata<'a> {
     /// A positive integer per layer, stated once for all layers or as an
     /// array with one entry per layer.
     pub fn per_layer(&self, key: &str, layers: u64) -> Result<Vec<u64>, HeaderError> {
-        let value = self.typed(key, "a positive integer or one per layer", |value| {
-            match value {
-                Value::Array(values) if values.len() as u64 == layers => values
-                    .iter()
-                    .map(|value| nonnegative(value).filter(|value| *value > 0))
-                    .collect(),
-                Value::Array(_) => None,
-                value => value
-                    .unsigned()
-                    .filter(|value| *value > 0)
-                    .map(|value| vec![value; layers as usize]),
-            }
-        })?;
+        let value = self.uniform_or_array(
+            key,
+            "a positive integer or one per layer",
+            layers,
+            |element| element.unsigned().filter(|value| *value > 0),
+        )?;
         self.required(key, value)
+    }
+
+    /// `key`'s value per layer, when present: stated once for all layers
+    /// or as an array with one entry per layer, each read by `read`.
+    fn uniform_or_array<T: Clone>(
+        &self,
+        key: &str,
+        expected: &'static str,
+        layers: u64,
+        read: impl Fn(Element<'a>) -> Option<T>,
+    ) -> Result<Option<Vec<T>>, HeaderError> {
+        match self.value(key) {
+            Some(Value::Array(_)) => self.array(key, expected, Some(layers), read),
+            _ => self.typed(key, expected, |value| match value {
+                Value::Scalar(scalar) => {
+                    read(scalar.element()).map(|value| vec![value; layers as usize])
+                }
+                Value::Array(_) => unreachable!("an array value is read by `array`"),
+            }),
+        }
+    }
+
+    /// `key`'s array, of `length` elements when given, each read by `read`,
+    /// when present: the one reader of array values.
+    fn array<T>(
+        &self,
+        key: &str,
+        expected: &'static str,
+        length: Option<u64>,
+        read: impl Fn(Element<'a>) -> Option<T>,
+    ) -> Result<Option<Vec<T>>, HeaderError> {
+        match self.value(key) {
+            None => Ok(None),
+            Some(Value::Array(values))
+                if length.is_none_or(|length| values.len() as u64 == length) =>
+            {
+                array_elements(&self.key(key), values)?
+                    .iter()
+                    .map(read)
+                    .collect::<Option<Vec<T>>>()
+                    .map(Some)
+                    .ok_or_else(|| self.malformed(key, expected))
+            }
+            Some(_) => Err(self.malformed(key, expected)),
+        }
     }
 
     /// An array of nonnegative integers.
     pub fn counts(&self, key: &str) -> Result<Vec<u64>, HeaderError> {
-        let value = self.typed(key, "an array of nonnegative integers", |value| {
-            match value {
-                Value::Array(values) => values.iter().map(nonnegative).collect(),
-                Value::Scalar(_) => None,
-            }
-        })?;
+        let value = self.array(
+            key,
+            "an array of nonnegative integers",
+            None,
+            Element::unsigned,
+        )?;
         self.required(key, value)
     }
 
     /// One nonnegative integer per layer, stated as an array.
     pub fn layer_counts(&self, key: &str, layers: u64) -> Result<Vec<u64>, HeaderError> {
-        let value = self.typed(
+        let value = self.array(
             key,
             "a per-layer array of nonnegative integers with one entry per layer",
-            |value| match value {
-                Value::Array(values) if values.len() as u64 == layers => {
-                    values.iter().map(nonnegative).collect()
-                }
-                _ => None,
-            },
+            Some(layers),
+            Element::unsigned,
+        )?;
+        self.required(key, value)
+    }
+
+    /// One finite number per layer, stated as an array.
+    pub fn layer_numbers(&self, key: &str, layers: u64) -> Result<Vec<f64>, HeaderError> {
+        let value = self.array(
+            key,
+            "a per-layer array of finite numbers with one entry per layer",
+            Some(layers),
+            element_number,
+        )?;
+        self.required(key, value)
+    }
+
+    /// A nonnegative integer per layer, stated once for all layers or as an
+    /// array with one entry per layer.
+    pub fn uniform_or_layer_counts(&self, key: &str, layers: u64) -> Result<Vec<u64>, HeaderError> {
+        let value = self.uniform_or_array(
+            key,
+            "a nonnegative integer or one per layer",
+            layers,
+            Element::unsigned,
         )?;
         self.required(key, value)
     }
 
     /// One flag per layer.
     pub fn optional_flags(&self, key: &str, layers: u64) -> Result<Option<Vec<bool>>, HeaderError> {
-        self.typed(key, "one flag per layer", |value| match value {
-            Value::Array(values) if values.len() as u64 == layers => values
-                .iter()
-                .map(|value| match value {
-                    Scalar::Bool(value) => Some(*value),
-                    _ => None,
-                })
-                .collect(),
+        self.array(key, "one flag per layer", Some(layers), |element| match element {
+            Element::Bool(value) => Some(value),
             _ => None,
         })
     }
@@ -192,19 +278,18 @@ impl<'a> Metadata<'a> {
 
 fn number(value: &Value) -> Option<f64> {
     match value {
-        Value::Scalar(Scalar::Float(value)) => Some(*value),
-        Value::Scalar(Scalar::Unsigned(value)) => Some(*value as f64),
-        Value::Scalar(Scalar::Signed(value)) => Some(*value as f64),
-        _ => None,
+        Value::Scalar(scalar) => element_number(scalar.element()),
+        Value::Array(_) => None,
     }
-    .filter(|value| value.is_finite())
 }
 
-/// An array entry; converters store integer arrays signed or unsigned.
-fn nonnegative(value: &Scalar) -> Option<u64> {
-    match value {
-        Scalar::Unsigned(value) => Some(*value),
-        Scalar::Signed(value) => u64::try_from(*value).ok(),
-        _ => None,
+/// A finite number, stored as a float or an integer.
+fn element_number(element: Element) -> Option<f64> {
+    match element {
+        Element::Float(value) => Some(value),
+        Element::Unsigned(value) => Some(value as f64),
+        Element::Signed(value) => Some(value as f64),
+        Element::String(_) | Element::Bool(_) => None,
     }
+    .filter(|value| value.is_finite())
 }

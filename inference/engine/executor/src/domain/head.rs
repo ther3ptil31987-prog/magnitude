@@ -1,8 +1,9 @@
 //! head lifecycle for the executor domain.
 
 use super::*;
-use crate::batching::{HeadPasses, HeadSlot};
 use crate::DraftForm;
+use crate::batching::{HeadPasses, HeadSlot};
+use crate::programs::HeadOutput;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static HEAD_LAUNCH_TRACED: AtomicBool = AtomicBool::new(false);
@@ -11,7 +12,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// Bytes of one head conditioning row: the target's normalized output
     /// feature in the activation representation.
     pub(super) fn head_conditioning_bytes(&self) -> usize {
-        self.definition.decoder.hidden as usize * self.definition.decoder.activation_dtype.bytes()
+        let decoder = &self.definition.decoder;
+        self.definition.head.as_ref().map_or(
+            decoder.hidden as usize * decoder.activation_dtype.bytes(),
+            |head| head.conditioning_width(decoder) as usize * if head.residual_conditioning() { 4 } else { decoder.activation_dtype.bytes() },
+        )
     }
 
     /// Submit one batch of head transactions. Each commits its entry rows to
@@ -19,12 +24,24 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// The flight holds `bindings` until `finish_head` returns them.
     pub fn submit_head(
         &mut self,
-        bindings: StateBindings<F>,
+        bindings: StateBindings,
         operations: &[Operation],
         graph_workspace: NativeGraphWorkspaceLease,
         graph_output: NativeGraphOutputLease,
-        advances: Vec<OwnedStateAdvance>,
-    ) -> Result<HeadFlight<F>, SubmitFailure<F>> {
+        reservation: HeadReservation,
+    ) -> Result<HeadFlight<F>, SubmitFailure> {
+        let advances = match reservation {
+            HeadReservation::Advances(advances) => advances,
+            HeadReservation::TargetReads(states) => {
+                return self.submit_target_reading_head(
+                    bindings,
+                    operations,
+                    graph_workspace,
+                    graph_output,
+                    states,
+                );
+            }
+        };
         if operations.is_empty() && advances.is_empty() {
             return Err(SubmitFailure::Refused(
                 "head group is empty".into(),
@@ -33,8 +50,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         // Reservation checked the group and moved its states into the
         // advances: a mismatch now is a broken domain invariant.
-        let broken =
-            |detail: String| SubmitFailure::Failed(DomainError::invariant(detail));
+        let broken = |detail: String| SubmitFailure::Failed(DomainError::invariant(detail));
         let store = self
             .head_store
             .clone()
@@ -107,21 +123,17 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             Operation::Head { form, .. } => *form,
             _ => unreachable!("validated head group"),
         };
-        if operations.iter().any(
-            |operation| !matches!(operation, Operation::Head { form: other, .. } if *other == form),
-        ) {
+        let shape = operations[0].draft_shape();
+        if operations.iter().any(|operation| {
+            !matches!(operation, Operation::Head { form: other, .. } if *other == form)
+                || operation.draft_shape() != shape
+        }) {
             self.restore_head_advances(&metadata, advances);
             return Err(SubmitFailure::Refused(
-                "head group mixes draft forms".into(),
+                "head group mixes draft forms or draft shapes".into(),
                 bindings,
             ));
         }
-        // A drafting block drafts the load's proposals; a request takes its
-        // leading ones.
-        let steps = match form {
-            DraftForm::Block if steps > 0 => self.execution.policy().method().draft_rows(),
-            DraftForm::Chained | DraftForm::Block => steps,
-        };
         let vocabulary = self.definition.decoder.vocabulary as usize;
         let class_limits = self.head_class_limits().map_err(SubmitFailure::Failed)?;
         let batch = match form {
@@ -242,6 +254,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             None
         };
         let started = Instant::now();
+        let epoch = self.launch_epoch();
         let submission = match self.family.submit_head(launch) {
             Ok(submission) => submission,
             Err((error, launch)) => {
@@ -251,13 +264,294 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 return Err(SubmitFailure::Failed(error.into()));
             }
         };
+        let requests = metadata.iter().map(|(request, ..)| *request).collect::<Vec<_>>();
         Ok(HeadFlight {
+            started: self.service_start(&requests, started),
+            epoch,
             requests: metadata,
             steps,
             submission,
-            started,
             launch_trace,
             bindings,
+        })
+    }
+
+    /// Submit one batch of transactions of a head that keeps no history.
+    /// Each drafts from one anchor row at its request's accepted target
+    /// position, reading that state's history; nothing is written. The
+    /// flight holds the accepted target states and `bindings` until
+    /// `finish_head` returns them, so no target work, checkpoint or binding
+    /// change can touch the rows it reads.
+    fn submit_target_reading_head(
+        &mut self,
+        bindings: StateBindings,
+        operations: &[Operation],
+        graph_workspace: NativeGraphWorkspaceLease,
+        graph_output: NativeGraphOutputLease,
+        states: Vec<SequenceState>,
+    ) -> Result<HeadFlight<F>, SubmitFailure> {
+        let launch = self.target_reading_launch(operations, &states);
+        let (batch, history, metadata, steps) = match launch {
+            Ok(launch) => launch,
+            Err(error) => {
+                self.restore_target_reads(operations, states);
+                return Err(SubmitFailure::Refused(error.into(), bindings));
+            }
+        };
+        let conditioning = HeadConditioning::Rows(
+            operations
+                .iter()
+                .filter_map(|operation| match operation {
+                    Operation::Head { conditioning, .. } => Some(conditioning.clone()),
+                    _ => None,
+                })
+                .collect(),
+        );
+        let inputs = HeadLaunchInputs::reading_target(
+            batch,
+            crate::TargetReads { states, history },
+            conditioning,
+            graph_workspace,
+            graph_output,
+        );
+        let launch = match ValidatedHeadLaunch::new(
+            inputs,
+            &self.target_store,
+            self.domain.id(),
+            self.head_conditioning_bytes(),
+        ) {
+            Ok(launch) => launch,
+            Err((inputs, error)) => {
+                if let Some(reads) = inputs.into_target_reads() {
+                    self.restore_target_reads(operations, reads.states);
+                }
+                return Err(SubmitFailure::Failed(DomainError::Invariant(error)));
+            }
+        };
+        let started = Instant::now();
+        let epoch = self.launch_epoch();
+        let submission = match self.family.submit_head(launch) {
+            Ok(submission) => submission,
+            Err((error, launch)) => {
+                let (core, _, _) = launch.into_submission_parts();
+                if let Some(reads) = core.into_target_reads() {
+                    self.restore_target_reads(operations, reads.states);
+                }
+                return Err(SubmitFailure::Failed(error.into()));
+            }
+        };
+        let requests = metadata.iter().map(|(request, ..)| *request).collect::<Vec<_>>();
+        Ok(HeadFlight {
+            started: self.service_start(&requests, started),
+            epoch,
+            requests: metadata,
+            steps,
+            submission,
+            launch_trace: None,
+            bindings,
+        })
+    }
+
+    /// Return the accepted target states a head reading them held.
+    fn restore_target_reads(&mut self, operations: &[Operation], states: Vec<SequenceState>) {
+        for (operation, state) in operations.iter().zip(states) {
+            self.target.insert(operation.request(), state);
+        }
+    }
+
+    /// The batch of a head reading target history, the target history each
+    /// of its blocks binds, and per slot its request, entry rows and
+    /// proposals with the batch's steps.
+    #[allow(clippy::type_complexity)]
+    fn target_reading_launch(
+        &self,
+        operations: &[Operation],
+        states: &[SequenceState],
+    ) -> Result<
+        (
+            crate::batching::ValidatedHeadBatch,
+            Vec<crate::TargetHistoryRead>,
+            Vec<(RequestId, usize, usize)>,
+            usize,
+        ),
+        String,
+    > {
+        if operations.is_empty() || operations.len() != states.len() {
+            return Err("head reservation state count differs from operations".into());
+        }
+        let mut seen = BTreeSet::new();
+        let mut steps = 0usize;
+        let mut metadata = Vec::with_capacity(operations.len());
+        for (operation, state) in operations.iter().zip(states) {
+            operation.validate().map_err(|error| error.to_string())?;
+            let Operation::Head {
+                request,
+                tokens,
+                position,
+                proposals,
+                form: DraftForm::Chained,
+                ..
+            } = operation
+            else {
+                return Err("a head reading target history runs chained head operations".into());
+            };
+            if !seen.insert(*request) {
+                return Err("head request is repeated".into());
+            }
+            if tokens.len() != 1 || proposals.is_empty() || state.position() != *position {
+                return Err(
+                    "a head reading target history drafts from one anchor row at the accepted \
+                     target position"
+                        .into(),
+                );
+            }
+            steps = steps.max(proposals.len());
+            metadata.push((*request, tokens.len(), proposals.len()));
+        }
+        let slots = operations
+            .iter()
+            .zip(states)
+            .enumerate()
+            .map(|(slot, (operation, state))| {
+                self.target_reading_slot(operation, state, steps, slot)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let batch = crate::batching::ValidatedHeadBatch::from_slots(
+            &slots,
+            self.definition.decoder.vocabulary as usize,
+            self.head_class_limits()
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let head = self
+            .definition
+            .head
+            .as_ref()
+            .ok_or("a head operation without a head definition")?;
+        let crate::operators::HeadForm::Shared(shared) =
+            crate::operators::head_form(head, &self.definition.decoder)
+                .map_err(|error| error.to_string())?
+        else {
+            return Err("a head with its own history reads no target state".into());
+        };
+        let planes = self
+            .target_store
+            .history_planes()
+            .map_err(|error| error.to_string())?;
+        let history = (0..shared.blocks.len())
+            .map(|index| {
+                let source = shared.source(index).map_err(|error| error.to_string())?;
+                let source = self
+                    .target_store
+                    .history_source(magnitude_state::LayerRef::Target(source.block))
+                    .ok_or("a head block reads a target layer without history")?;
+                Ok(crate::TargetHistoryRead {
+                    domain: source.domain.0,
+                    planes: planes
+                        .iter()
+                        .filter(|plane| plane.layer == source.layer)
+                        .map(|plane| plane.buffer.clone())
+                        .collect(),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok((batch, history, metadata, steps))
+    }
+
+    /// One transaction of a head reading target history, padded to `steps`
+    /// selections: every step is one row at the anchor's position reading
+    /// the accepted target history of every stored domain from that
+    /// position's window start, and appending nowhere. Steps past the
+    /// request's own proposals select at its last proposal position; their
+    /// selections are discarded.
+    fn target_reading_slot(
+        &self,
+        operation: &Operation,
+        state: &SequenceState,
+        steps: usize,
+        slot: usize,
+    ) -> Result<crate::batching::HeadSlot, String> {
+        let Operation::Head {
+            request,
+            tokens,
+            position,
+            proposals,
+            ..
+        } = operation
+        else {
+            return Err("non-head operation".into());
+        };
+        let i32_of = |value: usize, what: &str| {
+            i32::try_from(value).map_err(|_| format!("head {what} exceeds i32"))
+        };
+        let coordinates = *self
+            .input_coordinates(*request, *position, 1)?
+            .first()
+            .ok_or("prepared input has no coordinate at the anchor")?;
+        let histories = self
+            .target_store
+            .history_domains()
+            .map(|domain| {
+                let from = self
+                    .target_store
+                    .history_domain_kind(domain)
+                    .visible_from(*position);
+                let visible = state
+                    .visible_ranges(domain, from)
+                    .into_iter()
+                    .map(|(start, count)| {
+                        Ok([
+                            i32_of(start, "history start")?,
+                            i32_of(
+                                start
+                                    .checked_add(count)
+                                    .ok_or("head history end overflow")?,
+                                "history end",
+                            )?,
+                        ])
+                    })
+                    .collect::<Result<Vec<[i32; 2]>, String>>()?;
+                Ok(RowHistory {
+                    visible,
+                    fresh_start: 0,
+                    bidirectional_end: None,
+                    destination: -1,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let row = |token: i32| Row {
+            token,
+            coordinates,
+            histories: histories.clone(),
+            demand: crate::batching::Demand::NONE,
+            select: None,
+        };
+        let anchor = tokens.first().ok_or("a head transaction has no anchor")?;
+        let last = proposals.last();
+        let selections = (0..steps)
+            .map(|step| {
+                let spec = proposals
+                    .get(step)
+                    .or(last)
+                    .ok_or("a head reading target history has no selection")?;
+                Ok(super::target::select_row(spec))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        // Rows that read history and append nowhere have no recurrent
+        // version: the slot takes the zero seed and a successor bank of its
+        // own that nothing binds.
+        Ok(crate::batching::HeadSlot {
+            entry: crate::batching::Slot {
+                rows: vec![row(
+                    i32::try_from(anchor.0).map_err(|_| "head token exceeds i32")?
+                )],
+                bank: 0,
+                previous_tape: 0,
+                following_bank: i32::try_from(slot + 1).map_err(|_| "head slot exceeds i32")?,
+                stop: 1,
+            },
+            chain: (1..steps).map(|_| row(0)).collect(),
+            proposals: selections,
         })
     }
 
@@ -293,49 +587,48 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let i32_of = |value: usize, what: &str| {
             i32::try_from(value).map_err(|_| format!("head {what} exceeds i32"))
         };
-        // The draft head's store has one Token domain.
-        let domain = self
+        let store = self
             .head_store
             .as_ref()
-            .ok_or("a head operation without a head store")?
-            .sole_history_domain()
-            .map_err(|error| error.to_string())?;
-        let history = advance
-            .history_ranges(domain)
-            .into_iter()
-            .map(|(start, count)| {
-                Ok([
-                    i32_of(start, "history start")?,
-                    i32_of(
-                        start
-                            .checked_add(count)
-                            .ok_or("head history end overflow")?,
-                        "history end",
-                    )?,
-                ])
-            })
-            .collect::<Result<Vec<[i32; 2]>, String>>()?;
-        let destination = |row: usize| -> Result<i32, String> {
-            binding.destinations[domain.0]
-                .get(row)
-                .map_or(Ok(-1), |value| i32_of(*value, "destination"))
-        };
-        // A head row at head position p pairs the token after target row p
-        // with that row's feature, so it takes target row p's coordinates.
+            .ok_or("a head operation without a head store")?;
+        // The entry rows are one launch; each chained row is a launch of its
+        // own, reading every earlier row of the advance as stored history.
+        let appends = super::target::SlotAppends::every_domain(store, advance);
+        let reads = vec![false; store.history_reads().len()];
+        let written = advance.rows();
+        let last_written = written
+            .checked_sub(1)
+            .expect("a head advance carries its entry rows");
         let chained = steps.saturating_sub(1);
         let coordinates = self.input_coordinates(request, position, tokens.len() + chained)?;
-        let row = |index: usize, token: i32, visible: Vec<[i32; 2]>| -> Result<Row, String> {
+        let row = |index: usize, token: i32, pass_start: usize| -> Result<Row, String> {
+            // A chained row past the request's own proposals appends nowhere
+            // and its selection is discarded: it reads as the last written
+            // row does, appending nothing.
+            let unwritten = index >= written;
+            let at = index.min(last_written);
+            let mut histories = super::target::row_histories(
+                store,
+                advance,
+                &appends,
+                at,
+                pass_start.min(at),
+                None,
+                &reads,
+            )?;
+            for history in &mut histories {
+                // Adjacent spans read as one, as the accepted rows' are.
+                history.visible = crate::batching::coalesce_spans(&history.visible);
+                if unwritten {
+                    history.destination = -1;
+                }
+            }
             Ok(Row {
                 token,
                 coordinates: *coordinates
                     .get(index)
                     .ok_or("prepared input coordinate count differs from head rows")?,
-                histories: vec![RowHistory {
-                    visible,
-                    fresh_start: 0,
-                    bidirectional_end: None,
-                    destination: destination(index)?,
-                }],
+                histories,
                 demand: crate::batching::Demand::NONE,
                 select: None,
             })
@@ -344,29 +637,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .iter()
             .enumerate()
             .map(|(index, token)| {
-                row(
-                    index,
-                    i32::try_from(token.0).map_err(|_| "head token exceeds i32")?,
-                    history.clone(),
-                )
+                row(index, i32::try_from(token.0).map_err(|_| "head token exceeds i32")?, 0)
             })
             .collect::<Result<Vec<_>, String>>()?;
-        // Chained row j sees the history, the entry rows, and the chained
-        // rows before it; the entry rows were appended by the entry pass.
-        let mut visible = history.clone();
-        for index in 0..tokens.len() {
-            let appended = destination(index)?;
-            visible.push([appended, appended + 1]);
-        }
-        let mut chain = Vec::with_capacity(chained);
-        for step in 1..steps {
-            let index = tokens.len() + step - 1;
-            chain.push(row(index, 0, coalesce(&visible))?);
-            let appended = destination(index)?;
-            if appended >= 0 {
-                visible.push([appended, appended + 1]);
-            }
-        }
+        let chain = (1..steps)
+            .map(|step| {
+                let index = tokens.len() + step - 1;
+                row(index, 0, index)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         let last = proposals.last();
         let selections = (0..steps)
             .map(|step| {
@@ -397,12 +676,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     pub fn finish_head(
         &mut self,
         flight: HeadFlight<F>,
-    ) -> Result<(Vec<PendingOperationOutcome>, StateBindings<F>), DomainError> {
+    ) -> Result<(Vec<PendingOperationOutcome>, StateBindings), DomainError> {
         let HeadFlight {
             requests,
             steps,
             submission,
             started,
+            epoch,
             launch_trace,
             bindings,
         } = flight;
@@ -437,35 +717,62 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 }
             }
             let mut entries = entries.into_iter().collect::<Vec<_>>();
-            entries.sort_by(|a, b| b.1 .1.total_cmp(&a.1 .1));
+            entries.sort_by(|a, b| b.1.1.total_cmp(&a.1.1));
             eprintln!("head launch attribution (one proposing flight):");
             for (entry, (launches, ms)) in entries {
                 eprintln!("  {entry}: {ms:.3} ms across {launches} launches");
             }
         }
-        let duration = started.elapsed();
         if std::env::var_os("MAGNITUDE_TRACE_FLIGHTS").is_some() {
             eprintln!(
                 "flight head duration_ms={:.3} requests={:?}",
-                duration.as_secs_f64() * 1000.0,
+                started.elapsed().as_secs_f64() * 1000.0,
                 requests
             );
         }
-        let (core, selections) = completed.into_parts();
+        let (core, mut output) = completed.into_parts();
+        // The rows the step's landed reads landed take slots of their own:
+        // later rounds find them there.
+        output.complete_landed_reads().map_err(DomainError::Submit)?;
+        let HeadOutput {
+            selections,
+            landed_reads: _,
+        } = output;
         let slots = core.batch().actual_slots();
         if slots != requests.len() {
             return Err(DomainError::invariant(
                 "head slot count differs from request count",
             ));
         }
-        let selected = match selections {
+        let read = |tensor: &crate::GraphOutputTensor| {
+            tensor.tensor().read_to_host().map_err(|error| {
+                DomainError::Device(crate::DeviceError::Transfer(error.to_string()))
+            })
+        };
+        let (selected, confidence) = match selections {
             Some(selections) => {
-                decode_selected(&selections.tensor().read_to_host().map_err(|error| {
-                    DomainError::Device(crate::DeviceError::Transfer(error.to_string()))
-                })?)
-                .map_err(DomainError::invariant)?
+                let selected =
+                    decode_selected(&read(&selections.tokens)?).map_err(DomainError::invariant)?;
+                let confidence = selections
+                    .confidence
+                    .as_ref()
+                    .map(|confidence| {
+                        let bytes = read(confidence)?;
+                        let confidence = bytes
+                            .chunks_exact(4)
+                            .map(|word| f32::from_le_bytes(word.try_into().expect("four bytes")))
+                            .collect::<Vec<_>>();
+                        if !bytes.len().is_multiple_of(4) || confidence.len() != selected.len() {
+                            return Err(DomainError::invariant(
+                                "head confidences differ from its selections",
+                            ));
+                        }
+                        Ok(confidence)
+                    })
+                    .transpose()?;
+                (selected, confidence)
             }
-            None => Vec::new(),
+            None => (Vec::new(), None),
         };
         let slot_class = selected.len().checked_div(steps).unwrap_or(0);
         if steps != 0 && (slot_class < slots || selected.len() != steps * slot_class) {
@@ -487,17 +794,39 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 );
             }
         }
-        let (_, advances, _) = core.into_parts();
-        let advances = advances
-            .into_iter()
-            .map(|advance| match advance {
-                TentativeAdvance::Accepted(advance) => Ok(advance),
-                TentativeAdvance::Successor(_) => Err(DomainError::invariant(
-                    "a head transaction follows an in-flight advance",
-                )),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let pending = requests
+        // A head that keeps no history read its requests' accepted target
+        // states: the device is done with them, so they return unchanged and
+        // its outcomes own no advance.
+        let advances = if core.target_reads().is_some() {
+            let reads = core
+                .into_target_reads()
+                .ok_or_else(|| DomainError::invariant("a head flight lost its target reads"))?;
+            if reads.states.len() != requests.len() {
+                return Err(DomainError::invariant(
+                    "head target reads differ from request count",
+                ));
+            }
+            for ((request, _, _), state) in requests.iter().zip(reads.states) {
+                if self.target.insert(*request, state).is_some() {
+                    return Err(DomainError::invariant(
+                        "request already has another physical state owner",
+                    ));
+                }
+            }
+            requests.iter().map(|_| None).collect::<Vec<_>>()
+        } else {
+            let (_, advances, _) = core.into_parts();
+            advances
+                .into_iter()
+                .map(|advance| match advance {
+                    TentativeAdvance::Accepted(advance) => Ok(Some(advance)),
+                    TentativeAdvance::Successor(_) | TentativeAdvance::Chained(_) => Err(
+                        DomainError::invariant("a head transaction follows an in-flight advance"),
+                    ),
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut pending: Vec<PendingOperationOutcome> = requests
             .into_iter()
             .zip(advances)
             .enumerate()
@@ -508,36 +837,69 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         proposals: (0..proposals)
                             .map(|step| selected[step * slot_class + slot])
                             .collect(),
+                        confidence: confidence.as_ref().map(|confidence| {
+                            (0..proposals)
+                                .map(|step| confidence[step * slot_class + slot])
+                                .collect()
+                        }),
                     },
-                    advance: Some(advance),
+                    advance: advance.map(Advance::Step),
                     primed: None,
                     rows: advance_rows(passes, rows, proposals),
                     committed_rows: rows,
                     kind: WorkKind::Decode,
-                    physical_duration: duration,
+                    physical_duration: Duration::ZERO,
+                    timed: Timed::Untimed,
                     image: None,
                 },
             )
             .collect();
+        // Include the existing selection read and host materialization in
+        // completed service; request timing must not omit width-dependent work.
+        let duration = started.elapsed();
+        let timed = self.timed(epoch);
+        for item in &mut pending {
+            item.physical_duration = duration;
+            item.timed = timed;
+        }
+        // A request whose drafter proposed verifies its round next: no
+        // decode queues behind that launch (`queue::continuations`).
+        self.proposed.extend(
+            pending
+                .iter()
+                .filter(|item| matches!(&item.outcome, Outcome::Head { proposals, .. } if !proposals.is_empty()))
+                .map(|item| item.request),
+        );
+        self.begin_host_turn(pending.iter().map(|item| item.request));
         Ok((pending, bindings))
     }
 }
 
 /// The widest window of a drafter store whose injection can skip its
-/// windowed layers: one that also keeps a history no window drops (with
-/// every layer windowed, skipping them leaves nothing to inject).
+/// windowed layers: a window narrower than the store's widest history,
+/// which keeps reading the rows the narrower windows drop (with every
+/// domain equally wide, skipping leaves nothing to inject).
 pub(super) fn skippable_window(store: &StateStore) -> Option<usize> {
-    let mut widest = None;
-    let mut full = false;
-    for domain in store.history_domains() {
-        match store.history_domain_kind(domain) {
-            magnitude_state::HistoryDomainKind::Window { rows } => {
-                widest = widest.max(Some(rows))
-            }
-            _ => full = true,
-        }
-    }
-    widest.filter(|_| full)
+    // A domain's reach: its window, or `None` for a history of every row.
+    // An indexer's domains are no attention's.
+    let reaches = store
+        .history_domains()
+        .filter(|&domain| !store.is_produced_domain(domain))
+        .map(|domain| match store.history_domain_kind(domain) {
+            magnitude_state::HistoryDomainKind::Window { rows } => Some(rows),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let widest = if reaches.contains(&None) {
+        None
+    } else {
+        reaches.iter().flatten().max().copied()
+    };
+    reaches
+        .into_iter()
+        .flatten()
+        .filter(|rows| widest.is_none_or(|widest| *rows < widest))
+        .max()
 }
 
 /// Rows a head transaction advances its state by: the entry rows, and a
@@ -547,16 +909,4 @@ fn advance_rows(passes: HeadPasses, entry: usize, proposals: usize) -> usize {
         HeadPasses::Chained => entry + proposals.saturating_sub(1),
         HeadPasses::Block => entry,
     }
-}
-
-/// Ascending visible spans with adjacent spans merged.
-fn coalesce(spans: &[[i32; 2]]) -> Vec<[i32; 2]> {
-    let mut merged: Vec<[i32; 2]> = Vec::with_capacity(spans.len());
-    for &span in spans {
-        match merged.last_mut() {
-            Some(previous) if previous[1] == span[0] => previous[1] = span[1],
-            _ => merged.push(span),
-        }
-    }
-    merged
 }

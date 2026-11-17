@@ -1,8 +1,8 @@
-import { BunSqliteDriverLayer } from "@magnitudedev/daemon-management/bun"
+import { BunSqliteDriverLayer } from "@magnitudedev/storage/sqlite/bun"
 import { FetchHttpClient } from "@effect/platform"
 import * as FileSystem from "@effect/platform/FileSystem"
 import { BunContext } from "@effect/platform-bun"
-import { HARNESS_PRIORITY, HarnessIdSchema, UnavailableHarnessConnection } from "@magnitudedev/client-common"
+import { HARNESS_PRIORITY, HarnessIdSchema } from "@magnitudedev/sdk"
 import { ProviderModelIdSchema, ReasoningEffortSchema } from "@magnitudedev/sdk"
 import { Brand, Effect, Option, Schema } from "effect"
 import { parse } from "jsonc-parser"
@@ -12,11 +12,14 @@ import { describe, expect, it, vi } from "vitest"
 import { fixturePackageFiles, piPackageFiles } from "./pi-package-fixture"
 import { inspectPluginContent } from "@magnitudedev/release/plugin-content"
 import { MAGNITUDE_RPC_VERSION } from "@magnitudedev/sdk"
-import { HarnessModelSchema, type HarnessCompanionPackage } from "./contract"
+import { HarnessModelSchema, type HarnessCompanionPackage, type HarnessModel } from "./contract"
+import { skillText } from "./inspection"
+import { jsonObject, valueAt } from "./shared"
 import { PiPackageSourceSchema } from "./connectors/pi-package-state"
 import { PiPackageEntrySchema } from "./connectors/pi-settings"
 import {
   ANTHROPIC_BASE_URL,
+  CLAUDE_AUTH_TOKEN_PLACEHOLDER,
   CLAUDE_GATEWAY_DISCOVERY,
   CODEX_PROXY_BASE_URL,
   OPENAI_BASE_URL,
@@ -104,6 +107,11 @@ const fixturePaths = (root: string): HarnessConnectionPaths => ({
   codexUser: `${root}/codex/config.toml`,
   codexModels: `${root}/codex/magnitude.models.json`,
   claude: `${root}/claude/settings.json`,
+  claudeLogin: {
+    credentialFiles: [`${root}/claude/.credentials.json`],
+    globalConfigFiles: [`${root}/claude.json`],
+    keychainItems: [],
+  },
   ompModels: `${root}/omp/models.yml`,
   ompSettings: `${root}/omp/config.yml`,
   clineProviders: `${root}/cline/providers.json`,
@@ -246,18 +254,8 @@ describe("HarnessModel persistence", () => {
 })
 
 describe("HarnessConnector contract and registry", () => {
-  it("rejects the removed Magnitude destination and never offers a built-in fallback", async () => {
+  it("rejects the removed Magnitude destination", () => {
     expect(Schema.is(HarnessIdSchema)("magnitude")).toBe(false)
-    expect(await Effect.runPromise(UnavailableHarnessConnection.list)).toEqual([])
-    const harness = HarnessIdSchema.make("pi")
-    for (const action of [
-      UnavailableHarnessConnection.connect(harness, { model: Option.none() }),
-      UnavailableHarnessConnection.sync(harness),
-      UnavailableHarnessConnection.disconnect(harness),
-    ]) {
-      expect((await Effect.runPromise(Effect.either(action)))._tag).toBe("Left")
-    }
-    expect(UnavailableHarnessConnection).not.toHaveProperty("launch")
   })
 
   it("composes one complete connector module per harness in canonical order", () => {
@@ -1341,7 +1339,10 @@ describe("HarnessConnection model-set behavior", () => {
         env: {
           USER_KEY: "preserve",
           ANTHROPIC_BASE_URL,
+          ANTHROPIC_AUTH_TOKEN: CLAUDE_AUTH_TOKEN_PLACEHOLDER,
+          ANTHROPIC_API_KEY: "",
           CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: CLAUDE_GATEWAY_DISCOVERY,
+          CLAUDE_CODE_MAX_CONTEXT_TOKENS: "32768",
         },
       })
       expect(readYaml(yield* fs.readFileString(paths.ompModels))).toMatchObject({
@@ -1880,6 +1881,139 @@ describe("HarnessConnection model-set behavior", () => {
     }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
   })
 
+  const claudeInspection = (service: { readonly inspect: Effect.Effect<ReadonlyArray<{ readonly id: string; readonly inspection: { readonly _tag: string } }>, unknown> }) =>
+    service.inspect.pipe(Effect.map((rows) => rows.find((row) => row.id === "claude-code")?.inspection._tag))
+
+  it("connects Claude Code without an Anthropic login and disconnects to exactly the prior settings", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-harness-claude-login-" })
+      const paths = fixturePaths(root)
+      const prior = { theme: "dark", model: "user/model" }
+      yield* writeFixtures({ ...initialFiles(paths), [paths.claude]: stringifyJson(prior) })
+      const service = yield* installedService(paths)
+      const id = HarnessIdSchema.make("claude-code")
+
+      yield* service.connect(id, { model: Option.some(model) })
+      expect(readJson(yield* fs.readFileString(paths.claude))).toEqual({
+        theme: "dark",
+        model: anthropicLocalModelId(model),
+        env: {
+          ANTHROPIC_BASE_URL,
+          ANTHROPIC_AUTH_TOKEN: CLAUDE_AUTH_TOKEN_PLACEHOLDER,
+          ANTHROPIC_API_KEY: "",
+          CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: CLAUDE_GATEWAY_DISCOVERY,
+          CLAUDE_CODE_MAX_CONTEXT_TOKENS: "50000",
+        },
+      })
+      expect(yield* claudeInspection(service)).toBe("Connected")
+
+      const settings = readJson(yield* fs.readFileString(paths.claude)) as { env: Record<string, string> }
+      delete settings.env.ANTHROPIC_AUTH_TOKEN
+      yield* fs.writeFileString(paths.claude, stringifyJson(settings))
+      expect(yield* claudeInspection(service)).toBe("Disconnected")
+
+      yield* service.connect(id, { model: Option.none() })
+      yield* service.disconnect(id)
+      expect(readJson(yield* fs.readFileString(paths.claude))).toEqual(prior)
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
+  })
+
+  for (const [name, login] of [
+    ["an OAuth login", (paths: HarnessConnectionPaths) => ({ [paths.claudeLogin.credentialFiles[0]!]: stringifyJson({ claudeAiOauth: { accessToken: "test-only" } }) })],
+    ["a Console API key", (paths: HarnessConnectionPaths) => ({ [paths.claudeLogin.globalConfigFiles[0]!]: stringifyJson({ primaryApiKey: "test-only" }) })],
+  ] as const) {
+    it(`connects Claude Code with ${name} without a placeholder credential`, async () => {
+      await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-harness-claude-signed-in-" })
+        const paths = fixturePaths(root)
+        const prior = { theme: "dark", model: "user/model" }
+        yield* writeFixtures({ ...initialFiles(paths), [paths.claude]: stringifyJson(prior), ...login(paths) })
+        const service = yield* installedService(paths)
+        const id = HarnessIdSchema.make("claude-code")
+
+        yield* service.connect(id, { model: Option.some(model) })
+        expect(readJson(yield* fs.readFileString(paths.claude))).toEqual({
+          theme: "dark",
+          model: anthropicLocalModelId(model),
+          env: { ANTHROPIC_BASE_URL, CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: CLAUDE_GATEWAY_DISCOVERY, CLAUDE_CODE_MAX_CONTEXT_TOKENS: "50000" },
+        })
+        expect(yield* claudeInspection(service)).toBe("Connected")
+
+        yield* service.disconnect(id)
+        expect(readJson(yield* fs.readFileString(paths.claude))).toEqual(prior)
+      }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
+    })
+  }
+
+  it("treats a credential in Claude settings as a login", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-harness-claude-settings-login-" })
+      const paths = fixturePaths(root)
+      for (const prior of [{ apiKeyHelper: "/bin/echo" }, { env: { ANTHROPIC_API_KEY: "test-only" } }]) {
+        yield* writeFixtures({ ...initialFiles(paths), [paths.claude]: stringifyJson(prior) })
+        const service = yield* installedService(paths)
+        yield* service.connect(HarnessIdSchema.make("claude-code"), { model: Option.some(model) })
+        const { env } = readJson(yield* fs.readFileString(paths.claude)) as { env: Record<string, string> }
+        expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
+        expect(yield* claudeInspection(service)).toBe("Connected")
+        yield* service.disconnect(HarnessIdSchema.make("claude-code"))
+        expect(readJson(yield* fs.readFileString(paths.claude))).toEqual(prior)
+      }
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
+  })
+
+  it("drops the Claude placeholder credentials on sync once a login appears", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-harness-claude-later-login-" })
+      const paths = fixturePaths(root)
+      const prior = { theme: "dark", model: "user/model" }
+      yield* writeFixtures({ ...initialFiles(paths), [paths.claude]: stringifyJson(prior) })
+      const service = yield* installedService(paths)
+      const id = HarnessIdSchema.make("claude-code")
+      yield* service.connect(id, { model: Option.some(model) })
+
+      yield* fs.writeFileString(paths.claudeLogin.credentialFiles[0]!, stringifyJson({ claudeAiOauth: { accessToken: "test-only" } }))
+      expect(yield* claudeInspection(service)).toBe("Connected")
+      yield* service.sync(id)
+      expect(readJson(yield* fs.readFileString(paths.claude))).toEqual({
+        theme: "dark",
+        model: anthropicLocalModelId(model),
+        env: { ANTHROPIC_BASE_URL, CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: CLAUDE_GATEWAY_DISCOVERY, CLAUDE_CODE_MAX_CONTEXT_TOKENS: "50000" },
+      })
+      expect(yield* claudeInspection(service)).toBe("Connected")
+
+      yield* service.disconnect(id)
+      expect(readJson(yield* fs.readFileString(paths.claude))).toEqual(prior)
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
+  })
+
+  it("keeps a user's own Claude auth token on disconnect", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-harness-claude-token-" })
+      const paths = fixturePaths(root)
+      yield* writeFixtures(initialFiles(paths))
+      const service = yield* installedService(paths)
+      const id = HarnessIdSchema.make("claude-code")
+      yield* service.connect(id, { model: Option.none() })
+      const settings = readJson(yield* fs.readFileString(paths.claude)) as { env: Record<string, string> }
+      settings.env.ANTHROPIC_AUTH_TOKEN = "user-token"
+      yield* fs.writeFileString(paths.claude, stringifyJson(settings))
+
+      yield* service.disconnect(id)
+
+      expect(readJson(yield* fs.readFileString(paths.claude))).toEqual({
+        theme: "dark",
+        model: "user/model",
+        env: { USER_KEY: "preserve", ANTHROPIC_AUTH_TOKEN: "user-token" },
+      })
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
+  })
+
   it("sync refreshes Cline's custom Magnitude catalog", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem
@@ -2065,12 +2199,34 @@ describe("read-only connection inspection", () => {
       expect((yield* fs.stat(primary)).type).toBe("Directory")
     }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
   })
+  it("keeps a connection whose skill an earlier build wrote with CRLF line endings, and writes LF", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-inspection-crlf-skill-" })
+      const paths = fixturePaths(root)
+      const service = yield* installedService(paths)
+      yield* service.connect(HarnessIdSchema.make("opencode"), { model: Option.none(), installSkill: true })
+      const skillFile = paths.skillInstallations["shared-agents"].skillFile
+      const written = yield* fs.readFileString(skillFile)
+      expect(written).not.toContain("\r\n")
+      yield* fs.writeFileString(skillFile, written.replace(/\n/g, "\r\n"))
+      const reopened = yield* installedService(paths)
+      expect((yield* reopened.inspect).find((row) => row.id === "opencode")?.inspection._tag).toBe("Connected")
+      yield* fs.writeFileString(skillFile, `${written}\nchanged\n`)
+      expect((yield* reopened.inspect).find((row) => row.id === "opencode")?.inspection).toEqual({ _tag: "Disconnected", reason: "Magnitude skill is missing or has changed" })
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
+  })
+  it("compares skill files by text, not line endings", () => {
+    expect(skillText("---\r\nname: magnitude\r\n---\r\n")).toBe("---\nname: magnitude\n---\n")
+    expect(skillText("a\nb\n")).toBe("a\nb\n")
+  })
   it("remembers a chosen optional skill and detects its later removal", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem
       const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-inspection-optional-skill-" })
       const paths = fixturePaths(root)
       const service = yield* installedService(paths)
+      expect((yield* service.inspect).find((row) => row.id === "opencode")?.inspection).toEqual({ _tag: "Disconnected", reason: "Not connected" })
       yield* service.connect(HarnessIdSchema.make("opencode"), { model: Option.none(), installSkill: true })
       expect((yield* service.inspect).find((row) => row.id === "opencode")?.inspection._tag).toBe("Connected")
       yield* fs.remove(paths.skillInstallations["shared-agents"].skillFile)
@@ -2172,4 +2328,242 @@ it.each(HARNESS_PRIORITY)("disconnects %s after its provider configuration has b
     expect(row.managed).toBe(false)
     expect(row.inspection._tag).toBe("Disconnected")
   }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
+})
+
+describe("selections after an upgrade", () => {
+  it.each(["opencode", "claude-code", "codex", "hermes", "openclaw", "oh-my-pi", "cline"] as const)(
+    "moves a %s selection naming a renamed model to the model it now names on sync",
+    async (harness) => {
+      await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-renamed-selection-" })
+        const paths = fixturePaths(root)
+        yield* writeFixtures(initialFiles(paths))
+        const registry = makeHarnessConnectorRegistry(paths, {
+          readCodexBundledCatalog: () => Effect.succeed(bundledCodexCatalog),
+          piCompanion: testPiCompanion,
+        })
+        const service = (canonicalModel: (id: typeof model) => Effect.Effect<typeof model>) => makeHarnessConnectionService({
+          paths,
+          registry,
+          canonicalModel,
+          detect: (connector) => Effect.succeed(Option.some({ executable: `/installed/${connector.id}` })),
+          resolveModels: Effect.succeed(models),
+          now: () => new Date("2026-08-26T00:00:00.000Z"),
+          installStartup: Effect.void,
+        })
+        const id = HarnessIdSchema.make(harness)
+        yield* (yield* service(Effect.succeed)).connect(id, { model: Option.some(secondModel) })
+        expect(yield* registry.get(id).selectedModel).toEqual(Option.some(secondModel))
+        yield* (yield* service((selected) => Effect.succeed(selected === secondModel ? model : selected))).sync(id)
+        expect(yield* registry.get(id).selectedModel).toEqual(Option.some(model))
+      }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
+    },
+  )
+})
+
+describe("stale context windows", () => {
+  it("rewrites a connection written with a context window its model is no longer served at, once", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-context-resync-" })
+      const paths = fixturePaths(root)
+      yield* writeFixtures(initialFiles(paths))
+      const registry = makeHarnessConnectorRegistry(paths, {
+        readCodexBundledCatalog: () => Effect.succeed(bundledCodexCatalog),
+        piCompanion: testPiCompanion,
+      })
+      const service = (served: ReadonlyArray<HarnessModel>) => makeHarnessConnectionService({
+        paths,
+        registry,
+        canonicalModel: Effect.succeed,
+        detect: (connector) => Effect.succeed(Option.some({ executable: `/installed/${connector.id}` })),
+        resolveModels: Effect.succeed(served),
+        now: () => new Date("2026-08-26T00:00:00.000Z"),
+        installStartup: Effect.void,
+      })
+      const opencode = HarnessIdSchema.make("opencode")
+      const before = yield* service(models)
+      yield* before.connect(opencode, { model: Option.some(model) })
+      expect(yield* before.syncStaleConnections).toEqual([])
+      const limit = () => fs.readFileString(paths.opencode).pipe(Effect.map((text) =>
+        (jsonObject(text) as { provider: { magnitude: { models: Record<string, { limit: { context: number } }> } } })
+          .provider.magnitude.models[model]!.limit.context))
+      expect(yield* limit()).toBe(50_000)
+      const resized = yield* service([{ ...models[0], contextWindow: 131_072 }, models[1]])
+      expect(yield* resized.syncStaleConnections).toEqual([opencode])
+      expect(yield* limit()).toBe(131_072)
+      expect(yield* resized.syncStaleConnections).toEqual([])
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
+  })
+
+  it("declares the selected model's served context to Claude Code, follows it, and removes it on disconnect", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-claude-window-" })
+      const paths = fixturePaths(root)
+      yield* writeFixtures(initialFiles(paths))
+      const registry = makeHarnessConnectorRegistry(paths, {
+        readCodexBundledCatalog: () => Effect.succeed(bundledCodexCatalog),
+        piCompanion: testPiCompanion,
+      })
+      const service = (served: ReadonlyArray<HarnessModel>) => makeHarnessConnectionService({
+        paths,
+        registry,
+        canonicalModel: Effect.succeed,
+        detect: (connector) => Effect.succeed(Option.some({ executable: `/installed/${connector.id}` })),
+        resolveModels: Effect.succeed(served),
+        now: () => new Date("2026-08-26T00:00:00.000Z"),
+        installStartup: Effect.void,
+      })
+      const claude = HarnessIdSchema.make("claude-code")
+      const window = () => fs.readFileString(paths.claude).pipe(Effect.map((text) =>
+        valueAt(jsonObject(text), ["env", "CLAUDE_CODE_MAX_CONTEXT_TOKENS"])))
+      const before = yield* service(models)
+      yield* before.connect(claude, { model: Option.some(secondModel) })
+      expect(yield* window()).toBe("32768")
+      const resized = yield* service([models[0], { ...models[1], contextWindow: 65_536 }])
+      expect(yield* resized.syncStaleConnections).toEqual([claude])
+      expect(yield* window()).toBe("65536")
+      yield* resized.disconnect(claude)
+      expect(readJson(yield* fs.readFileString(paths.claude))).toEqual(readJson(initialFiles(paths)[paths.claude]!))
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
+  })
+})
+
+describe("Claude Code without a selected model", () => {
+  it("declares the smallest served context, since --model may pick any Magnitude model", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-claude-smallest-window-" })
+      const paths = fixturePaths(root)
+      yield* writeFixtures(initialFiles(paths))
+      const registry = makeHarnessConnectorRegistry(paths, {
+        readCodexBundledCatalog: () => Effect.succeed(bundledCodexCatalog),
+        piCompanion: testPiCompanion,
+      })
+      const service = makeHarnessConnectionService({
+        paths,
+        registry,
+        canonicalModel: Effect.succeed,
+        detect: (connector) => Effect.succeed(Option.some({ executable: `/installed/${connector.id}` })),
+        resolveModels: Effect.succeed(models),
+        now: () => new Date("2026-08-26T00:00:00.000Z"),
+        installStartup: Effect.void,
+      })
+      const claude = HarnessIdSchema.make("claude-code")
+      yield* (yield* service).connect(claude, { model: Option.none() })
+      const settings = jsonObject(yield* fs.readFileString(paths.claude))
+      expect(valueAt(settings, ["env", "CLAUDE_CODE_MAX_CONTEXT_TOKENS"])).toBe("32768")
+      yield* (yield* service).disconnect(claude)
+      expect(readJson(yield* fs.readFileString(paths.claude))).toEqual(readJson(initialFiles(paths)[paths.claude]!))
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
+  })
+})
+
+describe("automatic alias reconciliation", () => {
+  it("moves a Claude Code selection naming an alias in a Windows-written settings file", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-claude-alias-" })
+      const paths = fixturePaths(root)
+      yield* writeFixtures(initialFiles(paths))
+      const registry = makeHarnessConnectorRegistry(paths, {
+        readCodexBundledCatalog: () => Effect.succeed(bundledCodexCatalog),
+        piCompanion: testPiCompanion,
+      })
+      const service = (canonicalModel: (id: typeof model) => Effect.Effect<typeof model>) => makeHarnessConnectionService({
+        paths,
+        registry,
+        canonicalModel,
+        detect: (connector) => Effect.succeed(Option.some({ executable: `/installed/${connector.id}` })),
+        resolveModels: Effect.succeed(models),
+        now: () => new Date("2026-08-26T00:00:00.000Z"),
+        installStartup: Effect.void,
+      })
+      const claude = HarnessIdSchema.make("claude-code")
+      yield* (yield* service(Effect.succeed)).connect(claude, { model: Option.some(secondModel) })
+      const written = yield* fs.readFileString(paths.claude)
+      yield* fs.writeFileString(paths.claude, `\uFEFF${written.replace(/\n/g, "\r\n")}`)
+      expect(yield* registry.get(claude).selectedModel).toEqual(Option.some(secondModel))
+      const upgraded = yield* service((selected) => Effect.succeed(selected === secondModel ? model : selected))
+      expect(yield* upgraded.syncStaleConnections).toEqual([claude])
+      expect(yield* registry.get(claude).selectedModel).toEqual(Option.some(model))
+      expect(jsonObject(yield* fs.readFileString(paths.claude)).model).toBe(`anthropic-local/${model}`)
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
+  })
+
+  it("moves Claude Code's selection even when another connected harness can't be synced", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-claude-alias-isolated-" })
+      const paths = fixturePaths(root)
+      yield* writeFixtures(initialFiles(paths))
+      const registry = makeHarnessConnectorRegistry(paths, {
+        readCodexBundledCatalog: () => Effect.succeed(bundledCodexCatalog),
+        piCompanion: testPiCompanion,
+      })
+      const service = (
+        canonicalModel: (id: typeof model) => Effect.Effect<typeof model>,
+        installed: (id: string) => boolean,
+      ) => makeHarnessConnectionService({
+        paths,
+        registry,
+        canonicalModel,
+        detect: (connector) => Effect.succeed(installed(connector.id)
+          ? Option.some({ executable: `/installed/${connector.id}` })
+          : Option.none()),
+        resolveModels: Effect.succeed(models),
+        now: () => new Date("2026-08-26T00:00:00.000Z"),
+        installStartup: Effect.void,
+      })
+      const codex = HarnessIdSchema.make("codex")
+      const claude = HarnessIdSchema.make("claude-code")
+      const before = yield* service(Effect.succeed, () => true)
+      yield* before.connect(codex, { model: Option.some(secondModel) })
+      yield* before.connect(claude, { model: Option.some(secondModel) })
+      const upgraded = yield* service((selected) => Effect.succeed(selected === secondModel ? model : selected), (id) => id !== "codex")
+      expect(yield* upgraded.syncStaleConnections).toEqual([claude])
+      expect(yield* registry.get(claude).selectedModel).toEqual(Option.some(model))
+      expect(yield* registry.get(codex).selectedModel).toEqual(Option.some(secondModel))
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
+  })
+
+  it("moves only connected harnesses whose selection names a renamed model, once, and leaves other configuration alone", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-alias-reconciliation-" })
+      const paths = fixturePaths(root)
+      yield* writeFixtures({
+        ...initialFiles(paths),
+        [paths.claude]: stringifyJson({ model: `anthropic-local/${secondModel}` }),
+      })
+      const registry = makeHarnessConnectorRegistry(paths, {
+        readCodexBundledCatalog: () => Effect.succeed(bundledCodexCatalog),
+        piCompanion: testPiCompanion,
+      })
+      const service = (canonicalModel: (id: typeof model) => Effect.Effect<typeof model>) => makeHarnessConnectionService({
+        paths,
+        registry,
+        canonicalModel,
+        detect: (connector) => Effect.succeed(Option.some({ executable: `/installed/${connector.id}` })),
+        resolveModels: Effect.succeed(models),
+        now: () => new Date("2026-08-26T00:00:00.000Z"),
+        installStartup: Effect.void,
+      })
+      const opencode = HarnessIdSchema.make("opencode")
+      const hermes = HarnessIdSchema.make("hermes")
+      const before = yield* service(Effect.succeed)
+      yield* before.connect(opencode, { model: Option.some(secondModel) })
+      yield* before.connect(hermes, { model: Option.some(model) })
+      const hermesBefore = yield* fs.readFileString(paths.hermes)
+      const claudeBefore = yield* fs.readFileString(paths.claude)
+      const upgraded = yield* service((selected) => Effect.succeed(selected === secondModel ? model : selected))
+      expect(yield* upgraded.syncStaleConnections).toEqual([opencode])
+      expect(yield* registry.get(opencode).selectedModel).toEqual(Option.some(model))
+      expect(yield* fs.readFileString(paths.hermes)).toBe(hermesBefore)
+      expect(yield* fs.readFileString(paths.claude)).toBe(claudeBefore)
+      expect(yield* upgraded.syncStaleConnections).toEqual([])
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
+  })
 })

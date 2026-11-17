@@ -317,7 +317,7 @@ struct value_string_t : public value_t {
     }
 protected:
     virtual bool equivalent(const value_t & other) const override {
-        return typeid(*this) == typeid(other) && val_str.str() == other.val_str.str();
+        return typeid(*this) == typeid(other) && val_str.equals(other.val_str);
     }
 };
 using value_string = std::shared_ptr<value_string_t>;
@@ -544,6 +544,18 @@ struct value_object_t : public value_t {
         unordered[key] = val;
         if (!replaced) {
             val_obj.push_back({key, val});
+        }
+    }
+    void erase(const value & key) {
+        if (unordered.erase(key) == 0) {
+            return;
+        }
+        // a key added last is erased first, so search from the end
+        for (auto it = val_obj.rbegin(); it != val_obj.rend(); ++it) {
+            if (*(it->first) == *key) {
+                val_obj.erase(std::next(it).base());
+                break;
+            }
         }
     }
     virtual value & at(const value & key, value & default_val) override {

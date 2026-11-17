@@ -12,6 +12,10 @@ seismic-ir.workspace = true
 seismic-estimator.workspace = true
 seismic-lang.workspace = true
 seismic-native-target.workspace = true
+seismic-memory.workspace = true
 magnitude-solver = { path = "../../solver" }
+serde.workspace = true
 sha2 = "=0.11.0"
 
+[dev-dependencies]
+seismic-topology.workspace = true

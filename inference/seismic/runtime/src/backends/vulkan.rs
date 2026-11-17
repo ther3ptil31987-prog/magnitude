@@ -2,16 +2,13 @@
 //! opened device with no compiler target, discovery from the device floor,
 //! and storage behind the shared allocation core.
 
-use super::{Descriptor, DiscoveredDevice, DiscoveredMemory};
-use crate::devices::{
-    Availability, CapacityBasis, DeviceInfo, DeviceKind, DeviceSelector, LedgerKey, OpenError,
-};
+use crate::devices::OpenError;
 use crate::driver::{self, Allocation, AllocationLimits, Storage};
-use crate::memory::{MemoryDomain, MemoryUsage};
+use crate::memory::DeviceStores;
 use crate::native::abi::vulkan::VulkanFeatures;
 use seismic_compiler::errors::{ExecutionError, TargetError};
 use seismic_compiler::prepared::DeviceIdentity;
-use seismic_lang::registry::BackendName;
+use seismic_topology::Executor;
 use std::any::Any;
 use std::sync::Arc;
 
@@ -19,56 +16,29 @@ use std::sync::Arc;
 /// any power of two up to its block size.
 const MAX_ALLOCATION_ALIGNMENT: u64 = 4096;
 
-/// A discovered physical device. Integrated GPUs and software devices
-/// allocate from host RAM; a discrete GPU has its device-local heap.
-pub(super) fn discovered(description: seismic_vulkan::Description) -> DiscoveredDevice {
-    let facts = description.facts;
-    let memory = if facts.device_type == seismic_vulkan::DeviceType::Discrete {
-        DiscoveredMemory::Dedicated {
-            capacity_bytes: facts.device_local_bytes,
-            basis: CapacityBasis::VulkanDeviceLocalHeap,
-            ledger: LedgerKey::PhysicalGpu(facts.uuid),
-            max_allocation_bytes: facts.limits.max_allocation_bytes,
-        }
-    } else {
-        DiscoveredMemory::Host {
-            max_allocation_bytes: facts.limits.max_allocation_bytes,
-        }
-    };
-    DiscoveredDevice {
-        selector: DeviceSelector::Vulkan { uuid: facts.uuid },
-        name: facts.name.clone(),
-        kind: if facts.is_gpu() {
-            DeviceKind::Gpu
-        } else {
-            DeviceKind::Cpu
-        },
-        backend: BackendName::Vulkan,
-        availability: match description.floor {
-            Ok(()) => Availability::Available,
-            Err(reason) => Availability::Unavailable { reason },
-        },
-        memory,
-        memory_bandwidth: None,
-        descriptor: Descriptor::Vulkan { uuid: facts.uuid },
-    }
-}
-
-/// An opened Vulkan device: the service, its facts, and its memory domain.
+/// An opened Vulkan device: the service, its facts, and the stores its
+/// storage kinds lie in.
 pub(crate) struct VulkanOpened {
     identity: DeviceIdentity,
     service: seismic_vulkan::Device,
-    memory: Arc<MemoryDomain>,
+    memory: Arc<DeviceStores>,
 }
 
 impl VulkanOpened {
     pub(super) fn open(
         uuid: [u8; 16],
-        info: &DeviceInfo,
-        memory: Arc<MemoryDomain>,
+        info: &Executor,
+        memory: Arc<DeviceStores>,
+        probed: &seismic_vulkan::Probed,
     ) -> Result<Self, OpenError> {
-        let service = seismic_vulkan::Device::open(uuid).map_err(|error| match error {
-            seismic_vulkan::OpenError::Missing => OpenError::IdentityChanged(info.selector),
+        let stores = seismic_vulkan::MemoryStores {
+            // The store of every kind the device's placements allocate in.
+            kinds: memory.kind_stores(),
+            host: memory.host_store(),
+        };
+        let service = seismic_vulkan::Device::open(uuid, stores, probed).map_err(|error| match error {
+            seismic_vulkan::OpenError::Missing => OpenError::IdentityChanged(info.selector()),
+            busy @ seismic_vulkan::OpenError::Busy(_) => OpenError::Backend(TargetError::DeviceBusy(busy.to_string())),
             other => OpenError::Backend(TargetError::DeviceUnavailable(other.to_string())),
         })?;
         Ok(Self {
@@ -88,60 +58,70 @@ impl VulkanOpened {
 
     /// The device features the generated prefix exposes.
     pub(crate) fn features(&self) -> VulkanFeatures {
-        VulkanFeatures::of(&self.service.facts().formation())
+        VulkanFeatures::of(&self.service.formation())
     }
 
-    pub(crate) fn memory_usage(&self) -> MemoryUsage {
-        self.memory.usage()
-    }
-
-    pub(crate) fn set_memory_limit(&self, limit: Option<u64>) {
-        self.memory.set_limit(limit)
-    }
-
-    fn allocate_with(
+    /// A buffer of `contract` in the kinds it is allocated from now
+    /// ([`DeviceStores::kinds`]), landing on the first with room, ordered by
+    /// `access`'s hazard domain where given; it lies along the path of the
+    /// kind it landed in ([`seismic_vulkan::Buffer::kind`]).
+    pub(crate) fn allocate_contract(
         &self,
+        contract: seismic_topology::Contract,
         bytes: u64,
         alignment: u64,
-        make: impl FnOnce(&seismic_vulkan::Device) -> Result<seismic_vulkan::Buffer, ExecutionError>,
+        access: Option<Arc<driver::AccessGroup>>,
     ) -> Result<Arc<Allocation>, ExecutionError> {
-        let limits = AllocationLimits {
+        let (kinds, entry) = (self.memory.kinds(contract)?, self.entry(contract));
+        driver::allocate_in(self.allocation_limits(), &self.memory, bytes, alignment, access, || {
+            let buffer = self.service.allocate_kinds(kinds, bytes, alignment, &entry)?;
+            let kind = buffer.kind();
+            let storage: Box<dyn Storage> = Box::new(VulkanStorage { service: self.service.clone(), buffer: Arc::new(buffer) });
+            Ok((kind, storage))
+        })
+    }
+
+    /// The ledger entry an allocation of `contract` through this device is
+    /// charged on this thread (`driver::Opened::entry`).
+    pub(crate) fn entry(&self, contract: seismic_topology::Contract) -> Arc<dyn crate::memory::Entry> {
+        self.memory.entry(contract)
+    }
+
+    /// One block of a granule pool, one memory object of `kind` and the
+    /// buffer bound to it, lying along the kind's path
+    /// (`driver::Opened::allocate_block`).
+    pub(crate) fn allocate_block(
+        &self,
+        kind: u32,
+        bytes: u64,
+        entry: &Arc<dyn crate::memory::Entry>,
+        access: Arc<driver::AccessGroup>,
+    ) -> Result<Arc<Allocation>, ExecutionError> {
+        self.allocation_limits().admit_bytes(bytes)?;
+        let buffer = self.service.allocate_block(kind, bytes, entry)?;
+        Ok(Allocation::new_in(
+            driver::fresh_allocation_identity(),
+            bytes,
+            self.memory.path_of(kind),
+            Box::new(VulkanStorage { service: self.service.clone(), buffer: Arc::new(buffer) }),
+            Some(access),
+        ))
+    }
+
+
+    fn allocation_limits(&self) -> AllocationLimits {
+        AllocationLimits {
             max_allocation_bytes: self.service.facts().limits.max_allocation_bytes,
             max_allocation_alignment: MAX_ALLOCATION_ALIGNMENT,
-        };
-        let mut reservation = driver::reserve(&self.memory, bytes)?;
-        driver::allocate_reserved(limits, bytes, alignment, &mut reservation, || {
-            Ok(Box::new(VulkanStorage {
-                service: self.service.clone(),
-                buffer: make(&self.service)?,
-            }))
-        })
+        }
     }
 
-    pub(crate) fn allocate(
-        &self,
-        bytes: u64,
-        alignment: u64,
-    ) -> Result<Arc<Allocation>, ExecutionError> {
-        self.allocate_with(bytes, alignment, |service| {
-            service.allocate(bytes, alignment)
-        })
-    }
-
-    pub(crate) fn allocate_upload(
-        &self,
-        bytes: u64,
-        alignment: u64,
-    ) -> Result<Arc<Allocation>, ExecutionError> {
-        self.allocate_with(bytes, alignment, |service| {
-            service.allocate_upload(bytes, alignment)
-        })
-    }
 }
 
+/// Storage of one buffer.
 struct VulkanStorage {
     service: seismic_vulkan::Device,
-    buffer: seismic_vulkan::Buffer,
+    buffer: Arc<seismic_vulkan::Buffer>,
 }
 
 impl Storage for VulkanStorage {
@@ -154,6 +134,19 @@ impl Storage for VulkanStorage {
     fn as_any(&self) -> &dyn Any {
         self
     }
+    fn host_address(&self) -> Option<std::ptr::NonNull<u8>> {
+        self.buffer.host_address()
+    }
+}
+
+/// The device address of byte `offset` of a Vulkan allocation.
+pub(crate) fn vulkan_address(allocation: &Allocation, offset: u64) -> u64 {
+    vulkan_buffer(allocation).address() + offset
+}
+
+/// Byte `offset` of a Vulkan allocation as a transfer reaches it.
+pub(crate) fn vulkan_transfer_end(allocation: &Allocation, offset: u64) -> seismic_vulkan::transfer::TransferEnd<'_> {
+    seismic_vulkan::transfer::TransferEnd(vulkan_buffer(allocation), offset)
 }
 
 /// The Vulkan buffer of an allocation of a Vulkan device.
@@ -164,4 +157,14 @@ pub(crate) fn vulkan_buffer(allocation: &Allocation) -> &seismic_vulkan::Buffer 
         .downcast_ref::<VulkanStorage>()
         .unwrap_or_else(|| panic!("Tensor allocation backend invariant violated after successful WrongDevice validation"))
         .buffer
+}
+
+/// The stores a test opens a device of `facts` with: one unbounded store
+/// for every kind and the host.
+#[cfg(test)]
+pub(crate) fn test_stores(facts: &seismic_vulkan::Facts) -> seismic_vulkan::MemoryStores {
+    let store: Arc<dyn crate::memory::Store> =
+        Arc::new(seismic_memory::entry::Tally::unbounded(seismic_topology::StoreIdentity::HostRam));
+    let kinds = (0..facts.memory.types.len() as u32).map(|kind| (kind, store.clone())).collect();
+    seismic_vulkan::MemoryStores { kinds, host: store }
 }

@@ -1,4 +1,8 @@
+import { Command } from "@effect/platform"
 import { Effect, Option } from "effect"
+import { isDeepStrictEqual } from "node:util"
+import { MAGNITUDE_CLAUDE_CODE_PLACEHOLDER_CREDENTIAL } from "@magnitudedev/sdk"
+import type { HarnessModel } from "../contract"
 import type { HarnessConnectionPaths } from "../paths"
 import {
   ANTHROPIC_BASE_URL,
@@ -6,7 +10,10 @@ import {
   defineConnector,
   isAnthropicLocalModelId,
   jsonObject,
+  LOCAL_ANTHROPIC_MODEL_PREFIX,
+  magnitudeSelection,
   readOr,
+  removeJsoncPaths,
   removeOwnedJsonc,
   updateJsonc,
   valueAt,
@@ -14,6 +21,84 @@ import {
 } from "../shared"
 
 export const CLAUDE_GATEWAY_DISCOVERY = "1"
+/**
+ * Claude Code refuses to send any request without a credential. Without a login, the connection
+ * writes Magnitude's placeholder bearer (no approval prompt, unlike `ANTHROPIC_API_KEY`) and an
+ * empty `ANTHROPIC_API_KEY` so an exported key cannot take over. The gateway
+ * serves every placeholder request locally. A placeholder outranks a Claude login, so it is written
+ * only while Claude Code has no credential of its own.
+ */
+export const CLAUDE_AUTH_TOKEN_PLACEHOLDER = MAGNITUDE_CLAUDE_CODE_PLACEHOLDER_CREDENTIAL
+
+const nonEmptyString = (value: unknown): boolean => typeof value === "string" && value !== ""
+
+const fileHasField = (file: string, segments: ReadonlyArray<string>) => readOr(file, "").pipe(
+  Effect.flatMap((source) => Effect.try(() => source !== "" && nonEmptyString(valueAt(jsonObject(source), segments)))),
+  Effect.orElseSucceed(() => false),
+)
+
+const keychainItemExists = (service: string, account: string) =>
+  Command.make("security", "find-generic-password", "-a", account, "-s", service).pipe(
+    Command.stdout("pipe"),
+    Command.stderr("pipe"),
+    Command.exitCode,
+    Effect.timeout("5 seconds"),
+    Effect.map((code) => code === 0),
+    Effect.orElseSucceed(() => false),
+  )
+
+/**
+ * Whether Claude Code has a credential of its own, checked the way Claude Code finds one. Only the
+ * existence of each credential is read; the Keychain lookup never requests the secret.
+ */
+export const claudeCodeHasLogin = (paths: HarnessConnectionPaths, settings: unknown) => Effect.gen(function* () {
+  const env = valueAt(settings, ["env"])
+  const token = valueAt(env, ["ANTHROPIC_AUTH_TOKEN"])
+  if (nonEmptyString(valueAt(env, ["ANTHROPIC_API_KEY"])) || nonEmptyString(valueAt(env, ["CLAUDE_CODE_OAUTH_TOKEN"]))
+      || (nonEmptyString(token) && token !== CLAUDE_AUTH_TOKEN_PLACEHOLDER)
+      || nonEmptyString(valueAt(settings, ["apiKeyHelper"]))) return true
+  for (const file of paths.claudeLogin.credentialFiles) {
+    if (yield* fileHasField(file, ["claudeAiOauth", "accessToken"])) return true
+  }
+  for (const file of paths.claudeLogin.globalConfigFiles) {
+    if (yield* fileHasField(file, ["primaryApiKey"])) return true
+  }
+  for (const { service, account } of paths.claudeLogin.keychainItems) {
+    if (yield* keychainItemExists(service, account)) return true
+  }
+  return false
+})
+
+/** Magnitude's no-login credential values, removed once a login exists and on disconnect. */
+const noLoginEnv: ReadonlyArray<readonly [ReadonlyArray<string>, string]> = [
+  [["env", "ANTHROPIC_AUTH_TOKEN"], CLAUDE_AUTH_TOKEN_PLACEHOLDER],
+  [["env", "ANTHROPIC_API_KEY"], ""],
+]
+
+/**
+ * Claude Code assumes 200K tokens for a model ID it doesn't recognize, so it would run a local model
+ * served at a smaller context past that context before compacting. For an ID outside its own
+ * `claude-` names this variable declares the window instead; the connection writes the served
+ * context of the Magnitude model Claude Code is set to, or with none set, the smallest any Magnitude
+ * model is served at, since `--model` may pick any of them.
+ */
+const CONTEXT_WINDOW_ENV = ["env", "CLAUDE_CODE_MAX_CONTEXT_TOKENS"] as const
+
+const contextWindowValue = (window: number) => String(window)
+
+const ownedContextWindows = (models: ReadonlyArray<HarnessModel>) =>
+  models.map((model) => [CONTEXT_WINDOW_ENV, contextWindowValue(model.contextWindow)] as const)
+
+const declaredContextWindow = (models: ReadonlyArray<HarnessModel>, selected: Option.Option<string>) =>
+  Option.match(selected, {
+    onNone: () => models.length === 0
+      ? Option.none<number>()
+      : Option.some(Math.min(...models.map((model) => model.contextWindow))),
+    onSome: (id) => Option.map(
+      Option.fromNullable(models.find((model) => model.id === id)),
+      (model) => model.contextWindow,
+    ),
+  }).pipe(Option.map(contextWindowValue))
 
 export const makeClaudeCodeConnector = (paths: HarnessConnectionPaths, baseUrl = ANTHROPIC_BASE_URL) => defineConnector({
   id: "claude-code",
@@ -21,16 +106,29 @@ export const makeClaudeCodeConnector = (paths: HarnessConnectionPaths, baseUrl =
   executable: "claude",
   skillInstallationTarget: "claude-user",
   configurationFiles: [paths.claude],
+  selectedModel: readOr(paths.claude, "{}\n").pipe(Effect.map((source) =>
+    magnitudeSelection(valueAt(jsonObject(source), ["model"]), LOCAL_ANTHROPIC_MODEL_PREFIX))),
   connect: (spec) => Effect.gen(function* () {
     const source = yield* readOr(paths.claude, "{}\n")
     const value = jsonObject(source)
     const previous = valueAt(value, ["model"])
+    const loggedIn = yield* claudeCodeHasLogin(paths, value)
     const changes: Array<readonly [ReadonlyArray<string>, unknown]> = [
       [["env", "ANTHROPIC_BASE_URL"], baseUrl],
       [["env", "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"], CLAUDE_GATEWAY_DISCOVERY],
     ]
+    if (!loggedIn) changes.push(...noLoginEnv)
     if (Option.isSome(spec.model)) changes.push([["model"], anthropicLocalModelId(spec.model.value)])
-    yield* writeIfChanged(paths.claude, source, updateJsonc(source, changes))
+    const window = declaredContextWindow(spec.models, Option.orElse(
+      spec.model,
+      () => magnitudeSelection(previous, LOCAL_ANTHROPIC_MODEL_PREFIX),
+    ))
+    if (Option.isSome(window)) changes.push([CONTEXT_WINDOW_ENV, window.value])
+    const withoutLogin = loggedIn ? removeOwnedJsonc(source, noLoginEnv) : source
+    const base = Option.isSome(window)
+      ? withoutLogin
+      : removeOwnedJsonc(withoutLogin, ownedContextWindows([...spec.models, ...(spec.previousModels ?? [])]))
+    yield* writeIfChanged(paths.claude, source, updateJsonc(base, changes))
     return Option.map(spec.model, () => ({
       model: typeof previous === "string" ? Option.some(previous) : Option.none(),
     }))
@@ -40,10 +138,15 @@ export const makeClaudeCodeConnector = (paths: HarnessConnectionPaths, baseUrl =
     const value = jsonObject(source)
     const current = valueAt(value, ["model"])
     const currentBaseUrl = valueAt(value, ["env", "ANTHROPIC_BASE_URL"])
-    const withoutGateway = removeOwnedJsonc(source, [
+    const withoutGatewayEnv = removeOwnedJsonc(source, [
       [["env", "ANTHROPIC_BASE_URL"], baseUrl],
       [["env", "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"], CLAUDE_GATEWAY_DISCOVERY],
+      ...noLoginEnv,
+      ...ownedContextWindows(spec.models),
     ])
+    const withoutGateway = isDeepStrictEqual(valueAt(jsonObject(withoutGatewayEnv), ["env"]), {})
+      ? removeJsoncPaths(withoutGatewayEnv, [["env"]])
+      : withoutGatewayEnv
     const next = isAnthropicLocalModelId(current) && currentBaseUrl === baseUrl && Option.isSome(spec.restore)
       ? updateJsonc(withoutGateway, [[["model"], Option.getOrUndefined(spec.restore.value.model)]])
       : withoutGateway

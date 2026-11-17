@@ -1,126 +1,242 @@
-//! The assessment environment: the selected execution device, its memory bandwidth and the
-//! engine configuration every model is assessed with, and the identity that keys every cached
-//! assessment made in it. Established once, during service start.
+//! The execution environment models are assessed in: its structure, established once from
+//! discovery before assessment, and what the measurement job has stored of this machine.
 
-use magnitude_engine::assessment::{AssessmentSetup, ModelAssessmentError};
+use magnitude_engine::assessment::{AssessmentSetup, AssessmentStructure, Measurements};
 use magnitude_engine::options::{ModelPolicy, standard_service_limits};
 use magnitude_engine::worker::protocol::EngineBuild;
-use magnitude_executor::assessment::{BandwidthSource, DeviceClass};
-use magnitude_executor::platform::{DeviceRequest, MemoryReserves};
+use magnitude_executor::ExecutionPath;
+use magnitude_executor::platform::{DeviceRequest, ReleaseRate, SelectionError, select};
 use magnitude_service_contracts::models::AssessmentEnvironmentId;
-use seismic::{DeviceCatalog, DeviceMemory, DeviceTopology, HostMemoryStatus};
+use seismic::{Devices, ExecutorSelector};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 
 /// The engine configuration the service loads and assesses every model with.
 pub fn serving_policy() -> ModelPolicy {
     ModelPolicy::default()
 }
 
+/// The request the service's device is selected by: the engine's automatic selection.
+const SERVING_REQUEST: DeviceRequest = DeviceRequest::Automatic;
+
+/// The device the service assesses, loads and reports every model on: [`SERVING_REQUEST`]
+/// selected once over the service's topology. The service discovers its device inventory once
+/// and never refreshes it, so the topology has one revision for the service's lifetime and the
+/// serving device is decided once, at startup. Assessment, every load preview (and so every
+/// load) and the hardware report read this value; none of them selects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ServingDevice(ExecutorSelector);
+
+impl ServingDevice {
+    /// Select the serving device over `devices`' topology.
+    pub fn select(devices: &Devices) -> Result<Self, SelectionError> {
+        let executor = select(&devices.topology(), ExecutionPath::Native, SERVING_REQUEST)?;
+        tracing::info!(
+            device = %executor.selector(),
+            device.name = %executor.name(),
+            backend = executor.backend().as_str(),
+            "serving device selected"
+        );
+        Ok(Self(executor.selector()))
+    }
+
+    /// The serving device named by `selector`, for tests that serve on a chosen device.
+    #[cfg(test)]
+    pub(crate) fn of(selector: ExecutorSelector) -> Self {
+        Self(selector)
+    }
+
+    pub fn selector(self) -> ExecutorSelector {
+        self.0
+    }
+
+    /// The engine request that opens exactly this device or fails.
+    pub fn request(self) -> DeviceRequest {
+        DeviceRequest::Selector(self.0)
+    }
+}
+
+/// The structure every model is assessed on: the [`ServingDevice`], its graphs priced as a load
+/// prices them from the kernel cache at `kernels`. Opens no device and measures nothing.
+pub fn assessment_structure(
+    devices: &Devices,
+    serving: ServingDevice,
+    kernels: Option<&std::path::Path>,
+) -> anyhow::Result<AssessmentStructure> {
+    let structure = AssessmentStructure::discover(
+        devices,
+        serving.request(),
+        kernels,
+        ReleaseRate::of_machine(kernels.zip(Some(&*devices.topology()))),
+        serving_policy(),
+        standard_service_limits(),
+    )?;
+    tracing::info!(
+        device = %structure.selected.info.selector(),
+        device.name = %structure.selected.info.name(),
+        backend = structure.selected.info.backend().as_str(),
+        "assessment structure established"
+    );
+    Ok(structure)
+}
+
+/// One structure under what is measured of the machine, with the identity that keys every
+/// cached assessment made in it.
 pub struct AssessmentEnvironment {
     pub id: AssessmentEnvironmentId,
     pub setup: AssessmentSetup,
+    /// The identity of the structure without what the records price of it (its graphs' cost),
+    /// derived once with it: what a model's preparation, which reads nothing the records price,
+    /// is keyed by, so records that land prepare no model again.
+    pub structure_id: Arc<str>,
 }
 
 impl AssessmentEnvironment {
-    /// Select the device a native load selects, resolve its bandwidth, observe the host and
-    /// derive the environment's identity. Opens no device.
-    pub fn establish(catalog: &DeviceCatalog) -> Result<Self, ModelAssessmentError> {
-        let setup = AssessmentSetup::discover(
-            catalog,
-            DeviceRequest::Automatic,
-            MemoryReserves::standard(),
-            serving_policy(),
-            standard_service_limits(),
-        )?;
-        let bandwidth = setup.bandwidth;
-        tracing::info!(
-            device = %setup.selected.info.selector,
-            device.name = %setup.selected.info.name,
-            backend = setup.selected.info.backend.as_str(),
-            bandwidth.bytes_per_second = bandwidth.bytes_per_second,
-            bandwidth.source = bandwidth_source(bandwidth.source),
-            "assessment environment established"
-        );
-        Ok(Self {
-            id: environment_id(&setup),
-            setup,
-        })
+    /// The environment of `structure` under `measurements`. Fails only when the structure's
+    /// host sample did: the process limits it read enter every identity on it.
+    pub fn new(
+        structure: Arc<AssessmentStructure>,
+        measurements: Measurements,
+    ) -> anyhow::Result<Self> {
+        let structure_id = structure_id(&structure);
+        Ok(Self::of(structure, structure_id, measurements))
     }
-}
 
-fn bandwidth_source(source: BandwidthSource) -> &'static str {
-    match source {
-        BandwidthSource::Reported => "reported",
-        BandwidthSource::Published => "published",
-        BandwidthSource::Assumed(DeviceClass::DedicatedGpu) => "assumed_dedicated_gpu",
-        BandwidthSource::Assumed(DeviceClass::IntegratedGpu) => "assumed_integrated_gpu",
-        BandwidthSource::Assumed(DeviceClass::Cpu) => "assumed_cpu",
+    /// The environment of what the stored records give assessment now (`stored`,
+    /// [`AssessmentStructure::stored`]): the records price only this structure's graphs, which
+    /// its identity leaves out, so it is this one's.
+    pub fn stored(&self, stored: AssessmentSetup) -> Self {
+        Self::of(stored.structure, Arc::clone(&self.structure_id), stored.measurements)
     }
-}
 
-/// The identity of everything an assessment result depends on besides the model: engine build
-/// (covering model families, the fit workload, decode costs and the bandwidth table), device and
-/// its resolved bandwidth, the stable topology and process limits that bound fit capacity, the
-/// reserve policy and the serving configuration. Live free memory is not an input.
-fn environment_id(setup: &AssessmentSetup) -> AssessmentEnvironmentId {
-    let material = json!({
-        "engine_build": EngineBuild::current().0,
-        "backend": setup.selected.info.backend.as_str(),
-        "device": setup.selected.info.selector,
-        "device_name": setup.selected.info.name,
-        "bandwidth": {
-            "bytes_per_second": setup.bandwidth.bytes_per_second,
-            "source": bandwidth_source(setup.bandwidth.source),
-        },
-        "topology": normalized_topology(&setup.topology),
-        "process_limits": process_limits(&setup.host),
-        "reserves": format!("{:?}", setup.reserves),
-        "policy": format!("{:?}", setup.policy),
-        "service": format!("{:?}", setup.service),
-    });
-    AssessmentEnvironmentId(format!(
-        "environment_{:x}",
-        Sha256::digest(material.to_string().as_bytes())
-    ))
-}
-
-/// Devices and memory pools without the per-process revision: identity, kind, backend,
-/// availability, memory relationships and capacities.
-fn normalized_topology(topology: &DeviceTopology) -> serde_json::Value {
-    let pools = topology.pools();
-    let pool_index = |id| pools.iter().position(|pool| pool.id == id);
-    json!({
-        "devices": topology.devices().iter().map(|device| json!({
-            "selector": device.selector,
-            "name": device.name,
-            "kind": format!("{:?}", device.kind),
-            "backend": device.backend.as_str(),
-            "availability": format!("{:?}", device.availability),
-            "memory": match &device.memory {
-                DeviceMemory::Established(memory) => json!({
-                    "allocation_pool": pool_index(memory.allocation_pool),
-                    "host_pool": pool_index(memory.host_pool),
-                    "max_allocation_bytes": memory.max_allocation_bytes,
-                }),
-                DeviceMemory::Unsupported { reason } => json!({ "unsupported": reason }),
+    /// Only stable evidence enters identity: the structure's, its graphs' cost, and the executor costs once
+    /// derived (that they are pending, or unavailable and why, otherwise), not current usage or
+    /// measurement timestamps. The costs enter as the stored records they were derived from (the
+    /// structure's identity includes the engine build, which derives costs from records). No
+    /// model's own measurement enters it. The identity keys every assessment's work, cache entry and contract
+    /// identity, the candidates' cache, and the snapshot's `environment_id`, and a new one is
+    /// what moves the pool to new records ([`super::assessor::ModelAssessor::adopt`]).
+    fn of(
+        structure: Arc<AssessmentStructure>,
+        structure_id: Arc<str>,
+        measurements: Measurements,
+    ) -> Self {
+        let measured = match &measurements {
+            Measurements::Pending => json!("pending"),
+            Measurements::Unavailable { reason } => json!({ "unavailable": reason }),
+            Measurements::Measured { records, .. } => json!({ "records": records.as_ref() }),
+        };
+        let material = json!({
+            "structure": &*structure_id,
+            "graph_cost": structure.selected.graph_cost,
+            "measurements": measured,
+        });
+        Self {
+            id: AssessmentEnvironmentId(format!(
+                "environment_{:x}",
+                Sha256::digest(material.to_string().as_bytes())
+            )),
+            setup: AssessmentSetup {
+                structure,
+                measurements,
             },
-            "recommended_working_set_bytes": device.recommended_working_set_bytes(),
-        })).collect::<Vec<_>>(),
-        "pools": pools.iter().map(|pool| json!({
-            "kind": format!("{:?}", pool.kind),
-            "capacity_bytes": pool.capacity_bytes,
-            "basis": format!("{:?}", pool.basis),
-        })).collect::<Vec<_>>(),
+            structure_id,
+        }
+    }
+}
+
+/// The identity of `structure`'s [`structure_identity`].
+fn structure_id(structure: &AssessmentStructure) -> Arc<str> {
+    let identity = structure_identity(structure);
+    format!("structure_{:x}", Sha256::digest(identity.to_string().as_bytes())).into()
+}
+
+/// What of `structure` enters identity: the engine build, the selected device, the topology's
+/// normalized structure, the bytes of host RAM's binding scope (the host's, or the process
+/// limit that binds), and the configuration models are assessed with. Its graphs' cost, which the records price, enters
+/// the environment's ([`AssessmentEnvironment::of`]).
+fn structure_identity(structure: &AssessmentStructure) -> serde_json::Value {
+    json!({
+        "engine_build": EngineBuild::current().0,
+        "device": structure.selected.info.selector().to_string(),
+        "topology": structure.topology.normalized(),
+        "host_scope_bytes": structure.status.sample.host.total,
+        "policy": structure.policy,
+        "service": structure.service,
     })
 }
 
-fn process_limits(host: &HostMemoryStatus) -> serde_json::Value {
-    json!({
-        "limits": host.limits.iter().map(|limit| json!({
-            "kind": format!("{:?}", limit.kind),
-            "limit_bytes": limit.limit_bytes,
-        })).collect::<Vec<_>>(),
-        "visibility": format!("{:?}", host.limit_visibility),
-    })
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use seismic::BackendName;
+
+    fn cpu_structure() -> AssessmentStructure {
+        assessment_structure(
+            &seismic::Devices::discover(&[]).expect("device catalog"),
+            ServingDevice::of(ExecutorSelector::HostCpu),
+            None,
+        )
+        .expect("the host CPU is usable")
+    }
+
+    /// The serving device is the automatic selection, and the structure is assessed on exactly
+    /// the serving device it is given, whatever the automatic selection is.
+    #[test]
+    fn the_structure_is_assessed_on_the_serving_device() {
+        let devices = seismic::Devices::discover(&[]).expect("device catalog");
+        let automatic = select(&devices.topology(), ExecutionPath::Native, SERVING_REQUEST)
+            .expect("the host CPU is usable");
+        let serving = ServingDevice::select(&devices).unwrap();
+        assert_eq!(serving.selector(), automatic.selector());
+        for executor in devices
+            .topology()
+            .executors()
+            .iter()
+            .filter(|executor| magnitude_executor::platform::unusable_reason(executor).is_none())
+        {
+            let serving = ServingDevice::of(executor.selector());
+            let structure = assessment_structure(&devices, serving, None).unwrap();
+            assert_eq!(structure.selected.info.selector(), serving.selector());
+            assert_eq!(structure.device, serving.request());
+        }
+    }
+
+    fn environment_id(
+        structure: AssessmentStructure,
+        measurements: Measurements,
+    ) -> AssessmentEnvironmentId {
+        AssessmentEnvironment::new(Arc::new(structure), measurements)
+            .unwrap()
+            .id
+    }
+
+    #[test]
+    fn a_different_backend_hardware_or_measurement_is_a_different_environment() {
+        let id = environment_id(cpu_structure(), Measurements::Pending);
+        assert_eq!(
+            environment_id(cpu_structure(), Measurements::Pending),
+            id,
+            "the identity is stable"
+        );
+
+        // Any other executor of the machine (another backend, another device).
+        let mut other = cpu_structure();
+        if let Some(executor) = other
+            .topology
+            .executors()
+            .iter()
+            .find(|executor| executor.backend() != BackendName::Cpu)
+            .cloned()
+        {
+            other.selected.info = executor;
+            assert_ne!(environment_id(other, Measurements::Pending), id);
+        }
+
+        let unavailable = Measurements::Unavailable {
+            reason: "no record".to_owned(),
+        };
+        assert_ne!(environment_id(cpu_structure(), unavailable), id);
+    }
 }

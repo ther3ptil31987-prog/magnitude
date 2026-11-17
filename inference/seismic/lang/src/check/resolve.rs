@@ -2,8 +2,8 @@
 //! and explicit target coverage. One flat global namespace.
 
 use super::ir::{DefKind, Ownership, Predicate, WhereConjunct};
-use crate::checked::DiagnosticRule;
-use crate::expr::{AnyExpr, ExprArena, IntExpr, SymbolId};
+use crate::checked::{DiagnosticRule, ElementPredicate, ElementTerm};
+use crate::expr::{AnyExpr, BoolExpr, CmpOp, ExprArena, IntExpr, NodeView, SymbolId};
 use crate::ids::{CapabilityId, FamilyId, FunctionId, ProgramId};
 use crate::registry::{self, BackendName};
 use crate::span::{Diagnostic, Span};
@@ -22,6 +22,9 @@ pub(crate) struct Located {
 pub(crate) struct SigParam {
     pub name: String,
     pub ownership: Ownership,
+    /// How the parameter's binding reaches its elements
+    /// ([`ShapedHead::AwaitTensor`], [`ShapedHead::SlabTensor`]).
+    pub binding: crate::entry::PortBinding,
     pub ty: ValueType,
     pub span: Span,
 }
@@ -45,6 +48,7 @@ pub(crate) struct Sig {
     pub params: Vec<SigParam>,
     pub result: ValueType,
     pub predicates: Vec<WhereConjunct>,
+    pub element_predicates: Vec<ElementPredicate>,
     pub arena: ExprArena,
 }
 
@@ -57,6 +61,7 @@ pub(crate) struct BodySig {
     pub params: Vec<SigParam>,
     pub result: ValueType,
     pub predicates: Vec<WhereConjunct>,
+    pub element_predicates: Vec<ElementPredicate>,
 }
 
 impl BodySig {
@@ -101,27 +106,39 @@ impl Sig {
             .map(|parameter| SigParam {
                 name: parameter.name.clone(),
                 ownership: parameter.ownership.clone(),
+                binding: parameter.binding,
                 ty: transfer_type(&self.arena, &parameter.ty, &mut arena, &mut map),
                 span: parameter.span,
             })
             .collect();
         let result = transfer_type(&self.arena, &self.result, &mut arena, &mut map);
-        let predicates = self
-            .predicates
-            .iter()
-            .map(|conjunct| {
-                let mut transfer =
-                    |value| super::xfer::transfer_int(&self.arena, value, &mut arena, &mut map);
-                WhereConjunct {
+        let predicates =
+            self.predicates
+                .iter()
+                .map(|conjunct| WhereConjunct {
                     predicate: match conjunct.predicate {
-                        Predicate::NonNegative(value) => Predicate::NonNegative(transfer(value)),
-                        Predicate::Zero(value) => Predicate::Zero(transfer(value)),
-                        Predicate::NonZero(value) => Predicate::NonZero(transfer(value)),
+                        Predicate::NonNegative(value) => Predicate::NonNegative(
+                            super::xfer::transfer_int(&self.arena, value, &mut arena, &mut map),
+                        ),
+                        Predicate::Zero(value) => Predicate::Zero(super::xfer::transfer_int(
+                            &self.arena,
+                            value,
+                            &mut arena,
+                            &mut map,
+                        )),
+                        Predicate::NonZero(value) => Predicate::NonZero(super::xfer::transfer_int(
+                            &self.arena,
+                            value,
+                            &mut arena,
+                            &mut map,
+                        )),
+                        Predicate::Boolean(value) => Predicate::Boolean(
+                            super::xfer::transfer_bool(&self.arena, value, &mut arena, &mut map),
+                        ),
                     },
                     span: conjunct.span,
-                }
-            })
-            .collect();
+                })
+                .collect();
         (
             BodySig {
                 name: self.name.clone(),
@@ -139,6 +156,7 @@ impl Sig {
                 params,
                 result,
                 predicates,
+                element_predicates: self.element_predicates.clone(),
             },
             arena,
         )
@@ -194,6 +212,9 @@ pub(crate) struct Declared<'a> {
     pub family: FamilyId,
     pub elem_bindings: Vec<(String, Elem)>,
     pub body: &'a ast::Block,
+    /// The declaration this definition was resolved from (an `fn` or a
+    /// `lower`): its structure is the definition's own content.
+    pub declaration: &'a ast::Decl,
     pub file: usize,
     pub span: Span,
     pub name_span: Span,
@@ -340,6 +361,11 @@ impl NameCallGraph {
     /// after all of its callees), and one cycle of every recursive strongly
     /// connected component (L20). A recursion therefore never hides the
     /// definitions outside it.
+    /// The definitions `definition` may call.
+    pub(crate) fn callees(&self, definition: usize) -> &BTreeSet<usize> {
+        &self.callees[definition]
+    }
+
     pub(crate) fn bottom_up_order(&self) -> (Vec<usize>, Vec<RecursionCycle>) {
         let components = self.components();
         let mut blocked = vec![false; self.callees.len()];
@@ -580,6 +606,25 @@ pub(crate) fn shape_expr(
                 .expect("shape parameter lookup disagrees with contains");
             Ok(arena.int_symbol(shape_symbols[ordinal]))
         }
+        A::Call {
+            callee,
+            bindings,
+            args,
+        } if bindings.is_empty()
+            && args.len() == 2
+            && args.iter().all(|arg| arg.name.is_none())
+            && matches!(&callee.kind, A::Name(name) if name.name == "min" || name.name == "max") =>
+        {
+            let lhs = shape_expr(&args[0].value, shape_params, shape_symbols, arena)?;
+            let rhs = shape_expr(&args[1].value, shape_params, shape_symbols, arena)?;
+            Ok(
+                if matches!(&callee.kind, A::Name(name) if name.name == "min") {
+                    arena.int_min(lhs, rhs)
+                } else {
+                    arena.int_max(lhs, rhs)
+                },
+            )
+        }
         A::Name(n) => Err(Diagnostic::with_rule(
             DiagnosticRule::Resolution,
             n.span,
@@ -670,7 +715,7 @@ fn type_from_ast(
                 .is_some_and(|c| c.is_ascii_uppercase()) =>
             {
                 Err(Diagnostic::with_rule(
-DiagnosticRule::Type,
+                    DiagnosticRule::Type,
                     name.span,
                     format!(
                         "element parameter `{}` cannot be a scalar type: scalar values have a concrete dtype",
@@ -679,7 +724,7 @@ DiagnosticRule::Type,
                 ))
             }
             None => Err(Diagnostic::with_rule(
-DiagnosticRule::Resolution,
+                DiagnosticRule::Resolution,
                 name.span,
                 format!("unknown type `{}`", name.name),
             )),
@@ -692,7 +737,11 @@ DiagnosticRule::Resolution,
         }),
         TypeKind::Shaped { head, shape, elem } => {
             if shape.is_empty() {
-                return Err(Diagnostic::with_rule(DiagnosticRule::Type, t.span, "a tensor type needs a shape"));
+                return Err(Diagnostic::with_rule(
+                    DiagnosticRule::Type,
+                    t.span,
+                    "a tensor type needs a shape",
+                ));
             }
             let mut axes = Vec::new();
             for e in shape {
@@ -708,7 +757,7 @@ DiagnosticRule::Resolution,
                 let ty = type_from_ast(item, shape_params, shape_symbols, arena, elem_params)?;
                 if ty.is_void() {
                     return Err(Diagnostic::with_rule(
-DiagnosticRule::Type,
+                        DiagnosticRule::Type,
                         item.span,
                         "`void` is not a tuple component",
                     ));
@@ -726,12 +775,80 @@ DiagnosticRule::Type,
 
 /// Conjuncts of a `where` clause: comparisons, divisibility and equalities over
 /// shape parameters and integer literals.
+fn shape_bool(
+    e: &ast::Expr,
+    parameters: &[String],
+    symbols: &[SymbolId],
+    arena: &mut ExprArena,
+) -> Result<BoolExpr, Diagnostic> {
+    match &e.kind {
+        A::Bool(value) => Ok(arena.bool(*value)),
+        A::Unary {
+            op: ast::UnaryOp::Not,
+            expr,
+        } => {
+            let value = shape_bool(expr, parameters, symbols, arena)?;
+            Ok(arena.not(value))
+        }
+        A::Binary {
+            op: BinaryOp::And | BinaryOp::Or,
+            lhs,
+            rhs,
+        } => {
+            let l = shape_bool(lhs, parameters, symbols, arena)?;
+            let r = shape_bool(rhs, parameters, symbols, arena)?;
+            Ok(
+                if matches!(
+                    &e.kind,
+                    A::Binary {
+                        op: BinaryOp::And,
+                        ..
+                    }
+                ) {
+                    arena.and(l, r)
+                } else {
+                    arena.or(l, r)
+                },
+            )
+        }
+        A::Binary { op, lhs, rhs } => {
+            let comparison = match op {
+                BinaryOp::Eq => CmpOp::Eq,
+                BinaryOp::Ne => CmpOp::Ne,
+                BinaryOp::Ge => CmpOp::Ge,
+                BinaryOp::Gt => CmpOp::Gt,
+                BinaryOp::Le => CmpOp::Le,
+                BinaryOp::Lt => CmpOp::Lt,
+                _ => {
+                    return Err(Diagnostic::with_rule(
+                        DiagnosticRule::Type,
+                        e.span,
+                        "a where condition compares integer shape expressions",
+                    ));
+                }
+            };
+            let l = shape_expr(lhs, parameters, symbols, arena)?;
+            let r = shape_expr(rhs, parameters, symbols, arena)?;
+            Ok(arena.int_cmp(comparison, l, r))
+        }
+        _ => Err(Diagnostic::with_rule(
+            DiagnosticRule::Type,
+            e.span,
+            "a where condition is a boolean expression over integer shape parameters",
+        )),
+    }
+}
+
+/// The shape conjuncts of a `where` clause into `out`, and its comparisons
+/// of element operand recipes into `elements`.
 fn predicates_of(
     e: &ast::Expr,
     shape_params: &[String],
     shape_symbols: &[SymbolId],
+    elem_params: &[String],
     arena: &mut ExprArena,
     out: &mut Vec<WhereConjunct>,
+    elements: &mut Vec<ElementPredicate>,
 ) -> Result<(), Diagnostic> {
     match &e.kind {
         A::Binary {
@@ -739,8 +856,34 @@ fn predicates_of(
             lhs,
             rhs,
         } => {
-            predicates_of(lhs, shape_params, shape_symbols, arena, out)?;
-            predicates_of(rhs, shape_params, shape_symbols, arena, out)
+            predicates_of(lhs, shape_params, shape_symbols, elem_params, arena, out, elements)?;
+            predicates_of(rhs, shape_params, shape_symbols, elem_params, arena, out, elements)
+        }
+        A::Binary {
+            op: op @ (BinaryOp::Eq | BinaryOp::Ne),
+            lhs,
+            rhs,
+        } if operands_call(lhs).is_some() || operands_call(rhs).is_some() => {
+            elements.push(ElementPredicate {
+                equal: matches!(op, BinaryOp::Eq),
+                left: element_term(lhs, elem_params)?,
+                right: element_term(rhs, elem_params)?,
+            });
+            Ok(())
+        }
+        A::Binary {
+            op: BinaryOp::Or, ..
+        }
+        | A::Unary {
+            op: ast::UnaryOp::Not,
+            ..
+        }
+        | A::Bool(_) => {
+            out.push(WhereConjunct {
+                predicate: Predicate::Boolean(shape_bool(e, shape_params, shape_symbols, arena)?),
+                span: e.span,
+            });
+            Ok(())
         }
         A::Binary { op, lhs, rhs } => {
             let l = shape_expr(lhs, shape_params, shape_symbols, arena)?;
@@ -748,12 +891,24 @@ fn predicates_of(
             let one = arena.int(1);
             let predicate = match op {
                 BinaryOp::Ge => Predicate::NonNegative(arena.int_sub(l, r)),
-                BinaryOp::Gt => { let d = arena.int_sub(l, r); Predicate::NonNegative(arena.int_sub(d, one)) },
+                BinaryOp::Gt => {
+                    let d = arena.int_sub(l, r);
+                    Predicate::NonNegative(arena.int_sub(d, one))
+                }
                 BinaryOp::Le => Predicate::NonNegative(arena.int_sub(r, l)),
-                BinaryOp::Lt => { let d = arena.int_sub(r, l); Predicate::NonNegative(arena.int_sub(d, one)) },
+                BinaryOp::Lt => {
+                    let d = arena.int_sub(r, l);
+                    Predicate::NonNegative(arena.int_sub(d, one))
+                }
                 BinaryOp::Eq => Predicate::Zero(arena.int_sub(l, r)),
                 BinaryOp::Ne => Predicate::NonZero(arena.int_sub(l, r)),
-                _ => return Err(Diagnostic::with_rule(DiagnosticRule::Type, e.span, "a `where` predicate is a conjunction of comparisons, divisibility and equalities over shape parameters")),
+                _ => {
+                    return Err(Diagnostic::with_rule(
+                        DiagnosticRule::Type,
+                        e.span,
+                        "a `where` predicate is a conjunction of comparisons, divisibility and equalities over shape parameters",
+                    ));
+                }
             };
             out.push(WhereConjunct {
                 predicate,
@@ -762,9 +917,44 @@ fn predicates_of(
             Ok(())
         }
         _ => Err(Diagnostic::with_rule(
-DiagnosticRule::Type,
+            DiagnosticRule::Type,
             e.span,
             "a `where` predicate is a conjunction of comparisons, divisibility and equalities over shape parameters",
+        )),
+    }
+}
+
+/// The argument of `operands(argument)`.
+fn operands_call(e: &ast::Expr) -> Option<&ast::Expr> {
+    match &e.kind {
+        A::Call {
+            callee,
+            bindings,
+            args,
+        } if matches!(&callee.kind, A::Name(name) if name.name == "operands")
+            && bindings.is_empty() =>
+        {
+            match args.as_slice() {
+                [arg] if arg.name.is_none() => Some(&arg.value),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// A side of an element predicate: `operands(E)` of an element parameter, or
+/// a constant.
+fn element_term(e: &ast::Expr, elem_params: &[String]) -> Result<ElementTerm, Diagnostic> {
+    match (&e.kind, operands_call(e).map(|argument| &argument.kind)) {
+        (A::Int(value), _) => Ok(ElementTerm::Constant(*value)),
+        (_, Some(A::Name(name))) if elem_params.contains(&name.name) => {
+            Ok(ElementTerm::Operands(name.name.clone()))
+        }
+        _ => Err(Diagnostic::with_rule(
+            DiagnosticRule::Type,
+            e.span,
+            "an element predicate compares `operands` of element parameters and constants",
         )),
     }
 }
@@ -837,18 +1027,72 @@ pub(crate) fn signature_of(
                     head: ShapedHead::MutTensor,
                     ..
                 } => Ownership::Exclusive,
+                TypeKind::Shaped {
+                    head: ShapedHead::HostTensor { write },
+                    ..
+                } => Ownership::Host { write: *write },
+                TypeKind::Shaped {
+                    head:
+                        ShapedHead::AwaitTensor { write: false }
+                        | ShapedHead::SlabTensor { write: false },
+                    ..
+                } => Ownership::Shared,
+                TypeKind::Shaped {
+                    head:
+                        ShapedHead::AwaitTensor { write: true }
+                        | ShapedHead::SlabTensor { write: true },
+                    ..
+                } => Ownership::Exclusive,
                 _ => Ownership::Value,
             }
         }
         let ownership = ownership(&p.ty);
+        // An awaited or slab port is a parameter of its own, so its binding
+        // is the parameter's.
+        fn binding(ty: &ast::TypeExpr) -> Option<(crate::entry::PortBinding, &'static str)> {
+            match &ty.kind {
+                TypeKind::Shaped {
+                    head: ShapedHead::AwaitTensor { .. },
+                    ..
+                } => Some((crate::entry::PortBinding::Awaited, "an awaited port")),
+                TypeKind::Shaped {
+                    head: ShapedHead::SlabTensor { .. },
+                    ..
+                } => Some((crate::entry::PortBinding::Slab, "a slab port")),
+                TypeKind::Tuple(parts) => parts.iter().find_map(binding),
+                _ => None,
+            }
+        }
+        let bound = binding(&p.ty);
+        if let (Some((_, port)), Ownership::Tuple(_)) = (bound, &ownership) {
+            return Err(Diagnostic::with_rule(
+                DiagnosticRule::Ownership,
+                p.ty.span,
+                format!("{port} is a parameter of its own, never a tuple's part"),
+            ));
+        }
+        let binding = bound.map_or(crate::entry::PortBinding::Ordinary, |(binding, _)| binding);
+        // The body never names a host port, so none is a tuple's part.
+        fn holds_host(ownership: &Ownership) -> bool {
+            match ownership {
+                Ownership::Host { .. } => true,
+                Ownership::Tuple(parts) => parts.iter().any(holds_host),
+                _ => false,
+            }
+        }
+        if matches!(ownership, Ownership::Tuple(_)) && holds_host(&ownership) {
+            return Err(Diagnostic::with_rule(
+                DiagnosticRule::Ownership,
+                p.ty.span,
+                "a host port is a parameter of its own, never a tuple's part",
+            ));
+        }
         if ownership == Ownership::Exclusive {
             if let ValueType::Tensor(tensor) = &ty {
                 if let Elem::Repr(representation) = &tensor.elem {
-                    if crate::registry::representation_info(*representation).access
-                        != crate::registry::RepresentationAccess::ReadWrite
-                    {
+                    if !crate::registry::record_writable(*representation) {
                         return Err(Diagnostic::with_rule(
-DiagnosticRule::Type,
+                            DiagnosticRule::Type,
                             p.ty.span,
                             format!(
                                 "representation `{}` is decode-only and cannot be a mutable tensor parameter",
@@ -862,6 +1106,7 @@ DiagnosticRule::Type,
         params.push(SigParam {
             name: p.name.name.clone(),
             ownership,
+            binding,
             ty,
             span: p.name.span,
         });
@@ -869,7 +1114,11 @@ DiagnosticRule::Type,
     fn borrowed_result(ty: &ast::TypeExpr) -> bool {
         match &ty.kind {
             TypeKind::Shaped {
-                head: ShapedHead::SharedTensor | ShapedHead::MutTensor,
+                head: ShapedHead::SharedTensor
+                    | ShapedHead::MutTensor
+                    | ShapedHead::HostTensor { .. }
+                    | ShapedHead::AwaitTensor { .. }
+                    | ShapedHead::SlabTensor { .. },
                 ..
             } => true,
             TypeKind::Tuple(parts) => parts.iter().any(borrowed_result),
@@ -899,13 +1148,16 @@ DiagnosticRule::Type,
     };
     collect_body_element_parameters(body, &mut elem_params);
     let mut predicates = Vec::new();
+    let mut element_predicates = Vec::new();
     for e in s.predicates.iter().chain(extra_predicates) {
         predicates_of(
             e,
             &shape_params,
             &shape_symbols,
+            &elem_params,
             &mut arena,
             &mut predicates,
+            &mut element_predicates,
         )?;
     }
     let dimensions = shape_params
@@ -913,9 +1165,9 @@ DiagnosticRule::Type,
         .zip(&shape_symbols)
         .map(|(name, &symbol)| {
             let value = arena.int_symbol(symbol);
-            let admits_zero = predicates.iter().any(|conjunct: &WhereConjunct| {
-                matches!(conjunct.predicate, Predicate::NonNegative(expression) if super::prove::same(&arena, expression, value))
-            });
+            let admits_zero = predicates
+                .iter()
+                .any(|conjunct: &WhereConjunct| states_zero(&arena, conjunct.predicate, value));
             SignatureDimension {
                 name: name.clone(),
                 symbol,
@@ -930,8 +1182,42 @@ DiagnosticRule::Type,
         params,
         result,
         predicates,
+        element_predicates,
         arena,
     })
+}
+
+/// Whether a lowered `where` conjunct admits `value` zero: `value >= 0`, or
+/// `value == 0` as the conjunct or in any branch of a disjunction, a
+/// declaration that states a case of zero admitting it as `>= 0` does.
+fn states_zero(arena: &ExprArena, predicate: Predicate, value: IntExpr) -> bool {
+    match predicate {
+        Predicate::NonNegative(expression) | Predicate::Zero(expression) => {
+            super::prove::same(arena, expression, value)
+        }
+        Predicate::NonZero(_) => false,
+        Predicate::Boolean(condition) => bool_states_zero(arena, condition, value),
+    }
+}
+
+fn bool_states_zero(arena: &ExprArena, condition: BoolExpr, value: IntExpr) -> bool {
+    match arena.view(condition.into()) {
+        NodeView::Binary {
+            op: crate::expr::BinaryOp::And | crate::expr::BinaryOp::Or,
+            lhs: AnyExpr::Bool(lhs),
+            rhs: AnyExpr::Bool(rhs),
+        } => bool_states_zero(arena, lhs, value) || bool_states_zero(arena, rhs, value),
+        NodeView::Cmp {
+            op: CmpOp::Eq,
+            lhs: AnyExpr::Int(lhs),
+            rhs: AnyExpr::Int(rhs),
+        } => {
+            let is_zero = |e: IntExpr| super::prove::constant(arena, e) == Some(0);
+            (super::prove::same(arena, lhs, value) && is_zero(rhs))
+                || (is_zero(lhs) && super::prove::same(arena, rhs, value))
+        }
+        _ => false,
+    }
 }
 
 /// Element parameters are implicit lexical binders wherever a tensor element
@@ -990,7 +1276,16 @@ fn collect_body_element_parameters(block: &ast::Block, out: &mut Vec<String>) {
                 args,
             } => {
                 expr(callee, out);
-                for (_, value) in bindings {
+                for (parameter, value) in bindings {
+                    // Repack's destination is a representation even when it
+                    // appears only in an intermediate, not the signature.
+                    if matches!(&callee.kind, ast::ExprKind::Name(name) if name.name == "repack")
+                        && parameter.name == "U"
+                    {
+                        if let ast::ExprKind::Name(name) = &value.kind {
+                            element(name, out);
+                        }
+                    }
                     expr(value, out);
                 }
                 for argument in args {
@@ -1051,7 +1346,7 @@ fn reject_rank_zero_packed(ty: &ValueType, span: Span) -> Result<(), Diagnostic>
             if tensor.axes.is_empty() && matches!(tensor.elem, Elem::Repr(_)) =>
         {
             Err(Diagnostic::with_rule(
-DiagnosticRule::Type,
+                DiagnosticRule::Type,
                 span,
                 "a packed tensor must have at least one axis because packets run along the last axis",
             ))
@@ -1131,6 +1426,12 @@ fn contract_mismatch(a: &Sig, b: &Sig) -> Option<String> {
         return Some(format!(
             "parameter `{}` has different ownership than `{}` of an overlapping definition of `{}`",
             q.name, p.name, a.name
+        ));
+    }
+    if let Some((p, q)) = a.params.iter().zip(&b.params).find(|(p, q)| p.binding != q.binding) {
+        return Some(format!(
+            "parameter `{}` has a different binding ({:?}) than `{}` ({:?}) of an overlapping definition of `{}`",
+            q.name, q.binding, p.name, p.binding, a.name
         ));
     }
     if let Some((p, q)) = a
@@ -1368,6 +1669,7 @@ pub(crate) fn resolve<'a>(
                         family: FamilyId::new(program, 0),
                         elem_bindings: Vec::new(),
                         body: &f.body,
+                        declaration: decl,
                         file: *file,
                         span: f.span,
                         name_span: f.name.span,
@@ -1555,6 +1857,7 @@ pub(crate) fn resolve<'a>(
                     ),
                     elem_bindings,
                     body,
+                    declaration: decl,
                     file: *file,
                     span: l.span,
                     name_span: l.name.span,

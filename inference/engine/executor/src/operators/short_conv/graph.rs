@@ -1,24 +1,36 @@
-//! Short-convolution (LFM2) block graph: the normed `u = B⊙X | C`
+//! Short-convolution (LFM2, LFM3) block graph: the normed `u = B⊙X | C`
 //! projection rows, the gated convolution over the layer's window with its
-//! publication, and the output projection plus residual
+//! publication, and the output projection plus residual, or for a post-norm
+//! sublayer the projection normalized into the residual
 //! (`operators::short_conv`). Slots and versions follow the recurrent
 //! contract, so the block binds the recurrent control ports; its bank is the
 //! window alone.
 
-use crate::operators::gated_delta::graph::RecurrentControlPorts;
-use crate::programs::graph::{draft::GraphDraft, GraphError};
-use crate::programs::native_target_graph::{weight, WeightPort};
-use crate::{
-    native::ShortConvKernels, ModelLoadPlan, ShortConvBinding, ShortConvShape, StateResourcePlan,
+use crate::operators::gated_delta::graph::{RecurrentControlPorts, bank_ports, slab_banks};
+use crate::operators::{Join, RecurrentBank, split_bank};
+use crate::programs::graph::facts::Numbers;
+use seismic::Argument;
+use crate::operators::output::{CheckedPostNormEntries, PostNorm, PostNormShape, TailEntries, post_norm};
+use crate::programs::graph::{
+    GraphError,
+    draft::{ControlSource, GraphDraft},
 };
-use magnitude_family_contracts::{WeightKind, WeightScope};
+use crate::programs::native_constants::GraphConstant;
+use crate::programs::native_target_graph::{
+    PlannedWeights, WeightPort, packed_weight, scaled_weight, weight,
+};
+use crate::{
+    ShortConvBinding, ShortConvShape, StateResourcePlan, SublayerTail, native::ShortConvKernels,
+};
+use magnitude_family_contracts::{ShortConv, WeightKind, WeightScope};
 use magnitude_kernels::{attention_output, short_conv_project, short_conv_rows};
-use seismic::{Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
+use seismic::{Dim, Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
 
+/// A short-convolution block's entries; each projection's by row range.
 pub(crate) struct ShortConvGraphEntries<'a, G: GraphDraft + 'a> {
-    pub project: G::Binding<'a, short_conv_project::Entry>,
+    pub project: G::Ranged<'a, short_conv_project::Entry>,
     pub rows: G::Binding<'a, short_conv_rows::Entry>,
-    pub output: G::Binding<'a, attention_output::Entry>,
+    pub output: TailEntries<'a, G, attention_output::Entry>,
 }
 
 impl<'a> From<&'a ShortConvKernels> for ShortConvGraphEntries<'a, NativeGraph> {
@@ -26,16 +38,18 @@ impl<'a> From<&'a ShortConvKernels> for ShortConvGraphEntries<'a, NativeGraph> {
         Self {
             project: &kernels.project,
             rows: &kernels.rows,
-            output: &kernels.output,
+            output: (&kernels.output).into(),
         }
     }
 }
 
 /// Entry element assignments from the program binding.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CheckedShortConvEntries {
     project: [(&'static str, Element); 5],
     rows: [(&'static str, Element); 1],
     output: [(&'static str, Element); 2],
+    post_norm: Option<CheckedPostNormEntries>,
 }
 
 impl CheckedShortConvEntries {
@@ -50,6 +64,14 @@ impl CheckedShortConvEntries {
             ],
             rows: [("A", binding.activation)],
             output: [("OW", binding.output), ("A", binding.activation)],
+            post_norm: match binding.tail {
+                SublayerTail::Residual => None,
+                SublayerTail::PostNorm { norm, .. } => Some(CheckedPostNormEntries::new(
+                    binding.output,
+                    binding.activation,
+                    norm,
+                )),
+            },
         }
     }
 
@@ -57,85 +79,162 @@ impl CheckedShortConvEntries {
         ShortConvGraphEntries {
             project: &self.project,
             rows: &self.rows,
-            output: &self.output,
+            output: match &self.post_norm {
+                None => TailEntries::Residual(&self.output[..]),
+                Some(post_norm) => TailEntries::PostNorm(post_norm.entries()),
+            },
         }
     }
 }
 
-/// One short-convolution block at one graph class.
-pub(crate) struct ShortConvBlock {
-    pub rows: u64,
-    pub slots: u64,
-    pub slab_banks: u32,
-    pub shape: ShortConvShape,
+/// What decides a short-convolution block's graph beside its entries: no
+/// model number. Its reals `R` (`RecurrentTopology`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ShortConvTopology<R = Argument<f64>> {
     /// The input norm's epsilon.
-    pub epsilon: f32,
-    /// Index of this layer's window in the store's recurrent components.
-    pub component_index: usize,
+    pub epsilon: R,
+    /// The post-norm tail's reals; none for a residual tail.
+    pub post_norm: Option<PostNorm<R>>,
+    /// The element of the layer's window.
+    pub window: [Element; 1],
+    /// How the graph takes its launch's slot tables.
+    pub controls: ControlSource,
+}
+
+impl<R> Numbers<R> for ShortConvTopology<R> {
+    type Of<E> = ShortConvTopology<E>;
+    fn map<E>(self, f: &mut impl FnMut(R) -> E) -> ShortConvTopology<E> {
+        ShortConvTopology {
+            epsilon: f(self.epsilon),
+            post_norm: self.post_norm.map(|post_norm| post_norm.map(&mut *f)),
+            window: self.window,
+            controls: self.controls,
+        }
+    }
+}
+
+/// The numbers of one short-convolution block at one graph class.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ShortConvBlock<D = Dim> {
+    pub rows: D,
+    pub slots: D,
+    pub shape: ShortConvShape<D>,
+    /// The layer's window, also its tape.
+    pub bank: RecurrentBank<D, 1>,
+}
+
+impl<D> Numbers<D> for ShortConvBlock<D> {
+    type Of<E> = ShortConvBlock<E>;
+    fn map<E>(self, f: &mut impl FnMut(D) -> E) -> ShortConvBlock<E> {
+        ShortConvBlock {
+            rows: f(self.rows),
+            slots: f(self.slots),
+            shape: self.shape.map(f),
+            bank: self.bank.map(f),
+        }
+    }
+}
+
+/// The topology and numbers of the short-convolution block of `conv` over a
+/// `hidden`-wide residual at a class of `rows` rows and `slots` slots, its
+/// window `state`'s component `component_index`, with `post_norm`'s reals
+/// where its output joins the residual through a post-norm.
+pub(crate) fn split(
+    conv: &ShortConv,
+    hidden: u64,
+    rows: u64,
+    slots: u64,
+    epsilon: f32,
+    post_norm: Option<PostNorm<f64>>,
+    state: &StateResourcePlan,
+    component_index: usize,
+    controls: ControlSource,
+) -> Result<(ShortConvTopology<f64>, ShortConvBlock<u64>), GraphError> {
+    let (window, bank) = split_bank(state, component_index)?;
+    Ok((
+        ShortConvTopology {
+            epsilon: f64::from(epsilon),
+            post_norm,
+            window,
+            controls,
+        },
+        ShortConvBlock {
+            rows,
+            slots,
+            shape: ShortConvShape::of(hidden, conv).map_err(|error| error.to_string())?,
+            bank,
+        },
+    ))
 }
 
 pub(crate) fn short_conv<'a, G: GraphDraft + 'a>(
     graph: &mut G,
     kernels: ShortConvGraphEntries<'a, G>,
-    state: &StateResourcePlan,
-    load: &ModelLoadPlan,
+    topology: &ShortConvTopology,
+    block: &ShortConvBlock,
+    weights: &(impl PlannedWeights + ?Sized),
     scope: WeightScope,
-    weights: &mut Vec<(WeightPort, NativePort)>,
-    weight_scale: &WorkflowTensor,
+    ports: &mut Vec<(WeightPort, NativePort)>,
+    constants: &mut Vec<GraphConstant>,
     hidden: &WorkflowTensor,
-    block: ShortConvBlock,
+    join: &Join,
 ) -> Result<(WorkflowTensor, NativePort, RecurrentControlPorts), GraphError> {
-    let shape = block.shape;
-    let mut weight = |graph: &mut G, kind| weight(graph, load, scope, kind, weights);
+    let shape = &block.shape;
+    let mut scaled =
+        |graph: &mut G, kind| scaled_weight(graph, weights, scope, kind, ports, constants);
+    let input_gate = scaled(graph, WeightKind::ShortConvInputGate)?;
+    let output_gate = scaled(graph, WeightKind::ShortConvOutputGate)?;
+    let value = scaled(graph, WeightKind::ShortConvValue)?;
+    let output = packed_weight(
+        graph,
+        weights,
+        scope,
+        WeightKind::RecurrentOutput,
+        ports,
+        constants,
+    )?;
+    let mut weight = |graph: &mut G, kind| weight(graph, weights, scope, kind, ports);
     let input_norm = weight(graph, WeightKind::InputNorm)?;
-    let input_gate = weight(graph, WeightKind::ShortConvInputGate)?;
-    let output_gate = weight(graph, WeightKind::ShortConvOutputGate)?;
-    let value = weight(graph, WeightKind::ShortConvValue)?;
     let convolution = weight(graph, WeightKind::RecurrentConvolution)?;
-    let output_weight = weight(graph, WeightKind::RecurrentOutput)?;
 
-    let store = state.target_state();
-    let banks = u64::try_from(
-        store
-            .bank_capacity
-            .storage_total()
-            .map_err(|error| error.to_string())?,
-    )
-    .map_err(|_| "recurrent bank count exceeds u64")?;
-    let component = store
-        .recurrent_components
-        .get(block.component_index)
-        .ok_or("short convolution window component is absent")?;
-    let extents = std::iter::once(Ok(banks))
-        .chain(component.shape.iter().map(|extent| {
-            u64::try_from(*extent).map_err(|_| "recurrent state extent exceeds u64".to_owned())
-        }))
-        .collect::<Result<Vec<_>, String>>()?;
-    let tape_rows = extents
-        .get(1)
-        .and_then(|rows| shape.tape_rows(*rows))
+    let [mut window] = bank_ports(graph, &topology.window, &block.bank)?;
+    let [window_extents] = &block.bank.components;
+    let tape_rows = window_extents
+        .first()
+        .and_then(|rows| shape.tape_rows(rows))
         .ok_or("short convolution window is narrower than its taps")?;
-    let mut window = graph.port(Element::dense(component.dtype), &extents)?;
+    let slab_banks = slab_banks(&block.bank)?;
 
     let projection = graph
         .enqueue(
-            kernels.project,
-            &[shape.project_dimensions(block.rows).as_slice(), &[("BS", 0), ("CS", 0), ("XS", 0)]].concat(),
+            G::pick(kernels.project, &block.rows),
+            &[
+                shape.project_dimensions(&block.rows).as_slice(),
+                &[
+                    ("BS", input_gate.scale.extent.clone()),
+                    ("CS", output_gate.scale.extent.clone()),
+                    ("XS", value.scale.extent.clone()),
+                ],
+            ]
+            .concat(),
             short_conv_project::WorkflowArgs {
                 residual: hidden.into(),
                 norm: (&input_norm).into(),
-                b_weight: (&input_gate).into(),
-                c_weight: (&output_gate).into(),
-                x_weight: (&value).into(),
-                eps: block.epsilon,
-                b_scale: weight_scale.into(),
-                c_scale: weight_scale.into(),
-                x_scale: weight_scale.into(),
+                b_weight: (&input_gate.weight).into(),
+                c_weight: (&output_gate.weight).into(),
+                x_weight: (&value.weight).into(),
+                eps: topology.epsilon.f32(),
+                b_scale: (&input_gate.scale.tensor).into(),
+                c_scale: (&output_gate.scale.tensor).into(),
+                x_scale: (&value.scale.tensor).into(),
             },
         )?
         .value;
-    let dimensions = shape.rows_dimensions(block.rows, block.slots, banks, tape_rows);
-    let input = |graph: &mut G, name: &str| graph.input_for(kernels.rows, name, &dimensions);
+    let dimensions =
+        shape.rows_dimensions(&block.rows, &block.slots, &block.bank.banks, &tape_rows);
+    let input = |graph: &mut G, name: &str| {
+        graph.control_for(topology.controls, kernels.rows, name, &dimensions)
+    };
     let controls = RecurrentControlPorts {
         segments: input(graph, "segments")?,
         stop: input(graph, "stop")?,
@@ -156,46 +255,85 @@ pub(crate) fn short_conv<'a, G: GraphDraft + 'a>(
                 previous_tape: controls.previous_tape.tensor().into(),
                 following_bank: controls.following_bank.tensor().into(),
                 window: window.tensor_mut().into(),
-                slab_banks: block.slab_banks,
+                slab_banks,
             },
         )?
         .value;
-    // One output head of every channel.
-    let gated = gated.reshape(&[block.rows, 1, shape.channels]);
-    let output = graph
-        .enqueue(
-            kernels.output,
-            &shape.output_dimensions(block.rows),
-            attention_output::WorkflowArgs {
-                hidden: hidden.into(),
-                gated: (&gated).into(),
-                output_weight: (&output_weight).into(),
-            },
-        )?
-        .value;
-    Ok((output, window, controls))
+    let mixed = match (kernels.output, &topology.post_norm) {
+        (TailEntries::Residual(entry), None) => {
+            // One output head of every channel.
+            let gated = gated.reshape(&[block.rows.clone(), Dim::from(1u64), shape.channels.clone()]);
+            let inject = join.inject(graph, &block.rows, constants)?;
+            graph
+                .enqueue(
+                    G::pick(entry, &block.rows),
+                    &[
+                        shape.output_dimensions(&block.rows).as_slice(),
+                        &[
+                            ("OS", output.operands.scale.extent.clone()),
+                            ("OB", output.operands.bound.extent.clone()),
+                        ],
+                    ]
+                    .concat(),
+                    attention_output::WorkflowArgs {
+                        hidden: hidden.into(),
+                        inject: (&inject).into(),
+                        gated: (&gated).into(),
+                        output_weight: (&output.weight).into(),
+                        output_scale: (&output.operands.scale.tensor).into(),
+                        output_bound: (&output.operands.bound.tensor).into(),
+                    },
+                )?
+                .value
+        }
+        (TailEntries::PostNorm(entries), Some(tail)) => {
+            let norm = weight(graph, WeightKind::PostNorm)?;
+            let out_rows = GraphConstant::row_identity(graph, &block.rows, Some("M"))?;
+            let mixed = post_norm(
+                graph,
+                entries,
+                hidden,
+                (&gated).into(),
+                &output,
+                &norm,
+                out_rows.port().tensor(),
+                PostNormShape {
+                    rows: block.rows.clone(),
+                    out: block.rows.clone(),
+                    inputs: shape.channels.clone(),
+                    outputs: shape.hidden.clone(),
+                },
+                tail,
+            )?;
+            constants.push(out_rows);
+            mixed
+        }
+        _ => return Err("a short convolution's output entries disagree with its post-norm tail".into()),
+    };
+    Ok((mixed, window, controls))
 }
 
 #[cfg(test)]
 mod tests {
     use crate::programs::native_target_graph::checked_target_family_storage;
     use crate::{
-        resident_layout, source_element, ComponentSelection, ExecutionPath,
-        FeedForwardProgramSlot, MixerProgramSlot, ModelLoadPlan, PlannedMethod, ResourceCapacity,
-        ResourceLimits, ResourcePlanner,
+        ComponentSelection, ExecutionPath, FeedForwardProgramSlot, MixerProgramSlot, ModelLoadPlan,
+        PlannedMethod, ResourceCapacity, ResourceLimits, ResourcePlanner, resident_layout,
+        source_element,
     };
     use magnitude_artifacts::{
-        gguf::{Encoding, TensorDescriptor},
         ArtifactIdentity, ComponentFile, ComponentManifest, PackageIdentity, PackageManifest,
+        gguf::{Encoding, TensorDescriptor},
     };
     use magnitude_family_contracts::{
         ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder, DenseFfn,
         EmbeddingScale, EntryForm, ExitForm, ExitNorm, ExpertSelection, FamilyId, FeedForwardUp,
-        HeadNorm, HistoryDomain, HistoryReads, ImportTransform, InputNorm, InputSemantics,
-        KeyValue, MediaRowAttention, ModelDefinition, Operator, OutputForm, ResidualForm, RmsNorm,
-        Rotary, RotaryPair, RouteNormalization, RoutedFfn, Router, RouterInput, RowRange,
-        ScoreFunction, ShortConv, Sublayer, ValueNorm, ValueSource,
-        WeightDescriptor,
+        HeadNorm, HistoryRows, HistorySource, ImportTransform, InputNorm, InputSemantics,
+        MediaRowAttention, ModelDefinition, Operator, OutputForm, OutputProjection,
+        OutputRotary, ProjectedRows, QueryKeys, QueryProjection, ResidualForm, RmsNorm, Rotary,
+        RotaryLayout, RotaryPair, RouteNormalization, RoutedFfn, Router, RouterInput,
+        RowProducer, RowRange, RowRounding, TokenDomain,
+        ScoreFunction, ShortConv, Sublayer, ValueNorm, ValueSource, WeightDescriptor,
     };
     use magnitude_state::KvCodec;
     use seismic::BackendName;
@@ -205,8 +343,10 @@ mod tests {
     /// An LFM2-shaped decoder: short-convolution blocks (the fused `in_proj`
     /// split into B, C, X rows) with a dense and a routed feed-forward, and
     /// an ungated NEOX attention block with a routed feed-forward (sigmoid
-    /// scores ranked with a selection bias, no shared expert).
-    fn lfm2() -> (ModelDefinition, PackageManifest) {
+    /// scores ranked with a selection bias, no shared expert). With
+    /// `post_norm` the short convolutions normalize their output before the
+    /// residual add (LFM3's sandwich norm).
+    fn lfm2(post_norm: bool) -> (ModelDefinition, PackageManifest) {
         let mut tensors = Vec::new();
         let mut offset = 0;
         let mut tensor = |name: String, shape: Vec<u64>| {
@@ -215,7 +355,7 @@ mod tests {
             } else {
                 Encoding::F32
             };
-            let nbytes = source_element(encoding)
+            let nbytes = source_element(encoding, *shape.last().unwrap())
                 .unwrap()
                 .canonical_byte_len(&shape)
                 .unwrap();
@@ -255,7 +395,11 @@ mod tests {
                     convolution: tensor(name("shortconv.conv"), vec![HIDDEN, 3]),
                     output: tensor(name("shortconv.out_proj"), vec![HIDDEN, HIDDEN]),
                 })),
-                output: OutputForm::Residual,
+                output: if post_norm {
+                    OutputForm::PostNorm(rms(tensor(name("post_attention_norm"), vec![HIDDEN])))
+                } else {
+                    OutputForm::Residual
+                },
             }
         };
         let conv = [short_conv(0), short_conv(2)];
@@ -267,16 +411,23 @@ mod tests {
                     heads: 4,
                     kv_heads: 2,
                     width: 64,
-                    query: tensor(name("attn_q"), vec![HIDDEN, HIDDEN]),
+                    query: QueryProjection::Full(tensor(name("attn_q"), vec![HIDDEN, HIDDEN])),
+                    query_keys: QueryKeys::Direct,
                     gate: AttentionGate::None,
                     query_norm: HeadNorm::Rms(rms(tensor(name("attn_q_norm"), vec![64]))),
-                    key_value: KeyValue::Owned {
-                        key: tensor(name("attn_k"), vec![128, HIDDEN]),
-                        value: ValueSource::Projected(tensor(name("attn_v"), vec![128, HIDDEN])),
-                        key_norm: HeadNorm::Rms(rms(tensor(name("attn_k_norm"), vec![64]))),
-                        value_norm: ValueNorm::None,
-                        domain: HistoryDomain::Token,
-                    },
+                    history: vec![HistorySource::visible(HistoryRows::Own(
+                        RowProducer::Projected(ProjectedRows {
+                            key: tensor(name("attn_k"), vec![128, HIDDEN]),
+                            value: ValueSource::Projected(tensor(
+                                name("attn_v"),
+                                vec![128, HIDDEN],
+                            )),
+                            key_norm: HeadNorm::Rms(rms(tensor(name("attn_k_norm"), vec![64]))),
+                            value_norm: ValueNorm::None,
+                            domain: TokenDomain::Token,
+                            rounding: RowRounding::None,
+                        }),
+                    ))],
                     rotary: Rotary::Table {
                         pairs: (0..32)
                             .map(|pair| RotaryPair {
@@ -284,12 +435,17 @@ mod tests {
                                 amplitude: 1.0,
                             })
                             .collect(),
+                        layout: RotaryLayout::HALF_SPLIT_LEADING,
                         divisors: None,
+                        output: OutputRotary::None,
                     },
                     scale: 1.0 / 8.0,
-                    reads: HistoryReads::Visible,
                     media_rows: MediaRowAttention::Causal,
-                    output: tensor(name("attn_output"), vec![HIDDEN, HIDDEN]),
+                    sinks: None,
+                    output: OutputProjection::Full(tensor(
+                        name("attn_output"),
+                        vec![HIDDEN, HIDDEN],
+                    )),
                 })),
                 output: OutputForm::Residual,
             }
@@ -302,6 +458,7 @@ mod tests {
                     intermediate: 512,
                     up: FeedForwardUp::Gated {
                         activation: ActivationFunction::Silu,
+                        limit: None,
                         gate: tensor(name("ffn_gate"), vec![512, HIDDEN]),
                         up: tensor(name("ffn_up"), vec![512, HIDDEN]),
                     },
@@ -326,11 +483,13 @@ mod tests {
                         selection: ExpertSelection::TopK {
                             bias: Some(tensor(name("exp_probs_b"), vec![experts])),
                         },
+                        media_bias: None,
                         normalization: RouteNormalization::SumPlusEpsilon(1e-6),
                         scale: 1.0,
                     },
                     expert_up: FeedForwardUp::Gated {
                         activation: ActivationFunction::Silu,
+                        limit: None,
                         gate: tensor(name("ffn_gate_exps"), vec![experts, features, HIDDEN]),
                         up: tensor(name("ffn_up_exps"), vec![experts, features, HIDDEN]),
                     },
@@ -363,9 +522,7 @@ mod tests {
         let definition = ModelDefinition {
             family: FamilyId("lfm2-shaped".into()),
             artifact_identity: identity,
-            inputs: InputSemantics {
-                coordinate_axes: 1,
-            },
+            inputs: InputSemantics { coordinate_axes: 1 },
             decoder: Decoder {
                 activation_dtype: ActivationDType::BF16,
                 hidden: HIDDEN,
@@ -377,7 +534,6 @@ mod tests {
                     scale: EmbeddingScale::Unit,
                     norm: None,
                     per_layer: None,
-                    hash_routing: None,
                 },
                 blocks,
                 exit: ExitForm {
@@ -408,10 +564,17 @@ mod tests {
 
     /// Short-convolution blocks plan with a one-component bank each, and
     /// their graphs (the checked metadata route of the production fragment)
-    /// certify on every backend at every row class.
+    /// certify on every backend at every row class, joining the residual
+    /// directly or through a post-norm.
     #[test]
     fn short_convolution_blocks_plan_and_certify_on_every_backend() {
-        let (definition, manifest) = lfm2();
+        for post_norm in [false, true] {
+            short_convolution_blocks_plan_and_certify(post_norm);
+        }
+    }
+
+    fn short_convolution_blocks_plan_and_certify(post_norm: bool) {
+        let (definition, manifest) = lfm2(post_norm);
         definition.validate().unwrap();
         let limits = ResourceLimits {
             max_launch_rows: 64,
@@ -422,6 +585,8 @@ mod tests {
             max_images_per_request: 1,
             max_image_cells: 0,
             lookahead: false,
+            chain_capacity: std::num::NonZeroUsize::MIN,
+            conversations: std::num::NonZeroUsize::MIN,
         };
         for backend in [
             BackendName::Cpu,
@@ -437,11 +602,17 @@ mod tests {
                     vision: false,
                 },
                 resident_layout(ExecutionPath::Native, backend),
+                crate::PlannedMethod::Plain,
+                crate::planning::fixtures::LIMITS,
             )
             .unwrap();
             let plan = load.program_plan(&definition, KvCodec::Dense).unwrap();
             let blocks = plan.target().blocks();
-            assert!(matches!(blocks[0].mixer(), MixerProgramSlot::ShortConv(_)));
+            assert!(matches!(
+                blocks[0].mixer(),
+                MixerProgramSlot::ShortConv(binding)
+                    if matches!(binding.tail, crate::SublayerTail::PostNorm { .. }) == post_norm
+            ));
             assert!(matches!(
                 blocks[0].feed_forward(),
                 Some(FeedForwardProgramSlot::Dense(_))
@@ -461,6 +632,7 @@ mod tests {
                 ResourceCapacity {
                     domain_bytes: 16 * 1024 * 1024 * 1024,
                     tensor_operations: crate::TensorOperations::Absent,
+                    allocations: seismic::NativeAllocations::EXACT,
                 },
             )
             .unwrap();
@@ -476,13 +648,17 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
             // The decode step streams every block's windows and weights.
-            let demand = crate::assessment::DecodeDemand::from_model(
+            let demand = crate::assessment::demand::tests::demand_on(
                 &definition,
                 &load,
                 magnitude_state::KvCodec::Dense,
+                backend,
             )
             .unwrap();
-            assert!(demand.streamed_bytes > 0 && demand.launches > 0, "{backend:?}");
+            assert!(
+                crate::assessment::demand::tests::streamed(&demand) > 0,
+                "{backend:?}"
+            );
         }
     }
 }

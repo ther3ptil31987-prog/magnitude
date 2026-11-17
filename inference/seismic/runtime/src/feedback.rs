@@ -169,7 +169,7 @@ impl<T: TargetFamily, E: NativeExecutor<T>> Observer<T, E> {
                     registry::RepresentationKind::PackedRows(_) => {
                         return Err(ObservationError::Unsupported(
                             registry::ROW_LAYOUT_IS_NATIVE_ONLY.into(),
-                        ))
+                        ));
                     }
                 };
                 construction_temporary = construction_temporary.max(temporary);
@@ -452,10 +452,10 @@ impl<T: TargetFamily, E: NativeExecutor<T>> Observer<T, E> {
                 })? {
                     Comparison::Match => {}
                     Comparison::Mismatch(reason) => {
-                        return Err(ObservationError::IncorrectResult(format!("{reason:?}")))
+                        return Err(ObservationError::IncorrectResult(format!("{reason:?}")));
                     }
                     Comparison::Unsupported(reason) => {
-                        return Err(ObservationError::Unsupported(reason))
+                        return Err(ObservationError::Unsupported(reason));
                     }
                 }
             }
@@ -542,10 +542,11 @@ fn dense_input_value(
     random: &mut u64,
 ) -> Result<f64, ObservationError> {
     let bits = random_bits(random);
-    if matches!(dtype, DType::I32 | DType::U32 | DType::Bool) {
+    if matches!(dtype, DType::I32 | DType::U32 | DType::U64 | DType::Bool) {
         let (minimum, maximum) = match dtype {
             DType::I32 => (i32::MIN as f64, i32::MAX as f64),
             DType::U32 => (0.0, u32::MAX as f64),
+            DType::U64 => (0.0, (1u64 << 53) as f64),
             DType::Bool => (0.0, 1.0),
             _ => unreachable!(),
         };
@@ -608,6 +609,8 @@ fn packed_input(
                         }
                     }
                     registry::PlaneEncoding::Packed { .. }
+                    | registry::PlaneEncoding::Grid(_)
+                    | registry::PlaneEncoding::SignedLocal { .. }
                     | registry::PlaneEncoding::FloatCode { .. } => {
                         for byte in storage {
                             *byte = random_bits(random) as u8;
@@ -640,14 +643,13 @@ fn packed_input(
 
 fn call_error(error: CallError) -> ObservationError {
     match error {
-        CallError::Execution(ExecutionError::AllocationCapacity {
-            required,
-            available,
-        }) => ObservationError::Capacity {
-            required,
-            limit: available,
+        CallError::Execution(error) => match error.capacity_refusal() {
+            Some((required, available)) => ObservationError::Capacity {
+                required: required.into(),
+                limit: available,
+            },
+            None => ObservationError::Execution(error),
         },
-        CallError::Execution(error) => ObservationError::Execution(error),
         CallError::Invocation(InvocationError::AllocationCapacity {
             required,
             available,
@@ -685,7 +687,7 @@ fn scalar(
         _ => {
             return Err(ObservationError::InvalidCase(
                 "index sort cannot encode a scalar parameter".into(),
-            ))
+            ));
         }
     })
 }
@@ -699,6 +701,7 @@ fn encode(dtype: DType, value: f64, bytes: &mut Vec<u8>) {
         ),
         DType::I32 => bytes.extend_from_slice(&(value as i32).to_le_bytes()),
         DType::U32 => bytes.extend_from_slice(&(value as u32).to_le_bytes()),
+        DType::U64 => bytes.extend_from_slice(&(value as u64).to_le_bytes()),
         DType::Bool => bytes.push(u8::from(value != 0.0)),
     }
 }
@@ -712,10 +715,12 @@ fn validation_input_value(
     if case == ValidationCase::FiniteRandom {
         return dense_input_value(dtype, assumption, random);
     }
-    let integer = matches!(dtype, DType::I32 | DType::U32 | DType::Bool);
+    let integer = matches!(dtype, DType::I32 | DType::U32 | DType::U64 | DType::Bool);
     let default = match dtype {
         DType::I32 => (i32::MIN as f64, i32::MAX as f64),
         DType::U32 => (0.0, u32::MAX as f64),
+        // The largest U64 every input value carries exactly.
+        DType::U64 => (0.0, (1u64 << 53) as f64),
         DType::Bool => (0.0, 1.0),
         DType::F16 => (-65504.0, 65504.0),
         DType::BF16 => {
@@ -809,7 +814,7 @@ fn capture_invocation<T: TargetFamily, H>(
     termination: SourceTermination<Vec<DecodedValue>>,
     inputs: &[Input],
     live: u64,
-    mut read: impl FnMut(&TensorInner) -> Result<Vec<u8>, ExecutionError>,
+    mut read: impl FnMut(&TensorInner) -> Result<Vec<u8>, crate::api::TensorError>,
 ) -> Result<ObservedInvocation, ObservationError> {
     let outputs = match &termination {
         SourceTermination::Returned(values) => values.as_slice(),
@@ -855,7 +860,7 @@ fn capture_invocation<T: TargetFamily, H>(
         Ok(ObservedTensor {
             representation: t.representation(),
             shape: t.extents().iter().map(|n| *n as usize).collect(),
-            bytes: read(t).map_err(ObservationError::Execution)?,
+            bytes: read(t).map_err(tensor_error)?,
         })
     };
     let mut results = Vec::with_capacity(outputs.len());
@@ -863,7 +868,7 @@ fn capture_invocation<T: TargetFamily, H>(
         check_deadline(request)?;
         let value = match output {
             DecodedValue::Tensor(t) => ObservedValue::Tensor(tensor(t)?),
-            DecodedValue::Scalar(value) => match value {
+            DecodedValue::Scalar(value) => match value.value() {
                 ArgumentValue::Index(v) => ObservedValue::Index(SymbolValue::Nat(v.clone())),
                 ArgumentValue::Range { start, end } => ObservedValue::Range {
                     start: SymbolValue::Nat(start.clone()),
@@ -874,11 +879,12 @@ fn capture_invocation<T: TargetFamily, H>(
                 ArgumentValue::BF16(v) => ObservedValue::Scalar(SymbolValue::BF16(*v)),
                 ArgumentValue::I32(v) => ObservedValue::Scalar(SymbolValue::I32(*v)),
                 ArgumentValue::U32(v) => ObservedValue::Scalar(SymbolValue::U32(*v)),
+                ArgumentValue::U64(v) => ObservedValue::Scalar(SymbolValue::U64(*v)),
                 ArgumentValue::Bool(v) => ObservedValue::Scalar(SymbolValue::Bool(*v)),
                 _ => {
                     return Err(ObservationError::InvalidCase(
                         "non-value in completed scalar result".into(),
-                    ))
+                    ));
                 }
             },
         };
@@ -925,6 +931,7 @@ mod tests {
             }
             DType::I32 => i32::from_le_bytes(bytes.try_into().unwrap()) as f64,
             DType::U32 => u32::from_le_bytes(bytes.try_into().unwrap()) as f64,
+            DType::U64 => u64::from_le_bytes(bytes.try_into().unwrap()) as f64,
             DType::Bool => f64::from(bytes[0] != 0),
         }
     }
@@ -1062,8 +1069,8 @@ mod tests {
     #[test]
     #[ignore = "requires Metal for complete-entry numerical corpus execution"]
     fn metal_validation_collects_complete_mutated_input_state() {
-        let catalog = crate::devices::Catalog::discover().unwrap();
-        let device = catalog.open_backend(registry::BackendName::Metal).unwrap();
+        let devices = crate::devices::Devices::discover(&[]).unwrap();
+        let device = devices.open_backend(registry::BackendName::Metal).unwrap();
         let module = check_source(SourceSet::new(vec![SourceFile {
             path: "validation-state.seismic".into(),
             text: "fn update[N](x: &tensor[N] f32, output: &mut tensor[N] f32):\n    parallel for i in 0..N:\n        output[i] = x[i] + 1.0\n".into(),
@@ -1122,7 +1129,7 @@ mod tests {
                 reference_work_limit: 10000,
             };
             if corpus_case == ValidationCase::CORPUS[0].0 {
-                let before = device.memory_usage();
+                let before = device.allocated();
                 let mut wrong = case.clone();
                 wrong.values.bind(
                     prepared.kernel.schema().dimensions()[0].symbol,
@@ -1139,7 +1146,7 @@ mod tests {
                     Err(ObservationError::InvalidCase(_))
                 ));
                 assert_eq!(
-                    device.memory_usage(),
+                    device.allocated(),
                     before,
                     "rejected point releases admitted resources"
                 );
@@ -1154,7 +1161,7 @@ mod tests {
                     Err(ObservationError::DeadlineExpired)
                 ));
                 assert_eq!(
-                    device.memory_usage(),
+                    device.allocated(),
                     before,
                     "expired observation allocates no resources"
                 );
@@ -1169,7 +1176,7 @@ mod tests {
                     Err(ObservationError::Capacity { .. })
                 ));
                 assert_eq!(
-                    device.memory_usage(),
+                    device.allocated(),
                     before,
                     "capacity rejection retains no resources"
                 );
@@ -1193,8 +1200,8 @@ mod tests {
     #[test]
     #[ignore = "requires Metal for participant-local portable calls"]
     fn metal_feedback_inlines_portable_reference_calls_in_parallel_segments() {
-        let catalog = crate::devices::Catalog::discover().unwrap();
-        let device = catalog.open_backend(registry::BackendName::Metal).unwrap();
+        let devices = crate::devices::Devices::discover(&[]).unwrap();
+        let device = devices.open_backend(registry::BackendName::Metal).unwrap();
         let module = check_source(SourceSet::new(vec![SourceFile {
             path: "feedback-reduce.seismic".into(),
             text: "fn sum_values[W](row: tensor[W] f32) -> f32:\n    return reduce(row, 0, sum)\n\nfn row_sums[N,W](x: &tensor[N,W] f32) -> (tensor[N] f32, tensor[N,W] bf16):\n    let mut result = tensor[N] f32\n    let mut copied = tensor[N,W] bf16\n    parallel for row in 0..N:\n        let mut local = to_owned(x[row])\n        let mut total = f32(0.0)\n        for column in 0..W:\n            if local[column] > 0.0:\n                total = total + local[column]\n            else:\n                total = total - local[column]\n            local[column] = local[column] + 1.0\n        copied[row] = local\n        result[row] = sum_values(local) + total\n    return result, copied\n".into(),
@@ -1238,8 +1245,8 @@ mod tests {
     #[test]
     #[ignore = "requires Metal to validate many source checks within its argument limit"]
     fn metal_feedback_shares_status_storage_without_dropping_checks() {
-        let catalog = crate::devices::Catalog::discover().unwrap();
-        let device = catalog.open_backend(registry::BackendName::Metal).unwrap();
+        let devices = crate::devices::Devices::discover(&[]).unwrap();
+        let device = devices.open_backend(registry::BackendName::Metal).unwrap();
         let mut source = "fn checked_sum[N,W](x: &tensor[N,W] f32, indices: &tensor[N] i32) -> tensor[N] f32:\n    let mut result = tensor[N] f32\n    parallel for row in 0..N:\n        let mut total = f32(0.0)\n".to_string();
         for offset in 0..40 {
             source.push_str(&format!(
@@ -1316,8 +1323,8 @@ mod tests {
     #[test]
     #[ignore = "requires Metal for complete-entry packed gather replay"]
     fn metal_feedback_observes_checked_content_addressing_of_packed_inputs() {
-        let catalog = crate::devices::Catalog::discover().unwrap();
-        let device = catalog.open_backend(registry::BackendName::Metal).unwrap();
+        let devices = crate::devices::Devices::discover(&[]).unwrap();
+        let device = devices.open_backend(registry::BackendName::Metal).unwrap();
         let module = check_source(SourceSet::new(vec![SourceFile {
             path: "feedback-gather.seismic".into(),
             text: "fn gather[M,V,D](table: &tensor[V,D] Q, indices: &tensor[M] i32) -> tensor[M,D] f32:\n    let mut result = tensor[M,D] f32\n    parallel for row in 0..M:\n        parallel for col in 0..D:\n            result[row,col] = f32(table[indices[row],col])\n    return result\n".into(),
@@ -1371,10 +1378,10 @@ mod tests {
     #[test]
     #[ignore = "requires CPU native compilation"]
     fn ordinary_and_trial_binding_preserve_tensor_device_identity() {
-        let catalog = crate::devices::Catalog::discover().unwrap();
-        let device = catalog.open_backend(registry::BackendName::Cpu).unwrap();
-        let foreign_catalog = crate::devices::Catalog::discover().unwrap();
-        let foreign = foreign_catalog
+        let devices = crate::devices::Devices::discover(&[]).unwrap();
+        let device = devices.open_backend(registry::BackendName::Cpu).unwrap();
+        let foreign_devices = crate::devices::Devices::discover(&[]).unwrap();
+        let foreign = foreign_devices
             .open_backend(registry::BackendName::Cpu)
             .unwrap();
         assert_ne!(device.kind.identity(), foreign.kind.identity());
@@ -1444,8 +1451,8 @@ mod tests {
     }
 
     fn measures_without_profile(backend: registry::BackendName, continuation: bool) {
-        let catalog = crate::devices::Catalog::discover().unwrap();
-        let device = catalog
+        let devices = crate::devices::Devices::discover(&[]).unwrap();
+        let device = devices
             .open_backend(backend)
             .expect("hardware qualification needs the requested backend");
         let profile_is_absent = || match &device.kind {

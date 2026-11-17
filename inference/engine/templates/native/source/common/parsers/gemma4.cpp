@@ -377,8 +377,9 @@ common_chat_params common_chat_params_init_gemma4(const common_chat_template &  
                                                          const autoparser::generation_params & inputs) {
     common_chat_params data;
 
-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
-    data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs);
+    auto rendered          = common_chat_template_render_prompt(tmpl, inputs);
+    data.prompt            = std::move(rendered.prompt);
+    data.generation_prompt = std::move(rendered.generation_prompt);
 
     if (inputs.add_generation_prompt && string_ends_with(data.prompt, "<turn|>\n")) {
         // This may happen if the model generates content + tool_call, the
@@ -422,14 +423,25 @@ common_chat_params common_chat_params_init_gemma4(const common_chat_template &  
     auto has_response_format = !inputs.json_schema.is_null() && inputs.json_schema.is_object();
     auto include_grammar     = has_response_format || (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE);
     auto extract_reasoning   = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
+    auto callable            = !has_response_format && has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
 
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
         auto start = p.rule("start", p.optional(p.literal("<|turn>model\n")));
 
+        // The tool grammar ends the text before the calls at the first call
+        // opener, inside a thought or not, so with callable tools a call
+        // opener also closes the thought it interrupts. A thought read past
+        // it would take in the call, then end at a `<channel|>` the call's
+        // arguments contain and read the rest of the call as content. Unless
+        // a call is required, the grammar lets the output end anywhere before
+        // the calls, so the end of output closes the thought too.
+        auto thought_text  = callable ? p.until_one_of({"<channel|>", "<|tool_call>"}) : p.until("<channel|>");
+        auto thought_close = callable ? p.literal("<channel|>") | p.peek(p.literal("<|tool_call>")) | p.end()
+                                      : p.literal("<channel|>");
         if (extract_reasoning) {
-            p.rule("thought", p.literal("<|channel>thought") + p.space() + p.reasoning(p.until("<channel|>")) + p.literal("<channel|>"));
+            p.rule("thought", p.literal("<|channel>thought") + p.space() + p.reasoning(thought_text) + thought_close);
         } else {
-            p.rule("thought", p.content(p.literal("<|channel>thought") + p.space() + p.until("<channel|>") + p.literal("<channel|>")));
+            p.rule("thought", p.content(p.literal("<|channel>thought") + p.space() + thought_text + thought_close));
         }
 
         auto consume_empty_channels = p.gbnf(p.zero_or_more(p.literal("<|channel>") + p.negate(p.literal("thought"))), "");
@@ -505,11 +517,10 @@ common_chat_params common_chat_params_init_gemma4(const common_chat_template &  
             auto content = p.rule("content", p.content(p.until_one_of({"<|channel>", "<channel|>", "<|tool_call>"})));
             auto message = p.rule("message", thought + content);
             // GBNF has no lookahead: rendered literally, `message*` overlaps
-            // the scan after it and a thought's text may hold a call opener,
-            // so text before the calls would read many ways. The scan alone
-            // admits the same text, thoughts included, up to the first call.
-            // A required call may follow only a thought, whose text ends
-            // where a call opens.
+            // the scan after it, so text before the calls would read many
+            // ways. The scan alone admits the same text, thoughts included,
+            // up to the first call. A required call may follow only a
+            // thought, whose text ends where a call opens.
             auto preamble = p.gbnf(p.zero_or_more(message) + scan_to_toolcall,
                 inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED
                     ? "(\"<|channel>thought\" space content \"<channel|>\")?"

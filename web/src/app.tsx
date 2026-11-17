@@ -1,1019 +1,494 @@
-/**
- * App root component — spec §9.2
- *
- * Wraps the component tree in DisplayViewControllerProvider.
- * Wires the display view controller, session list, composer, and panels.
- *
- * Boundary operations are members of useAgentClient() (client.Sessions.GetSession(input),
- * client.Agent.Interrupt); StreamDisplayView is consumed by the display view controller.
- * Local UI state uses plain atoms (spec §6.3).
- */
-import {
-  useCallback,
-  useMemo,
-  useRef,
-  useSyncExternalStore,
-  type ReactNode,
-} from "react"
-import { ListIcon, SidebarSimpleIcon } from "@phosphor-icons/react"
-import { Gear, NotePencil, SidebarSimple } from "@phosphor-icons/react"
-import { Cause, Option, Effect } from "effect"
-import {
-  useAtomValue,
-  useAtomSet,
-  useAtomMount,
-  Atom,
-  Result,
-} from "@effect-atom/atom-react"
-import {
-  type CommandContext,
-  DisplayViewControllerProvider,
-  useDisplayState,
-  useDisplayViewController,
-  useDisplayConnectionError,
-  useSelectedSessionId,
-  usePlatform,
-  useAgentClient,
-  useComposerState,
-  useSessionPreload,
-  useSessionActions,
-  useServiceLifecycle,
-  useLocalModels,
-  useModelSlots,
-  useModelConfig,
-  useProviderModelCatalog,
-  deriveCurrentLocalModel,
-  deriveLocalModelLoadActivity,
-  installedLocalModels,
-  localModelProviderModelId,
-  formatLocalModelDisplayName,
-  selectedSlotModel,
-  reasoningEffortControl,
-  formatReasoningEffort,
-  useActiveSessionStatuses,
-} from "@magnitudedev/client-common"
-import { SessionsSidebar } from "./components/sessions-sidebar"
-import { ChatTimeline } from "./components/chat-timeline"
-import { Composer } from "./components/composer"
-import {
-  FooterBar,
-  type FooterModelOptionsState,
-} from "./components/footer-bar"
-import { WorkspacePanel } from "./components/workspace-panel"
-import { WorkerDetailPanel } from "./components/worker-detail-panel"
-import { ContextUsageIndicator } from "./components/context-usage-indicator"
-import { SettingsCenter } from "./components/settings-center"
-import { ChatColumnPage } from "./components/chat-column-page"
-import {
-  selectedCwdAtom,
-  selectedProjectIdAtom,
-  selectedFilePathAtom,
-  bashModeAtom,
-  nextEscWillKillAllAtom,
-} from "@magnitudedev/client-common"
-import {
-  sidebarSearchAtom,
-  sidebarCollapsedAtom,
-  sidebarWidthAtom,
-  sidebarVisibleAtom,
-  settingsTabAtom,
-  workspacePanelEnteringAtom,
-  workspacePanelOpenAtom,
-  workspacePresentationAtom,
-} from "./state/web-atoms"
-import { addBrowserTab, addEmptyFileTab, changeWorkspaceProject, makeWorkspaceTabId } from "@/lib/workspace-tabs"
-import { useMenuActions } from "./hooks/use-menu-actions"
-import { DaemonConnectionError } from "./components/daemon-connection-error"
-import { AcnBootstrapScreen } from "./components/acn-bootstrap-screen"
+import { ChatPage } from "./components/chat"
+import { ErrorNotice, NoticeAction } from "./components/error-notice"
+import { SkeletonLine, ConnectionsSkeleton } from "./components/page-skeletons"
+import { ModelsSkeleton } from "./components/models/skeletons"
+import { pageLayout } from "./components/page-layout"
+import { ServingUsage } from "./components/serving-usage"
+import { setAppearancePreference, useAppearancePreference } from "./stores/appearance-store"
+import { Button, buttonVariants } from "./components/ui/button"
+import { Switch } from "./components/ui/switch"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./components/ui/select"
 import { MagnitudeMark } from "./components/magnitude-mark"
-import { Button } from "@/components/ui/button"
-import { Spinner } from "@/components/ui/spinner"
-import { Toaster } from "@/components/ui/toast"
-import { ActionTooltip, TooltipProvider } from "@/components/ui/tooltip"
-import { notify } from "@/lib/notifications"
-import { subscribeResponsive, getIsNarrow } from "./stores/responsive-store"
-import { useInitializeConversationPreferences } from "./stores/conversation-preferences"
 import {
-  useSlotProfiles,
-  findSlotProfile,
-  type SlotProfile,
-  type SlotProfiles,
+  ChatCircleIcon,
+  SidebarSimpleIcon,
+  ArrowUpRightIcon,
+  CubeIcon,
+  PlugIcon,
+  ChartBarIcon,
+  SlidersIcon,
+  XIcon,
+  MonitorIcon,
+  SunIcon,
+  MoonIcon,
+  FolderOpenIcon,
+  BookOpenIcon,
+} from "@phosphor-icons/react"
+import { CopyCommand } from "./components/copy-command"
+import { useEffect, useMemo, useState, type ReactNode } from "react"
+import { Atom, Result, useAtomValue, useAtomSet, useAtomMount } from "@effect-atom/atom-react"
+import { Cause, Effect, Option } from "effect"
+import { type ProviderModelId } from "@magnitudedev/sdk"
+import type { AppearancePreference } from "@magnitudedev/sdk/desktop-host"
+import { ServerSettingsFailed, type NetworkAccessChange, type NetworkBind } from "@magnitudedev/sdk"
+import { FolderPicker, choosePath, useNativeOpenPath } from "./components/folder-picker"
+import { SettingsGroup, SettingsRow } from "./components/settings-row"
+import {
+  activeLocalModel,
+  deriveHardwareRoles,
+  useAgentClient,
+  type ApplicationPage,
+  useLocalModels,
+  useLocalInferenceHardware,
+  formatStorageSize,
+  localModelConnectionOptions,
 } from "@magnitudedev/client-common"
-import {
-  isRoleId,
-  PRIMARY_SLOT_ID,
-  ProviderIdSchema,
-  ProviderModelCatalogLifecycle,
-  ReasoningEffortSchema,
-  ROLE_TO_SLOT,
-  SECONDARY_SLOT_ID,
-} from "@magnitudedev/sdk"
-import type { ServiceLifecycleState } from "@magnitudedev/client-common"
-import type { DisplayActor, SessionMetadata } from "@magnitudedev/sdk"
-import type { SlotId } from "@magnitudedev/sdk"
-import { registerWebCommands } from "./commands/register"
-registerWebCommands()
-function formatRoleLabel(role: string | null | undefined): string {
-  if (!role) return "Leader"
-  return role.charAt(0).toUpperCase() + role.slice(1)
-}
+import { appearanceReadError } from "./appearance"
+import { useNavigate, useServerPlatform, useSession } from "./session"
+import { useReconnectAttempt, useServiceObservation, type ServiceObservation } from "./service-view"
+import { signOut, useDisconnectWarning, useRemoteAccess, viewerPlatform } from "./remote-access"
+import { useNarrowViewport } from "./lib/viewport"
+import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "./components/ui/alert-dialog"
+import { SettingsStatus } from "./components/settings-status"
+import { HarnessConnections, type CommandModel } from "./components/harness-connections"
+import { HarnessSetupList } from "./components/harness-setup"
+import { OtherApps } from "./components/other-apps"
+import { ModelLocationsRow } from "./components/model-locations"
+import { HuggingFaceRow } from "./components/hugging-face"
+import { HostNotices } from "./components/host-notices"
+import { ModelsScreen } from "./components/models/models-screen"
+import { Explore } from "./components/models/explore"
+import { OnboardingScreen } from "./components/models/onboarding-screen"
+import { onThisComputer } from "./components/models/data"
+import { onboardingCompletedHere, recordOnboardingCompleted } from "./components/models/onboarding-record"
+import { useRecommendations } from "./components/models/recommendations"
+import { SidebarUpdatePill, SidebarUpdateProvider, useApplicationOwner, useApplicationUpdateActions, useApplicationUpdateObservation, useSidebarUpdate, type UpdateTransfer } from "./components/application-update"
 
-/**
- * Look up a slot profile for a given actor role.
- * Maps role → slot via ROLE_TO_SLOT, then finds the profile for that slot.
- */
-function findSlotProfileForRole(
-  profiles: SlotProfiles | null,
-  role: string | null | undefined
-): SlotProfile | null {
-  if (!profiles || !role || !isRoleId(role)) return null
-  const slotId =
-    ROLE_TO_SLOT[role] === "primary" ? PRIMARY_SLOT_ID : SECONDARY_SLOT_ID
-  return Option.getOrNull(findSlotProfile(profiles, slotId))
-}
-function useRootSlotProfile(slotProfiles: SlotProfiles | null): {
-  roleId: string
-  roleLabel: string
-  profile: SlotProfile | null
-} {
-  const rootRole = useDisplayState(
-    (state) => state.actors["root"]?.role ?? null
-  )
-  const roleId = rootRole ?? "leader"
-  return {
-    roleId,
-    roleLabel: formatRoleLabel(roleId),
-    profile: findSlotProfileForRole(slotProfiles, roleId),
-  }
-}
+const ALL_INTERFACES = "all"
+const inferenceUrl = (address: string, port: number) => `http://${address}:${port}/inference/v1`
+/** The exact command that moves an existing store; the root holds only hub/, locks/ and one JSON file. */
+const moveModelsCommand = (platform: string, from: string, to: string) => platform === "win32"
+  ? `robocopy "${from}" "${to}" /E /MOVE`
+  : `mv "${from}/"* "${to}/"`
+const pageNames: Record<ApplicationPage, string> = { chat: "Chat", models: "Models", connections: "Connections", usage: "Usage", settings: "Settings" }
+const pageIcons = { models: CubeIcon, chat: ChatCircleIcon, connections: PlugIcon, usage: ChartBarIcon, settings: SlidersIcon }
 
-/** Sessions sidebar container — session/project actions around the sidebar's own queries */
-function SessionsSidebarContainer(props?: {
-  overlay?: boolean
-  onCloseOverlay?: () => void
-  titlebarIntegrated?: boolean
-}): ReactNode {
+/** The Models page and its Explore models modal; a Hugging Face link opens Explore on that repository. */
+function ModelsPage() {
+  const session = useSession()
+  const linked = useAtomValue(session.addModelRequest)
+  const clearLinked = useAtomSet(useMemo(() => Atom.fn((_: void) => session.clearAddModelRequest), [session]))
+  const hardware = useLocalInferenceHardware()
+  const models = useLocalModels()
+  const [explore, setExplore] = useState<{ readonly open: boolean; readonly query: string }>({ open: false, query: "" })
+  const linkedQuery = Option.map(linked, request => request._tag === "HuggingFace" ? request.repository : request.query)
+  const open = explore.open || Option.isSome(linkedQuery)
+  const query = Option.getOrElse(linkedQuery, () => explore.query)
+  const memory = Result.isSuccess(hardware) ? deriveHardwareRoles(hardware.value).servingMemory : "Device"
+  const machine = Result.isSuccess(hardware) ? [...Option.toArray(hardware.value.productName), ...Option.toArray(hardware.value.processor)].join(" · ") : ""
+  const recommendations = useRecommendations(false, memory)
+  const owned = new Set(Result.isSuccess(models) ? models.value.models.filter(onThisComputer).map(model => String(model.modelId)) : [])
+  return <>
+    <ModelsScreen onExplore={next => setExplore({ open: true, query: next })} />
+    <Explore open={open} query={query} memory={memory} machine={machine} recommended={recommendations.offered.slice(0, 3).map(entry => entry.model)} measuring={recommendations.ready ? recommendations.measuring : { settled: 0, total: 0 }} families={recommendations.families} owned={owned}
+      setOpen={value => { setExplore(current => ({ ...current, open: value })); if (!value && Option.isSome(linked)) clearLinked() }}
+      setQuery={next => { if (Option.isSome(linked)) clearLinked(); setExplore({ open: true, query: next }) }} />
+  </>
+}
+function Connections({ serviceReady, selectedModel }: { serviceReady: boolean; selectedModel: Option.Option<ProviderModelId> }) {
+  const service = useSession()
+  const models = useLocalModels()
+  const commandModels = Result.isSuccess(models) ? localModelConnectionOptions(models.value.models) : []
+  const canConnect = serviceReady && commandModels.length > 0
+  const navigate = useNavigate()
+  const state = useAtomValue(service.application)
+  // The desktop app, its service, and the agents always share one computer and user, so it
+  // configures agents in place. A browser can't know where its viewer's agents run.
+  const desktop = Option.isSome(service.clientWindow)
+  // A desktop window serves its own loopback endpoint; a browser reaches the service at its own origin.
+  const apiOrigin = desktop
+    ? (Result.isSuccess(state) ? Option.some(`http://127.0.0.1:${new URL(state.value.endpoint).port}`) : Option.none<string>())
+    : Option.some(window.location.origin)
+  const platform = useServerPlatform()
+  const { remote } = useRemoteAccess()
   const client = useAgentClient()
-  const { startNewSession, resumeSession } = useSessionActions()
-  const selectedSessionId = useSelectedSessionId()
-  const activeSessionStatuses = useActiveSessionStatuses()
-  const settingsTab = useAtomValue(settingsTabAtom)
-  const setSettingsTab = useAtomSet(settingsTabAtom)
-  const selectedProjectId = useAtomValue(selectedProjectIdAtom)
-  const setSelectedCwd = useAtomSet(selectedCwdAtom)
-  const setSelectedProjectId = useAtomSet(selectedProjectIdAtom)
-
-  // Listen for __magnitude:focus-search custom event → focus the search input
-  const focusSearchAtom = useMemo(
-    () =>
-      Atom.make(
-        Effect.gen(function* () {
-          const handler = () => {
-            const input = document.getElementById("sidebar-search-input")
-            if (input) input.focus()
-          }
-          window.addEventListener("__magnitude:focus-search", handler)
-          yield* Effect.addFinalizer(() =>
-            Effect.sync(() =>
-              window.removeEventListener("__magnitude:focus-search", handler)
-            )
-          )
-        })
-      ),
-    []
-  )
-  useAtomMount(focusSearchAtom)
-  const archiveSession = useAtomSet(client.Sessions.ArchiveSession, {
-    mode: "promise",
-  })
-  const setSessionPinned = useAtomSet(client.Sessions.SetSessionPinned, { mode: "promise" })
-  const revealProject = useAtomSet(client.Projects.RevealProjectSource, { mode: "promise" })
-  const handleCompose = () => {
-    setSettingsTab(null)
-    startNewSession()
-    if (props?.overlay && props.onCloseOverlay) props.onCloseOverlay()
-  }
-  return (
-    <SessionsSidebar
-      liveStatuses={activeSessionStatuses}
-      onSelectSession={(session, project) => {
-        setSettingsTab(null)
-        setSelectedProjectId(project?.projectId ?? null)
-        setSelectedCwd(session.cwd)
-        resumeSession(session.sessionId)
-      }}
-      onArchiveSession={(session) => {
-        void archiveSession({ sessionId: session.sessionId }).then(() => {
-          if (session.sessionId !== selectedSessionId) return
-          startNewSession({ cwd: session.cwd, projectId: null })
-        }).catch(() => notify("error", "Could not archive this session."))
-      }}
-      onSetSessionPinned={(sessionId, pinned) => {
-        void setSessionPinned({ sessionId, pinned })
-          .catch(() => notify("error", `Could not ${pinned ? "pin" : "unpin"} this session.`))
-      }}
-      onCompose={handleCompose}
-      onRevealProject={(projectId) => {
-        void revealProject({ projectId })
-          .catch(() => notify("error", "Could not reveal this project folder."))
-      }}
-      onCreateProject={(project) => {
-        setSettingsTab(null)
-        startNewSession({ cwd: project.cwd, projectId: project.projectId })
-        props?.onCloseOverlay?.()
-      }}
-      onEditProject={(project) => {
-        if (selectedProjectId !== project.projectId) return
-        setSelectedCwd(project.cwd)
-      }}
-      onRemoveProject={(project, next) => {
-        if (selectedProjectId !== project.projectId) return
-        startNewSession(next
-          ? { cwd: next.cwd, projectId: next.projectId }
-          : { cwd: null, projectId: null })
-      }}
-      onOpenSettings={() => {
-        setSettingsTab("general")
-      }}
-      settingsTab={settingsTab}
-      onSettingsTabChange={(tab) => {
-        setSettingsTab(tab)
-        props?.onCloseOverlay?.()
-      }}
-      onCloseSettings={() => setSettingsTab(null)}
-      overlay={props?.overlay}
-      onCloseOverlay={props?.onCloseOverlay}
-      titlebarIntegrated={props?.titlebarIntegrated}
-    />
-  )
+  const network = useAtomValue(client.Configuration.GetNetworkAccess({})).result
+  const active = Result.isSuccess(models) ? Option.getOrUndefined(activeLocalModel(models.value))?.model.modelId : undefined
+  const defaultModel = commandModels.find(model => model.id === active)?.id ?? commandModels[0]?.id
+  return <>
+    {!serviceReady && <p className="mt-5 text-sm text-slate-500">{desktop ? "Configuration checks are available. Check the service in Settings before connecting a harness." : "Check the service in Settings before setting up an agent."}</p>}
+    {serviceReady && !canConnect && !Result.isInitial(models) && <ErrorNotice severity={Result.isFailure(models) ? "error" : "info"} title={Result.isFailure(models) ? "Couldn’t check available models" : "Download a model to connect an agent"} description={Result.isFailure(models) ? "Check the service in Settings." : "Choose a compatible model. It doesn’t need to be loaded."} className="mt-5" actions={!Result.isFailure(models) && <NoticeAction onClick={() => navigate("models")}>Open Models</NoticeAction>} />}
+    {desktop
+      ? <DesktopHarnessConnections canConnect={canConnect} models={commandModels} defaultModel={defaultModel} platform={platform} selectedModel={selectedModel} />
+      : Option.isSome(apiOrigin) && <HarnessSetupList defaultModel={defaultModel} origin={apiOrigin.value} remote={remote} platform={viewerPlatform()} />}
+    {Option.isSome(apiOrigin) && <OtherApps origin={apiOrigin.value} model={defaultModel} platform={remote ? viewerPlatform() : platform} remote={remote} networkAccess={Result.isSuccess(network) && network.value.enabled} onOpenSettings={() => navigate("settings")} />}
+  </>
 }
-
-/** WorkerDetailPanel container — read-only worker timeline */
-function WorkerDetailPanelContainer({
-  slotProfiles,
-}: {
-  slotProfiles: SlotProfiles | null
-}): ReactNode {
-  const { topForkId } = useDisplayViewController()
-  const actors = useDisplayState((state) => state.actors)
-  const tasks = useDisplayState((state) => state.tasks)
-  const actor = topForkId ? actors[topForkId] ?? null : null
-  const worker = topForkId ? deriveWorkerInfo(topForkId, actors) : null
-  const taskTitle = actor?.taskId
-    ? tasks?.byId[actor.taskId]?.title ?? null
-    : null
-  const profile = findSlotProfileForRole(slotProfiles, actor?.role)
-  const modelDisplayName = profile?.modelDisplayName ?? null
-  return (
-    <WorkerDetailPanel
-      forkId={topForkId}
-      worker={worker}
-      loadingTitle={taskTitle ?? undefined}
-      loadingSubtitle={modelDisplayName}
-    />
-  )
-}
-function WorkerDetailPageContainer({
-  slotProfiles,
-}: {
-  slotProfiles: SlotProfiles | null
-}): ReactNode {
-  const { topForkId, popFork } = useDisplayViewController()
-  const actors = useDisplayState((state) => state.actors)
-  const actor = topForkId ? actors[topForkId] ?? null : null
-  const worker = topForkId ? deriveWorkerInfo(topForkId, actors) : null
-  const profile = findSlotProfileForRole(slotProfiles, actor?.role)
-  const title = worker
-    ? `${formatRoleLabel(worker.role)}: ${worker.name}`
-    : "Worker"
-  return (
-    <ChatColumnPage
-      title={title}
-      backLabel="Back to session"
-      onBack={popFork}
-      actions={
-        actor ? (
-          <ContextUsageIndicator
-            context={actor.context}
-            tokenCap={profile?.contextWindow ?? null}
-            size={20}
-            strokeWidth={2}
-            showTokenLabel
-            tooltip="native"
-          />
-        ) : null
-      }
-    >
-      <WorkerDetailPanelContainer slotProfiles={slotProfiles} />
-    </ChatColumnPage>
-  )
-}
-function deriveWorkerInfo(
-  forkId: string,
-  actors: Record<string, DisplayActor>
-): {
-  forkId: string
-  role: string
-  name: string
-} | null {
-  const actor = actors[forkId]
-  if (!actor || actor.kind !== "worker") return null
-  return {
-    forkId,
-    role: actor.role,
-    name: actor.name,
-  }
-}
-
-function ComposerContainer({
-  docked = false,
-  footer,
-}: {
-  docked?: boolean
-  footer?: ReactNode
-}): ReactNode {
-  const platform = usePlatform()
-  const setBashMode = useAtomSet(bashModeAtom)
-  const setSettingsTab = useAtomSet(settingsTabAtom)
-  const setFilePath = useAtomSet(selectedFilePathAtom)
-  const sidebarVisible = useAtomValue(sidebarVisibleAtom)
-  const setSidebarVisible = useAtomSet(sidebarVisibleAtom)
-  const { startNewSession } = useSessionActions()
-  const sendRef = useRef<(text: string) => void>(() => {})
-  const slotsResult = useModelSlots()
-  const slots = Option.getOrNull(Result.value(slotsResult))
-  const currentModel = slots === null
-    ? null
-    : deriveCurrentLocalModel(Option.some(slots.slots.primary))
-  const disabledReason = currentModel?._tag === "NoSelection"
-    ? "Choose a model before sending"
-    : null
-  const commandContext: CommandContext = useMemo(
-    () => ({
-      resetConversation: () => startNewSession(),
-      showSystemMessage: (message: string) => notify("info", message),
-      exitApp: () => {
-        if (platform.quit) platform.quit()
-      },
-      openRecentChats: () => {
-        if (getIsNarrow() && !sidebarVisible) {
-          setSidebarVisible(true)
-        }
-        window.dispatchEvent(new CustomEvent("__magnitude:focus-search"))
-      },
-      enterBashMode: () => setBashMode(true),
-      activateSkill: (
-        skillName: string,
-        _skillPath: string | undefined,
-        args: string
-      ) => {
-        const content = args.trim()
-          ? `/${skillName} ${args.trim()}`
-          : `/${skillName}`
-        sendRef.current(content)
-      },
-      initProject: () => {
-        notify(
-          "info",
-          "Project initialization is not available in the web app yet."
-        )
-      },
-      openSettings: () => setSettingsTab("general"),
-      openModelMenu: (menu) => {
-        if (menu === "models" || menu === "catalog" || menu === "hardware") {
-          setSettingsTab(menu)
-        }
-      },
-      toggleAutopilot: () => {
-        notify("info", "Autopilot mode is not yet available in the web app.")
-      },
-    }),
-    [
-      startNewSession,
-      platform,
-      sidebarVisible,
-      setSidebarVisible,
-      setBashMode,
-      setSettingsTab,
-    ]
-  )
-  const composer = useComposerState(commandContext)
-  sendRef.current = (text: string) => composer.handleSend(text)
-  const handleMentionConfirm = useCallback(
-    (item: { path: string }) => {
-      setFilePath(item.path)
-    },
-    [setFilePath]
-  )
-  return (
-    <Composer
-      key={`${composer.sessionId ?? "draft"}:${composer.cwd ?? ""}`}
-      role={composer.roleLabel}
-      isStreaming={composer.isStreaming}
-      bashMode={composer.bashMode}
-      onSend={(text, mentions, uploads) => {
-        void composer.handleSend(text, {
-          mentions,
-          uploads,
-        })
-      }}
-      onAttachmentError={(message) => notify("error", message)}
-      onInterrupt={composer.handleInterrupt}
-      onRunBash={composer.handleRunBash}
-      onSlashCommand={composer.handleSlashCommand}
-      onToggleBashMode={() => composer.setBashMode((prev: boolean) => !prev)}
-      onMentionConfirm={handleMentionConfirm}
-      mentionClient={composer.mentionClient}
-      cwd={composer.cwd}
-      docked={docked}
-      disabledReason={disabledReason}
-      onDisabledAction={() => setSettingsTab("models")}
-      footer={footer}
-    />
-  )
-}
-
-/** FooterBar container */
-function FooterBarContainer({
-  slotProfiles,
-}: {
-  slotProfiles: SlotProfiles | null
-}): ReactNode {
-  const hasMessages = useDisplayState(
-    (state) => (state.timelines.root?.messages.order.length ?? 0) > 0
-  )
-  const context = useDisplayState(
-    (state) => state.actors["root"]?.context ?? null
-  )
-  const { profile } = useRootSlotProfile(slotProfiles)
-  const tokenCap = profile?.contextWindow ?? null
-  const bashMode = useAtomValue(bashModeAtom)
-  const nextEscWillKillAll = useAtomValue(nextEscWillKillAllAtom)
-  const localModelsResult = useLocalModels()
-  const slotsResult = useModelSlots()
-  const catalogResult = useProviderModelCatalog()
-  const modelConfig = useModelConfig()
-  const slots = Option.getOrNull(Result.value(slotsResult))
-  const currentModel = deriveCurrentLocalModel(
-    Option.fromNullable(slots?.slots.primary)
-  )
-  const selectedModel = Option.flatMap(
-    Option.all({
-      catalog: Result.value(catalogResult),
-      slots: Result.value(slotsResult),
-    }),
-    ({ catalog, slots }) => selectedSlotModel(catalog, slots, PRIMARY_SLOT_ID)
-  )
-  const thinkingOptions = Option.match(selectedModel, {
-    onNone: () => [],
-    onSome: ({ model }) => {
-      const control = reasoningEffortControl(model)
-      return control._tag === "Available" ? control.options : []
-    },
-  })
-  const thinkingLevel = thinkingOptions.length > 0 && profile?.reasoningEffort
-    ? formatReasoningEffort(profile.reasoningEffort)
-    : null
-  const localModels = Option.getOrNull(Result.value(localModelsResult))
-  const providerCatalog = Option.match(Result.value(catalogResult), {
-    onNone: () => ({ _tag: "Loading" as const, models: [] }),
-    onSome: (state) => ProviderModelCatalogLifecycle.match(state, {
-      Loading: () => ({ _tag: "Loading" as const, models: [] }),
-      Ready: ({ models }) => ({ _tag: "Ready" as const, models }),
-      Refreshing: ({ models }) => ({ _tag: "Loading" as const, models }),
-      Degraded: ({ models }) => ({ _tag: "Degraded" as const, models }),
-      Unavailable: () => ({ _tag: "Failed" as const, models: [] }),
-    }),
-  })
-  const modelOptions = Option.match(Result.value(localModelsResult), {
-    onNone: () => [],
-    onSome: (state) =>
-      installedLocalModels(state)
-        .flatMap((model) => {
-          const providerModelId = Option.getOrUndefined(localModelProviderModelId(model))
-          if (providerModelId === undefined) return []
-          const providerModel = providerCatalog.models.find((candidate) =>
-            candidate.providerId === "local"
-            && candidate.providerModelId === providerModelId)
-          // The compound picker commits model and reasoning atomically. A model
-          // is not selectable until its authoritative reasoning capabilities
-          // have arrived from the provider catalog.
-          if (providerModel === undefined) return []
-          const thinkingControl = reasoningEffortControl(providerModel)
-          return [
-            {
-              value: providerModelId,
-              label: formatLocalModelDisplayName(model),
-              thinkingOptions: thinkingControl._tag === "Available" ? thinkingControl.options : [],
-              defaultThinkingEffort: Option.getOrElse(
-                providerModel.capabilities.reasoning.defaultEffort,
-                () => ReasoningEffortSchema.make("none"),
-              ),
-            },
-          ]
-        })
-        .sort((left, right) => left.label.localeCompare(right.label)),
-  })
-  const modelOptionsState: FooterModelOptionsState =
-    Result.isFailure(localModelsResult) ||
-    Result.isFailure(catalogResult) ||
-    providerCatalog._tag === "Failed"
-      ? { _tag: "Failed", options: modelOptions }
-      : providerCatalog._tag === "Degraded"
-      ? { _tag: "Degraded", options: modelOptions }
-      : localModels === null ||
-        !localModels.preparation.discovery.complete ||
-        providerCatalog._tag === "Loading"
-      ? { _tag: "Loading", options: modelOptions }
-      : { _tag: "Ready", options: modelOptions }
-  const primarySlot = slots?.slots.primary
-  const selectedModelId =
-    primarySlot && primarySlot._tag !== "Unassigned"
-      ? primarySlot.selection.providerModelId
-      : null
-  const modelLabel =
-    currentModel._tag === "NoSelection"
-      ? "Choose model"
-      : currentModel.displayName
-  return (
-    <FooterBar
-      context={context}
-      showContext={hasMessages}
-      tokenCap={tokenCap}
-      model={modelLabel}
-      thinkingLevel={thinkingLevel}
-      thinkingEffort={profile?.reasoningEffort ?? null}
-      thinkingOptions={thinkingOptions}
-      modelOptionsState={modelOptionsState}
-      selectedModelId={selectedModelId}
-      onSelectionCommit={(providerModelId, reasoningEffort) => {
-        modelConfig.updateSlotSelection(PRIMARY_SLOT_ID, {
-          providerId: ProviderIdSchema.make("local"),
-          providerModelId,
-          reasoningEffort,
-        })
-      }}
-      onThinkingSelect={(effort) => {
-        modelConfig.updateSlotReasoning(PRIMARY_SLOT_ID, effort)
-      }}
-      bashMode={bashMode}
-      nextEscWillKillAll={nextEscWillKillAll}
-    />
-  )
-}
-function BottomDockContainer({
-  slotProfiles,
-}: {
-  slotProfiles: SlotProfiles | null
-}): ReactNode {
-  return (
-    <div className="mx-auto my-[14px] flex w-[calc(100%-24px)] max-w-[800px] shrink-0 flex-col">
-      <ComposerContainer
-        docked
-        footer={<FooterBarContainer slotProfiles={slotProfiles} />}
-      />
-    </div>
-  )
-}
-function ChatTitleBar({
-  onOpenSidebar,
-  onOpenWorkspacePanel,
-  workspacePanelExpanded = false,
-  workspacePanelAvailable,
-  desktop = false,
-  onCompose,
-  showTitle = true,
-}: {
-  onOpenSidebar?: () => void
-  onOpenWorkspacePanel: () => void
-  workspacePanelExpanded?: boolean
-  workspacePanelAvailable: boolean
-  desktop?: boolean
-  onCompose?: () => void
-  showTitle?: boolean
-}): ReactNode {
+/** One-click connections, for the desktop app only: it runs where the agents run. */
+function DesktopHarnessConnections({ canConnect, models, defaultModel, platform, selectedModel }: { canConnect: boolean; models: readonly CommandModel[]; defaultModel: ProviderModelId | undefined; platform: string; selectedModel: Option.Option<ProviderModelId> }) {
   const client = useAgentClient()
-  const selectedSessionId = useSelectedSessionId()
-  const displaySession = useDisplayState((state) => state.session)
-  const selectedSessionAtom = useMemo(
-    () =>
-      selectedSessionId
-        ? Atom.make((get) => get(client.Sessions.GetSession({ sessionId: selectedSessionId })).result)
-        : Atom.make(() => null),
-    [client, selectedSessionId]
-  )
-  const selectedSessionResult = useAtomValue(selectedSessionAtom)
-  const metadataTitle =
-    selectedSessionResult !== null && Result.isSuccess(selectedSessionResult)
-      ? (selectedSessionResult.value as SessionMetadata).title
-      : null
-  const streamedTitle =
-    displaySession.sessionId === selectedSessionId ? displaySession.title : null
-  const title = selectedSessionId
-    ? (streamedTitle ?? metadataTitle)?.trim() || "Untitled session"
-    : "New session"
-  const sidebarCollapsed = useAtomValue(sidebarCollapsedAtom)
-  const sidebarWidth = useAtomValue(sidebarWidthAtom)
-  const setSidebarCollapsed = useAtomSet(sidebarCollapsedAtom)
-  const settingsTab = useAtomValue(settingsTabAtom)
-  const setSettingsTab = useAtomSet(settingsTabAtom)
-  const workspacePanelButton = (
-    <ActionTooltip
-      label="Expand sidebar"
-      side="bottom"
-      trigger={
-        <span
-          className="inline-flex [-webkit-app-region:no-drag]"
-          tabIndex={!workspacePanelAvailable ? 0 : undefined}
-          aria-label={!workspacePanelAvailable ? "Expand sidebar" : undefined}
-        >
-          <Button variant="unstyled" size="unstyled" type="button"
-            onClick={onOpenWorkspacePanel}
-            disabled={!workspacePanelAvailable}
-            className="flex size-8 shrink-0 items-center justify-center rounded-md border-0 bg-transparent text-slate-600 hover:bg-slate-150 dark:text-slate-400 dark:hover:bg-slate-800"
-            aria-label="Expand sidebar"
-          ><SidebarSimpleIcon size={18} /></Button>
-        </span>
-      }
-    />
-  )
-  if (desktop) {
-    const titlebarActions = (
-      <>
-        <ActionTooltip
-          label="Settings"
-          side="bottom"
-          trigger={
-            <Button variant="unstyled" size="unstyled"
-              type="button"
-              onClick={() => {
-                if (settingsTab !== null) {
-                  setSettingsTab(null)
-                  return
-                }
-                setSidebarCollapsed(false)
-                setSettingsTab("general")
-              }}
-              className="flex size-8 shrink-0 items-center justify-center rounded-md border-0 bg-transparent text-slate-600 hover:bg-white aria-[current=page]:bg-slate-200 aria-[current=page]:text-blue-700 dark:text-slate-400 dark:hover:bg-slate-800 dark:aria-[current=page]:bg-slate-750 dark:aria-[current=page]:text-blue-400 [-webkit-app-region:no-drag]"
-              aria-label="Settings"
-              aria-current={settingsTab !== null ? "page" : undefined}
-            >
-              <Gear size={17} />
-            </Button>
-          }
-        />
-        <ActionTooltip
-          label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
-          side="bottom"
-          trigger={
-            <Button variant="unstyled" size="unstyled"
-              type="button"
-              onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
-              className="flex size-8 shrink-0 items-center justify-center rounded-md border-0 bg-transparent text-slate-600 hover:bg-white dark:text-slate-400 dark:hover:bg-slate-800 [-webkit-app-region:no-drag]"
-              aria-label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
-            >
-              <SidebarSimple size={18} />
-            </Button>
-          }
-        />
-        <ActionTooltip
-          label="New chat"
-          side="bottom"
-          trigger={
-            <Button variant="unstyled" size="unstyled"
-              type="button"
-              onClick={onCompose}
-              className="flex size-8 shrink-0 items-center justify-center rounded-md border-0 bg-transparent text-slate-600 hover:bg-white dark:text-slate-400 dark:hover:bg-slate-800 [-webkit-app-region:no-drag]"
-              aria-label="New chat"
-            >
-              <NotePencil size={18} />
-            </Button>
-          }
-        />
-      </>
-    )
-
-    return (
-      <div
-        className="relative h-11 shrink-0 bg-slate-50 dark:bg-slate-900 select-none [-webkit-app-region:drag]"
-        title={title}
-      >
-        {!sidebarCollapsed ? (
-          <div
-            className="absolute inset-y-0 left-0 flex items-center justify-end gap-1 border-r border-slate-200 bg-slate-100 px-3 dark:border-slate-800 dark:bg-slate-850"
-            style={{ width: sidebarWidth }}
-          >
-            {titlebarActions}
-          </div>
-        ) : (
-          <div className="ml-[env(titlebar-area-x,_0px)] flex h-full w-[env(titlebar-area-width,_100%)] items-center gap-1 px-3 mac:pl-[84px]">
-            {titlebarActions}
-            {showTitle ? (
-              <span className="ml-3 min-w-0 max-w-[60%] overflow-hidden text-ellipsis whitespace-nowrap font-sans text-[15px] font-medium text-slate-900 dark:text-slate-200">
-                {title}
-              </span>
-            ) : null}
-          </div>
-        )}
-        {showTitle && !sidebarCollapsed ? (
-          <span
-            className="absolute top-0 flex h-11 min-w-0 max-w-[60%] items-center overflow-hidden text-ellipsis whitespace-nowrap font-sans text-[15px] font-medium text-slate-900 dark:text-slate-200"
-            style={{ left: sidebarWidth + 16 }}
-          >
-            {title}
-          </span>
-        ) : null}
-        {!workspacePanelExpanded ? (
-          <div className="absolute inset-y-0 right-2 flex items-center">{workspacePanelButton}</div>
-        ) : null}
-      </div>
-    )
-  }
-  return (
-    <div
-      className="h-11 shrink-0 flex items-center px-4 bg-slate-50 dark:bg-slate-900 select-none"
-      title={title}
-    >
-      {onOpenSidebar && (
-        <ActionTooltip
-          label="Open sessions"
-          side="bottom"
-          trigger={
-            <Button variant="unstyled" size="unstyled"
-              type="button"
-              className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 w-8 !px-0 bg-transparent text-slate-600 dark:text-slate-400 border border-slate-300 dark:border-slate-750 hover:bg-slate-150 hover:text-slate-900 dark:hover:bg-slate-750 dark:hover:text-slate-200 shrink-0 mr-2.5"
-              aria-label="Open sessions"
-              onClick={onOpenSidebar}
-            >
-              <ListIcon size={17} />
-            </Button>
-          }
-        />
-      )}
-      <span className="min-w-0 max-w-[60%] overflow-hidden text-ellipsis whitespace-nowrap text-slate-900 dark:text-slate-200 font-sans text-[15px] font-medium">
-        {title}
-      </span>
-      {!workspacePanelExpanded ? <div className="ml-auto">{workspacePanelButton}</div> : null}
-    </div>
-  )
+  const rows = useAtomValue(client.Connections.WatchHarnessConnections({})).result
+  const connect = useAtomSet(client.Connections.ConnectHarness)
+  const disconnect = useAtomSet(client.Connections.DisconnectHarness)
+  const connecting = useAtomValue(client.Connections.ConnectHarness)
+  const disconnecting = useAtomValue(client.Connections.DisconnectHarness)
+  const busy = connecting.waiting || disconnecting.waiting
+  const error = !busy && firstFailure([connecting, disconnecting])
+  return <>
+    {error && Result.isFailure(error) && <ErrorNotice title={Result.isFailure(disconnecting) ? "Couldn’t disconnect this agent" : "Couldn’t connect this agent"} description="Check the agent’s configuration before trying again. Some changes may not have completed." className="mt-5" />}
+    {Result.isFailure(rows) ? <ErrorNotice title="Couldn’t check your connections" description="Connection status is unavailable. Magnitude will check again automatically." className="mt-5" />
+      : !Result.isSuccess(rows) ? <ConnectionsSkeleton />
+      : rows.value._tag === "Unavailable" ? <ErrorNotice title="Couldn’t check your connections" description="Magnitude can’t read the saved connection information. Check that its configuration is accessible." className="mt-5" />
+      : <HarnessConnections connections={rows.value.connections} busy={busy} canConnect={canConnect} models={models} defaultModel={defaultModel} platform={platform}
+          onConnect={harness => connect({ harness, model: selectedModel, installSkill: true })} onDisconnect={harness => disconnect({ harness })} />}
+  </>
 }
-
-/** Listen for __magnitude:interrupt-all custom event → Interrupt RPC with target: all */
-function useInterruptAllListener(): void {
+const firstFailure = (results: ReadonlyArray<Result.Result<unknown, unknown>>) => results.find((result): result is Result.Failure<unknown, unknown> => Result.isFailure(result) && !result.waiting)
+function ThemeRow() {
+  const appearance = useAppearancePreference()
+  const session = useSession()
+  const saveAppearance = useMemo(() => Atom.fn((preference: AppearancePreference) => session.saveAppearance(preference).pipe(
+    Effect.tap(() => Effect.sync(() => setAppearancePreference(preference))))), [session])
+  const save = useAtomSet(saveAppearance)
+  const saving = useAtomValue(saveAppearance)
+  const readError = useAtomValue(appearanceReadError)
+  return <SettingsRow label="Theme" alert={!saving.waiting && (Result.isFailure(saving) ? <ErrorNotice title="Your theme wasn’t saved" description="Your previous appearance setting is still in use." /> : readError ? <ErrorNotice title="Couldn’t read your saved theme" description="System appearance is being used for this window." /> : undefined)} control={
+    <div className="inline-flex rounded-md border border-slate-300 p-0.5 dark:border-slate-700" role="group" aria-label="Theme">
+      {(["system", "light", "dark"] as const).map(value => { const Icon = value === "system" ? MonitorIcon : value === "light" ? SunIcon : MoonIcon
+        return <Button key={value} size="sm" variant={appearance === value ? "secondary" : "ghost"} aria-pressed={appearance === value} disabled={saving.waiting} onClick={() => save(value)}><Icon />{value[0]!.toUpperCase() + value.slice(1)}</Button> })}
+    </div>} />
+}
+function LaunchAtLoginRow() {
   const client = useAgentClient()
-  const selectedSessionId = useSelectedSessionId()
-  const interruptMutation = useAtomSet(client.Agent.Interrupt)
-  const interruptAtom = useMemo(
-    () =>
-      Atom.make(
-        Effect.gen(function* () {
-          const handler = () => {
-            if (!selectedSessionId) return
-            interruptMutation({
-              sessionId: selectedSessionId,
-              target: {
-                _tag: "all",
-              },
-            })
-          }
-          window.addEventListener("__magnitude:interrupt-all", handler)
-          yield* Effect.addFinalizer(() =>
-            Effect.sync(() =>
-              window.removeEventListener("__magnitude:interrupt-all", handler)
-            )
-          )
-        })
-      ),
-    [selectedSessionId, interruptMutation]
-  )
-  useAtomMount(interruptAtom)
+  const { owner, supports } = useApplicationOwner()
+  const state = Result.flatMap(owner, value => Option.match(value.loginStartup, { onNone: () => Result.initial(), onSome: login => Result.success(login) }))
+  const setLaunchAtLogin = useAtomSet(client.Application.SetLaunchAtLogin)
+  const set = (enabled: boolean) => setLaunchAtLogin({ enabled })
+  const change = useAtomValue(client.Application.SetLaunchAtLogin)
+  if (Result.isSuccess(owner) && !supports("LaunchAtLogin")) return null
+  const current = Result.isSuccess(state) ? state.value : null
+  const enabled = current?._tag === "Enabled" || current?._tag === "RequiresApproval"
+  const hint = current?._tag === "Unavailable" ? current.message
+    : current?._tag === "RequiresApproval" ? "Allow Magnitude in your system login settings to finish enabling startup."
+    : "Starts in the background with its tray icon."
+  const alert = !change.waiting && Result.isFailure(change) ? <ErrorNotice title="Couldn’t update launch at login" description="Check Magnitude’s status in your system startup settings." /> : Result.isFailure(state) ? <ErrorNotice title="Couldn’t check launch at login" description="Magnitude can’t confirm whether it will open when you sign in." /> : undefined
+  return <SettingsRow label="Launch at login" hint={Result.isInitial(state) ? <SkeletonLine className="h-4 text-xs" width="160px" /> : hint} alert={alert}
+    control={current && <Switch aria-label="Launch at login" checked={enabled} disabled={current._tag === "Unavailable" || change.waiting} onCheckedChange={checked => set(checked)} />} />
+}
+function ModelStorageRow() {
+  const client = useAgentClient()
+  const settings = useAtomValue(client.Configuration.GetModelStorage({})).result
+  const save = useAtomSet(client.Configuration.SetModelStorage)
+  const saving = useAtomValue(client.Configuration.SetModelStorage)
+  const [choosing, setChoosing] = useState(false)
+  const busy = saving.waiting
+  const current = Result.isSuccess(settings) ? settings.value : null
+  const native = useNativeOpenPath()
+  const chooseFolder = choosePath(native, { title: "Choose a folder for downloaded models", defaultPath: current ? Option.some(current.path) : Option.none() }, path => save({ path: Option.some(path) }), () => setChoosing(true))
+  const failure = firstFailure([saving])
+  const refusal = failure ? Option.flatMap(Cause.failureOption(failure.cause), error => error instanceof ServerSettingsFailed ? Option.some(error.message) : Option.none()) : Option.none<string>()
+  return <>
+    <FolderPicker open={choosing} onOpenChange={setChoosing} initialPath={current ? Option.some(current.path) : Option.none()}
+      title="Choose a folder for downloaded models" description="Folders on the computer running Magnitude." confirmLabel="Use this folder"
+      onChoose={path => save({ path: Option.some(path) })} />
+    <SettingsRow label="Model storage" alert={!busy && failure ? <ErrorNotice title="The model folder wasn’t saved" description={Option.getOrElse(refusal, () => "Check that the folder is available and writable, then try again.")} /> : Result.isFailure(settings) ? <ErrorNotice title="Couldn’t read the model folder setting" description="The folder used by the running service has not been changed." /> : current && Option.isSome(current.warning) ? <ErrorNotice severity="warning" title="The saved model folder can’t be used" description="Magnitude is using the default folder instead. Choose a folder the Magnitude service can write to." /> : undefined}
+      hint={current ? <span className="block truncate" title={current.path}>Current path is <span className="text-slate-700 dark:text-slate-300" data-testid="model-storage-path">{current.path}</span>{current.source === "Default" && " (default)"}</span>  : Result.isInitial(settings) ? <SkeletonLine className="h-4 text-xs" width="220px" /> : undefined}
+      control={<>
+        {(current?.source === "Configured" || (current && Option.isSome(current.warning))) && <Button size="sm" variant="ghost" disabled={busy} onClick={() => save({ path: Option.none() })}>Use default</Button>}
+        <Button size="sm" variant="outline" disabled={!current || busy} onClick={chooseFolder}><FolderOpenIcon />Change…</Button>
+      </>} />
+  </>
+}
+function useRestartPending() {
+  const client = useAgentClient()
+  const storage = useAtomValue(client.Configuration.GetModelStorage({})).result
+  const network = useAtomValue(client.Configuration.GetNetworkAccess({})).result
+  const storageValue = Result.isSuccess(storage) ? storage.value : null
+  return { storageValue, storagePending: storageValue !== null && storageValue.path !== storageValue.active, networkPending: Result.isSuccess(network) && network.value.pending }
+}
+function RestartRequiredToast() {
+  const session = useSession()
+  const client = useAgentClient()
+  const platform = useServerPlatform()
+  const { storageValue, storagePending, networkPending } = useRestartPending()
+  const { supports } = useApplicationOwner()
+  const restartApplication = useAtomSet(client.Application.RestartApplication)
+  const disconnect = useDisconnectWarning()
+  const relaunch = () => disconnect.warn("Restart", () => restartApplication({}))
+  const relaunching = useAtomValue(client.Application.RestartApplication)
+  if (!storagePending && !networkPending) return null
+  const reason = storagePending && networkPending ? "Magnitude is still using the previous model folder and network settings."
+    : storagePending ? "Magnitude is still using the previous model folder." : "Magnitude is still using the previous network settings."
+  return <div className="fixed bottom-4 right-4 z-50 w-96 max-w-[calc(100vw-2rem)] rounded-lg bg-white shadow-md dark:bg-slate-850">
+    {disconnect.dialog}
+    <ErrorNotice severity={Result.isFailure(relaunching) && !relaunching.waiting ? "error" : "info"}
+      title={Result.isFailure(relaunching) && !relaunching.waiting ? "Magnitude couldn’t restart" : "Restart to apply your changes"}
+      description={supports("RestartService") ? reason : `${reason} Restart the Magnitude server to apply them.`}
+      actions={supports("RestartService") ? <NoticeAction disabled={relaunching.waiting} onClick={() => relaunch()}>Restart Magnitude</NoticeAction> : undefined}>
+      {storagePending && storageValue && <details className="mt-2 text-xs text-slate-600 dark:text-slate-400">
+        <summary className="w-fit cursor-pointer rounded py-0.5 hover:underline focus-visible:outline-2 focus-visible:outline-blue-500">Moving existing models</summary>
+        <p className="my-2">Existing downloads stay in the previous folder. To move them, quit Magnitude, run this command, then open Magnitude again.</p>
+        <CopyCommand command={moveModelsCommand(platform, storageValue.active, storageValue.path)} label="Copy move command" />
+      </details>}
+    </ErrorNotice>
+  </div>
 }
 
-/** Inner app — has display view + AgentClient context */
-function AppInner({
-  initialAcnLifecycle,
-}: {
-  readonly initialAcnLifecycle: ServiceLifecycleState
-}): ReactNode {
-  // Detect responsive mode (≤640px) — no useEffect, uses matchMedia store
-  const isNarrow = useSyncExternalStore(subscribeResponsive, getIsNarrow)
-  useMenuActions()
-  useInterruptAllListener()
-  const platform = usePlatform()
-  const acnLifecycle = useServiceLifecycle(initialAcnLifecycle)
-  if (acnLifecycle.state._tag !== "Ready") {
-    return (
-      <AcnBootstrapScreen
-        state={acnLifecycle.state}
-        onRetry={acnLifecycle.retry}
-        {...(platform.quit === undefined ? {} : { onQuit: platform.quit })}
-      />
-    )
-  }
-  return <AuthenticatedAppContent isNarrow={isNarrow} />
+function NetworkAccessRows() {
+  const client = useAgentClient()
+  const settings = useAtomValue(client.Configuration.GetNetworkAccess({})).result
+  const save = useAtomSet(client.Configuration.SetNetworkAccess)
+  const update = (change: Partial<NetworkAccessChange>) => save({ enabled: Option.none(), bind: Option.none(), requireApiKey: Option.none(), ...change })
+  const disconnect = useDisconnectWarning()
+  const updating = useAtomValue(client.Configuration.SetNetworkAccess)
+  const regenerate = useAtomSet(client.Configuration.RegenerateNetworkApiKey)
+  const regenerating = useAtomValue(client.Configuration.RegenerateNetworkApiKey)
+  const current = Result.isSuccess(settings) ? settings.value : null
+  // A container always serves on every interface with a key, set by its environment; Settings only shows it.
+  const managed = current?.container === true
+  const busy = updating.waiting || regenerating.waiting || managed
+  const failure = firstFailure([updating, regenerating])
+  const reachable = current?.enabled ? Option.getOrElse(current.bind, () => current.interfaces[0]?.address) : undefined
+  return <>
+    {disconnect.dialog}
+    <SettingsRow label="Network access" hint={current ? <>{managed ? "Set by the container: it accepts connections on every interface with an API key. MAGNITUDE_NETWORK_KEY sets the key and MAGNITUDE_ALLOWED_HOSTS adds host names. " : "Let other devices on your network use Magnitude for inference. "}<a href={managed ? "https://docs.magnitude.dev/installation/docker" : "https://docs.magnitude.dev/remote-server"} target="_blank" rel="noreferrer" className="inline-flex items-center gap-0.5 font-medium text-slate-700 hover:underline dark:text-slate-300">{managed ? "Docker guide" : "Remote server guide"}<ArrowUpRightIcon aria-hidden="true" className="size-3" /></a></> : Result.isInitial(settings) ? <SkeletonLine className="h-4 text-xs" width="240px" /> : undefined}
+      alert={!busy && failure ? <ErrorNotice title="Network settings weren’t saved" description="Your previous saved settings are still in use." /> : Result.isFailure(settings) ? <ErrorNotice title="Couldn’t read network settings" description="The running service’s network settings have not been changed." /> : current && Option.isSome(current.warning) ? <ErrorNotice severity="warning" title="The saved network address is invalid" description="All interfaces are selected. Choose an address below to save a valid setting." /> : undefined}
+      control={current && <Switch aria-label="Network access" checked={current.enabled} disabled={busy} onCheckedChange={checked => checked ? update({ enabled: Option.some(true) }) : disconnect.warn("TurnOffNetworkAccess", () => update({ enabled: Option.some(false) }))} />} />
+    {current?.enabled && <>
+      {!managed && <SettingsRow nested label="Address" hint={current.interfaces.length === 0 ? "No network interfaces were found." : "Which of this computer's addresses accepts connections."}
+        control={<Select items={[{ value: ALL_INTERFACES, label: "All interfaces" }, ...current.interfaces.map(entry => ({ value: entry.address, label: `${entry.address} (${entry.kind === "tailscale" ? "Tailscale" : entry.name})` }))]}
+          value={Option.getOrElse(current.bind, () => ALL_INTERFACES)} onValueChange={value => value === ALL_INTERFACES || value === null ? update({ bind: Option.some<NetworkBind>({ _tag: "AllInterfaces" }) }) : disconnect.warn("ChangeAddress", () => update({ bind: Option.some<NetworkBind>({ _tag: "Address", address: String(value) }) }))}>
+          <SelectTrigger aria-label="Network address" className="min-w-56"><SelectValue /></SelectTrigger>
+          <SelectContent>{[<SelectItem key={ALL_INTERFACES} value={ALL_INTERFACES}>All interfaces</SelectItem>, ...current.interfaces.map(entry => <SelectItem key={entry.address} value={entry.address}>{entry.address} ({entry.kind === "tailscale" ? "Tailscale" : entry.name})</SelectItem>)]}</SelectContent>
+        </Select>} />}
+      <SettingsRow nested label="API key" hint={current.requireApiKey ? "Other devices must send this key as a Bearer token." : "Other devices can connect without a key. Only do this on a network you trust."}
+        control={<>{!managed && <Button size="sm" variant="ghost" disabled={busy} onClick={() => disconnect.warn("RegenerateKey", () => regenerate({}))}>Regenerate</Button>}<span className="flex items-center gap-2 text-sm text-slate-600 dark:text-slate-400"><span aria-hidden="true">Require</span><Switch aria-label="Require API key" checked={current.requireApiKey} disabled={busy} onCheckedChange={checked => checked ? update({ requireApiKey: Option.some(true) }) : disconnect.warn("StopRequiringKey", () => update({ requireApiKey: Option.some(false) }))} /></span></>}>
+        {Option.isSome(current.apiKey) && current.requireApiKey && <div className="mt-2"><CopyCommand command={current.apiKey.value} label="Copy API key" /></div>}
+      </SettingsRow>
+      {reachable && !managed && <SettingsRow nested label="Reachable at" hint={`Use this as the OpenAI-compatible base URL on other devices${current.requireApiKey ? ", with the API key above" : ""}. Anthropic-compatible apps use /inference/anthropic on the same address.`}>
+        <div className="mt-2"><CopyCommand command={inferenceUrl(reachable, current.port)} label="Copy base URL" /></div>
+      </SettingsRow>}
+    </>}
+  </>
 }
-function AlertTriangleIcon(): ReactNode {
-  return (
-    <span className="size-[30px] rounded-full grid place-items-center text-red-700 bg-red-200 font-extrabold dark:text-red-300 dark:bg-red-800">
-      !
-    </span>
-  )
+function AutomaticUpdatesRow() {
+  const client = useAgentClient()
+  const { owner, supports, observation, snapshot } = useApplicationUpdateObservation()
+  const saveAutoDownload = useAtomSet(client.Application.SetApplicationAutoDownload)
+  const setAutoDownload = (enabled: boolean) => saveAutoDownload({ enabled })
+  const saving = useAtomValue(client.Application.SetApplicationAutoDownload)
+  if (Result.isSuccess(owner) && !supports("Updates")) return null
+  const preference = snapshot?.preference
+  const closed = snapshot?.transfer._tag === "Closed"
+  return <SettingsRow label="Automatic updates"
+    hint={Result.isInitial(observation) ? <SkeletonLine className="h-4 text-xs" width="200px" /> : preference?._tag === "Known" ? "Download updates in the background when they are available." : undefined}
+    alert={Result.isFailure(saving) && !saving.waiting ? <ErrorNotice title="Update preferences weren’t saved" description="Your previous preference is still in use." /> : Result.isFailure(observation) || preference?._tag === "Unavailable" ? <ErrorNotice title="Couldn’t read update preferences" description="Automatic downloads are unavailable until your preference can be read." /> : undefined}
+    control={snapshot && <Switch aria-label="Automatic updates" checked={preference?._tag === "Known" && preference.autoDownload} disabled={preference?._tag !== "Known" || saving.waiting || closed} onCheckedChange={checked => setAutoDownload(checked)} />} />
 }
-function AuthenticatedAppContent({
-  isNarrow,
-}: {
-  isNarrow: boolean
-}): ReactNode {
-  useSessionPreload()
-  useInitializeConversationPreferences()
-  const connectionError = useDisplayConnectionError()
-  const platform = usePlatform()
-  const isDesktop = platform.id === "desktop"
-  const sidebarVisible = useAtomValue(sidebarVisibleAtom)
-  const setSidebarVisible = useAtomSet(sidebarVisibleAtom)
-  const {
-    profiles: slotProfiles,
-    slots: slotsResult,
-    rootSlotId,
-    rootProfile,
-  } = useSlotProfiles()
-  const modelSlots = Option.getOrNull(Result.value(slotsResult))
-  const modelLoadActivity = modelSlots === null
-    ? null
-    : deriveLocalModelLoadActivity(modelSlots, rootSlotId)
-  const rootActor = useDisplayState((state) => state.actors["root"] ?? null)
-  const rootStatus = rootActor?.kind === "root" ? rootActor.status : null
-  const showOverlaySidebar = isNarrow && sidebarVisible
-  const settingsTab = useAtomValue(settingsTabAtom)
-  const workspacePanelOpen = useAtomValue(workspacePanelOpenAtom)
-  const setWorkspacePanelOpen = useAtomSet(workspacePanelOpenAtom)
-  const setWorkspacePanelEntering = useAtomSet(workspacePanelEnteringAtom)
-  const workspacePresentation = useAtomValue(workspacePresentationAtom)
-  const setWorkspacePresentation = useAtomSet(workspacePresentationAtom)
-  const selectedProjectId = useAtomValue(selectedProjectIdAtom)
-  const setSettingsTab = useAtomSet(settingsTabAtom)
-  const { startNewSession } = useSessionActions()
-  const controller = useDisplayViewController()
-  const forkStack = controller.expandedForkStack
-  const panelOpen = settingsTab !== null
-  const workerDetailOpen = !panelOpen && forkStack.length > 0
-  const browser = platform.embeddedBrowser
-  const filesAvailable = selectedProjectId !== null
-  const browserAvailable = browser !== undefined
-  const workspacePanelAvailable = filesAvailable || browserAvailable
-  const workspacePanelExpanded = !panelOpen
-    && !workerDetailOpen
-    && workspacePanelOpen
-    && workspacePanelAvailable
-  const openWorkspacePanel = () => {
-    setSettingsTab(null)
-    const compatibleTabs = changeWorkspaceProject(workspacePresentation, selectedProjectId).tabs
-    if (compatibleTabs.length === 0) {
-      if (selectedProjectId !== null) {
-        setWorkspacePresentation((current) => {
-          const scoped = changeWorkspaceProject(current, selectedProjectId)
-          return scoped.tabs.length === 0
-            ? addEmptyFileTab(scoped, makeWorkspaceTabId(), selectedProjectId)
-            : scoped
-        })
-      } else if (browser !== undefined) {
-        void browser.createTab().then((browserTabId) => {
-          setWorkspacePresentation((current) => addBrowserTab(current, makeWorkspaceTabId(), browserTabId))
-        }).catch((cause: unknown) => {
-          console.error("[workspace] Could not create a browser tab.", cause)
-          notify("error", "Could not create a browser tab.")
-        })
-      }
-    }
-    if (!workspacePanelOpen) {
-      setWorkspacePanelEntering(true)
-      setWorkspacePanelOpen(true)
-    }
-  }
-  return (
-    <div
-      className={`${
-        isDesktop ? "[background:transparent]" : "bg-slate-50 dark:bg-slate-900"
-      } app relative flex h-screen overflow-hidden`}
-    >
-      <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
-        {isDesktop ? (
-          <ChatTitleBar
-            desktop
-            showTitle={!panelOpen}
-            workspacePanelExpanded={workspacePanelExpanded}
-            workspacePanelAvailable={workspacePanelAvailable}
-            onOpenWorkspacePanel={openWorkspacePanel}
-            onCompose={() => {
-              setSettingsTab(null)
-              startNewSession()
-            }}
-          />
-        ) : null}
-        <div className="relative flex min-h-0 flex-1 overflow-hidden">
-        {/* Docked sidebar — hidden by CSS when narrow */}
-        {!isNarrow && <SessionsSidebarContainer titlebarIntegrated={isDesktop} />}
-        {/* Overlay sidebar — shown when narrow + visible */}
-        {showOverlaySidebar && (
-          <SessionsSidebarContainer
-            overlay
-            onCloseOverlay={() => setSidebarVisible(false)}
-          />
-        )}
-        <div className="chat-column [flex:1] min-w-0 flex flex-col relative bg-slate-50 dark:bg-slate-900">
-        {/* Main chat column — always mounted, always in the layout. When a
-            panel or worker detail is open, it's covered by an absolute
-            overlay. Keeping it in the layout (not display:none) preserves
-            scroll metrics so the scroll controller can capture and restore
-            the correct position across overlay navigation. */}
-        <div className="flex flex-col [flex:1] min-h-0">
-          {!isDesktop ? (
-            <ChatTitleBar
-              onOpenSidebar={isNarrow ? () => setSidebarVisible(true) : undefined}
-              workspacePanelExpanded={workspacePanelExpanded}
-              workspacePanelAvailable={workspacePanelAvailable}
-              onOpenWorkspacePanel={openWorkspacePanel}
-            />
-          ) : null}
-          <ChatTimeline
-            isVisible={!panelOpen && !workerDetailOpen}
-            rootStatus={rootStatus}
-            modelLoadActivity={modelLoadActivity}
-            modelName={rootProfile?.modelDisplayName ?? null}
-          />
-          <BottomDockContainer
-            slotProfiles={slotProfiles}
-          />
-        </div>
-        {(panelOpen || workerDetailOpen) && (
-          <div className="absolute [inset:0px] flex flex-col bg-slate-50 dark:bg-slate-900 z-[1]">
-            {panelOpen && (
-              <>
-                {isNarrow && (
-                  <ActionTooltip
-                    label="Open settings navigation"
-                    side="right"
-                    trigger={
-                      <Button variant="unstyled" size="unstyled"
-                        type="button"
-                        className="appearance-none min-h-8 rounded-[7px] px-3 inline-flex items-center justify-center gap-1.5 font-sans text-xs font-semibold leading-none cursor-pointer disabled:cursor-not-allowed disabled:opacity-50 focus-visible:outline focus-visible:outline-1 focus-visible:outline-offset-1 focus-visible:outline-blue-700 dark:focus-visible:outline-blue-500 w-8 !px-0 bg-transparent text-slate-600 dark:text-slate-400 border border-slate-300 dark:border-slate-750 hover:bg-slate-150 hover:text-slate-900 dark:hover:bg-slate-750 dark:hover:text-slate-200 absolute top-3 left-3 z-[4] bg-slate-50 dark:bg-slate-900"
-                        aria-label="Open settings navigation"
-                        onClick={() => setSidebarVisible(true)}
-                      >
-                        <ListIcon size={17} />
-                      </Button>
-                    }
-                  />
-                )}
-                <SettingsCenter tab={settingsTab} />
-              </>
-            )}
-            {workerDetailOpen && (
-              <WorkerDetailPageContainer slotProfiles={slotProfiles} />
-            )}
-          </div>
-        )}
-        <Toaster />
-        </div>
-        {connectionError && (
-          <DaemonConnectionError
-            message={connectionError.message}
-            reconnecting={connectionError.reconnecting}
-            invariantViolation={connectionError.invariantViolation}
-            onRetry={() => {
-              const retried = controller.retry()
-              if (!retried) {
-                controller.clearSession()
-              }
-            }}
-            onQuit={() => {
-              // If the platform supports quit (desktop), quit the app
-              if (platform.quit) {
-                platform.quit()
-              } else {
-                controller.clearSession()
-              }
-            }}
-          />
-        )}
-        </div>
-      </div>
-      {workspacePanelExpanded
-        ? <WorkspacePanel projectId={selectedProjectId} browser={browser} />
+const failedUpdatePhrase = { verify: "couldn’t be verified", install: "failed to install", authorization: "wasn’t authorized to install", startup: "failed to start" } as const
+
+function AboutRow() {
+  const service = useSession()
+  const client = useAgentClient()
+  const health = useAtomValue(client.Connection.Health({})).result
+  const version = Result.isSuccess(health) ? `Magnitude ${health.value.version}` : Result.isFailure(health) ? "Magnitude" : <SkeletonLine className="h-5 text-sm" width="120px" />
+  const { observation, snapshot } = useApplicationUpdateObservation()
+  const { check, discard, download, restart, checking, downloading, restarting, discarding, pending, dialog } = useApplicationUpdateActions()
+  const current: UpdateTransfer | undefined = snapshot?.transfer
+  const message = !current ? Result.isFailure(observation) ? "Update status unavailable." : "Reading update status…"
+    : current._tag === "Idle" ? snapshot?.check._tag === "Succeeded" ? "You’re up to date." : "Checks for updates automatically."
+    : current._tag === "Available" ? `Version ${current.version} is available · ${formatStorageSize(current.bytes)}${Option.match(current.failed, {
+      onNone: () => "", onSome: failed => ` · It ${failedUpdatePhrase[failed]} on this computer, so it isn’t downloaded automatically.` })}`
+    : current._tag === "Downloading" ? `Downloading version ${current.version} · ${formatStorageSize(current.completed)} of ${formatStorageSize(current.total)}`
+    : current._tag === "Cancelling" ? "Stopping automatic download…"
+    : current._tag === "Staging" ? `Preparing version ${current.version}…`
+    : current._tag === "Ready" ? `Version ${current.version} is ready. Restarting stops the running model and service.`
+    : current._tag === "ImageAvailable" ? `Version ${current.version} is available. Pull the new image and recreate the container.`
+    : current._tag === "Closed" ? "Magnitude is quitting…" : current._tag === "Unavailable" ? "Updates aren’t available right now." : undefined
+  const actionFailure = firstFailure([checking, downloading, restarting, discarding])
+  const checkFailed = snapshot?.check._tag === "Failed"
+  const installable = current?._tag === "Ready" || current?._tag === "InstallationFailed"
+  const hasFailure = Boolean(actionFailure || checkFailed || current?._tag === "Failed" || current?._tag === "InstallationFailed")
+  const busy = pending || checking.waiting || snapshot?.check._tag === "Checking"
+  const actions = <>
+    {installable ? <><NoticeAction disabled={busy} onClick={() => restart()}>Retry update</NoticeAction><NoticeAction disabled={busy} onClick={() => discard()}>Discard download</NoticeAction></>
+      : current?._tag === "Available" ? <NoticeAction disabled={busy} onClick={() => download()}>Download update</NoticeAction>
+      : current && !["Unavailable", "Closed"].includes(current._tag) ? <NoticeAction disabled={busy} onClick={() => check()}>Check for updates</NoticeAction> : null}
+  </>
+  return <>{dialog}<SettingsRow label={version} hint={Result.isInitial(observation) ? <SkeletonLine className="h-4 text-xs" width="160px" /> : message}
+    children={current?._tag === "ImageAvailable" && <div className="mt-2"><CopyCommand command={`docker pull ${current.image}`} label="Copy pull command" /></div>}
+    alert={hasFailure && !busy ? <ErrorNotice
+      title={Result.isFailure(discarding) && !discarding.waiting ? "Couldn’t discard the update" : current?._tag === "InstallationFailed" ? "The update wasn’t completed" : checkFailed ? "Couldn’t check for updates" : "The update couldn’t finish"}
+      description={installable ? "The prepared update is still available. Retry it, or discard its download."
+        : snapshot?.check._tag === "Failed" ? snapshot.check.message
+        : current?._tag === "Failed" ? current.message : "Check your connection before trying again."}
+      actions={actions} /> : undefined}
+    control={hasFailure ? busy ? <span className="text-xs text-slate-500">Working…</span> : null : <>
+      {installable && <Button size="sm" variant="ghost" disabled={pending} onClick={() => discard()}>Discard download</Button>}
+      {installable ? <Button size="sm" disabled={pending} onClick={() => restart()}>Restart to update</Button>
+        : current?._tag === "Available" ? <Button size="sm" disabled={pending} onClick={() => download()}>Download update</Button>
+        : current && !["Unavailable", "Closed"].includes(current._tag) ? <Button size="sm" variant="outline" disabled={busy} onClick={() => check()}>{busy ? "Checking…" : "Check for updates"}</Button>
         : null}
+    </>} /></>
+}
+function SignOutRow() {
+  const { origin } = useRemoteAccess()
+  const action = useMemo(() => Atom.fn((_: void) => signOut(origin)), [origin])
+  const run = useAtomSet(action)
+  const signingOut = useAtomValue(action)
+  return <SettingsRow label="Signed in from another device" hint={`This browser controls Magnitude at ${new URL(origin).host}.`}
+    alert={Result.isFailure(signingOut) && !signingOut.waiting ? <ErrorNotice title="Couldn’t sign out" description="Check that this device can still reach Magnitude, then try again." /> : undefined}
+    control={<Button size="sm" variant="outline" disabled={signingOut.waiting} onClick={() => run()}>Sign out</Button>} />
+}
+function SettingsPage({ observation }: { observation: ServiceObservation }) {
+  // A fresh mount observes hand edits; writes refresh in their own Effect actions.
+  const client = useAgentClient()
+  const { remote } = useRemoteAccess()
+  const { storagePending, networkPending } = useRestartPending()
+  useAtomMount(useMemo(() => Atom.make(Effect.all([Atom.refresh(client.Configuration.GetModelStorage({})), Atom.refresh(client.Configuration.GetNetworkAccess({})), Atom.refresh(client.Models.ListModelLocations({}))], { discard: true })), [client]))
+  return <>
+    <SettingsStatus observation={observation} />
+    <SettingsGroup label="General"><ThemeRow /><LaunchAtLoginRow /><ModelStorageRow /><ModelLocationsRow /><HuggingFaceRow /><NetworkAccessRows /><AutomaticUpdatesRow /></SettingsGroup>
+    <SettingsGroup label="About"><AboutRow /></SettingsGroup>
+    {remote && <SettingsGroup label="This browser"><SignOutRow /></SettingsGroup>}
+    {(storagePending || networkPending) && <div aria-hidden="true" className="h-44" />}
+  </>
+}
+export function App() {
+  const session = useSession()
+  const observation = useServiceObservation()
+  const page = useAtomValue(session.page)
+  const known = useAtomValue(session.onboardingPending)
+  useEffect(() => { if (Option.isSome(known)) recordOnboardingCompleted(!known.value) }, [known])
+  const onboarding = Option.getOrElse(known, () => !onboardingCompletedHere())
+  const navigate = useNavigate()
+  const service = Result.isSuccess(observation.service) ? observation.service.value : null
+  const platform = Option.getOrUndefined(Option.map(session.clientWindow, window => window.platform))
+  return <><RestartRequiredToast /><HostNotices /><QuitFailureDialog />{onboarding && <OnboardingScreen />}<SidebarUpdateProvider><AppShell page={page} navigate={navigate} platform={platform}>
+      {page === "settings" ? <SettingsPage observation={observation} />
+      : service?._tag === "Unreachable" ? <CannotReachMagnitude />
+      : service?._tag === "Reconnecting" ? <ReconnectingToMagnitude />
+      : page === "chat" ? <ChatPage />
+      : page === "usage" ? <ServingUsage />
+      : page === "connections" ? <Connections serviceReady={service?._tag === "Ready"} selectedModel={Option.none()} />
+      : service?._tag !== "Ready" ? (service?._tag === "Failed" || service?._tag === "CleanupFailed" || Result.isFailure(observation.service) ? <><h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1><ErrorNotice title="Magnitude needs your attention" description="The inference service is unavailable." className="mt-8" actions={<NoticeAction onClick={() => navigate("settings")}>Open Settings</NoticeAction>} /></> : <ModelsSkeleton startingService />)
+      : page === "models" ? <ModelsPage />
+      : null}
+  </AppShell></SidebarUpdateProvider></>
+}
+/** Shown while a browser's own retries run after its connection drops, as it does when Magnitude restarts. */
+function ReconnectingToMagnitude() {
+  return <ErrorNotice className="mt-8" severity="info" title="Reconnecting to Magnitude…"
+    description="The connection to the Magnitude service was interrupted, as it is when Magnitude restarts." />
+}
+/** A browser cannot restart the service; it keeps retrying in the background, and Reconnect tries at once. */
+function CannotReachMagnitude() {
+  const attempt = useReconnectAttempt()
+  const reconnectAction = useMemo(() => Atom.fn((_: void) => attempt), [attempt])
+  const reconnect = useAtomSet(reconnectAction)
+  const reconnecting = useAtomValue(reconnectAction)
+  return <ErrorNotice className="mt-8" title="Can’t reach Magnitude"
+    description="This page can’t connect to the Magnitude service and keeps trying. Check that Magnitude is running on that computer and that this device can reach it."
+    actions={<NoticeAction disabled={reconnecting.waiting} onClick={() => reconnect()}>Reconnect</NoticeAction>} />
+}
+/** Messages raised by Electron main while this window exists, such as a link that couldn't open. */
+/** Electron main couldn't confirm background work stopped while quitting; the user decides what happens next. */
+function QuitFailureDialog() {
+  const session = useSession()
+  const open = useAtomValue(session.quitFailed)
+  const resolve = useAtomSet(session.resolveQuitFailure)
+  const resolving = useAtomValue(session.resolveQuitFailure)
+  return <AlertDialog open={open} onOpenChange={next => { if (!next && open) resolve("KeepOpen") }}>
+    <AlertDialogContent>
+      <AlertDialogHeader>
+        <AlertDialogTitle>Magnitude could not finish quitting</AlertDialogTitle>
+        <AlertDialogDescription>Background processes could not be confirmed stopped. Retry Quit tries to stop background work again. Force Quit closes Magnitude even though some background processes may still be running.</AlertDialogDescription>
+      </AlertDialogHeader>
+      <AlertDialogFooter>
+        <AlertDialogCancel disabled={resolving.waiting} onClick={() => resolve("KeepOpen")}>Keep Magnitude Open</AlertDialogCancel>
+        <Button variant="outline" disabled={resolving.waiting} onClick={() => resolve("ForceQuit")}>Force Quit</Button>
+        <AlertDialogAction disabled={resolving.waiting} onClick={() => resolve("RetryQuit")}>Retry Quit</AlertDialogAction>
+      </AlertDialogFooter>
+    </AlertDialogContent>
+  </AlertDialog>
+}
+export function AppShell({ page, navigate, platform, children }: { page: ApplicationPage; navigate?: (page: ApplicationPage) => void; platform: string | undefined; children: ReactNode }) {
+  const narrow = useNarrowViewport()
+  const [open, setOpen] = useState(false)
+  // Only the navigation chrome changes across `md`; the page stays mounted, so resizing keeps its state.
+  return <div className={narrow ? "relative flex h-screen flex-col bg-slate-50 font-sans text-slate-900 dark:bg-slate-925 dark:text-slate-200" : "relative flex h-screen bg-slate-50 font-sans text-slate-900 dark:bg-slate-925 dark:text-slate-200"}>
+    {narrow ? <NarrowBar open={open} onOpen={() => setOpen(true)} /> : <DockedSidebar page={page} navigate={navigate} platform={platform} />}
+    <main key={page} className="min-w-0 flex-1 overflow-y-auto" inert={narrow && open}>
+      <div data-page-content className={page === "chat" ? `mx-auto flex h-full w-full max-w-[min(100%,72rem)] flex-col px-4 pb-0 pt-5 md:px-10 ${platform === "win32" ? "md:pt-14" : "md:pt-9"}` : narrow ? "mx-auto w-full max-w-6xl px-4 pb-8 pt-5" : `mx-auto w-[calc(100vw-224px)] max-w-[min(100%,72rem)] px-10 pb-9 ${platform === "win32" ? "pt-14" : "pt-9"}`}>
+        {page !== "models" && page !== "chat" && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}
+        {children}
+      </div>
+    </main>
+    {narrow && open && <NavigationDrawer page={page} navigate={navigate} onClose={() => setOpen(false)} />}
+  </div>
+}
+function Navigation({ page, navigate, onNavigate }: { page: ApplicationPage; navigate?: (page: ApplicationPage) => void; onNavigate?: () => void }) {
+  const pageButton = (key: ApplicationPage) => {
+    const Icon = pageIcons[key]
+    const current = page === key
+    return <Button key={key} variant="ghost" disabled={!navigate} onClick={() => { navigate?.(key); onNavigate?.() }} aria-label={pageNames[key]} aria-current={current ? "page" : undefined} className={`h-10 gap-3 rounded-lg px-3 text-left text-sm font-medium justify-start ${current ? "bg-blue-50 text-blue-700 dark:bg-slate-800 dark:text-blue-400" : "hover:bg-slate-100 dark:hover:bg-slate-800"}`}>
+      <Icon className="size-4 shrink-0" />{pageNames[key]}
+    </Button>
+  }
+  return <nav id="desktop-navigation" className="flex min-h-0 flex-1 flex-col gap-2 px-4">
+    {(["models", "chat", "connections", "usage"] as const).map(pageButton)}
+    <div className="mt-auto flex flex-col gap-2">
+      <SidebarUpdatePill navigate={navigate} onNavigate={onNavigate} />
+      <a href="https://docs.magnitude.dev" target="_blank" rel="noreferrer" onClick={onNavigate} className={`${buttonVariants({ variant: "ghost" })} h-10 gap-3 rounded-lg px-3 text-left text-sm font-medium justify-start hover:bg-slate-100 dark:hover:bg-slate-800`}>
+        <BookOpenIcon className="size-4 shrink-0" />Docs<ArrowUpRightIcon aria-hidden="true" className="ml-auto size-3.5 shrink-0 text-slate-400" />
+      </a>
+      {pageButton("settings")}
     </div>
-  )
+  </nav>
 }
-export function App({
-  initialAcnLifecycle,
-}: {
-  readonly initialAcnLifecycle: ServiceLifecycleState
-}): ReactNode {
-  return (
-    <DisplayViewControllerProvider>
-      <TooltipProvider>
-        <AppInner initialAcnLifecycle={initialAcnLifecycle} />
-      </TooltipProvider>
-    </DisplayViewControllerProvider>
-  )
+/** Below `md`: a top bar that opens a navigation drawer over the page, closed by default. */
+function NarrowBar({ open, onOpen }: { open: boolean; onOpen: () => void }) {
+  return <header className="flex h-14 shrink-0 items-center gap-3 border-b border-slate-200 px-4 dark:border-slate-750" inert={open}>
+    <button type="button" className="inline-flex size-10 items-center justify-center rounded-md text-slate-600 hover:bg-slate-100 focus-visible:outline-2 focus-visible:outline-blue-500 dark:text-slate-300 dark:hover:bg-slate-800" aria-label="Open navigation" aria-expanded={open} aria-controls="desktop-navigation" onClick={onOpen}>
+      <SidebarSimpleIcon className="size-5" />
+    </button>
+    <span className="flex items-center gap-2 font-heading text-base font-semibold"><MagnitudeMark className="h-7 w-7 shrink-0" />Magnitude</span>
+  </header>
 }
+function NavigationDrawer({ page, navigate, onClose }: { page: ApplicationPage; navigate?: (page: ApplicationPage) => void; onClose: () => void }) {
+  return <div className="fixed inset-0 z-50 flex" onKeyDown={event => { if (event.key === "Escape") onClose() }}>
+    <button type="button" aria-label="Close navigation" className="absolute inset-0 cursor-default bg-black/45 dark:bg-black/70" onClick={onClose} />
+    <aside aria-label="Navigation" className="relative flex h-full w-64 max-w-[85vw] flex-col border-r border-slate-200 bg-slate-50 pb-6 pt-4 shadow-xl dark:border-slate-750 dark:bg-slate-925 motion-safe:animate-[slide-in-left_150ms_ease-out]">
+      <div className="mb-6 flex h-10 items-center justify-between px-4">
+        <span className="flex items-center gap-3 px-3 font-heading text-base font-semibold"><MagnitudeMark className="h-8 w-8 shrink-0" />Magnitude</span>
+        <button type="button" autoFocus className="inline-flex size-10 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:bg-slate-800" aria-label="Close navigation" onClick={onClose}><XIcon className="size-5" /></button>
+      </div>
+      <Navigation page={page} navigate={navigate} onNavigate={onClose} />
+    </aside>
+  </div>
+}
+/** From `md` up: the collapsible sidebar with the window's integrated controls and drag regions. */
+function DockedSidebar({ page, navigate, platform }: { page: ApplicationPage; navigate?: (page: ApplicationPage) => void; platform: string | undefined }) {
+  const [collapsed, setCollapsed] = useState(false)
+  const updatePending = useSidebarUpdate().update._tag !== "None"
+  const integratedControls = platform === "darwin" || platform === "win32"
+  const sidebarWidth = collapsed ? 0 : 224
+  return <>
+    {integratedControls && <div aria-hidden="true" data-window-drag-region style={{ left: sidebarWidth }} className="absolute right-0 top-0 z-50 h-8 select-none transition-[left] duration-250 ease-in-out motion-reduce:transition-none [-webkit-app-region:drag]" />}
+    <div data-window-drag-region={integratedControls ? "" : undefined} style={{ width: collapsed ? (platform === "darwin" ? 128 : 64) : sidebarWidth }} className={`absolute left-0 top-0 z-50 flex h-[42px] items-center justify-end px-4 transition-[width] duration-250 ease-in-out motion-reduce:transition-none ${integratedControls ? "select-none [-webkit-app-region:drag]" : ""}`}>
+      <button type="button" className="relative inline-flex size-6 items-center justify-center rounded-sm text-slate-500 hover:text-slate-900 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:text-slate-100 [-webkit-app-region:no-drag]" aria-label={collapsed ? (updatePending ? "Expand sidebar, update available" : "Expand sidebar") : "Collapse sidebar"} aria-expanded={!collapsed} aria-controls="desktop-navigation" onClick={() => setCollapsed(value => !value)}>
+        <SidebarSimpleIcon className="size-5" />
+        {collapsed && updatePending && <span data-update-dot aria-hidden="true" className="absolute -right-0.5 -top-0.5 size-2 rounded-full bg-blue-500 ring-2 ring-slate-50 dark:ring-slate-925" />}
+      </button>
+    </div>
+    <aside aria-hidden={collapsed} inert={collapsed} style={{ width: sidebarWidth }} className="shrink-0 overflow-hidden transition-[width] duration-250 ease-in-out motion-reduce:transition-none">
+      <div className={`flex h-full w-56 flex-col border-r border-slate-200 pt-10 pb-8 transition-transform duration-250 ease-in-out motion-reduce:transition-none dark:border-slate-750 ${collapsed ? "-translate-x-full" : "translate-x-0"}`}>
+      <div className="mb-10 mt-4 flex h-8 shrink-0 items-center gap-3 px-7 font-heading text-base font-semibold">
+        <MagnitudeMark className="h-8 w-8 shrink-0" />Magnitude
+      </div>
+      <Navigation page={page} navigate={navigate} />
+      </div>
+    </aside>
+  </>
+}
+

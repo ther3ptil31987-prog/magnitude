@@ -1,0 +1,61 @@
+# Gemma's per-layer input gate: the gate projection of the hidden rows (the
+# F32 residual after the layer, rounded to A as a projection input), then
+# A(A(act(A(gate))) * inputs[m, layer, p]) with the layer's per-layer input
+# (`per_layer_inputs`' [M, L * P] output viewed as [M, L, P]; `activation`:
+# 1 GELU-tanh). Its projection back to D is `project_rows` into the layer's
+# `post_norm_residual`.
+fn per_layer_gate[M, D, L, P, GS](hidden: &tensor[M, D] f32, gate_weight: &tensor[P, D] GW,
+    inputs: &tensor[M, L, P] f32, layer: i32, activation: i32,
+    gate_scale: &tensor[GS] f32) -> tensor[M, P] A where GS >= 0 and GS <= 1:
+    let mut rounded = tensor[M, D] A
+    let mut gate_sum = tensor[M, P] f32
+    let mut gate = tensor[M, P] A
+    let mut activated = tensor[M, P] A
+    let mut product = tensor[M, P] A
+    parallel for row in 0..M:
+        parallel for col in 0..D:
+            rounded[row, col] = hidden[row, col]
+    linear(rounded, gate_weight, gate_sum)
+    scale_rows(gate_sum, gate_scale, gate)
+    activate(gate, activated, activation)
+    parallel for row in 0..M:
+        parallel for col in 0..P:
+            product[row, col] = f32(activated[row, col]) * inputs[row, layer, col]
+    return product
+
+# All backends: a stage launch rounds the hidden rows to A in scratch, then
+# the `dense` projection (`dense.seismic`), single, over them with the
+# activated-product epilogue (the multiplier row is `inputs[m, layer]`).
+# Metal keeps the tile mapping it ran before moving onto the projection for
+# every GEMV row count (SIMDGROUPS 16, ROWS 1, LANES 16).
+native per_layer_gate for metal from "metal/per_layer_gate.metal":
+    static (D, L, P, GS)
+    where GS <= 1
+    project dense single (gate_weight)
+    restate single_gemv
+    scratch rounded bytes (M * D * 2)
+    launch per_layer_gate_stage before gemv:
+        staging
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native per_layer_gate for vulkan from "vulkan/per_layer_gate.comp":
+    static (D, L, P, GS)
+    where GS <= 1
+    project dense single (gate_weight) rows staged
+
+# One producer rounds the hidden rows to semantic A and forms the selected
+# matrix operands; `project_rows`' row bands share that operand policy.
+native per_layer_gate for cuda from "cuda/per_layer_gate.cu":
+    static (D, L, P, GS)
+    where GS <= 1
+    project dense single (gate_weight) rows staged
+    restate arithmetic SPLIT in [1, 2] default 1
+
+native per_layer_gate for cpu from "cpu/per_layer_gate.rs":
+    static (GS)
+    where GS <= 1
+    project quantized tiled (GW) over (M, D) operand (hidden)
+    launch per_layer_gate_rows:
+        threadgroups (ceil_div(P, ROWS), 1, 1)
+        threads_per_threadgroup (1, 1, 1)

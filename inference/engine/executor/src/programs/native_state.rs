@@ -2,16 +2,17 @@
 
 use super::{ReadySubmission, StateProgram};
 use crate::{
-    native::AttestedState,
-    programs::graph::{draft::GraphDraft, GraphError},
     DeviceError, InvariantError, NativeGraphWorkspaceLease, StateLaunchCore, StateStorePlan,
     StateWork, SubmitError, ValidatedStateLaunch,
+    native::AttestedState,
+    programs::graph::{GraphError, draft::{Certified, GraphDraft}, facts::{FactIndex, FactSink}},
 };
 use magnitude_kernels::copy_rows;
 use seismic::{
-    BackendName, Device, Element, NativeGraphBindings, NativeGraphClassSlice, NativeGraphFamily,
-    NativeGraphFamilySlot, NativeGraphLayout, NativeGraphMetadata, NativeGraphOutputs,
-    NativeGraphPlan, NativeGraphStorageBytes, NativePort, Tensor,
+    BackendName, ClassFact, Device, Dim, Element, HostHeap, LaunchGraphs, LaunchedGraph, NativeGraphBindings,
+    NativeGraphClassSlice, NativeGraphFamily, NativeGraphFamilySlot, NativeGraphLayout, NativeGraphMetadata,
+    NativeGraphOutputs, NativeGraphPlan, NativeGraphResourceTemplate, NativeGraphStorageBytes, NativeGraphTraces,
+    NativePort, Reals, Tensor,
 };
 use std::rc::Rc;
 
@@ -28,8 +29,23 @@ pub struct NativeStateProgram {
     graphs: Rc<PreparedStateCopyGraphs>,
 }
 
+/// The map row classes a store copy of a plane holding `plane_rows` rows or
+/// banks launches: each chunk of at most the launch row limit runs at the
+/// row class of its moves (`magnitude_batching::row_class`), and a copy
+/// moves distinct rows of one plane, so every launch row class up to the
+/// first covering the plane.
+fn plane_copy_row_classes(row_classes: &[u64], plane_rows: u64) -> &[u64] {
+    let covered = row_classes
+        .iter()
+        .position(|&rows| rows >= plane_rows)
+        .map_or(row_classes.len(), |index| index + 1);
+    &row_classes[..covered]
+}
+
 /// The exact state-copy classes prepared for the target and optional head
-/// state planes. Assessment uses this list before opening a device.
+/// state planes, history rows and recurrent banks alike, at every row class
+/// a store copy of the plane launches. Assessment uses this list before
+/// opening a device.
 pub(crate) fn state_copy_classes(
     target: &StateStorePlan,
     head: Option<&StateStorePlan>,
@@ -48,12 +64,10 @@ pub(crate) fn state_copy_classes(
         for (domain, plane) in planes {
             let width =
                 u64::try_from(plane.row_elements).map_err(|_| "state plane width exceeds u64")?;
-            let extents = vec![
-                u64::try_from(domain.rows).map_err(|_| "state history rows exceed u64")?,
-                1,
-                width,
-            ];
-            for &rows in row_classes {
+            let history_rows =
+                u64::try_from(domain.rows).map_err(|_| "state history rows exceed u64")?;
+            let extents = vec![history_rows, 1, width];
+            for &rows in plane_copy_row_classes(row_classes, history_rows) {
                 let class = StateCopyGraphClass {
                     element: Element::dense(plane.dtype),
                     source_extents: extents.clone(),
@@ -82,15 +96,17 @@ pub(crate) fn state_copy_classes(
                         size.checked_mul(u64::try_from(extent).ok()?)
                     })
                     .ok_or("state bank component width exceeds u64")?;
-                let class = StateCopyGraphClass {
-                    element: Element::dense(component.dtype),
-                    source_extents: vec![banks, 1, width],
-                    destination_extents: vec![banks, 1, width],
-                    map_rows: 1,
-                    slab_rows: state.bank_slab_banks()?,
-                };
-                if !classes.contains(&class) {
-                    classes.push(class);
+                for &rows in plane_copy_row_classes(row_classes, banks) {
+                    let class = StateCopyGraphClass {
+                        element: Element::dense(component.dtype),
+                        source_extents: vec![banks, 1, width],
+                        destination_extents: vec![banks, 1, width],
+                        map_rows: rows,
+                        slab_rows: state.bank_slab_banks()?,
+                    };
+                    if !classes.contains(&class) {
+                        classes.push(class);
+                    }
                 }
             }
         }
@@ -141,9 +157,7 @@ impl NativeStateProgram {
                         .get(copy.plane_index)
                         .ok_or_else(|| invalid("copy plane is outside pinned history"))?;
                     let shape = plane.extents();
-                    let width = shape[1..]
-                        .iter()
-                        .try_fold(1u64, |n, extent| n.checked_mul(*extent))
+                    let width = crate::planning::elements(&shape[1..])
                         .ok_or_else(|| invalid("state plane width overflow"))?;
                     let view = plane.reshape(&[shape[0], 1, width]).map_err(device)?;
                     let class = StateCopyGraphClass {
@@ -188,9 +202,80 @@ pub(crate) struct StateCopyGraphClass {
     pub slab_rows: u32,
 }
 
+impl StateCopyGraphClass {
+    /// What its graph is built of beside its topology ([`CopyTopology`]):
+    /// its plane's rows, middle extent and width, the rows its map moves
+    /// (the class dimension `N` the family's slices vary), and its slab
+    /// rows (its kernel's argument). A validated class's (`validate_class`).
+    fn numbers(&self) -> [u64; 5] {
+        let [rows, middle, width] = self.source_extents[..] else {
+            unreachable!("a validated state copy class has a rank-three plane")
+        };
+        [rows, middle, width, self.map_rows, u64::from(self.slab_rows)]
+    }
+
+    /// Its numbers as its trace's facts, in [`Self::numbers`]' order, and
+    /// the fact of its map rows (the class dimension `N`).
+    fn facts(&self) -> (FactSink, FactIndex) {
+        let mut facts = FactSink::new();
+        let [_, _, _, map_rows, _] = facts.index(self.numbers());
+        (facts, map_rows)
+    }
+
+    fn topology(&self, backend: BackendName) -> CopyTopology {
+        CopyTopology {
+            backend,
+            element: self.element,
+        }
+    }
+}
+
+/// What decides a state copy graph's topology: its backend and its plane's
+/// element. Every number of it is a fact of its trace
+/// ([`StateCopyGraphClass::facts`]).
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct CopyTopology {
+    backend: BackendName,
+    element: Element,
+}
+
+/// The state copy graphs' traces, one per topology.
+static COPY_TRACES: NativeGraphTraces<CopyTopology> = NativeGraphTraces::new();
+
+/// How many state copy traces this process recorded.
+#[cfg(test)]
+pub(crate) fn copy_traces_recorded() -> usize {
+    COPY_TRACES.recorded()
+}
+
+/// The template of a state copy graph of `topology` at `facts`
+/// ([`StateCopyGraphClass::facts`]).
+fn record_copy_graph(
+    topology: &CopyTopology,
+    facts: &[Dim],
+    _reals: &Reals,
+) -> Result<(NativeGraphResourceTemplate, ()), GraphError> {
+    let [rows, middle, width, map_rows, slab_rows] = facts else {
+        unreachable!("a state copy graph is recorded at its five facts")
+    };
+    let elements = [("A", topology.element)];
+    let (graph, ..) = copy_graph_draft(
+        NativeGraphMetadata::new_template(topology.backend),
+        &elements,
+        topology.element,
+        [rows, middle, width],
+        map_rows,
+        slab_rows,
+    )?;
+    Ok((graph.seal_template()?, ()))
+}
+
 pub struct PreparedStateCopyGraphs {
     variants: Vec<PreparedStateCopyGraph>,
     family: NativeGraphFamily,
+    /// The host heap the plan counted for the graphs
+    /// (`planned_host_heap`).
+    planned: HostHeap,
 }
 
 struct PreparedStateCopyGraph {
@@ -208,10 +293,15 @@ impl PreparedStateCopyGraphs {
         classes: impl IntoIterator<Item = StateCopyGraphClass>,
     ) -> Result<Self, SubmitError> {
         let classes = classes.into_iter().collect::<Vec<_>>();
-        let (_, layouts) = certify_copy_family(target_device.backend(), &classes)
+        let (_, graphs, layouts) = certify_copy_family::<NativeGraphLayout>(target_device.backend(), &classes)
             .map_err(|error| invalid(error.to_string()))?;
-        let mut variants = Vec::new();
-        for (class, layout) in classes.into_iter().zip(layouts) {
+        let planned = copy_family_heap(&classes, &layouts).map_err(invalid)?;
+        // The graphs go into a vector of exactly the classes, and each
+        // class's extents hold exactly their lengths: what the plan counted.
+        let mut variants = Vec::with_capacity(classes.len());
+        for (mut class, layout) in classes.into_iter().zip(layouts) {
+            class.source_extents.shrink_to_fit();
+            class.destination_extents.shrink_to_fit();
             validate_class(&class).map_err(invalid)?;
             if variants
                 .iter()
@@ -242,12 +332,50 @@ impl PreparedStateCopyGraphs {
         if variants.is_empty() {
             return Err(invalid("state copy graph family has no classes"));
         }
-        let plans = variants
-            .iter()
-            .map(|variant| variant.plan.clone())
-            .collect::<Vec<_>>();
-        let family = NativeGraphFamily::new(&plans).map_err(device)?;
-        Ok(Self { variants, family })
+        // A state copy runs on its own lane, never in a decode step's launch.
+        let plans = variants.iter().map(|variant| (false, variant.plan.clone()));
+        let family = super::graph::serial_family("state copy", plans, &graphs).map_err(device)?;
+        let graphs = Self {
+            variants,
+            family,
+            planned,
+        };
+        // Graphs that hold another heap than the plan counted are a defect
+        // of the plan's accounting, which refuses the load.
+        let held = graphs.host_heap();
+        if held != planned {
+            return Err(invalid(format!(
+                "the state copy graphs hold {held:?}; the plan counted {planned:?}"
+            )));
+        }
+        Ok(graphs)
+    }
+
+    /// The host heap the plan counted for these graphs before any was
+    /// sealed (`copy_family_heap`).
+    pub fn planned_host_heap(&self) -> HostHeap {
+        self.planned
+    }
+
+    /// The host heap these graphs hold: their vector, each one's sealed
+    /// plan and its class's extents, at their capacities.
+    pub fn host_heap(&self) -> HostHeap {
+        use std::mem::size_of;
+        let mut heap = HostHeap::allocation(
+            self.variants.capacity(),
+            size_of::<PreparedStateCopyGraph>(),
+        );
+        for variant in &self.variants {
+            heap.hold(variant.class.source_extents.capacity(), size_of::<u64>());
+            heap.hold(
+                variant.class.destination_extents.capacity(),
+                size_of::<u64>(),
+            );
+            heap = heap
+                .plus(variant.plan.host_heap())
+                .expect("state copy graph heap overflows");
+        }
+        heap
     }
 
     pub fn workspace_bytes_max(&self) -> u64 {
@@ -325,21 +453,35 @@ fn copy_graph_topology<'a, G: GraphDraft + 'a>(
     entry: G::Binding<'a, copy_rows::Entry>,
     class: &StateCopyGraphClass,
 ) -> Result<(G::Plan, NativePort, NativePort, NativePort), GraphError> {
-    let (graph, rows, from, to) = copy_graph_draft(graph, entry, class)?;
+    let [rows, middle, width, map_rows, slab_rows] = class.numbers().map(Dim::from);
+    let (graph, rows, from, to) = copy_graph_draft(
+        graph,
+        entry,
+        class.element,
+        [&rows, &middle, &width],
+        &map_rows,
+        &slab_rows,
+    )?;
     Ok((graph.seal()?, rows, from, to))
 }
 
+/// A state copy graph: the plane `plane` (rows, middle extent, width) of
+/// `element`, `map_rows` of whose rows its `from` and `to` maps move within
+/// slabs of `slab_rows`.
 fn copy_graph_draft<'a, G: GraphDraft + 'a>(
     mut graph: G,
     entry: G::Binding<'a, copy_rows::Entry>,
-    class: &StateCopyGraphClass,
+    element: Element,
+    plane: [&Dim; 3],
+    map_rows: &Dim,
+    slab_rows: &Dim,
 ) -> Result<(G, NativePort, NativePort, NativePort), GraphError> {
-    let rows = graph.port(class.element, &class.source_extents)?;
+    let rows = graph.port(element, &plane)?;
     let dimensions = [
-        ("N", class.map_rows),
-        ("T", class.source_extents[0]),
-        ("KV", class.source_extents[1]),
-        ("W", class.source_extents[2]),
+        ("N", map_rows),
+        ("T", plane[0]),
+        ("KV", plane[1]),
+        ("W", plane[2]),
     ];
     let from = graph.input_for(entry, "from", &dimensions)?;
     let to = graph.input_for(entry, "to", &dimensions)?;
@@ -351,7 +493,7 @@ fn copy_graph_draft<'a, G: GraphDraft + 'a>(
             rows: (&mut rows_tensor).into(),
             from: from.tensor().into(),
             to: to.tensor().into(),
-            slab_rows: class.slab_rows,
+            slab_rows: slab_rows.word().ok_or("state slab rows exceed u32")?,
         },
     )?;
     Ok((graph, rows, from, to))
@@ -361,15 +503,49 @@ pub(crate) fn checked_copy_family_storage(
     backend: BackendName,
     classes: impl IntoIterator<Item = StateCopyGraphClass>,
 ) -> Result<NativeGraphStorageBytes, GraphError> {
-    let classes = classes.into_iter().collect::<Vec<_>>();
-    certify_copy_family(backend, &classes).map(|(storage, _)| storage)
+    checked_copy_family(backend, classes).map(|(storage, _, _)| storage)
 }
 
-fn certify_copy_family(
+/// The family's storage, what its graphs hold, and the host heap its
+/// prepared graphs hold (`copy_family_heap`): what a load's assessment
+/// charges, from the classes the load prepares.
+pub(crate) fn checked_copy_family(
+    backend: BackendName,
+    classes: impl IntoIterator<Item = StateCopyGraphClass>,
+) -> Result<(NativeGraphStorageBytes, LaunchGraphs, HostHeap), GraphError> {
+    let classes = classes.into_iter().collect::<Vec<_>>();
+    let (storage, graphs, layouts) = certify_copy_family::<seismic::NativeGraphOutline>(backend, &classes)?;
+    Ok((storage, graphs, copy_family_heap(&classes, &layouts)?))
+}
+
+/// The host heap the prepared state copy graphs of `classes` hold, each
+/// sealed into its layout: the vector of them, each one's sealed plan
+/// (`NativeGraphLayout::plan_heap`) and its class's extents. What the
+/// planner counts and what `PreparedStateCopyGraphs::prepare` allocates.
+fn copy_family_heap(
+    classes: &[StateCopyGraphClass],
+    layouts: &[impl Certified],
+) -> Result<HostHeap, String> {
+    use std::mem::size_of;
+    let mut heap = HostHeap::allocation(classes.len(), size_of::<PreparedStateCopyGraph>());
+    for (class, layout) in classes.iter().zip(layouts) {
+        heap.hold(class.source_extents.len(), size_of::<u64>());
+        heap.hold(class.destination_extents.len(), size_of::<u64>());
+        heap = heap
+            .plus(layout.plan_heap())
+            .ok_or("state copy graph heap overflows")?;
+    }
+    Ok(heap)
+}
+
+pub(crate) fn certify_copy_family<L: Certified>(
     backend: BackendName,
     classes: &[StateCopyGraphClass],
-) -> Result<(NativeGraphStorageBytes, Vec<NativeGraphLayout>), GraphError> {
+) -> Result<(NativeGraphStorageBytes, LaunchGraphs, Vec<L>), GraphError> {
     let mut family: Option<NativeGraphStorageBytes> = None;
+    // Each group's layout, a graph its copies replay, none in a decode
+    // step's launch.
+    let mut graphs = Vec::new();
     let mut layouts = vec![None; classes.len()];
     let mut groups: Vec<Vec<usize>> = Vec::new();
     for (index, class) in classes.iter().enumerate() {
@@ -388,14 +564,17 @@ fn certify_copy_family(
     }
     for group in groups {
         let first = &classes[group[0]];
-        let elements = [("A", first.element)];
-        let (graph, _, _, _) =
-            copy_graph_draft(NativeGraphMetadata::new_template(backend), &elements, first)?;
-        let layout = graph.seal_template().and_then(|template| {
-            template.certify(&[NativeGraphClassSlice::new()
-                .dimension("N", group.iter().map(|&index| classes[index].map_rows))])
-        })?;
+        let (facts, map_rows) = first.facts();
+        let (layout, ()) = L::traced(
+            &COPY_TRACES,
+            &first.topology(backend),
+            &facts,
+            &[ClassFact { fact: map_rows.position(), scope: None, dimension: "N" }],
+            vec![NativeGraphClassSlice::new().dimension("N", group.iter().map(|&index| classes[index].map_rows))],
+            record_copy_graph,
+        )?;
         let storage = layout.storage_bytes();
+        graphs.push(LaunchedGraph { graph: storage.recorded, pinned_runs: 0, runs: 1 });
         match &mut family {
             Some(maximum) => {
                 maximum.workspace = maximum.workspace.max(storage.workspace);
@@ -410,6 +589,7 @@ fn certify_copy_family(
     }
     Ok((
         family.ok_or("state copy graph family has no classes")?,
+        LaunchGraphs::of(graphs, Vec::new()).ok_or("state copy graph census overflows")?,
         layouts.into_iter().map(Option::unwrap).collect(),
     ))
 }
@@ -439,10 +619,8 @@ mod tests {
 
     #[test]
     fn prepared_graph_copies_within_held_slabs() {
-        let catalog = seismic::DeviceCatalog::discover().unwrap();
-        let Ok(device) = catalog.open_backend(BackendName::Cpu) else {
-            return;
-        };
+        let catalog = seismic::Devices::discover(&[]).unwrap();
+        let device = crate::test_support::open_backend(&catalog, BackendName::Cpu).expect("the CPU backend opens");
         let element = Element::f32();
         let kernel = copy_rows::native_for_device_with(
             &device,
@@ -451,6 +629,12 @@ mod tests {
         )
         .unwrap();
         let handles = AttestedState {
+            feature_copy: magnitude_kernels::feature_copy::native_for_device_with(
+                &device,
+                magnitude_kernels::feature_copy::Elements { A: element },
+                &seismic::NativeSpecialization::new(),
+            )
+            .unwrap(),
             copies: vec![(element, kernel)],
             conditioning: None,
         };
@@ -471,18 +655,20 @@ mod tests {
             PreparedStateCopyGraphs::prepare(&device, &handles, [other, class.clone()]).unwrap();
         assert_eq!(graphs.workspace_bytes_max(), assessment.workspace);
         assert_eq!(graphs.output_bytes_max(), assessment.output);
-        let mut slabs = seismic::SlabTensor::new(
+        let slabs = crate::experts::pooled_slabs(
             &device,
+            seismic::Contract::DeviceOnly,
             2,
             4,
-            vec![seismic::SlabRegion {
+            &[seismic::SlabRegion {
                 element,
                 row_shape: vec![1, 4],
             }],
+            2,
         )
         .unwrap();
-        slabs.add_slab().unwrap();
-        slabs.add_slab().unwrap();
+        slabs.add_slab(seismic::SlabFill::Zeroed).unwrap();
+        slabs.add_slab(seismic::SlabFill::Zeroed).unwrap();
         let source = [5.0f32, 6.0, 7.0, 8.0]
             .into_iter()
             .flat_map(f32::to_le_bytes)
@@ -496,7 +682,7 @@ mod tests {
         let reshaped = view.reshape(&[4, 1, 4]).unwrap();
         let bindings = graphs.bindings(&class, &reshaped).unwrap();
         let outputs = graphs.plan(&class).unwrap().new_outputs().unwrap();
-        let mut slot = graphs.family().new_slot(1).unwrap();
+        let mut slot = graphs.family().new_slot(&[graphs.family().upload_bytes()]).unwrap();
         graphs
             .run(
                 &class,
@@ -512,6 +698,10 @@ mod tests {
             source
         );
     }
+
+    /// The granule of these plans' state pool: 64 MiB, a slab of which
+    /// holds every one of their banks.
+    const BANK_GRANULE: u64 = 64 << 20;
 
     #[test]
     fn state_copy_classes_include_recurrent_banks() {
@@ -532,13 +722,69 @@ mod tests {
             recurrent_bank_bytes: 16,
             zero_seed_bytes: 16,
             recurrent_pool_bytes: 48,
+            granule: BANK_GRANULE,
+            block: seismic::BlockSize { bytes: BANK_GRANULE, held: BANK_GRANULE },
         };
-        let classes = state_copy_classes(&plan, None, &[1, 2]).unwrap();
-        assert_eq!(classes.len(), 1);
-        assert_eq!(classes[0].element, Element::f32());
-        assert_eq!(classes[0].source_extents, vec![4, 1, 4]);
-        assert_eq!(classes[0].map_rows, 1);
-        assert_eq!(classes[0].slab_rows, plan.bank_slab_banks().unwrap());
+        let classes = state_copy_classes(&plan, None, &[1, 2, 4, 8]).unwrap();
+        assert_eq!(
+            classes
+                .iter()
+                .map(|class| class.map_rows)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 4]
+        );
+        for class in &classes {
+            assert_eq!(class.element, Element::f32());
+            assert_eq!(class.source_extents, vec![4, 1, 4]);
+            assert_eq!(class.slab_rows, plan.bank_slab_banks().unwrap());
+        }
+    }
+
+    /// Reclaim moves every claimed bank outside the kept slabs in one store
+    /// copy, which the domain launches in chunks at the row class of their
+    /// moves. Each such class must be prepared, not only the single-bank one.
+    #[test]
+    fn every_store_copy_launch_of_banks_has_a_prepared_class() {
+        let plan = StateStorePlan {
+            context_rows: 8,
+            max_advance: 8,
+            history: Vec::new(),
+            domains: Vec::new(),
+            recurrent_components: vec![ComponentSpec {
+                shape: vec![4],
+                dtype: seismic::DType::F32,
+            }],
+            bank_capacity: BankCapacity {
+                active: 3,
+                in_flight: 3,
+                retained: 3,
+            },
+            recurrent_bank_bytes: 16,
+            zero_seed_bytes: 16,
+            recurrent_pool_bytes: 160,
+            granule: BANK_GRANULE,
+            block: seismic::BlockSize { bytes: BANK_GRANULE, held: BANK_GRANULE },
+        };
+        let banks = plan.bank_capacity.storage_total().unwrap();
+        let max_launch_rows = 64;
+        let row_classes = crate::batching::row_classes(max_launch_rows)
+            .into_iter()
+            .map(|rows| rows as u64)
+            .collect::<Vec<_>>();
+        let classes = state_copy_classes(&plan, None, &row_classes).unwrap();
+        for moves in 1..=banks.min(max_launch_rows) {
+            let class = StateCopyGraphClass {
+                element: Element::f32(),
+                source_extents: vec![banks as u64, 1, 4],
+                destination_extents: vec![banks as u64, 1, 4],
+                map_rows: crate::batching::row_class(moves).unwrap() as u64,
+                slab_rows: plan.bank_slab_banks().unwrap(),
+            };
+            assert!(
+                classes.contains(&class),
+                "a copy of {moves} banks launches an unprepared class {class:?}"
+            );
+        }
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! family-agnostic). The 4B covers the dense, attention, recurrent-state and
 //! selection cases; the 35B covers the routed ones (route, group, expand,
 //! output, experts, combine). With a kernel cache, a second load uses every
-//! stored tuning result (and, on CUDA, every stored image) and tunes nothing.
+//! stored tuning result and tunes nothing.
 //!
 //! `cargo test --release -p magnitude-engine --test native_tuning -- --ignored
 //! --test-threads 1 --nocapture` (CUDA: with `SEISMIC_NVRTC_DIRECTORY` naming
@@ -13,13 +13,14 @@
 
 use magnitude_artifacts::Package;
 use magnitude_executor::{
-    platform::{self, DeviceRequest, MemoryReserves, PlatformConfig},
-    AttestedPrograms, ComponentSelection, ExecutionPath, ExecutionPlanner, KernelCache,
-    PlannedMethod, ResourceLimits, TunedEntry, TuningContext, TuningOrigin, UnreportedTuning,
+    platform::{self, DeviceRequest, ReleaseRate, PlatformConfig},
+    memory::ledger::{DeviceLedgers, LoadShape},
+    AttestedPrograms, ComponentSelection, DeviceReader, ExecutionPath, ExecutionPlanner, KernelCache,
+    PlannedMethod, ResourceLimits, TunedEntry, TuningContext, TuningOrigin, UnreportedTuning, MachineReading,
     DEFAULT_KERNEL_CACHE_BYTES,
 };
 use magnitude_state::KvCodec;
-use seismic::{BackendName, DeviceCatalog};
+use seismic::BackendName;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -49,13 +50,13 @@ fn prepare_every_entry(
         .map(|relative| PathBuf::from(home.clone() + *relative))
         .find(|path| path.exists())
         .unwrap_or_else(|| panic!("none of {candidates:?} exists under {home}"));
-    let catalog = DeviceCatalog::discover().unwrap();
-    let reserves = MemoryReserves::standard();
+    let catalog = std::rc::Rc::new(seismic::Devices::discover(&[]).unwrap());
+    let release = ReleaseRate::of_machine(None);
     let selected = platform::select_device(
         &catalog,
         ExecutionPath::Native,
         DeviceRequest::Automatic,
-        &reserves,
+        &release,
     )
     .unwrap_or_else(|error| panic!("no accelerator: {error}"));
     let package = Package::open_without_projector(&path).unwrap();
@@ -69,6 +70,8 @@ fn prepare_every_entry(
         max_images_per_request: 1,
         max_image_cells: 0,
         lookahead: false,
+        chain_capacity: std::num::NonZeroUsize::MIN,
+        conversations: std::num::NonZeroUsize::MIN,
     };
     let draft = ExecutionPlanner::prepare(
         &selected,
@@ -88,14 +91,15 @@ fn prepare_every_entry(
         &catalog,
         draft.device().selector(),
         PlatformConfig {
+            graph_cost: None,
             path: ExecutionPath::Native,
-            artifacts: cache
-                .clone()
-                .map(|cache| cache as Arc<dyn seismic::ArtifactStore>),
-            reserves,
         },
     )
     .unwrap();
+    // Its stores are read as a load's are once it opens: every judgment
+    // Seismic asks of them (tuning's room) follows that reading.
+    let reader = DeviceReader::open(std::rc::Rc::new(MachineReading::new(catalog.clone())), release, std::rc::Rc::new(opened.device().clone())).unwrap();
+    let (_ledgers, _) = reader.read_opened(DeviceLedgers::open(opened.device(), Arc::new(LoadShape { stores: Vec::new() })));
     let backend = opened.device().backend();
     let mut tunings = Vec::with_capacity(loads);
     for load in 0..loads {
@@ -108,8 +112,10 @@ fn prepare_every_entry(
                 weights: &package,
                 observer: &UnreportedTuning,
                 cache: cache.as_deref(),
-                error_classes: &magnitude_executor::NO_ERROR_CLASSES,
+                numerical_profile: magnitude_executor::ResolvedNumericalProfile::standard(),
+                settings: magnitude_executor::TuningSettings::STANDARD,
             },
+            magnitude_executor::UnpreparedUnits::ServeDefaults,
         )
         .unwrap_or_else(|error| panic!("{error}"));
         let seconds = began.elapsed().as_secs_f64();
@@ -172,9 +178,9 @@ fn the_pinned_35b_tunes_every_entry_once_on_real_weights() {
 }
 
 /// Tuning spec §C and §E4 check 2: the first load with an empty kernel cache
-/// searches every unit and stores its result (and, on CUDA, every formed
-/// image); the second load uses every stored result, choosing the same
-/// configurations without forming or measuring anything to tune.
+/// searches every unit and stores its result; the second load uses every
+/// stored result, choosing the same configurations without forming or
+/// measuring anything to tune.
 #[test]
 #[ignore = "reads the pinned 4B GGUF; needs Metal or CUDA"]
 fn the_pinned_4b_uses_stored_tuning_on_its_second_load() {
@@ -182,7 +188,7 @@ fn the_pinned_4b_uses_stored_tuning_on_its_second_load() {
         std::env::temp_dir().join(format!("magnitude-kernel-cache-4b-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let cache = Arc::new(KernelCache::open(root.clone(), DEFAULT_KERNEL_CACHE_BYTES).unwrap());
-    let (backend, loads) = prepare_every_entry(&PINNED_4B, Some(cache), 2);
+    let (_, loads) = prepare_every_entry(&PINNED_4B, Some(cache), 2);
     let files = |directory: &str| std::fs::read_dir(root.join(directory)).unwrap().count();
     let (first, second) = (&loads[0], &loads[1]);
     assert!(first
@@ -201,12 +207,5 @@ fn the_pinned_4b_uses_stored_tuning_on_its_second_load() {
             .collect::<Vec<_>>()
     };
     assert_eq!(choices(first), choices(second));
-    // Seismic stores formed images under one directory per toolchain
-    // namespace.
-    if backend == BackendName::Cuda {
-        assert!(files("artifacts/cuda") > 0, "CUDA images are stored");
-    } else {
-        assert!(!root.join("artifacts/cuda").exists());
-    }
     std::fs::remove_dir_all(root).unwrap();
 }

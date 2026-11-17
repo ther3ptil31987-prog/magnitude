@@ -2,13 +2,67 @@
 //! holds the domain's [`StateBindings`] until its finish returns them.
 
 use super::*;
+use crate::programs::SubmittedTarget;
+
+/// The host's turn after a flight finished: until the next launch, the host
+/// reconciles the flight and prepares that launch for the flight's requests.
+/// The owner's own work between flights, which serves no request (memory
+/// observation and what it releases or grows), runs inside the turn but is
+/// no part of it: `owner` is the time it took.
+pub(super) struct HostTurn {
+    since: Instant,
+    owner: Duration,
+    requests: Vec<RequestId>,
+}
+
+impl<F: ProgramFamily> ExecutorDomain<F> {
+    /// A finished flight of `requests` hands the host its turn.
+    pub(super) fn begin_host_turn(&mut self, requests: impl IntoIterator<Item = RequestId>) {
+        self.host_turn = Some(HostTurn {
+            since: Instant::now(),
+            owner: Duration::ZERO,
+            requests: requests.into_iter().collect(),
+        });
+    }
+
+    /// When the service of a launch of `requests` submitted at `submitted`
+    /// starts: where the flight before it finished, when that flight
+    /// carried one of its requests and the owner did not idle since, so a
+    /// launch is charged the host work that prepared it (a round's host
+    /// time is part of its cost), less the owner's own work in that turn;
+    /// at its submission otherwise, so neither idle time nor another
+    /// request's work is charged to it.
+    pub(super) fn service_start(&mut self, requests: &[RequestId], submitted: Instant) -> Instant {
+        match self.host_turn.take() {
+            Some(turn) if requests.iter().any(|request| turn.requests.contains(request)) => {
+                turn.since + turn.owner
+            }
+            _ => submitted,
+        }
+    }
+
+    /// The owner spent `spent` on its own work, which serves no request: the
+    /// running host turn, if any, is charged none of it.
+    pub fn owner_worked(&mut self, spent: Duration) {
+        if let Some(turn) = &mut self.host_turn {
+            turn.owner += spent;
+        }
+    }
+
+    /// The owner has no work: time until its next launch is idle, not service.
+    pub fn host_idle(&mut self) {
+        self.host_turn = None;
+    }
+}
 
 pub struct VisionFlight<F: ProgramFamily = NativeFamily> {
     pub(super) request: RequestId,
     pub(super) image: ImageRef,
     pub(super) submission: F::VisionSubmission,
     pub(super) started: Instant,
-    pub(super) bindings: StateBindings<F>,
+    /// The epoch the flight's launches are timed across ([`LaunchEpoch`]).
+    pub(super) epoch: Option<LaunchEpoch>,
+    pub(super) bindings: StateBindings,
 }
 
 impl<F: ProgramFamily> VisionFlight<F> {
@@ -24,9 +78,11 @@ pub struct HeadFlight<F: ProgramFamily = NativeFamily> {
     pub(super) steps: usize,
     pub(super) submission: F::HeadSubmission,
     pub(super) started: Instant,
+    /// The epoch the flight's launches are timed across ([`LaunchEpoch`]).
+    pub(super) epoch: Option<LaunchEpoch>,
     /// Optional one-flight launch attribution for diagnosing a proposing head.
     pub(super) launch_trace: Option<seismic::SubmissionTrace>,
-    pub(super) bindings: StateBindings<F>,
+    pub(super) bindings: StateBindings,
 }
 
 impl<F: ProgramFamily> HeadFlight<F> {
@@ -36,19 +92,19 @@ impl<F: ProgramFamily> HeadFlight<F> {
 }
 
 /// A prompt chunk's drafter entry, drafted on the device behind its target
-/// flight, conditioned by the flight's feature output. It commits with the
-/// chunk.
+/// flight, conditioned by the flight's feature output. Only completion may
+/// resolve its head advance; a final target token may publish earlier.
 pub(super) struct PrimingFlight<H> {
     pub(super) request: RequestId,
     pub(super) submission: H,
-    /// For a claimed lookahead: the accepted head state its successor
+    /// For a claimed queued step: the accepted head state its successor
     /// advance attaches to at finish, or `None` when nobody claimed it (its
     /// rows are discarded). `None` for an ordinary flight.
     pub(super) continuation: Option<Option<InFlightState>>,
 }
 
-/// One submitted target step: a group's flight, or the lookahead queued
-/// behind one.
+/// One submitted target step: a group's flight, or a step queued behind one
+/// (`queue`).
 pub(super) struct TargetWork<F: ProgramFamily> {
     pub(super) requests: Vec<(
         RequestId,
@@ -63,16 +119,17 @@ pub(super) struct TargetWork<F: ProgramFamily> {
     /// Optional attribution for one prefill flight selected by diagnostics.
     pub(super) launch_trace: Option<seismic::SubmissionTrace>,
     pub(super) started: Instant,
+    /// The epoch the flight's launches are timed across ([`LaunchEpoch`]).
+    pub(super) epoch: Option<LaunchEpoch>,
     /// When the device could begin this step: its submission, or for a step
-    /// queued behind its predecessor (lookahead), the predecessor's
-    /// completion. The step's physical duration is measured from here, so
+    /// queued behind its predecessor, the predecessor's completion. The step's physical duration is measured from here, so
     /// pipelined steps never charge their predecessor's time again.
     pub(super) runnable: Instant,
     /// When the domain last read a selection before this step was submitted.
     pub(super) previous_selection: Option<Instant>,
-    /// Identifies the step a lookahead continues.
+    /// Identifies the step a queued step follows.
     pub(super) id: u64,
-    /// For a claimed lookahead, per slot: the accepted state its successor
+    /// For a claimed queued step, per slot: the accepted state its successor
     /// advance attaches to at finish, or `None` for a slot nobody claimed
     /// (its rows are discarded). `None` for an ordinary step.
     pub(super) continuation: Option<Vec<Option<InFlightState>>>,
@@ -80,8 +137,8 @@ pub(super) struct TargetWork<F: ProgramFamily> {
 
 pub struct TargetFlight<F: ProgramFamily = NativeFamily> {
     pub(super) work: TargetWork<F>,
-    /// Carries the lookahead queued behind `work`.
-    pub(super) bindings: StateBindings<F>,
+    /// The binding right, held while `work` is on the device.
+    pub(super) bindings: StateBindings,
 }
 
 impl<F: ProgramFamily> TargetFlight<F> {
@@ -113,4 +170,37 @@ pub(super) fn decode_selected(bytes: &[u8]) -> Result<Vec<Selected>, String> {
         })
         .collect::<Result<Vec<_>, &str>>()
         .map_err(str::to_owned)
+}
+
+/// The binding right returns only after every submitted use is complete.
+pub enum TargetContinuation<F: ProgramFamily> {
+    Ready(StateBindings),
+    Priming(PrimingCompletionFlight<F>),
+}
+
+/// A final prompt entry finishing after the first token was published.
+/// The binding right stays here, so neither lane can be checkpointed,
+/// evicted, or reused before the head advance resolves.
+pub struct PrimingCompletionFlight<F: ProgramFamily> {
+    pub(super) work: PrimingFlight<F::HeadSubmission>,
+    pub(super) target_end: usize,
+    pub(super) bindings: StateBindings,
+    pub(super) started: Instant,
+}
+
+impl<F: ProgramFamily> PrimingCompletionFlight<F> {
+    pub fn completion(&mut self) -> &mut dyn Completion {
+        self.work.submission.completion()
+    }
+}
+
+impl<F: ProgramFamily> TargetFlight<F> {
+    /// Separate entry completion when the caller publishes this final
+    /// chunk's target result before waiting for drafter history.
+    pub(super) fn detach_priming(&mut self) -> Option<(PrimingFlight<F::HeadSubmission>, usize)> {
+        let work = self.work.priming.take()?;
+        let advances = self.work.submission.launch().advances();
+        let target = &advances[0];
+        Some((work, target.position() + target.rows()))
+    }
 }

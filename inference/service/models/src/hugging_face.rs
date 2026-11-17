@@ -1,3 +1,10 @@
+/// The Hugging Face token ACN configured and the Hub client that presents it.
+#[derive(Clone)]
+pub(crate) struct HubCredential {
+    pub(crate) client: hf_hub::HFClient,
+    pub(crate) token: String,
+}
+
 pub(crate) fn revision_metadata_url(
     endpoint: &str,
     repository: &str,

@@ -7,13 +7,10 @@
 //! documentation names it a backend rule.
 
 use crate::capability;
-use crate::driver::{
-    compile_image, load_module, module_function, Allocation, Context, Driver, DriverError, Event,
-    Stream,
-};
+use crate::driver::{Allocation, Context, Driver, DriverError, Event, Stream};
 use crate::nvrtc;
 use crate::{
-    Cuda, SERVICE_ATOMIC, SERVICE_BARRIER, SERVICE_GLOBAL_READ, SERVICE_GLOBAL_WRITE,
+    Cuda, CudaPtxPrograms, SERVICE_ATOMIC, SERVICE_BARRIER, SERVICE_GLOBAL_READ, SERVICE_GLOBAL_WRITE,
     SERVICE_INSTRUCTION, SERVICE_MATRIX, SERVICE_REPACK, SERVICE_SHARED_READ, SERVICE_SHARED_WRITE,
     SERVICE_SUBGROUP,
 };
@@ -22,7 +19,7 @@ use seismic_compiler::target::{
     assemble_device_description, DiscoveredTarget, ExecutionProfileParts,
 };
 use seismic_estimator::{
-    CompositionQualificationCase, CompositionQualificationParts, DurationInterval, FactProvenance,
+    AnalyticalService, CoreService, CompositionQualificationCase, CompositionQualificationParts, DurationInterval, FactProvenance,
     MeasurementBatch, MeasurementSeries, ProfileAcquisitionMetrics, ResourceTopology,
     ServiceAccuracyClass, ServiceClassId, ServiceCorrelationId, ServiceCurve, ServiceCurveRegime,
     ServiceDefinition, ServiceQualificationDomain,
@@ -31,8 +28,8 @@ const SERVICE_SUBMISSION: ServiceClassId = ServiceClassId::new("core.submission"
 const SERVICE_COPY: ServiceClassId = ServiceClassId::new("core.copy");
 const SERVICE_FILL: ServiceClassId = ServiceClassId::new("core.fill");
 const SERVICE_SCALAR_READ: ServiceClassId = ServiceClassId::new("core.scalar-read");
-const SERVICE_SCALAR_MOVE: ServiceClassId = ServiceClassId::new("core.scalar-move");
-const SERVICE_DATA_CHECK: ServiceClassId = ServiceClassId::new("core.data-check");
+const SERVICE_ALLOCATION_INSTANCE: ServiceClassId = ServiceClassId::new("core.allocation-instance");
+const SERVICE_TENSOR_PUBLICATION: ServiceClassId = ServiceClassId::new("core.tensor-publication");
 use seismic_ir::kernel::Kernel;
 use seismic_ir::physical_target::{
     DataTypeSupport, KernelAbiAllocation, KernelAbiAllocationRole, KernelAbiFootprint,
@@ -121,8 +118,8 @@ const KERNEL_PARAMETER_BYTES_CLASSIC: u64 = 4_096;
 const LOCAL_BYTES_PER_THREAD: u64 = 512 * 1024;
 
 /// Documented per-thread register ceiling of every supported compute
-/// capability.
-const MAX_REGISTERS_PER_THREAD: u32 = 255;
+/// capability: the device's `registers_per_thread`.
+const MAX_REGISTERS_PER_THREAD: u64 = 255;
 /// Backend emission contract (`ptx::.maxnreg`), used by cooperative-grid
 /// residency constraints. This is not driver reflection.
 pub const CODEGEN_REGISTERS_PER_THREAD: u32 = 64;
@@ -179,6 +176,21 @@ impl DriverApiVersion {
     pub fn minor(self) -> u32 {
         (self.0 % 1000) / 10
     }
+}
+
+/// What the backend's kernels require of a device: the `sm_80` emission
+/// floor and the driver floor.
+fn admit_device(
+    name: &str,
+    compute_capability: ComputeCapability,
+    driver_api: DriverApiVersion,
+) -> Result<(), TargetError> {
+    if compute_capability < ComputeCapability::SM80 {
+        return Err(TargetError::UnsupportedDevice(format!(
+            "{name}: compute capability {compute_capability} is below the sm_80 emission floor"
+        )));
+    }
+    admit_driver(driver_api)
 }
 
 /// The driver floor of the backend: below it, the bundled NVRTC's CUBIN is
@@ -286,41 +298,69 @@ pub struct CudaFacts {
     pub driver_api: DriverApiVersion,
     pub ptx: PtxTarget,
     pub tensor_memory: TensorMemory,
-    /// `CU_DEVICE_ATTRIBUTE_WARP_SIZE`.
-    pub warp_size: u32,
-    /// `CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT`.
-    pub multiprocessors: u32,
-    /// `CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR`.
-    pub max_threads_per_multiprocessor: u32,
-    /// `CU_DEVICE_ATTRIBUTE_MAX_BLOCKS_PER_MULTIPROCESSOR`.
-    pub max_blocks_per_multiprocessor: u32,
-    /// `CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_BLOCK`.
-    pub registers_per_block: u32,
-    /// `CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_MULTIPROCESSOR`.
-    pub registers_per_multiprocessor: u32,
-    /// Documented per-thread register ceiling. No reliable pre-JIT register
-    /// pressure model exists for PTX, so this is a fact, not a constraint.
-    pub max_registers_per_thread: u32,
+    /// The device's properties (`seismic_lang::device::cuda`): its
+    /// multiprocessors, warp, block, register and shared-memory limits, L2
+    /// and cooperative launch. No reliable pre-JIT register pressure model
+    /// exists for PTX, so its register limits are facts, not constraints.
+    pub properties: Properties,
     /// Fixed physical-register ceiling emitted on every entry.
     pub codegen_registers_per_thread: u32,
-    /// `CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR`.
-    pub shared_bytes_per_multiprocessor: u64,
-    /// `CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN`: the true
-    /// per-block shared-memory ceiling (native compilation opts every
-    /// kernel in).
-    pub shared_bytes_per_block: u64,
-    /// `CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE`.
-    pub l2_cache_bytes: u64,
     /// `cuDeviceTotalMem`.
     pub global_memory_bytes: u64,
-    /// `CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH`.
-    pub cooperative_launch: bool,
     /// The kernel parameter space, by driver generation.
     pub kernel_parameter_bytes: u64,
 }
 
+pub use seismic_lang::device::cuda::Properties;
+
+/// The device attributes a device's properties are established from
+/// (`seismic_lang::device::cuda`), read once.
+struct Attributes {
+    multiprocessor_count: u64,
+    warp_size: u64,
+    max_threads_per_block: u64,
+    max_threads_per_multiprocessor: u64,
+    max_shared_memory_per_block_optin: u64,
+    l2_cache_size: u64,
+    cooperative_launch: bool,
+    max_registers_per_block: u64,
+}
+
+impl seismic_lang::device::cuda::Queries for Attributes {
+    fn multiprocessor_count(&self) -> Option<u64> {
+        Some(self.multiprocessor_count)
+    }
+    fn warp_size(&self) -> Option<u64> {
+        Some(self.warp_size)
+    }
+    fn max_threads_per_block(&self) -> Option<u64> {
+        Some(self.max_threads_per_block)
+    }
+    fn max_threads_per_multiprocessor(&self) -> Option<u64> {
+        Some(self.max_threads_per_multiprocessor)
+    }
+    fn max_shared_memory_per_block_optin(&self) -> Option<u64> {
+        Some(self.max_shared_memory_per_block_optin)
+    }
+    fn l2_cache_size(&self) -> Option<u64> {
+        Some(self.l2_cache_size)
+    }
+    fn cooperative_launch(&self) -> Option<bool> {
+        Some(self.cooperative_launch)
+    }
+    fn max_registers_per_thread(&self) -> Option<u64> {
+        Some(MAX_REGISTERS_PER_THREAD)
+    }
+    fn max_registers_per_block(&self) -> Option<u64> {
+        Some(self.max_registers_per_block)
+    }
+}
+
 /// Device attribute keys (`CUdevice_attribute`).
 mod attr {
+    pub const PCI_BUS_ID: i32 = 33;
+    pub const PCI_DEVICE_ID: i32 = 34;
+    pub const PCI_DOMAIN_ID: i32 = 50;
     pub const MAX_THREADS_PER_BLOCK: i32 = 1;
     pub const MAX_BLOCK_DIM_X: i32 = 2;
     pub const MAX_BLOCK_DIM_Y: i32 = 3;
@@ -335,29 +375,32 @@ mod attr {
     pub const MAX_THREADS_PER_MULTIPROCESSOR: i32 = 39;
     pub const COMPUTE_CAPABILITY_MAJOR: i32 = 75;
     pub const COMPUTE_CAPABILITY_MINOR: i32 = 76;
-    pub const MAX_SHARED_MEMORY_PER_MULTIPROCESSOR: i32 = 81;
-    pub const MAX_REGISTERS_PER_MULTIPROCESSOR: i32 = 82;
     pub const MAX_SHARED_MEMORY_PER_BLOCK_OPTIN: i32 = 97;
     pub const COOPERATIVE_LAUNCH: i32 = 99;
-    pub const MAX_BLOCKS_PER_MULTIPROCESSOR: i32 = 106;
     pub const INTEGRATED: i32 = 18;
-    pub const MEMORY_CLOCK_RATE: i32 = 36;
-    pub const GLOBAL_MEMORY_BUS_WIDTH: i32 = 37;
+    /// `CU_DEVICE_ATTRIBUTE_NUMA_CONFIG`: whether the device's memory is an
+    /// OS NUMA node.
+    pub const NUMA_CONFIG: i32 = 130;
 }
 
 fn unavailable(error: DriverError) -> TargetError {
-    TargetError::DeviceUnavailable(error.to_string())
+    match error.is_busy() {
+        true => TargetError::DeviceBusy(error.to_string()),
+        false => TargetError::DeviceUnavailable(error.to_string()),
+    }
 }
 
 /// The single-allocation limit of a CUDA device: one `cuMemAlloc` can at
 /// most cover the device's total memory. This is the `TargetLimits` value and
-/// the catalog's published allocation limit; it is not available memory.
+/// the executor's reported allocation limit in the topology; it is not
+/// available memory.
 pub fn max_allocation_bytes(total_memory_bytes: u64) -> u64 {
     total_memory_bytes
 }
 
-/// Cheap unopened catalog identity. Constructing this value does not retain
-/// a primary context, create a stream, run probes, or assemble a profile.
+/// Cheap unopened device identity, as discovery reads it. Constructing this
+/// value does not retain a primary context, create a stream, run probes, or
+/// assemble a profile.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DeviceDescriptor {
     pub ordinal: u32,
@@ -367,13 +410,79 @@ pub struct DeviceDescriptor {
     pub name: String,
     /// `cuDeviceTotalMem`: memory of the exposed device or partition.
     pub total_memory_bytes: u64,
+    /// `cuMemGetAllocationGranularity` (recommended) of its device memory:
+    /// what one allocation's size is rounded up to.
+    pub allocation_granularity: u64,
     /// `CU_DEVICE_ATTRIBUTE_INTEGRATED`: the device shares host memory.
     pub integrated: bool,
-    /// Peak memory bandwidth in bytes per second of a discrete device:
-    /// double-data-rate memory clock times bus width. `None` for an
-    /// integrated device, or when the driver reports either as zero or does
-    /// not report it.
-    pub memory_bandwidth: Option<u64>,
+    /// `CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE`: zero for a device without one.
+    pub l2_cache_bytes: u64,
+    /// `cuDriverGetVersion`.
+    pub driver_api: DriverApiVersion,
+    /// `CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR` / `_MINOR`.
+    pub compute_capability: ComputeCapability,
+    /// `CU_DEVICE_ATTRIBUTE_NUMA_CONFIG`: the device's memory is an OS NUMA
+    /// node, which the OS manages as host memory.
+    pub numa_node: bool,
+    /// `cuDeviceGetLuid`: the OS adapter's LUID, in `LUID` memory layout,
+    /// where the driver reports one (WDDM). It identifies nothing across
+    /// boots; it matches the memory the OS reports as dedicated to the
+    /// adapter.
+    pub luid: Option<[u8; 8]>,
+    /// `CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID`, `_PCI_BUS_ID`, `_PCI_DEVICE_ID`:
+    /// where the device sits on its bus (domain, bus, device).
+    pub pci: [u32; 3],
+}
+
+impl DeviceDescriptor {
+    /// Whether the backend's kernels can run on the device: the reason when
+    /// they cannot.
+    pub fn admission(&self) -> Result<(), TargetError> {
+        admit_device(&self.name, self.compute_capability, self.driver_api)
+    }
+
+    /// Whether the device's memory is the host's: an integrated device's,
+    /// or one the OS manages as a NUMA node.
+    pub fn memory_is_host(&self) -> bool {
+        self.integrated || self.numa_node
+    }
+}
+
+/// Whether device `ordinal` can read and write device `peer`'s memory
+/// directly (`cuDeviceCanAccessPeer`), without a context.
+pub fn can_access_peer(ordinal: u32, peer: u32) -> Result<bool, TargetError> {
+    let driver = Driver::load().map_err(TargetError::DeviceUnavailable)?;
+    let device = |ordinal: u32| {
+        c_int::try_from(ordinal).map_err(|_| {
+            TargetError::DeviceUnavailable(format!("ordinal {ordinal} exceeds the driver ABI"))
+        })
+    };
+    let mut access = 0;
+    unsafe {
+        driver
+            .check(
+                (driver.device_can_access_peer)(&mut access, device(ordinal)?, device(peer)?),
+                "peer access",
+            )
+            .map_err(unavailable)?;
+    }
+    Ok(access != 0)
+}
+
+fn read_compute_capability(
+    driver: &Driver,
+    device: c_int,
+) -> Result<ComputeCapability, TargetError> {
+    let unsigned = |key: i32| -> Result<u16, TargetError> {
+        let value = driver.attribute(key, device).map_err(unavailable)?;
+        u16::try_from(value).map_err(|_| {
+            TargetError::UnsupportedDevice(format!("device attribute {key} reports {value}"))
+        })
+    };
+    Ok(ComputeCapability {
+        major: unsigned(attr::COMPUTE_CAPABILITY_MAJOR)?,
+        minor: unsigned(attr::COMPUTE_CAPABILITY_MINOR)?,
+    })
 }
 
 /// Number of CUDA devices the driver reports; zero (or no driver) is
@@ -405,9 +514,13 @@ pub fn describe(ordinal: u32) -> Result<DeviceDescriptor, TargetError> {
     let mut name = [0 as std::ffi::c_char; 256];
     let mut memory = 0usize;
     let mut uuid = [0u8; 16];
+    let mut version = 0;
     unsafe {
         driver
             .check((driver.device_get)(&mut handle, device), "device selection")
+            .map_err(unavailable)?;
+        driver
+            .check((driver.driver_version)(&mut version), "driver version")
             .map_err(unavailable)?;
         driver
             .check(
@@ -429,18 +542,9 @@ pub fn describe(ordinal: u32) -> Result<DeviceDescriptor, TargetError> {
         .attribute(attr::INTEGRATED, device)
         .map_err(unavailable)?
         != 0;
-    // A discrete board's memory clock and bus give its bandwidth. An
-    // integrated device's shared memory has no meaningful board clock (GB10
-    // reports twice its LPDDR5X bandwidth), and newer drivers may not report
-    // the clock at all; either way bandwidth is resolved from the device's
-    // published specification.
-    let (clock_khz, bus_bits) = if integrated {
-        (None, None)
-    } else {
-        (
-            driver.attribute(attr::MEMORY_CLOCK_RATE, device).ok(),
-            driver.attribute(attr::GLOBAL_MEMORY_BUS_WIDTH, device).ok(),
-        )
+    let pci = |key: c_int| {
+        let value = driver.attribute(key, device).map_err(unavailable)?;
+        u32::try_from(value).map_err(|_| TargetError::DeviceUnavailable(format!("PCI attribute {key} of {value}")))
     };
     Ok(DeviceDescriptor {
         ordinal,
@@ -449,32 +553,58 @@ pub fn describe(ordinal: u32) -> Result<DeviceDescriptor, TargetError> {
             .to_string_lossy()
             .into_owned(),
         total_memory_bytes: memory as u64,
+        allocation_granularity: crate::driver::device_granularity(&driver, device).map_err(unavailable)?,
         integrated,
-        memory_bandwidth: clock_khz.zip(bus_bits).and_then(|(clock, bus)| {
-            memory_bandwidth(u64::try_from(clock).ok()?, u64::try_from(bus).ok()?)
-        }),
+        l2_cache_bytes: u64::try_from(
+            driver
+                .attribute(attr::L2_CACHE_SIZE, device)
+                .map_err(unavailable)?,
+        )
+        .map_err(|_| TargetError::DeviceUnavailable("negative L2 cache size".into()))?,
+        driver_api: DriverApiVersion(u32::try_from(version).map_err(|_| {
+            TargetError::UnsupportedDriver(format!("driver API version {version}"))
+        })?),
+        compute_capability: read_compute_capability(&driver, device)?,
+        numa_node: numa_node(&driver, device)?,
+        luid: luid(&driver, device)?,
+        pci: [pci(attr::PCI_DOMAIN_ID)?, pci(attr::PCI_BUS_ID)?, pci(attr::PCI_DEVICE_ID)?],
     })
 }
 
-/// Double-data-rate bandwidth of a memory clock (kHz) over a bus (bits).
-fn memory_bandwidth(clock_khz: u64, bus_bits: u64) -> Option<u64> {
-    if clock_khz == 0 || bus_bits == 0 {
-        return None;
+/// `CUDA_ERROR_INVALID_VALUE`.
+const INVALID_VALUE: i32 = 1;
+/// `CUDA_ERROR_NOT_SUPPORTED`.
+const NOT_SUPPORTED: i32 = 801;
+
+/// Whether the device's memory is an OS NUMA node
+/// (`CU_DEVICE_ATTRIBUTE_NUMA_CONFIG` is `CU_DEVICE_NUMA_CONFIG_NUMA_NODE`).
+/// A driver that does not know the attribute rejects it as an invalid value:
+/// it states no NUMA node for the device.
+fn numa_node(driver: &Driver, device: c_int) -> Result<bool, TargetError> {
+    /// `CU_DEVICE_NUMA_CONFIG_NUMA_NODE`.
+    const NUMA_NODE: i32 = 1;
+    match driver.attribute(attr::NUMA_CONFIG, device) {
+        Ok(config) => Ok(config == NUMA_NODE),
+        Err(error) if error.code == INVALID_VALUE => Ok(false),
+        Err(error) => Err(unavailable(error)),
     }
-    Some(2 * clock_khz * 1000 * bus_bits / 8)
 }
 
-#[cfg(test)]
-mod memory_bandwidth_tests {
-    use super::memory_bandwidth;
-
-    #[test]
-    fn published_boards_follow_from_clock_and_bus() {
-        // RTX 4090: 10,501 MHz on 384 bits.
-        assert_eq!(memory_bandwidth(10_501_000, 384), Some(1_008_096_000_000));
-        // RTX 5090: 14,001 MHz on 512 bits.
-        assert_eq!(memory_bandwidth(14_001_000, 512), Some(1_792_128_000_000));
-        assert_eq!(memory_bandwidth(0, 384), None);
+/// `cuDeviceGetLuid`, which only a driver under WDDM supports: elsewhere the
+/// device has no OS adapter LUID.
+fn luid(driver: &Driver, device: c_int) -> Result<Option<[u8; 8]>, TargetError> {
+    let Some(device_luid) = driver.device_luid else {
+        return Ok(None);
+    };
+    let mut luid = [0 as std::ffi::c_char; 8];
+    let mut node_mask: std::ffi::c_uint = 0;
+    match driver.check(
+        unsafe { device_luid(luid.as_mut_ptr(), &mut node_mask, device) },
+        "device LUID",
+    ) {
+        Ok(()) => Ok(Some(luid.map(|byte| byte as u8))),
+        Err(error) if error.code == NOT_SUPPORTED => Ok(None),
+        Err(error) => Err(unavailable(error)),
     }
 }
 
@@ -519,26 +649,12 @@ pub(crate) fn discover(ordinal: u32) -> Result<DiscoveredTarget<Cuda>, TargetErr
     let hardware = unsafe { CStr::from_ptr(name.as_ptr()) }
         .to_string_lossy()
         .into_owned();
-    let major = unsigned(attr::COMPUTE_CAPABILITY_MAJOR)?;
-    let minor = unsigned(attr::COMPUTE_CAPABILITY_MINOR)?;
-    let compute_capability = ComputeCapability {
-        major: u16::try_from(major).map_err(|_| {
-            TargetError::UnsupportedDevice(format!("compute capability major {major}"))
-        })?,
-        minor: u16::try_from(minor).map_err(|_| {
-            TargetError::UnsupportedDevice(format!("compute capability minor {minor}"))
-        })?,
-    };
-    if compute_capability < ComputeCapability::SM80 {
-        return Err(TargetError::UnsupportedDevice(format!(
-            "{hardware}: compute capability {compute_capability} is below the sm_80 emission floor"
-        )));
-    }
+    let compute_capability = read_compute_capability(&driver, device)?;
     let driver_api =
         DriverApiVersion(u32::try_from(version).map_err(|_| {
             TargetError::UnsupportedDriver(format!("driver API version {version}"))
         })?);
-    admit_driver(driver_api)?;
+    admit_device(&hardware, compute_capability, driver_api)?;
     let blackwell_100_family = in_blackwell_100_family(compute_capability, driver_api);
     let ptx = if blackwell_100_family {
         PtxTarget::BLACKWELL_100_FAMILY
@@ -558,9 +674,17 @@ pub(crate) fn discover(ordinal: u32) -> Result<DiscoveredTarget<Cuda>, TargetErr
     } else {
         TensorMemory::Unavailable
     };
-    let warp_size = unsigned(attr::WARP_SIZE)?;
-    let multiprocessors = unsigned(attr::MULTIPROCESSOR_COUNT)?;
-    let cooperative_launch = unsigned(attr::COOPERATIVE_LAUNCH)? == 1;
+    let properties = seismic_lang::device::cuda::describe(&Attributes {
+        multiprocessor_count: u64::from(unsigned(attr::MULTIPROCESSOR_COUNT)?),
+        warp_size: u64::from(unsigned(attr::WARP_SIZE)?),
+        max_threads_per_block: u64::from(unsigned(attr::MAX_THREADS_PER_BLOCK)?),
+        max_threads_per_multiprocessor: u64::from(unsigned(attr::MAX_THREADS_PER_MULTIPROCESSOR)?),
+        max_shared_memory_per_block_optin: u64::from(unsigned(attr::MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)?),
+        l2_cache_size: u64::from(unsigned(attr::L2_CACHE_SIZE)?),
+        cooperative_launch: unsigned(attr::COOPERATIVE_LAUNCH)? == 1,
+        max_registers_per_block: u64::from(unsigned(attr::MAX_REGISTERS_PER_BLOCK)?),
+    }, &Default::default())
+    .expect("every CUDA property's source is an attribute the driver reports");
     let kernel_parameter_bytes = if driver_api >= DriverApiVersion::LARGE_PARAMETERS_MINIMUM {
         KERNEL_PARAMETER_BYTES_LARGE
     } else {
@@ -573,21 +697,9 @@ pub(crate) fn discover(ordinal: u32) -> Result<DiscoveredTarget<Cuda>, TargetErr
         driver_api,
         ptx,
         tensor_memory,
-        warp_size,
-        multiprocessors,
-        max_threads_per_multiprocessor: unsigned(attr::MAX_THREADS_PER_MULTIPROCESSOR)?,
-        max_blocks_per_multiprocessor: unsigned(attr::MAX_BLOCKS_PER_MULTIPROCESSOR)?,
-        registers_per_block: unsigned(attr::MAX_REGISTERS_PER_BLOCK)?,
-        registers_per_multiprocessor: unsigned(attr::MAX_REGISTERS_PER_MULTIPROCESSOR)?,
-        max_registers_per_thread: MAX_REGISTERS_PER_THREAD,
+        properties,
         codegen_registers_per_thread: CODEGEN_REGISTERS_PER_THREAD,
-        shared_bytes_per_multiprocessor: u64::from(unsigned(
-            attr::MAX_SHARED_MEMORY_PER_MULTIPROCESSOR,
-        )?),
-        shared_bytes_per_block: u64::from(unsigned(attr::MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)?),
-        l2_cache_bytes: u64::from(unsigned(attr::L2_CACHE_SIZE)?),
         global_memory_bytes,
-        cooperative_launch,
         kernel_parameter_bytes,
     };
     let limits = TargetLimits {
@@ -596,13 +708,13 @@ pub(crate) fn discover(ordinal: u32) -> Result<DiscoveredTarget<Cuda>, TargetErr
             u64::from(unsigned(attr::MAX_BLOCK_DIM_Y)?),
             u64::from(unsigned(attr::MAX_BLOCK_DIM_Z)?),
         ],
-        max_workgroup_threads: u64::from(unsigned(attr::MAX_THREADS_PER_BLOCK)?),
+        max_workgroup_threads: properties.max_group_threads.get(),
         max_grid: [
             u64::from(unsigned(attr::MAX_GRID_DIM_X)?),
             u64::from(unsigned(attr::MAX_GRID_DIM_Y)?),
             u64::from(unsigned(attr::MAX_GRID_DIM_Z)?),
         ],
-        max_workgroup_bytes: facts.shared_bytes_per_block,
+        max_workgroup_bytes: properties.shared_bytes_per_group.get(),
         participant_local_bytes: Some(LOCAL_BYTES_PER_THREAD),
         // Every binding is one 8-byte pointer word plus its extents and
         // strides (`ptx::ParameterAbi`); the argument byte limit is the
@@ -617,7 +729,7 @@ pub(crate) fn discover(ordinal: u32) -> Result<DiscoveredTarget<Cuda>, TargetErr
         max_allocation_alignment: ALLOCATION_ALIGNMENT,
         // Kernel index registers are 64-bit (`.address_size 64`).
         max_index_bits: 64,
-        subgroup_width: Some(warp_size),
+        subgroup_width: Some(u32::try_from(properties.subgroup_width.get()).expect("a warp's width fits u32")),
     };
     let dtypes = DataTypeSupport {
         scalars: [
@@ -626,6 +738,7 @@ pub(crate) fn discover(ordinal: u32) -> Result<DiscoveredTarget<Cuda>, TargetErr
             DType::BF16,
             DType::I32,
             DType::U32,
+            DType::U64,
             DType::Bool,
         ]
         .into_iter()
@@ -689,14 +802,15 @@ pub(crate) fn discover(ordinal: u32) -> Result<DiscoveredTarget<Cuda>, TargetErr
 }
 
 /// Acquires and assembles the complete profile on the exact context and
-/// production stream retained by the opened device service.
+/// production stream retained by the opened device service, its probe
+/// kernels formed through `programs`, the device's.
 pub(crate) fn profile_for_opened(
-    ordinal: u32,
-    context: &Arc<Context>,
-    stream: &Arc<Stream>,
+    service: &crate::Device,
     device: Arc<seismic_native_target::DeviceDescription<Cuda>>,
+    programs: &CudaPtxPrograms,
 ) -> Result<seismic_compiler::evaluation::AnalyticalEvaluationContext<Cuda>, TargetError> {
     let total_started = Instant::now();
+    let (ordinal, context, stream) = (service.ordinal(), service.context(), service.stream());
     if context.ordinal()
         != c_int::try_from(ordinal).map_err(|_| {
             TargetError::DeviceUnavailable(format!("ordinal {ordinal} exceeds the driver ABI"))
@@ -706,7 +820,7 @@ pub(crate) fn profile_for_opened(
         panic!("CUDA profile acquisition received a context/stream for another opened device")
     }
     let (services, composition_qualification, probe_build_ns, probe_execution_ns) =
-        acquire_services(context, stream, device.facts())?;
+        acquire_services(service, device.facts(), programs)?;
     let execution_parts = ExecutionProfileParts::new(
         device,
         "seismic-cuda-probes-v5-classified-host-confidence95",
@@ -741,7 +855,6 @@ pub(crate) fn device_for_opened(
 const GPU_PROBE_REPETITIONS: usize = 64;
 const HOST_DETERMINISTIC_REPETITIONS: usize = 9;
 const HOST_STOCHASTIC_REPETITIONS: usize = 64;
-const HOST_COMPUTE_AMPLIFICATION_UNITS: u64 = 268_435_456;
 const GPU_CONFIDENCE_Z_95: f64 = 1.96;
 /// NVIDIA's CUDA Driver API documents `cuEventElapsedTime` with approximately
 /// 0.5 microsecond resolution. This is clock quantization, not the latency of
@@ -751,9 +864,9 @@ const MAX_GPU_ACQUISITION_ROUNDS: usize = 3;
 const MAX_HOST_ACQUISITION_ROUNDS: usize = 8;
 
 fn acquire_services(
-    context: &Arc<Context>,
-    stream: &Arc<Stream>,
+    service: &crate::Device,
     facts: &CudaFacts,
+    programs: &CudaPtxPrograms,
 ) -> Result<
     (
         Vec<ServiceDefinition>,
@@ -763,14 +876,20 @@ fn acquire_services(
     ),
     TargetError,
 > {
+    let (context, stream) = (service.context(), service.stream());
     let build_started = Instant::now();
-    let source = probe_source(facts.ptx);
-    let image = compile_image(context, &source).map_err(|error| {
-        TargetError::DeviceUnavailable(format!("CUDA probe compilation: {error:?}"))
+    let source = seismic_native_target::ProgramSource {
+        text: probe_source(facts.ptx),
+        entries: PROBE_ENTRIES.into_iter().map(seismic_native_target::ProgramEntry::named).collect(),
+    };
+    let formed = programs.form(std::slice::from_ref(&source)).map_err(|error| {
+        TargetError::DeviceUnavailable(format!("CUDA probe formation: {error:?}"))
     })?;
-    let (module, empty) = load_module(context, &image, "probe_empty").map_err(|error| {
-        TargetError::DeviceUnavailable(format!("CUDA probe loading: {error:?}"))
-    })?;
+    let probe = |entry: &str| {
+        let (module, position) = formed[0].program(&seismic_native_target::ProgramEntry::named(entry));
+        module.function(position)
+    };
+    let empty = probe("probe_empty");
     let probe_build_ns = u64::try_from(build_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let execution_started = Instant::now();
     let allocation = Allocation::new(context, 4096).map_err(unavailable)?;
@@ -795,15 +914,13 @@ fn acquire_services(
                           participants_per_unit: u64,
                           topology: ResourceTopology|
      -> Result<(), TargetError> {
-        let function = module_function(&module, entry).map_err(|error| {
-            TargetError::DeviceUnavailable(format!("CUDA probe `{entry}` lookup: {error:?}"))
-        })?;
+        let function = probe(entry);
         let latency_units = u64::from(latency_block[0])
             * u64::from(latency_block[1])
             * u64::from(latency_block[2])
             * operations_per_thread
             / participants_per_unit;
-        let capacity_grid = [facts.multiprocessors.max(1), 1, 1];
+        let capacity_grid = [u32::try_from(facts.properties.units.get()).expect("a device's multiprocessors fit u32").max(1), 1, 1];
         let capacity_units = u64::from(capacity_grid[0])
             * u64::from(capacity_block[0])
             * u64::from(capacity_block[1])
@@ -877,8 +994,8 @@ fn acquire_services(
         ));
         Ok(())
     };
-    let sms = facts.multiprocessors.max(1);
-    let lanes = facts.max_threads_per_multiprocessor.max(1);
+    let sms = u32::try_from(facts.properties.units.get()).expect("a device's multiprocessors fit u32").max(1);
+    let lanes = u32::try_from(facts.properties.threads_per_unit.get()).expect("a multiprocessor's threads fit u32").max(1);
     let compute_topology = ResourceTopology {
         resources: sms,
         max_concurrency: lanes,
@@ -980,21 +1097,15 @@ fn acquire_services(
     )?;
 
     definitions.extend(acquire_core_services(
-        context,
-        stream,
-        empty,
+        service,
         &allocation,
-        facts,
         timer_resolution,
         &baseline,
     )?);
     let required: BTreeSet<_> =
         <seismic_estimator::CoreService as seismic_estimator::AnalyticalService>::ALL
             .iter()
-            .copied()
-            .map(|service| {
-                ServiceClassId::new(seismic_estimator::AnalyticalService::stable_name(service))
-            })
+            .map(|service| seismic_estimator::AnalyticalService::class(*service))
             .collect();
     debug_assert!(required
         .iter()
@@ -1041,6 +1152,21 @@ fn acquire_services(
     ))
 }
 
+/// The entries of [`probe_source`], in its order.
+const PROBE_ENTRIES: [&str; 11] = [
+    "probe_empty",
+    "probe_instruction",
+    "probe_global_read",
+    "probe_global_write",
+    "probe_shared_read",
+    "probe_shared_write",
+    "probe_atomic",
+    "probe_barrier",
+    "probe_subgroup",
+    "probe_matrix",
+    "probe_repack",
+];
+
 fn probe_source(target: PtxTarget) -> String {
     format!(
         "{}\
@@ -1072,6 +1198,18 @@ struct ProbeObservation {
 struct AcquiredBatch {
     observations: Vec<ProbeObservation>,
     acquisition_duration_ns: u64,
+    /// How its observations were timed, which decides how they bound an
+    /// interval.
+    timing: BatchTiming,
+}
+
+/// How a batch's observations were timed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BatchTiming {
+    /// By CUDA events on the device's stream: a confidence interval.
+    Device,
+    /// By the host's monotonic clock, its observations bounded by `spread`.
+    Host(HostSpread),
 }
 
 fn interval_qualified(interval: DurationInterval, percent: u128) -> bool {
@@ -1168,6 +1306,7 @@ fn measure_kernel(
         observations,
         acquisition_duration_ns: u64::try_from(acquisition_started.elapsed().as_nanos())
             .unwrap_or(u64::MAX),
+        timing: BatchTiming::Device,
     })
 }
 
@@ -1179,27 +1318,10 @@ fn enqueue_kernel(
     block: [u32; 3],
     params: &mut [*mut std::ffi::c_void; 1],
 ) -> Result<(), TargetError> {
-    unsafe {
-        context
-            .driver
-            .check(
-                (context.driver.launch)(
-                    function,
-                    grid[0],
-                    grid[1],
-                    grid[2],
-                    block[0],
-                    block[1],
-                    block[2],
-                    0,
-                    stream.raw(),
-                    params.as_mut_ptr(),
-                    std::ptr::null_mut(),
-                ),
-                "profile probe launch",
-            )
-            .map_err(unavailable)?;
-    }
+    let status = unsafe {
+        context.enqueue().launch(false, function, grid, block, 0, stream.raw(), params.as_mut_ptr(), std::ptr::null_mut())
+    };
+    context.driver.check(status, "profile probe launch").map_err(unavailable)?;
     Ok(())
 }
 
@@ -1299,6 +1421,7 @@ fn measure_kernel_sequence_difference_round(
         observations,
         acquisition_duration_ns: u64::try_from(acquisition_started.elapsed().as_nanos())
             .unwrap_or(u64::MAX),
+        timing: BatchTiming::Device,
     })
 }
 
@@ -1311,10 +1434,9 @@ fn measured_definition(
     latency: &AcquiredBatch,
     saturated: &AcquiredBatch,
 ) -> ServiceDefinition {
-    let host_fact = probe.starts_with("probe_scalar_") || probe == "probe_data_check";
-    let stochastic_host_fact = probe == "probe_scalar_read";
+    let extrema = latency.timing == BatchTiming::Host(HostSpread::Extrema);
     let latency_interval = widen_interval(
-        if host_fact && !stochastic_host_fact {
+        if extrema {
             normalized_observation_interval(&latency.observations)
         } else {
             normalized_confidence_interval(&latency.observations)
@@ -1326,7 +1448,7 @@ fn measured_definition(
             normalized_confidence_interval(&saturated.observations),
             timer_resolution_ns,
         )
-    } else if host_fact && !stochastic_host_fact {
+    } else if extrema {
         widen_interval(
             differential_wave_interval(&saturated.observations, &baseline.observations, topology),
             timer_resolution_ns,
@@ -1341,12 +1463,10 @@ fn measured_definition(
             timer_resolution_ns,
         )
     };
-    let method = if stochastic_host_fact {
-        "bounded-whole-batch-v5/host-monotonic-confidence95-differential"
-    } else if host_fact {
-        "bounded-whole-batch-v5/host-monotonic-extrema-differential"
-    } else {
-        "bounded-whole-batch-v5/cuda-event-500ns-confidence95-differential"
+    let method = match latency.timing {
+        BatchTiming::Host(HostSpread::Confidence) => "calibrated-whole-batch-v6/host-monotonic-confidence95-differential",
+        BatchTiming::Host(HostSpread::Extrema) => "calibrated-whole-batch-v6/host-monotonic-extrema-differential",
+        BatchTiming::Device => "bounded-whole-batch-v5/cuda-event-500ns-confidence95-differential",
     };
     let saturated_units = saturated
         .observations
@@ -1434,6 +1554,8 @@ fn service_accuracy(class: seismic_estimator::ServiceClassId) -> ServiceAccuracy
             | SERVICE_FILL
             | SERVICE_SCALAR_READ
             | SERVICE_SUBMISSION
+            | SERVICE_ALLOCATION_INSTANCE
+            | SERVICE_TENSOR_PUBLICATION
     ) {
         ServiceAccuracyClass::MemoryOrTransfer
     } else {
@@ -1682,122 +1804,35 @@ fn differential_wave_confidence_interval(
     )
 }
 
+/// Every core service's definition, each measured on what this backend does
+/// for it.
 fn acquire_core_services(
-    context: &Arc<Context>,
-    stream: &Arc<Stream>,
-    _empty: crate::driver::Handle,
+    service: &crate::Device,
     allocation: &Allocation,
-    _facts: &CudaFacts,
     event_resolution: DurationInterval,
     launch_baseline: &AcquiredBatch,
 ) -> Result<Vec<ServiceDefinition>, TargetError> {
+    let (context, stream) = (service.context(), service.stream());
     let topology = ResourceTopology {
         resources: 1,
         max_concurrency: 1,
     };
-    let mut services = vec![measured_definition(
-        SERVICE_SUBMISSION,
-        topology,
-        "probe_empty",
-        event_resolution,
-        launch_baseline,
-        launch_baseline,
-        launch_baseline,
-    )];
     let bytes = 64 * 1024 * 1024;
     let transfer_source = Allocation::new(context, bytes).map_err(unavailable)?;
     let transfer_destination = Allocation::new(context, bytes).map_err(unavailable)?;
-    let copy = measure_stream_operation(
-        context,
-        stream,
-        bytes as u64,
-        event_resolution,
-        2,
-        "probe_device_copy",
-        || unsafe {
-            context.driver.check(
-                (context.driver.memcpy_device_async)(
-                    transfer_destination.pointer,
-                    transfer_source.pointer,
-                    bytes,
-                    stream.raw(),
-                ),
-                "profile device copy",
-            )
-        },
-    )?;
-    let fill = measure_stream_operation(
-        context,
-        stream,
-        bytes as u64,
-        event_resolution,
-        2,
-        "probe_device_fill",
-        || unsafe {
-            context.driver.check(
-                (context.driver.memset_d8_async)(transfer_source.pointer, 0, bytes, stream.raw()),
-                "profile device fill",
-            )
-        },
-    )?;
-    services.push(measured_definition(
-        SERVICE_COPY,
-        topology,
-        "probe_device_copy",
-        event_resolution,
-        launch_baseline,
-        &copy,
-        &copy,
-    ));
-    services.push(measured_definition(
-        SERVICE_FILL,
-        topology,
-        "probe_device_fill",
-        event_resolution,
-        launch_baseline,
-        &fill,
-        &fill,
-    ));
-
     let host_resolution = host_timer_resolution()?;
     let host_baseline = measure_host(
-        HOST_COMPUTE_AMPLIFICATION_UNITS,
         host_resolution,
         1,
+        HostSpread::Extrema,
         "probe_host_baseline",
-        || std::hint::black_box(()),
-    )?;
-    let scalar_read = measure_host_result(32_768, host_resolution, 2, "probe_scalar_read", || {
-        let mut bytes = [0u8; 4];
-        allocation.download_at(0, &mut bytes).map_err(unavailable)
-    })?;
-    let scalar_move = measure_host(
-        HOST_COMPUTE_AMPLIFICATION_UNITS,
-        host_resolution,
-        1,
-        "probe_scalar_move",
         || {
-            let source = std::hint::black_box(0x1234_5678_u64);
-            std::hint::black_box(source);
+            std::hint::black_box(());
+            Ok(())
         },
     )?;
-    let data_check = measure_host(
-        HOST_COMPUTE_AMPLIFICATION_UNITS,
-        host_resolution,
-        1,
-        "probe_data_check",
-        || {
-            let left = std::hint::black_box(0x1234_5678_u64);
-            let right = std::hint::black_box(0x1234_5678_u64);
-            std::hint::black_box(left == right);
-        },
-    )?;
-    for (class, probe, observations) in [
-        (SERVICE_SCALAR_READ, "probe_scalar_read", scalar_read),
-        (SERVICE_SCALAR_MOVE, "probe_scalar_move", scalar_move),
-        (SERVICE_DATA_CHECK, "probe_data_check", data_check),
-    ] {
-        services.push(measured_definition(
+    let host = |class, probe, observations: AcquiredBatch| {
+        measured_definition(
             class,
             topology,
             probe,
@@ -1805,9 +1840,177 @@ fn acquire_core_services(
             &host_baseline,
             &observations,
             &observations,
-        ));
-    }
-    Ok(services)
+        )
+    };
+    <CoreService as AnalyticalService>::ALL
+        .iter()
+        .map(|core| -> Result<ServiceDefinition, TargetError> {
+            let class = core.class();
+            Ok(match core {
+                CoreService::Submission => measured_definition(
+                    class,
+                    topology,
+                    "probe_empty",
+                    event_resolution,
+                    launch_baseline,
+                    launch_baseline,
+                    launch_baseline,
+                ),
+                CoreService::Copy => {
+                    let copy = measure_stream_operation(
+                        context,
+                        stream,
+                        bytes as u64,
+                        event_resolution,
+                        2,
+                        "probe_device_copy",
+                        || unsafe {
+                            context.driver.check(
+                                context.enqueue().memcpy_device_async(
+                                    transfer_destination.pointer,
+                                    transfer_source.pointer,
+                                    bytes,
+                                    stream.raw(),
+                                ),
+                                "profile device copy",
+                            )
+                        },
+                    )?;
+                    measured_definition(
+                        class,
+                        topology,
+                        "probe_device_copy",
+                        event_resolution,
+                        launch_baseline,
+                        &copy,
+                        &copy,
+                    )
+                }
+                CoreService::Fill => {
+                    let fill = measure_stream_operation(
+                        context,
+                        stream,
+                        bytes as u64,
+                        event_resolution,
+                        2,
+                        "probe_device_fill",
+                        || unsafe {
+                            context.driver.check(
+                                context.enqueue().memset_d8_async(
+                                    transfer_source.pointer,
+                                    0,
+                                    bytes,
+                                    stream.raw(),
+                                ),
+                                "profile device fill",
+                            )
+                        },
+                    )?;
+                    measured_definition(
+                        class,
+                        topology,
+                        "probe_device_fill",
+                        event_resolution,
+                        launch_baseline,
+                        &fill,
+                        &fill,
+                    )
+                }
+                CoreService::ScalarRead => host(
+                    class,
+                    "probe_scalar_read",
+                    measure_host(
+                        host_resolution,
+                        2,
+                        HostSpread::Confidence,
+                        "probe_scalar_read",
+                        || {
+                            let mut bytes = [0u8; 4];
+                            allocation.download_at(0, &mut bytes).map_err(unavailable)
+                        },
+                    )?,
+                ),
+                CoreService::ScalarMove => host(
+                    class,
+                    "probe_scalar_move",
+                    measure_host(
+                        host_resolution,
+                        1,
+                        HostSpread::Extrema,
+                        "probe_scalar_move",
+                        || {
+                            let source = std::hint::black_box(0x1234_5678_u64);
+                            std::hint::black_box(source);
+                            Ok(())
+                        },
+                    )?,
+                ),
+                // A reached instance's backing, as the executor acquires one:
+                // the device's allocation of a block range, charged to the
+                // device store's own entry, released after.
+                CoreService::AllocationInstance => {
+                    let entry = service.stores().device.own();
+                    host(
+                        class,
+                        "probe_allocation_instance",
+                        measure_host(
+                            host_resolution,
+                            2,
+                            HostSpread::Confidence,
+                            "probe_allocation_instance",
+                            || {
+                                let instance =
+                                    <crate::Device as seismic_compiler::executable::DeviceService<Cuda>>::allocate(
+                                        service,
+                                        crate::topology::DEVICE_KIND,
+                                        seismic_estimator::ALLOCATION_INSTANCE_BYTES,
+                                        256,
+                                        &entry,
+                                    )
+                                    .map_err(|error| TargetError::DeviceUnavailable(error.to_string()))?;
+                                drop(std::hint::black_box(instance));
+                                Ok(())
+                            },
+                        )?,
+                    )
+                }
+                // A publication as the schedule's execution records it.
+                CoreService::TensorPublication => {
+                    let mut probe = seismic_compiler::executable::TensorPublicationProbe::new();
+                    host(
+                        class,
+                        "probe_tensor_publication",
+                        measure_host(
+                            host_resolution,
+                            2,
+                            HostSpread::Confidence,
+                            "probe_tensor_publication",
+                            || {
+                                probe.publish();
+                                Ok(())
+                            },
+                        )?,
+                    )
+                }
+                CoreService::DataCheck => host(
+                    class,
+                    "probe_data_check",
+                    measure_host(
+                        host_resolution,
+                        1,
+                        HostSpread::Extrema,
+                        "probe_data_check",
+                        || {
+                            let left = std::hint::black_box(0x1234_5678_u64);
+                            let right = std::hint::black_box(0x1234_5678_u64);
+                            std::hint::black_box(left == right);
+                            Ok(())
+                        },
+                    )?,
+                ),
+            })
+        })
+        .collect()
 }
 
 fn measure_stream_operation(
@@ -1852,6 +2055,7 @@ fn measure_stream_operation(
                 observations,
                 acquisition_duration_ns: u64::try_from(acquisition_started.elapsed().as_nanos())
                     .unwrap_or(u64::MAX),
+                timing: BatchTiming::Device,
             });
         }
         last = Some(interval);
@@ -1864,96 +2068,86 @@ fn measure_stream_operation(
     ))
 }
 
-fn measure_host(
-    mut units: u64,
-    timer_resolution: DurationInterval,
-    percent: u128,
-    probe: &str,
-    mut operation: impl FnMut(),
-) -> Result<AcquiredBatch, TargetError> {
-    units = units.max(1);
-    let mut last = None;
-    for _ in 0..MAX_HOST_ACQUISITION_ROUNDS {
-        let acquisition_started = Instant::now();
-        for _ in 0..units {
-            operation();
-        }
-        let observations = (0..HOST_DETERMINISTIC_REPETITIONS)
-            .map(|_| {
-                let start = Instant::now();
-                for _ in 0..units {
-                    operation();
-                }
-                ProbeObservation {
-                    nanoseconds: start.elapsed().as_nanos() as f64,
-                    units,
-                }
-            })
-            .collect::<Vec<_>>();
-        let interval = widen_interval(
-            normalized_observation_interval(&observations),
-            timer_resolution,
-        );
-        if interval_qualified(interval, percent) {
-            return Ok(AcquiredBatch {
-                observations,
-                acquisition_duration_ns: u64::try_from(acquisition_started.elapsed().as_nanos())
-                    .unwrap_or(u64::MAX),
-            });
-        }
-        last = Some(interval);
-    }
-    Err(acquisition_failure(
-        probe,
-        percent,
-        last.unwrap_or_else(|| DurationInterval::new(0, u64::MAX, 1)),
-        MAX_HOST_ACQUISITION_ROUNDS,
-    ))
+/// How a host probe's observations bound its interval.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostSpread {
+    /// A deterministic operation: the extrema of a few observations.
+    Extrema,
+    /// A stochastic operation: the 95% confidence interval of the mean.
+    Confidence,
 }
 
-fn measure_host_result(
-    mut units: u64,
+impl HostSpread {
+    fn repetitions(self) -> usize {
+        match self {
+            Self::Extrema => HOST_DETERMINISTIC_REPETITIONS,
+            Self::Confidence => HOST_STOCHASTIC_REPETITIONS,
+        }
+    }
+
+    fn interval(self, observations: &[ProbeObservation]) -> DurationInterval {
+        match self {
+            Self::Extrema => normalized_observation_interval(observations),
+            Self::Confidence => normalized_confidence_interval(observations),
+        }
+    }
+}
+
+/// Measures a host operation in observations of a unit count calibrated to
+/// the duration the band needs at the host timer's resolution; a round that
+/// does not qualify grows the count for the next by how far it missed,
+/// within the round budget (`seismic_estimator::escalate_observation_units`).
+fn measure_host(
     timer_resolution: DurationInterval,
-    percent: u128,
+    percent: u64,
+    spread: HostSpread,
     probe: &str,
     mut operation: impl FnMut() -> Result<(), TargetError>,
 ) -> Result<AcquiredBatch, TargetError> {
-    units = units.max(1);
-    let mut last = None;
-    for _ in 0..MAX_HOST_ACQUISITION_ROUNDS {
-        let acquisition_started = Instant::now();
+    let mut observe = |units: u64| -> Result<u64, TargetError> {
+        let start = Instant::now();
         for _ in 0..units {
             operation()?;
         }
-        let mut observations = Vec::with_capacity(HOST_STOCHASTIC_REPETITIONS);
-        for _ in 0..HOST_STOCHASTIC_REPETITIONS {
-            let start = Instant::now();
-            for _ in 0..units {
-                operation()?;
-            }
+        Ok(u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX))
+    };
+    let mut units = seismic_estimator::calibrate_observation_units(
+        seismic_estimator::required_observation_ns(timer_resolution.upper_numerator, percent),
+        &mut observe,
+    )?;
+    let mut last = None;
+    let mut rounds = 0;
+    while rounds < MAX_HOST_ACQUISITION_ROUNDS {
+        rounds += 1;
+        let acquisition_started = Instant::now();
+        observe(units)?;
+        let mut observations = Vec::with_capacity(spread.repetitions());
+        for _ in 0..spread.repetitions() {
             observations.push(ProbeObservation {
-                nanoseconds: start.elapsed().as_nanos() as f64,
+                nanoseconds: observe(units)? as f64,
                 units,
             });
         }
-        let interval = widen_interval(
-            normalized_confidence_interval(&observations),
-            timer_resolution,
-        );
-        if interval_qualified(interval, percent) {
+        let interval = widen_interval(spread.interval(&observations), timer_resolution);
+        if interval_qualified(interval, u128::from(percent)) {
             return Ok(AcquiredBatch {
                 observations,
                 acquisition_duration_ns: u64::try_from(acquisition_started.elapsed().as_nanos())
                     .unwrap_or(u64::MAX),
+                timing: BatchTiming::Host(spread),
             });
         }
         last = Some(interval);
+        match seismic_estimator::escalate_observation_units(units, acquisition_started.elapsed(), Some(interval), percent) {
+            Some(next) => units = next,
+            None => break,
+        }
     }
     Err(acquisition_failure(
         probe,
-        percent,
+        u128::from(percent),
         last.unwrap_or_else(|| DurationInterval::new(0, u64::MAX, 1)),
-        MAX_HOST_ACQUISITION_ROUNDS,
+        rounds,
     ))
 }
 
@@ -2009,28 +2203,11 @@ fn fingerprint(
             digest.update(allocation_granularity_columns.to_le_bytes());
         }
     }
-    for value in [
-        facts.warp_size,
-        facts.multiprocessors,
-        facts.max_threads_per_multiprocessor,
-        facts.max_blocks_per_multiprocessor,
-        facts.registers_per_block,
-        facts.registers_per_multiprocessor,
-        facts.max_registers_per_thread,
-        facts.codegen_registers_per_thread,
-    ] {
+    digest.update(facts.properties.identity().as_bytes());
+    digest.update(facts.codegen_registers_per_thread.to_le_bytes());
+    for value in [facts.global_memory_bytes, facts.kernel_parameter_bytes] {
         digest.update(value.to_le_bytes());
     }
-    for value in [
-        facts.shared_bytes_per_multiprocessor,
-        facts.shared_bytes_per_block,
-        facts.l2_cache_bytes,
-        facts.global_memory_bytes,
-        facts.kernel_parameter_bytes,
-    ] {
-        digest.update(value.to_le_bytes());
-    }
-    digest.update([u8::from(facts.cooperative_launch)]);
     for value in limits.max_workgroup_size {
         digest.update(value.to_le_bytes());
     }
@@ -2168,13 +2345,9 @@ mod acquisition_tests {
     }
 
     #[test]
-    fn host_noop_baseline_uses_the_fixed_compute_amplification_domain() {
-        assert_eq!(HOST_COMPUTE_AMPLIFICATION_UNITS, 268_435_456);
+    fn host_noop_baseline_is_normalized_by_its_own_units() {
         let observed = [observation(65_536.0, 32_768)];
-        let baseline = [observation(
-            HOST_COMPUTE_AMPLIFICATION_UNITS as f64,
-            HOST_COMPUTE_AMPLIFICATION_UNITS,
-        )];
+        let baseline = [observation(268_435_456.0, 268_435_456)];
         assert_eq!(
             differential_interval(&observed, &baseline),
             DurationInterval::new(65_535, 65_535, 32_768),
@@ -2183,21 +2356,23 @@ mod acquisition_tests {
 
     #[test]
     fn host_probe_classification_separates_stochastic_downloads_from_compute() {
-        let batch = |values: Vec<f64>, units| AcquiredBatch {
+        let batch = |values: Vec<f64>, units, spread| AcquiredBatch {
             observations: values
                 .into_iter()
                 .map(|nanoseconds| observation(nanoseconds, units))
                 .collect(),
             acquisition_duration_ns: 1,
+            timing: BatchTiming::Host(spread),
         };
         let baseline = batch(
-            vec![HOST_COMPUTE_AMPLIFICATION_UNITS as f64; HOST_DETERMINISTIC_REPETITIONS],
-            HOST_COMPUTE_AMPLIFICATION_UNITS,
+            vec![268_435_456.0; HOST_DETERMINISTIC_REPETITIONS],
+            268_435_456,
+            HostSpread::Extrema,
         );
         let stochastic_values = (0..HOST_STOCHASTIC_REPETITIONS)
             .map(|index| if index % 2 == 0 { 90.0 } else { 110.0 })
             .collect::<Vec<_>>();
-        let stochastic = batch(stochastic_values.clone(), 1);
+        let stochastic = batch(stochastic_values.clone(), 1, HostSpread::Confidence);
         let scalar_read = measured_definition(
             SERVICE_SCALAR_READ,
             ResourceTopology {
@@ -2219,9 +2394,9 @@ mod acquisition_tests {
         };
         assert!(batches[1].method.contains("host-monotonic-confidence95"));
 
-        let deterministic = batch(stochastic_values, 1);
+        let deterministic = batch(stochastic_values, 1, HostSpread::Extrema);
         let scalar_move = measured_definition(
-            SERVICE_SCALAR_MOVE,
+            CoreService::ScalarMove.class(),
             ResourceTopology {
                 resources: 1,
                 max_concurrency: 1,
@@ -2299,6 +2474,7 @@ mod acquisition_tests {
                 .map(|_| observation(nanoseconds, 1))
                 .collect(),
             acquisition_duration_ns,
+            timing: BatchTiming::Device,
         };
         let baseline = batch(10.0, 11);
         let latency = batch(100.0, 22);

@@ -1,12 +1,15 @@
-// Shared device code of the Vulkan gated-delta entries (`gated_delta_step`,
-// `gated_delta_chunk`; contracts in recurrent.seismic): slot, bank and
-// version lookup (the tape replay), tensor addressing, the per-head gates,
-// the state-arena window publication, the row-sequential advance, which
-// records the tape rows after the stop row, and the gating of the raw outputs
-// into the entries' result. The counterpart of
-// `cuda/lib/recurrent/recurrent.cuh`, whose arithmetic it follows.
+// Shared device code of the Vulkan delta-rule entries (`gated_delta_step`,
+// `gated_delta_chunk`, and through `kimi.glsl` `kimi_delta_step` and
+// `kimi_delta_chunk`; contracts in recurrent.seismic): slot, bank and
+// version lookup (the tape replay), tensor addressing, Gated DeltaNet's
+// per-head gates, the state-arena window publication, the row-sequential
+// advance, which records the tape rows after the stop row, and the gating of
+// the raw outputs into the entries' result, over the rule's gates (below).
+// The counterpart of `cuda/lib/recurrent/recurrent.cuh`, whose arithmetic it
+// follows.
 // Activation tensors are canonical in their last axis.
 #include "../core/activation.glsl"
+#include "../core/functions.glsl"
 #include "../core/reduce.glsl"
 #include "versions.glsl"
 
@@ -20,7 +23,7 @@
 #define RECURRENT_ALPHA (RECURRENT_CH + RECURRENT_NV * RECURRENT_W)
 #define RECURRENT_BETA (RECURRENT_ALPHA + RECURRENT_NV)
 // A tape row: the innovations u [NV, W], the normalized keys k [NK, W], the
-// decays d [NV].
+// decay factors d [NV, RECURRENT_DECAYS].
 #define RECURRENT_TAPE_U 0u
 #define RECURRENT_TAPE_K (RECURRENT_NV * RECURRENT_W)
 #define RECURRENT_TAPE_D (RECURRENT_NV * RECURRENT_W + RECURRENT_NK * RECURRENT_W)
@@ -34,17 +37,18 @@ struct recurrent_inputs {
     uint64_t convolution;
     uint64_t rate;
     uint64_t time_bias;
-    uint64_t window;
-    uint64_t delta;
-    uint64_t tape;
+    // Owner handles of the slab-stored state arenas.
+    SlabOut window;
+    SlabOut delta;
+    SlabOut tape;
     float epsilon;
     bool grouped;
 };
 
 recurrent_inputs recurrent_inputs_of() {
     return recurrent_inputs(SEISMIC_PTR(SEISMIC_BUFFER_PROJECTION), SEISMIC_PTR(SEISMIC_BUFFER_CONVOLUTION),
-        SEISMIC_PTR(SEISMIC_BUFFER_RATE), SEISMIC_PTR(SEISMIC_BUFFER_TIME_BIAS), SEISMIC_PTR(SEISMIC_BUFFER_WINDOW),
-        SEISMIC_PTR(SEISMIC_BUFFER_DELTA), SEISMIC_PTR(SEISMIC_BUFFER_TAPE),
+        SEISMIC_PTR(SEISMIC_BUFFER_RATE), SEISMIC_PTR(SEISMIC_BUFFER_TIME_BIAS), SEISMIC_OUT_WINDOW,
+        SEISMIC_OUT_DELTA, SEISMIC_OUT_TAPE,
         element_word_f32(SEISMIC_PARAM_NORM_EPSILON), SEISMIC_PARAM_GROUPED != 0ul);
 }
 
@@ -75,23 +79,15 @@ int recurrent_tape_rows(recurrent_slot slot) {
     return min(int(SEISMIC_DIM_T), slot.hi - slot.lo - slot.stop);
 }
 
-// Byte address of tape row `entry` of `bank`.
-uint64_t recurrent_tape_row(recurrent_inputs in_, int bank, int entry) {
-    return versions_bank(in_.tape, bank, SEISMIC_TAPE_STRIDE_0 * 4ul)
-        + uint64_t(entry) * SEISMIC_TAPE_STRIDE_1 * 4ul;
+// Tape row `entry` of `bank`.
+Out recurrent_tape_row(recurrent_inputs in_, int bank, int entry) {
+    return out_offset(versions_out_bank(in_.tape, bank, SEISMIC_TAPE_STRIDE_0),
+        uint64_t(entry) * SEISMIC_TAPE_STRIDE_1);
 }
 
 // The one value head of each key head that records the key in a tape row.
 bool recurrent_records_key(recurrent_inputs in_, uint head) {
     return in_.grouped ? head % (RECURRENT_NV / RECURRENT_NK) == 0u : head < RECURRENT_NK;
-}
-
-// The first row no slot covers: slots partition a prefix of rows.
-int recurrent_covered_end() {
-    const uint64_t slots = SEISMIC_DIM_B;
-    return slots == 0ul ? 0
-                        : element_i32_index(SEISMIC_PTR(SEISMIC_BUFFER_SEGMENTS),
-                              (slots - 1ul) * SEISMIC_SEGMENTS_STRIDE_0 + SEISMIC_SEGMENTS_STRIDE_1);
 }
 
 // Element (row, value head, state row) of the raw outputs, an [M, NV, W]
@@ -104,17 +100,15 @@ float recurrent_projection(recurrent_inputs in_, uint64_t row, uint64_t column) 
     return element_at(ELEMENT_ACT, in_.projection, row * SEISMIC_PROJECTION_STRIDE_0 + column);
 }
 
-uint64_t recurrent_window_at(recurrent_inputs in_, int bank, int tap, uint64_t channel) {
-    const uint64_t element_bytes = ELEMENT_BYTES(ELEMENT_ACT);
-    return versions_bank(in_.window, bank, SEISMIC_WINDOW_STRIDE_0 * element_bytes)
-        + (uint64_t(tap) * SEISMIC_WINDOW_STRIDE_1 + channel) * element_bytes;
+Out recurrent_window_at(recurrent_inputs in_, int bank, int tap, uint64_t channel) {
+    return out_offset(versions_out_bank(in_.window, bank, SEISMIC_WINDOW_STRIDE_0),
+        uint64_t(tap) * SEISMIC_WINDOW_STRIDE_1 + channel);
 }
 
-// Byte address of state row `state_row` of value head `head` in `bank`: W
-// contiguous floats.
-uint64_t recurrent_state_row(recurrent_inputs in_, int bank, uint head, uint state_row) {
-    return versions_bank(in_.delta, bank, SEISMIC_DELTA_STRIDE_0 * 4ul)
-        + (uint64_t(head) * SEISMIC_DELTA_STRIDE_1 + uint64_t(state_row) * SEISMIC_DELTA_STRIDE_2) * 4ul;
+// State row `state_row` of value head `head` in `bank`: W contiguous floats.
+Out recurrent_state_row(recurrent_inputs in_, int bank, uint head, uint state_row) {
+    return out_offset(versions_out_bank(in_.delta, bank, SEISMIC_DELTA_STRIDE_0),
+        uint64_t(head) * SEISMIC_DELTA_STRIDE_1 + uint64_t(state_row) * SEISMIC_DELTA_STRIDE_2);
 }
 
 // The key head of value head `head`.
@@ -134,11 +128,49 @@ void recurrent_gates(recurrent_inputs in_, uint64_t row, uint head, out float be
     decay = exp(log_decay);
 }
 
+// The rule's gates, which the version load, the advance and the gating read:
+// RECURRENT_DECAYS decay factors per value head and row (1u: the head's one
+// decay scales every key column; RECURRENT_W: one per key column), a tape row
+// recording as many per value head; `recurrent_row_gates`, the decay factor of
+// a row's key channel `channel` (ignored for one decay) and, for channel 0,
+// beta; and `recurrent_gate_input`, z at column RECURRENT_GATE_FIRST +
+// head * W + i of a row. A rule's library defines RECURRENT_DECAYS and
+// RECURRENT_GATE_FIRST before it includes this file and the two functions
+// after it (Kimi's: `kimi.glsl`); Gated DeltaNet's, columns of the projection
+// row (`recurrent_gates`), are the default.
+#ifndef RECURRENT_DECAYS
+#define RECURRENT_DECAYS 1u
+#define RECURRENT_GATE_FIRST RECURRENT_CH
+
+void recurrent_row_gates(recurrent_inputs in_, uint64_t row, uint head, uint channel, out float beta,
+    out float decay) {
+    float log_decay;
+    recurrent_gates(in_, row, head, beta, log_decay, decay);
+}
+
+float recurrent_gate_input(recurrent_inputs in_, uint64_t row, uint64_t column) {
+    return recurrent_projection(in_, row, column);
+}
+#else
+void recurrent_row_gates(recurrent_inputs in_, uint64_t row, uint head, uint channel, out float beta,
+    out float decay);
+float recurrent_gate_input(recurrent_inputs in_, uint64_t row, uint64_t column);
+#endif
+
+// The decay of state column `column` among a value head's RECURRENT_DECAYS.
+#define RECURRENT_DECAY_COLUMN(column) (RECURRENT_DECAYS == 1u ? 0u : (column))
+
+// The element of a tape row holding the decay factor of state column
+// `column` of value head `head`.
+uint64_t recurrent_tape_factor(uint head, uint column) {
+    return uint64_t(RECURRENT_TAPE_D + head * RECURRENT_DECAYS + RECURRENT_DECAY_COLUMN(column));
+}
+
 // Raw input row `position` (slot-local) of a channel: the source version's
 // window rows before the slot, the projection after.
 float recurrent_raw_input(recurrent_inputs in_, recurrent_slot slot, int position, uint channel) {
     if (position < 0)
-        return element_at(ELEMENT_ACT, recurrent_window_at(in_, slot.source,
+        return out_at(recurrent_window_at(in_, slot.source,
             slot.taped + int(RECURRENT_C) - 1 + position, channel), 0ul);
     return recurrent_projection(in_, uint64_t(slot.lo + position), channel);
 }
@@ -155,9 +187,13 @@ void recurrent_publish_window(recurrent_inputs in_, recurrent_slot slot, uint pa
         const int row = int(index / RECURRENT_CH);
         const uint channel = index % RECURRENT_CH;
         const int position = slot.stop + row - (int(RECURRENT_C) - 1);
-        const float value = recurrent_raw_input(in_, slot, position, channel);
-        const uint64_t target = recurrent_window_at(in_, slot.target, row, channel);
-        element_put(ELEMENT_ACT, target, 0ul, value);
+        const Out target = recurrent_window_at(in_, slot.target, row, channel);
+        if (position < 0)
+            out_move_stored(target, 0ul,
+                recurrent_window_at(in_, slot.source, slot.taped + int(RECURRENT_C) - 1 + position, channel), 0ul, 1ul);
+        else
+            out_copy_stored(target, 0ul, in_.projection,
+                uint64_t(slot.lo + position) * SEISMIC_PROJECTION_STRIDE_0 + channel, 1ul);
     }
 }
 
@@ -171,7 +207,7 @@ void recurrent_load_rows(recurrent_inputs in_, const uint rows, int bank, uint h
     [[unroll]] for (uint r = 0u; r < RECURRENT_MAX_ROWS; ++r)
         if (r < rows)
             [[unroll]] for (uint c = 0u; c < RECURRENT_CPL; ++c)
-                state[r][c] = element_f32_at(recurrent_state_row(in_, bank, head, first_row + r) + uint64_t(lane * RECURRENT_CPL + c) * 4ul);
+                state[r][c] = out_at(recurrent_state_row(in_, bank, head, first_row + r), uint64_t(lane * RECURRENT_CPL + c));
 }
 
 void recurrent_store_rows(recurrent_inputs in_, const uint rows, int bank, uint head, uint first_row,
@@ -180,7 +216,7 @@ void recurrent_store_rows(recurrent_inputs in_, const uint rows, int bank, uint 
     [[unroll]] for (uint r = 0u; r < RECURRENT_MAX_ROWS; ++r)
         if (r < rows)
             [[unroll]] for (uint c = 0u; c < RECURRENT_CPL; ++c)
-                element_f32_put(recurrent_state_row(in_, bank, head, first_row + r) + uint64_t(lane * RECURRENT_CPL + c) * 4ul,
+                out_put(recurrent_state_row(in_, bank, head, first_row + r), uint64_t(lane * RECURRENT_CPL + c),
                     state[r][c]);
 }
 
@@ -193,22 +229,25 @@ void recurrent_load_version(recurrent_inputs in_, recurrent_slot slot, const uin
     const uint lane = SEISMIC_LANE;
     const uint key = recurrent_key_head(in_, head);
     for (int entry = 0; entry < slot.taped; ++entry) {
-        const uint64_t tape = recurrent_tape_row(in_, slot.source, entry);
-        const float decay = element_f32_at(tape + uint64_t(RECURRENT_TAPE_D + head) * 4ul);
-        float k[RECURRENT_CPL];
+        const Out tape = recurrent_tape_row(in_, slot.source, entry);
+        // One decay per value head is loaded once.
+        float k[RECURRENT_CPL], factor[RECURRENT_CPL];
         [[unroll]] for (uint c = 0u; c < RECURRENT_CPL; ++c)
-            k[c] = element_f32_at(tape + uint64_t(RECURRENT_TAPE_K + key * RECURRENT_W + lane * RECURRENT_CPL + c) * 4ul);
+            factor[c] = RECURRENT_DECAYS == 1u && c > 0u ? factor[0]
+                : out_at(tape, recurrent_tape_factor(head, lane * RECURRENT_CPL + c));
+        [[unroll]] for (uint c = 0u; c < RECURRENT_CPL; ++c)
+            k[c] = out_at(tape, uint64_t(RECURRENT_TAPE_K + key * RECURRENT_W + lane * RECURRENT_CPL + c));
         [[unroll]] for (uint s = 0u; s < RECURRENT_MAX_ROWS; ++s) {
             if (s < rows) {
-                const float u = element_f32_at(tape + uint64_t(RECURRENT_TAPE_U + head * RECURRENT_W + first_row + s) * 4ul);
+                const float u = out_at(tape, uint64_t(RECURRENT_TAPE_U + head * RECURRENT_W + first_row + s));
                 [[unroll]] for (uint c = 0u; c < RECURRENT_CPL; ++c)
-                    state[s][c] = seismic_fma_rn(u, k[c], state[s][c] * decay);
+                    state[s][c] = seismic_fma_rn(u, k[c], state[s][c] * factor[c]);
             }
         }
     }
 }
 
-// The row-sequential gated delta rule over the slot's rows from `begin` (a
+// The row-sequential delta rule over the slot's rows from `begin` (a
 // workgroup's shape never changes bits). Every invocation of the workgroup
 // calls it. The workgroup owns state rows [block_row, block_row + block_rows)
 // of value head `head`; each subgroup holds its `rows` rows from `first_row`
@@ -218,11 +257,11 @@ void recurrent_load_version(recurrent_inputs in_, recurrent_slot slot, const uin
 // workgroup convolves (causal depthwise conv + SiLU) the key head's q and k
 // channels and the workgroup's v channels with every load in flight at once;
 // each subgroup then walks the span's rows from shared memory: L2-normalized
-// q (scaled by W^-1/2) and k, S <- decay S + beta (v - decay S k) k^T,
-// output S q.
+// q (scaled by W^-1/2) and k, S <- S diag(d) + beta (v - S diag(d) k) k^T,
+// output S q, with d the row's decay factors.
 //
-// Shared floats: prepared [SPAN][2W + block_rows], then beta [SPAN] and decay
-// [SPAN].
+// Shared floats: prepared [SPAN][2W + block_rows], then beta [SPAN] and the
+// decay factors [SPAN][RECURRENT_DECAYS].
 void recurrent_advance_rows(recurrent_inputs in_, recurrent_slot slot, int begin, uint head, uint block_row,
     const uint block_rows, const uint rows, uint first_row, inout float state[RECURRENT_MAX_ROWS][RECURRENT_CPL],
     uint64_t mixed) {
@@ -267,18 +306,24 @@ void recurrent_advance_rows(recurrent_inputs in_, recurrent_slot slot, int begin
                 seismic_shared_f32[r * prepared_width + index] = seismic_div_rn(sum, 1.0 + exp(-sum));
             }
         }
-        if (thread < uint(count)) {
-            float beta, log_decay, decay;
-            recurrent_gates(in_, uint64_t(first) + thread, head, beta, log_decay, decay);
-            seismic_shared_f32[beta_at + thread] = beta;
-            seismic_shared_f32[decay_at + thread] = decay;
+        for (uint item = thread; item < uint(count) * RECURRENT_DECAYS; item += gl_WorkGroupSize.x) {
+            const uint r = item / RECURRENT_DECAYS, channel = item % RECURRENT_DECAYS;
+            float beta, decay;
+            recurrent_row_gates(in_, uint64_t(first) + r, head, channel, beta, decay);
+            seismic_shared_f32[decay_at + item] = decay;
+            if (channel == 0u)
+                seismic_shared_f32[beta_at + r] = beta;
         }
         barrier();
 
         for (int r = 0; r < count; ++r) {
             const int row = first + r;
             const uint base = uint(r) * prepared_width;
-            float q[RECURRENT_CPL], k[RECURRENT_CPL];
+            // One decay per value head is read once.
+            float q[RECURRENT_CPL], k[RECURRENT_CPL], factor[RECURRENT_CPL];
+            [[unroll]] for (uint c = 0u; c < RECURRENT_CPL; ++c)
+                factor[c] = RECURRENT_DECAYS == 1u && c > 0u ? factor[0]
+                    : seismic_shared_f32[decay_at + uint(r) * RECURRENT_DECAYS + RECURRENT_DECAY_COLUMN(lane * CPL + c)];
             float q_squares = 0.0, k_squares = 0.0;
             [[unroll]] for (uint c = 0u; c < RECURRENT_CPL; ++c) {
                 q[c] = seismic_shared_f32[base + lane * CPL + c];
@@ -292,7 +337,6 @@ void recurrent_advance_rows(recurrent_inputs in_, recurrent_slot slot, int begin
                 q[c] *= q_inverse;
                 k[c] *= k_inverse;
             }
-            const float decay = seismic_shared_f32[decay_at + uint(r)];
             const float beta = seismic_shared_f32[beta_at + uint(r)];
 
             float remembered[RECURRENT_MAX_ROWS];
@@ -300,21 +344,26 @@ void recurrent_advance_rows(recurrent_inputs in_, recurrent_slot slot, int begin
                 if (s < rows) {
                     float sum = 0.0;
                     [[unroll]] for (uint c = 0u; c < RECURRENT_CPL; ++c)
-                        sum = seismic_fma_rn(state[s][c] * decay, k[c], sum);
+                        sum = seismic_fma_rn(state[s][c] * factor[c], k[c], sum);
                     remembered[s] = seismic_subgroup_sum_f32(sum);
                 }
             }
             // Rows after the stop row are recorded in the successor's tape: the
-            // subgroup owning state row 0 records the decay, and the key when
-            // the head records its key head's key.
+            // subgroup owning state row 0 records the decay factors (column
+            // 0's alone for one decay), and the key when the head records its
+            // key head's key.
             const bool taping = row >= publish && row - publish < taped;
-            const uint64_t entry = taping ? recurrent_tape_row(in_, slot.target, row - publish) : 0ul;
+            // The successor's tape row, addressed only when taping.
+            Out entry;
+            if (taping)
+                entry = recurrent_tape_row(in_, slot.target, row - publish);
             if (taping && first_row == 0u) {
-                if (records_keys)
-                    [[unroll]] for (uint c = 0u; c < RECURRENT_CPL; ++c)
-                        element_f32_put(entry + uint64_t(RECURRENT_TAPE_K + key_row * W + lane * CPL + c) * 4ul, k[c]);
-                if (lane == 0u)
-                    element_f32_put(entry + uint64_t(RECURRENT_TAPE_D + head) * 4ul, decay);
+                [[unroll]] for (uint c = 0u; c < RECURRENT_CPL; ++c) {
+                    if (records_keys)
+                        out_put(entry, uint64_t(RECURRENT_TAPE_K + key_row * W + lane * CPL + c), k[c]);
+                    if (RECURRENT_DECAYS > 1u || (c == 0u && lane == 0u))
+                        out_put(entry, recurrent_tape_factor(head, lane * CPL + c), factor[c]);
+                }
             }
             float outputs[RECURRENT_MAX_ROWS];
             [[unroll]] for (uint s = 0u; s < RECURRENT_MAX_ROWS; ++s) {
@@ -322,10 +371,10 @@ void recurrent_advance_rows(recurrent_inputs in_, recurrent_slot slot, int begin
                     const float v = seismic_shared_f32[base + 2u * W + first_row - block_row + s];
                     const float residual = (v - remembered[s]) * beta;
                     if (taping && lane == s)
-                        element_f32_put(entry + uint64_t(RECURRENT_TAPE_U + head * W + first_row + s) * 4ul, residual);
+                        out_put(entry, uint64_t(RECURRENT_TAPE_U + head * W + first_row + s), residual);
                     float sum = 0.0;
                     [[unroll]] for (uint c = 0u; c < RECURRENT_CPL; ++c) {
-                        state[s][c] = seismic_fma_rn(residual, k[c], state[s][c] * decay);
+                        state[s][c] = seismic_fma_rn(residual, k[c], state[s][c] * factor[c]);
                         sum = seismic_fma_rn(state[s][c], q[c], sum);
                     }
                     outputs[s] = seismic_subgroup_sum_f32(sum);
@@ -346,27 +395,15 @@ void recurrent_advance_rows(recurrent_inputs in_, recurrent_slot slot, int begin
 }
 
 // One workgroup of the sequential advance: (value head, state-row block,
-// slot); slot index B zeroes the raw rows no slot covers. Subgroup sg owns
-// `rows` state rows from block_row + sg * rows.
+// slot). Subgroup sg owns `rows` state rows from block_row + sg * rows.
 void recurrent_sequential(const uint rows) {
     const recurrent_inputs in_ = recurrent_inputs_of();
     const uint64_t mixed = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_MIXED);
     const uint head = gl_WorkGroupID.x;
     const uint block_rows = rows * SEISMIC_SUBGROUPS;
     const uint block_row = gl_WorkGroupID.y * block_rows;
-    const uint64_t slot_index = gl_WorkGroupID.z;
-    const uint lane = SEISMIC_LANE;
     const uint first_row = block_row + SEISMIC_SUBGROUP * rows;
-
-    if (slot_index == SEISMIC_DIM_B) {
-        const int covered = recurrent_covered_end();
-        for (uint64_t row = uint64_t(covered); row < SEISMIC_DIM_M; ++row)
-            if (lane < rows)
-                element_put(ELEMENT_ACT, mixed, recurrent_raw_index(row, head, first_row + lane), 0.0);
-        return;
-    }
-
-    const recurrent_slot slot = recurrent_slot_of(slot_index);
+    const recurrent_slot slot = recurrent_slot_of(gl_WorkGroupID.z);
     float state[RECURRENT_MAX_ROWS][RECURRENT_CPL];
     recurrent_load_version(in_, slot, rows, head, first_row, state);
     recurrent_publish_window(in_, slot, head * gl_NumWorkGroups.y + gl_WorkGroupID.y, RECURRENT_NV * gl_NumWorkGroups.y);
@@ -375,9 +412,10 @@ void recurrent_sequential(const uint rows) {
 
 // ---------------------------------------------------------------------------
 // Gating: the result's value (row, head, i) is
-//   round_A(round_A(raw * inverse * norm[i]) * round_A(silu(z)))
-// with raw the stored raw output, z column CH + head * W + i of the
-// projection row and inverse = rsqrt(sum_head raw^2 / W + epsilon).
+//   round_A(round_A(raw * inverse * norm[i]) * round_A(gate(z)))
+// with gate the output gate of `gate_function` (`functions_output_gate`)
+// with raw the stored raw output, z column RECURRENT_GATE_FIRST + head * W + i
+// of the row's `recurrent_gate_input` and inverse = rsqrt(sum_head raw^2 / W + epsilon).
 
 #if defined(SEISMIC_RECURRENT_NORM_REPRESENTATION_F32)
 #define RECURRENT_NORM ELEMENT_F32
@@ -389,62 +427,71 @@ void recurrent_sequential(const uint rows) {
 #error "the gated-delta entries require a dense recurrent_norm"
 #endif
 
+// The raw output (row, head, i): stored by the advance in a slot's row, zero
+// in a row no slot covers (`covered`, the first such row).
+float recurrent_raw(uint64_t mixed, int covered, uint64_t row, uint head, uint i) {
+    return row < uint64_t(covered) ? element_at(ELEMENT_ACT, mixed, recurrent_raw_index(row, head, i)) : 0.0;
+}
+
 // The inputs of columns i..i+7 of (row, head) as (even, odd): raw outputs,
 // z and the norm weights.
 struct recurrent_gated8 {
     vec4 me, mo, ze, zo, ne, no;
 };
 
-recurrent_gated8 recurrent_gated_inputs8(recurrent_inputs in_, uint64_t mixed, uint64_t row, uint head, uint i) {
-    const uint64_t raw = recurrent_raw_index(row, head, i);
-    const uint64_t z = RECURRENT_CH + uint64_t(head) * RECURRENT_W + i;
+recurrent_gated8 recurrent_gated_inputs8(recurrent_inputs in_, uint64_t mixed, int covered, uint64_t row, uint head,
+    uint i) {
+    const uint64_t z = RECURRENT_GATE_FIRST + uint64_t(head) * RECURRENT_W + i;
     const uint64_t norm = SEISMIC_PTR(SEISMIC_BUFFER_RECURRENT_NORM);
     recurrent_gated8 v;
     [[unroll]] for (uint j = 0u; j < 4u; ++j) {
-        v.me[j] = element_at(ELEMENT_ACT, mixed, raw + 2u * j);
-        v.mo[j] = element_at(ELEMENT_ACT, mixed, raw + 2u * j + 1u);
-        v.ze[j] = recurrent_projection(in_, row, z + 2u * j);
-        v.zo[j] = recurrent_projection(in_, row, z + 2u * j + 1u);
+        v.me[j] = recurrent_raw(mixed, covered, row, head, i + 2u * j);
+        v.mo[j] = recurrent_raw(mixed, covered, row, head, i + 2u * j + 1u);
+        v.ze[j] = recurrent_gate_input(in_, row, z + 2u * j);
+        v.zo[j] = recurrent_gate_input(in_, row, z + 2u * j + 1u);
         v.ne[j] = element_at(RECURRENT_NORM, norm, uint64_t(i + 2u * j) * SEISMIC_RECURRENT_NORM_STRIDE_0);
         v.no[j] = element_at(RECURRENT_NORM, norm, uint64_t(i + 2u * j + 1u) * SEISMIC_RECURRENT_NORM_STRIDE_0);
     }
     return v;
 }
 
-float recurrent_silu_rounded(float gate) {
-    return element_round(ELEMENT_ACT, seismic_div_rn(gate, 1.0 + exp(-gate)));
+// The output gate of z by the entry's `gate_function` (`functions_output_gate`), rounded to A.
+float recurrent_gate_rounded(float z) {
+    return element_round(ELEMENT_ACT, functions_output_gate(int(SEISMIC_PARAM_GATE_FUNCTION), z));
 }
 
 // Stores the gated columns i..i+7 of (row, head) given the head's inverse.
 void recurrent_store_gated8(recurrent_gated8 v, float inverse, uint64_t row, uint head, uint i) {
-    const uint64_t gated = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const Out gated = SEISMIC_RESULT_0_OUT;
     const uint64_t at = row * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(head) * SEISMIC_RESULT_0_STRIDE_1;
     const vec4 e = v.me * inverse * v.ne, o = v.mo * inverse * v.no;
     [[unroll]] for (uint j = 0u; j < 4u; ++j) {
-        element_put(ELEMENT_ACT, gated, at + uint64_t(i + 2u * j) * SEISMIC_RESULT_0_STRIDE_2,
-            element_round(ELEMENT_ACT, element_round(ELEMENT_ACT, e[j]) * recurrent_silu_rounded(v.ze[j])));
-        element_put(ELEMENT_ACT, gated, at + uint64_t(i + 2u * j + 1u) * SEISMIC_RESULT_0_STRIDE_2,
-            element_round(ELEMENT_ACT, element_round(ELEMENT_ACT, o[j]) * recurrent_silu_rounded(v.zo[j])));
+        out_put(gated, at + uint64_t(i + 2u * j) * SEISMIC_RESULT_0_STRIDE_2,
+            element_round(ELEMENT_ACT, element_round(ELEMENT_ACT, e[j]) * recurrent_gate_rounded(v.ze[j])));
+        out_put(gated, at + uint64_t(i + 2u * j + 1u) * SEISMIC_RESULT_0_STRIDE_2,
+            element_round(ELEMENT_ACT, element_round(ELEMENT_ACT, o[j]) * recurrent_gate_rounded(v.zo[j])));
     }
 }
 
-// The `gate` launch of both entries: workgroup (head, row), one subgroup,
-// gates the row's head from the raw outputs. With `lanes` (the step to 8
-// rows), W / 8 lanes each own eight columns, sum their squares in column
-// order, and a butterfly over the lanes gives the head's sum: the order of
-// the projection GEMV's staging. Otherwise lanes stride the columns and the
+// The `gate` launch of every entry: workgroup (head, row), one subgroup,
+// gates the row's head from the raw outputs (`recurrent_raw`: a row no slot
+// covers from zeros, which the advance never stores). With `lanes` (the step
+// to 8 rows), W / 8 lanes each own eight columns, sum their squares in
+// column order, and a butterfly over the lanes gives the head's sum: the
+// order of the projection GEMV's staging. Otherwise lanes stride the columns and the
 // workgroup sums them: the order of its staging launch.
 void recurrent_gate(const bool lanes) {
     const recurrent_inputs in_ = recurrent_inputs_of();
     const uint64_t mixed = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_MIXED);
     const uint head = gl_WorkGroupID.x, W = RECURRENT_W, lane = SEISMIC_LANE;
     const uint64_t row = gl_WorkGroupID.y;
+    const int covered = versions_covered_end();
     const float eps = element_word_f32(SEISMIC_PARAM_EPSILON);
     if (lanes) {
         // Lanes past W / 8 repeat the first W / 8, so every lane of a
         // butterfly group takes part; they store nothing.
         const uint i = 8u * (lane % (W / 8u));
-        const recurrent_gated8 v = recurrent_gated_inputs8(in_, mixed, row, head, i);
+        const recurrent_gated8 v = recurrent_gated_inputs8(in_, mixed, covered, row, head, i);
         float squares = 0.0;
         [[unroll]] for (uint j = 0u; j < 4u; ++j) {
             squares = seismic_fma_rn(v.me[j], v.me[j], squares);
@@ -458,11 +505,11 @@ void recurrent_gate(const bool lanes) {
     }
     float squares = 0.0;
     for (uint i = lane; i < W; i += 32u) {
-        const float v = element_at(ELEMENT_ACT, mixed, recurrent_raw_index(row, head, i));
+        const float v = recurrent_raw(mixed, covered, row, head, i);
         squares = seismic_fma_rn(v, v, squares);
     }
     squares = reduce_group_sum(squares, 0u);
     const float inverse = inversesqrt(seismic_div_rn(squares, float(W)) + eps);
     for (uint i = 8u * lane; i < W; i += 8u * 32u)
-        recurrent_store_gated8(recurrent_gated_inputs8(in_, mixed, row, head, i), inverse, row, head, i);
+        recurrent_store_gated8(recurrent_gated_inputs8(in_, mixed, covered, row, head, i), inverse, row, head, i);
 }

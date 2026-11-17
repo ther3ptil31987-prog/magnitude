@@ -5,7 +5,7 @@
 
 pub(crate) mod graph;
 
-use super::{dense_ffn, routed, tail, PlanError};
+use super::{PlanError, dense_ffn, routed, tail};
 use crate::{DenseBranchBinding, ParallelBinding, SublayerTail};
 use magnitude_family_contracts::{
     Branch, BranchOutput, DenseFfn, InputNorm, Operator, OutputForm, RmsNorm, RoutedFfn,
@@ -116,6 +116,7 @@ pub(super) fn binding(
     output: &OutputForm,
     hidden: u64,
     lookup: impl Fn(WeightScope, WeightKind) -> Result<Element, PlanError>,
+    scalable: impl Fn(WeightScope, WeightKind) -> Result<crate::ScalableWeight, PlanError>,
     activation: Element,
 ) -> Result<ParallelBinding, PlanError> {
     let [dense, routed] = DenseBesideRouted::scopes(sublayer);
@@ -123,7 +124,9 @@ pub(super) fn binding(
         lookup(WeightScope::TargetSublayer(sublayer), kind)
     })?
     else {
-        return Err(PlanError::Unsupported("parallel branches without a post-norm tail"));
+        return Err(PlanError::Unsupported(
+            "parallel branches without a post-norm tail",
+        ));
     };
     if [dense, routed]
         .into_iter()
@@ -140,21 +143,19 @@ pub(super) fn binding(
         hidden,
         dense: DenseBranchBinding {
             features: branches.dense.intermediate,
+            function: super::dense_ffn::activation_code(branches.dense.up.activation()),
+            limit: branches.dense.up.limit(),
             norm: lookup(dense, WeightKind::InputNorm)?,
-            gate: lookup(dense, WeightKind::DenseGate)?,
-            up: lookup(dense, WeightKind::DenseUp)?,
-            down: lookup(dense, WeightKind::DenseDown)?,
+            gate: scalable(dense, WeightKind::DenseGate)?.element,
+            up: scalable(dense, WeightKind::DenseUp)?.element,
+            down: scalable(dense, WeightKind::DenseDown)?.element,
             activation,
         },
-        // The parallel graph binds no scale ports: `lookup` refuses scaled
-        // weights.
         routed: routed::binding(
             branches.routed,
             hidden,
             |kind| lookup(routed, kind),
-            |kind| {
-                lookup(routed, kind).map(|element| crate::ScalableWeight { element, scale: 0 })
-            },
+            |kind| scalable(routed, kind),
             activation,
         )?,
         norm,

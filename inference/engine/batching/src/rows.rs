@@ -120,8 +120,9 @@ pub struct Row {
 /// A row's history in one history domain.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RowHistory {
-    /// Accepted-history ranges of the domain this row reads. Each range stays
-    /// within one slab.
+    /// Prepared history ranges this row reads: accepted history and, for
+    /// compressed causal target attention, earlier reserved destinations.
+    /// Each range stays within one slab.
     pub visible: Vec<[i32; 2]>,
     /// The first row of its slot, by offset in the slot, whose fresh history
     /// this row reads: 0 unless the domain's window starts inside the slot.
@@ -132,6 +133,18 @@ pub struct RowHistory {
     pub bidirectional_end: Option<i32>,
     /// The domain row this row's history is written to, or -1.
     pub destination: i32,
+}
+
+/// Ascending visible spans with adjacent spans merged.
+pub fn coalesce_spans(spans: &[[i32; 2]]) -> Vec<[i32; 2]> {
+    let mut merged: Vec<[i32; 2]> = Vec::with_capacity(spans.len());
+    for &span in spans {
+        match merged.last_mut() {
+            Some(previous) if previous[1] == span[0] => previous[1] = span[1],
+            _ => merged.push(span),
+        }
+    }
+    merged
 }
 
 /// One history domain's row tables: per row its visible ranges, its fresh

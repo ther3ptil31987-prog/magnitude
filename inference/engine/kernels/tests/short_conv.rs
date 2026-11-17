@@ -9,6 +9,8 @@
 // Every case checks the outputs, the published windows (copies), and that
 // no bank other than each slot's successor changes.
 
+mod common;
+mod declared;
 mod versions_common;
 
 use magnitude_kernels::short_conv_rows;
@@ -132,7 +134,6 @@ impl Case {
     /// The portable body executed by the Seismic interpreter.
     fn oracle(&self, activation: Element) -> Outcome {
         use seismic_lang::{
-            checked::{check_source, SourceFile},
             entry::ElementBindings,
             failure::SourceTermination,
             interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -140,12 +141,7 @@ impl Case {
             registry,
             types::DType,
         };
-        let mut sources = seismic_std::sources();
-        sources.push(SourceFile {
-            path: "short_conv.seismic".into(),
-            text: include_str!("../kernels/short_conv.seismic").into(),
-        });
-        let module = check_source(sources).unwrap();
+        let module = crate::common::kernels();
         let dtype = if activation == Element::bf16() { DType::BF16 } else { DType::F32 };
         let elements = ElementBindings::new().bind("A", registry::dense(dtype));
         let logical = module
@@ -234,9 +230,9 @@ impl Case {
 }
 
 fn kernel(device: &Device, activation: Element) -> seismic::NativeKernel<short_conv_rows::Entry> {
-    short_conv_rows::native_for_device_with(
+    declared::prepared(
         device,
-        short_conv_rows::Elements { A: activation },
+        &short_conv_rows::native_entry_with(short_conv_rows::Elements { A: activation }),
         &NativeSpecialization::new(),
     )
     .unwrap()
@@ -436,47 +432,6 @@ fn tape_versions_equal_runs_that_stopped_there() {
                     && same_bits(&bank(&from_tape.window), &bank(&expected.window)),
                 "{backend}: version (bank, {accepted}) differs from a run that stopped after {} rows",
                 1 + accepted
-            );
-        }
-    }
-}
-
-/// Device time per call at the LFM2 geometry (BF16 output): decode at 1 and
-/// 8 slots, a 16-row verify, and 512 and 2048 prefill rows; also the bytes
-/// the call moves (u | c rows, the window reads and the published window).
-#[test]
-#[ignore = "timing; run explicitly on the measurement host"]
-fn short_conv_timings() {
-    let options = seismic::MeasureOptions {
-        samples: 11,
-        min_sample_seconds: 0.01,
-    };
-    let geometry = Geometry {
-        channels: 2048,
-        taps: 3,
-        banks: 0,
-        tape: 0,
-    };
-    for device in devices() {
-        let backend = device.backend().as_str();
-        let decode = |b: usize| (0..b).map(|s| slot(1, 1, 1 + s, 1 + b + s)).collect::<Vec<_>>();
-        for (label, rows, slots) in [
-            ("decode B=1", 1usize, decode(1)),
-            ("decode B=8", 8, decode(8)),
-            ("verify 16", 16, vec![slot(16, 1, 1, 2)]),
-            ("prefill 512", 512, vec![slot(512, 512, 1, 2)]),
-            ("prefill 2048", 2048, vec![slot(2048, 2048, 1, 2)]),
-        ] {
-            let banks = slots.iter().map(|s| s.following).max().unwrap() + 1;
-            let case = Case::new(Geometry { banks, ..geometry }, rows, slots.clone(), 3);
-            let mut rotation = (0..8).map(|_| case.bind(&device, false)).collect::<Vec<_>>();
-            let args = rotation.iter_mut().map(|bound| bound.args(case.slab_banks)).collect();
-            let seconds = kernel(&device, Element::bf16()).measure(args, &options).unwrap().median;
-            let bytes = rows * 2048 * (8 + 2) + slots.len() * 2 * 2 * 2048 * 4;
-            println!(
-                "{backend} short conv {label}: {:.1} us ({:.0} GB/s effective)",
-                seconds * 1e6,
-                bytes as f64 / seconds / 1e9
             );
         }
     }

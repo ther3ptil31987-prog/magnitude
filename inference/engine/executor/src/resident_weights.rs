@@ -7,9 +7,10 @@
 
 use crate::operators;
 use crate::{ResidencyStore, ResidentWeight, WeightImportError};
-use magnitude_artifacts::{gguf::GgufArtifact, Package};
+use magnitude_artifacts::{Package, gguf::GgufArtifact};
 use magnitude_family_contracts::{
-    ActivationDType, ModelDefinition, ProgressivePlane, VisionDescription, WeightKind, WeightRole,
+    ActivationDType, ExitNorm, HeadComponent, LayerNorm, RmsNorm, ModelDefinition, ProgressivePlane, VisionDescription,
+    WeightKind, WeightRole, WeightScope,
 };
 use seismic::DType;
 use std::collections::HashMap;
@@ -65,6 +66,28 @@ impl ResidentRoles {
         self.0.values()
     }
 
+    /// The stored tables (`TableFill::Stored`) among the weights, by their
+    /// roles.
+    pub(crate) fn stored_tables(
+        &self,
+    ) -> impl Iterator<Item = (WeightRole, &std::sync::Arc<crate::stored_table::StoredTable>)> {
+        self.0
+            .iter()
+            .filter_map(|(role, weight)| weight.table().stored().map(|table| (*role, table)))
+    }
+
+    /// The stored tables by the target block whose n-gram input reads each.
+    pub(crate) fn stored_blocks(
+        &self,
+    ) -> Result<std::collections::BTreeMap<usize, std::sync::Arc<crate::stored_table::StoredTable>>, String> {
+        self.stored_tables()
+            .map(|(role, table)| match role.scope {
+                WeightScope::TargetSublayer(index) => Ok((index.block as usize, table.clone())),
+                scope => Err(format!("a stored table of scope {scope:?}")),
+            })
+            .collect()
+    }
+
     fn import(
         weights: Vec<(WeightRole, &magnitude_family_contracts::WeightDescriptor)>,
         residency: &mut ResidencyStore,
@@ -73,6 +96,13 @@ impl ResidentRoles {
     ) -> Result<Self, ResidencyError> {
         let mut roles = HashMap::with_capacity(weights.len());
         for (role, descriptor) in weights {
+            // A banked expert stack is its bank's (`ResidentTarget::bank`).
+            if residency
+                .planned(role)
+                .is_some_and(|plan| plan.banked().is_some())
+            {
+                continue;
+            }
             let weight = residency.import_gguf(
                 artifact,
                 descriptor,
@@ -81,6 +111,28 @@ impl ResidentRoles {
             if roles.insert(role, weight).is_some() {
                 return Err(invalid(format!("weight role {role:?} is bound twice")));
             }
+            if role.kind == WeightKind::Output {
+                let planes = ProgressivePlane::ALL
+                    .map(|plane| {
+                        let role = WeightRole {
+                            scope: role.scope,
+                            kind: WeightKind::OutputPlane(plane),
+                        };
+                        residency
+                            .planned(role)
+                            .map(|plan| (role, plan.descriptor.clone()))
+                    })
+                    .into_iter()
+                    .collect::<Option<Vec<_>>>();
+                if let Some(planes) = planes {
+                    for (role, descriptor) in planes {
+                        let weight = residency.import_progressive(artifact, &descriptor)?;
+                        if roles.insert(role, weight).is_some() {
+                            return Err(invalid(format!("weight role {role:?} is bound twice")));
+                        }
+                    }
+                }
+            }
         }
         Ok(Self(roles))
     }
@@ -88,12 +140,12 @@ impl ResidentRoles {
 
 #[derive(Clone)]
 pub struct ResidentHead {
-    /// Tied target embedding; cloned from the sole ResidencyStore cache.
+    /// Target-shared or separately owned embedding from the sole ResidencyStore cache.
     pub embedding: ResidentWeight,
     /// Head blocks, whose weights are in `weights`.
     pub depth: usize,
     pub weights: ResidentRoles,
-    /// Tied target vocabulary projection; cloned from the sole ResidencyStore cache.
+    /// Target-shared or separately owned vocabulary projection from the residency cache.
     pub output: ResidentOutput,
 }
 
@@ -113,13 +165,23 @@ pub struct ResidentTarget {
     /// Decoder blocks, whose weights are in `sublayers`.
     pub blocks: usize,
     pub sublayers: ResidentRoles,
-    pub output_norm: ResidentWeight,
+    /// The readout's exit norm; absent for a hyper-connection exit site,
+    /// whose roles are in `sublayers`.
+    pub output_norm: Option<ResidentWeight>,
     pub output: ResidentOutput,
     /// A separate draft's fusion of the target taps, which the target
     /// readout applies; imported from the draft component.
     pub fusion: Option<ResidentFusion>,
     /// The per-layer entry, when the model has per-layer inputs.
     pub per_layer: Option<ResidentPerLayer>,
+    /// The expert bank of a load that streams its routed experts: it holds
+    /// the banked expert stacks, which `sublayers` does not.
+    pub(crate) bank: Option<std::sync::Arc<crate::experts::ExpertBank>>,
+    /// The residency cache that imported the target: its target imports'
+    /// bytes, as imported, are the target's resident imports' (a streamed
+    /// table's stagings at the floor's class; those it holds beyond it for
+    /// a group's class are the group's, `DeviceTable::hold_places`).
+    imports: crate::residency::Imports,
 }
 
 /// The target's vocabulary projection, as its plan places it.
@@ -127,8 +189,8 @@ pub struct ResidentTarget {
 pub enum ResidentOutput {
     /// The output projection in its resident representation.
     Packed(ResidentWeight),
-    /// Its progressive planes (`ModelLoadPlan::with_progressive_head`), which
-    /// replace it.
+    /// The cost-qualified planes of a scope stored as them: every reader of
+    /// the projection reads these.
     Progressive(ResidentPlanes),
 }
 
@@ -146,7 +208,7 @@ impl ResidentPlanes {
     pub(crate) fn plane(&self, plane: ProgressivePlane) -> &ResidentWeight {
         match plane {
             ProgressivePlane::Top => &self.top,
-            ProgressivePlane::Bit3 => &self.bit3,
+            ProgressivePlane::Next => &self.bit3,
             ProgressivePlane::Rest => &self.rest,
             ProgressivePlane::Scales => &self.scales,
             ProgressivePlane::Radius => &self.radius,
@@ -154,12 +216,13 @@ impl ResidentPlanes {
     }
 }
 
-/// The per-layer entry's device weights and its host-resident table.
+/// The per-layer entry's device weights and its host-resident table,
+/// streamed through its row cache.
 #[derive(Clone)]
 pub struct ResidentPerLayer {
     pub projection: ResidentWeight,
     pub norm: ResidentWeight,
-    pub table: crate::host_tables::HostTable,
+    pub table: std::rc::Rc<crate::streamed_table::StreamedTable>,
 }
 
 /// The draft's fusion projection of the concatenated taps, and the norm the
@@ -176,12 +239,12 @@ impl ResidentTarget {
     pub(crate) fn visit_weights<'a>(&'a self, mut visit: impl FnMut(&'a ResidentWeight)) {
         visit(&self.embedding);
         self.sublayers.values().for_each(&mut visit);
-        visit(&self.output_norm);
+        self.output_norm.iter().for_each(&mut visit);
         match &self.output {
             ResidentOutput::Packed(output) => visit(output),
-            ResidentOutput::Progressive(planes) => {
-                ProgressivePlane::ALL.into_iter().for_each(|plane| visit(planes.plane(plane)))
-            }
+            ResidentOutput::Progressive(progressive) => ProgressivePlane::ALL
+                .into_iter()
+                .for_each(|plane| visit(progressive.plane(plane))),
         }
         if let Some(fusion) = &self.fusion {
             visit(&fusion.projection);
@@ -193,39 +256,88 @@ impl ResidentTarget {
         }
     }
 
+    /// Every allocation the target holds: its expert bank's and its
+    /// resident imports' ([`Self::imports`]).
     pub(crate) fn storage_bytes(&self) -> Result<u64, &'static str> {
-        let mut seen = Vec::<&seismic::Tensor>::new();
-        let mut total = Some(0u64);
-        self.visit_weights(|weight| {
-            let tensor = weight.tensor();
-            if seen.iter().any(|other| other.shares_allocation(tensor)) {
-                return;
-            }
-            total = total.and_then(|bytes| bytes.checked_add(weight.storage_bytes()));
-            seen.push(tensor);
-        });
-        total.ok_or("resident target charge overflows")
+        let bank = self.bank.as_ref().map_or(Ok(0), |bank| bank.storage_bytes())?;
+        let imported = self.imports.bytes(crate::residency::Importer::Target)?;
+        bank.checked_add(imported).ok_or("resident target charge overflows")
+    }
+
+    /// The tensor a graph's bank port binds (`BankPort`): the bank's.
+    pub(crate) fn bank_part(
+        &self,
+        port: crate::programs::native_target_graph::BankPort,
+    ) -> Result<&seismic::Tensor, String> {
+        self.bank
+            .as_ref()
+            .ok_or_else(|| format!("bank port {port:?} of a load whose experts are held whole"))?
+            .part(port.scope, port.part)
+    }
+
+    /// The tensor a graph's weight port of `role`'s `part` binds: a banked
+    /// expert stack's values, home records and scale from the bank, any
+    /// other from its resident weight.
+    pub(crate) fn bound(
+        &self,
+        role: WeightRole,
+        part: crate::programs::native_target_graph::WeightPart,
+    ) -> Result<&seismic::Tensor, String> {
+        use crate::programs::native_target_graph::WeightPart;
+        match (&self.bank, part) {
+            (Some(bank), WeightPart::Values) if bank.holds(role) => bank.records(role),
+            (Some(bank), WeightPart::Home) if bank.holds(role) => bank.home(role),
+            (Some(bank), WeightPart::Scale) if bank.holds(role) => bank.expert_scale(role),
+            (_, part) => part.of(self.sublayers.get(role)?),
+        }
     }
 }
 
+/// The target `definition` names, imported through `residency`; its host
+/// tables' row caches charged to `host_tables`, the load's claim of them.
 pub(crate) fn import_target(
     definition: &ModelDefinition,
     package: &Package,
     residency: &mut ResidencyStore,
+    host_tables: &crate::memory::ledger::Held,
 ) -> Result<ResidentTarget, ResidencyError> {
     validate_definition_package(definition, package)?;
     let decoder = &definition.decoder;
     let activation = activation_dtype(decoder.activation_dtype);
     let target = package.target();
     let embedding = residency.import_gguf(target, &decoder.entry.embedding, activation)?;
+    // A low-rank hyper-connection exit site is the last block's mix site:
+    // its roles are resident beside the sublayers'. Every exit norm (a
+    // previous-site exit's among them) is the readout's.
+    let (exit_roles, output_norm) = match &decoder.exit.norm {
+        ExitNorm::HyperConnectionHead(exit) => (
+            operators::exit_weights(decoder)
+                .into_iter()
+                .filter(|(role, _)| role.kind != magnitude_family_contracts::WeightKind::OutputNorm)
+                .collect(),
+            exit.norm.as_ref().map(|norm| residency.import_gguf(target, &norm.weight, activation)).transpose()?,
+        ),
+        ExitNorm::Rms(RmsNorm { weight, .. }) | ExitNorm::Layer(LayerNorm { weight, .. }) => (
+            Vec::new(),
+            Some(residency.import_gguf(target, weight, activation)?),
+        ),
+    };
     let sublayers = ResidentRoles::import(
-        operators::decoder_weights(decoder),
+        operators::decoder_weights(decoder)
+            .into_iter()
+            .chain(exit_roles)
+            .collect(),
         residency,
         target,
         activation,
     )?;
-    let output_norm = residency.import_gguf(target, decoder.exit.norm.weight(), activation)?;
-    let output = import_output(decoder, target, residency, activation)?;
+    let output = import_output(
+        &decoder.exit.output,
+        WeightScope::Target,
+        target,
+        residency,
+        activation,
+    )?;
     let fusion = definition
         .draft
         .as_ref()
@@ -260,8 +372,7 @@ pub(crate) fn import_target(
                     &entry.projection_norm.weight,
                     operators::resident_dtype(WeightKind::PerLayerProjectionNorm, activation),
                 )?,
-                table: crate::host_tables::HostTable::open(&stored)
-                    .map_err(|error| invalid(error.to_string()))?,
+                table: std::rc::Rc::new(row_cached(&stored, residency.host_table(&entry.table), host_tables)?),
             })
         })
         .transpose()?;
@@ -273,14 +384,50 @@ pub(crate) fn import_target(
         output,
         fusion,
         per_layer,
+        bank: residency.open_expert_bank(target)?,
+        imports: residency.imports(),
     })
 }
 
-/// The target's output head as the plan places it: its progressive planes
-/// (imported once; the residency cache returns them again) or the packed
-/// projection.
+/// The host table `stored`, which `plan` plans, streamed through a row
+/// cache charged to the load's host-tables claim, which claims it in the
+/// one store host memory lies in.
+///
+/// # Panics
+/// Where `host_tables` claims other than one store: a plan with a host
+/// table claims its row cache.
+fn row_cached(
+    stored: &crate::residency::Stored,
+    plan: &crate::HostTablePlan,
+    host_tables: &crate::memory::ledger::Held,
+) -> Result<crate::streamed_table::StreamedTable, ResidencyError> {
+    let step_rows = usize::try_from(plan.step_rows).map_err(|_| invalid("a step's host table rows exceed the host range"))?;
+    let [claim] = host_tables.claims() else {
+        panic!(
+            "invariant violated: a host table's row cache is claimed in {} stores, not one",
+            host_tables.claims().len()
+        );
+    };
+    use crate::host_tables::{HostTable, HostTableError};
+    HostTable::open(stored)
+        .and_then(|table| crate::streamed_table::StreamedTable::new(table, step_rows, &claim.entry()))
+        .map_err(|error| match error {
+            // The ledger's refusal of the cache is a refusal of memory in the
+            // store a host-tables claim lies in: the shared contract's
+            // (`DeviceLedgers::claim`).
+            HostTableError::Refused(seismic::memory::Refused { required, available }) => {
+                ResidencyError::Import(WeightImportError::Refused { contract: seismic::Contract::Shared, required, available })
+            }
+            error => invalid(error.to_string()),
+        })
+}
+
+/// Import `scope`'s projection in the one form the finalized plan stores it
+/// in: its planes when the plan qualifies progressive classes of the scope,
+/// the canonical projection, once through the residency cache, otherwise.
 fn import_output(
-    decoder: &magnitude_family_contracts::Decoder,
+    descriptor: &magnitude_family_contracts::WeightDescriptor,
+    scope: WeightScope,
     target: &GgufArtifact,
     residency: &mut ResidencyStore,
     activation: DType,
@@ -289,7 +436,10 @@ fn import_output(
         .into_iter()
         .map(|plane| {
             residency
-                .planned_target(WeightKind::OutputPlane(plane))
+                .planned(WeightRole {
+                    scope,
+                    kind: WeightKind::OutputPlane(plane),
+                })
                 .map(|weight| weight.descriptor.clone())
         })
         .collect::<Option<Vec<_>>>();
@@ -309,7 +459,7 @@ fn import_output(
                 radius,
             })
         }
-        None => ResidentOutput::Packed(residency.import_gguf(target, &decoder.exit.output, activation)?),
+        None => ResidentOutput::Packed(residency.import_gguf(target, descriptor, activation)?),
     })
 }
 
@@ -330,13 +480,27 @@ pub(crate) fn import_optional_head(
         .map(|head| {
             let embedding =
                 residency.import_gguf(package.target(), &decoder.entry.embedding, activation)?;
-            let output = import_output(decoder, package.target(), residency, activation)?;
-            let weights = operators::head_weights(head)
-                .map_err(|error| invalid(error.to_string()))?;
+            let output = import_output(
+                &decoder.exit.output,
+                WeightScope::Target,
+                package.target(),
+                residency,
+                activation,
+            )?;
+            let weights =
+                operators::head_weights(head).map_err(|error| invalid(error.to_string()))?;
+            // The head's own weights are the target artifact's, or those of
+            // the draft component a separate head is stored in.
+            let artifact = match head.component {
+                HeadComponent::Target => package.target(),
+                HeadComponent::Draft => package
+                    .draft()
+                    .ok_or_else(|| invalid("a separate draft head has no draft component"))?,
+            };
             Ok(ResidentHead {
                 embedding,
                 depth: head.depth(),
-                weights: ResidentRoles::import(weights, residency, package.target(), activation)?,
+                weights: ResidentRoles::import(weights, residency, artifact, activation)?,
                 output,
             })
         })
@@ -369,13 +533,20 @@ fn import_draft(
             operators::resident_dtype(WeightKind::Embedding, activation),
         )?,
     };
-    // A separate draft's readouts read the packed projection (it admits no
-    // progressive head).
-    let output = ResidentOutput::Packed(residency.import_gguf(target, &decoder.exit.output, activation)?);
-    let mut weights = operators::draft::draft_weights(draft)
-        .map_err(|error| invalid(error.to_string()))?;
-    // The embedding is bound as `embedding`, not by role.
-    weights.retain(|(role, _)| role.kind != WeightKind::Embedding);
+    let output = match &draft.output {
+        Some(output) => import_output(output, WeightScope::Draft, artifact, residency, activation)?,
+        None => import_output(
+            &decoder.exit.output,
+            WeightScope::Target,
+            target,
+            residency,
+            activation,
+        )?,
+    };
+    let mut weights =
+        operators::draft::draft_weights(draft).map_err(|error| invalid(error.to_string()))?;
+    // These are bound as named resident fields, not by role.
+    weights.retain(|(role, _)| !matches!(role.kind, WeightKind::Embedding | WeightKind::Output));
     let [_, fusion_norm] = operators::draft::fusion_weights(draft);
     weights.push(fusion_norm);
     Ok(ResidentHead {
@@ -410,7 +581,11 @@ pub(crate) fn validate_definition_package(
     validate_projector_binding(definition.vision.is_some(), package.projector().is_some())?;
     // A package may carry a draft the definition leaves unselected; a bound
     // draft needs its component.
-    if definition.draft.is_some() && package.draft().is_none() {
+    let separate_head = definition
+        .head
+        .as_ref()
+        .is_some_and(|head| head.component == HeadComponent::Draft);
+    if (definition.draft.is_some() || separate_head) && package.draft().is_none() {
         return Err(invalid(
             "model definition binds a draft, but the package has no draft component",
         ));
@@ -429,15 +604,12 @@ fn validate_projector_binding(
     definition_has_vision: bool,
     package_has_projector: bool,
 ) -> Result<(), ResidencyError> {
-    match (definition_has_vision, package_has_projector) {
-        (true, false) => Err(invalid(
+    if definition_has_vision && !package_has_projector {
+        return Err(invalid(
             "model definition requires a projector component, but the package has none",
-        )),
-        (false, true) => Err(invalid(
-            "package contains a projector component not bound by the model definition",
-        )),
-        _ => Ok(()),
+        ));
     }
+    Ok(())
 }
 
 pub(crate) fn activation_dtype(dtype: ActivationDType) -> DType {
@@ -483,20 +655,15 @@ mod tests {
     }
 
     #[test]
-    fn projector_presence_must_exactly_match_the_family_contract() {
+    fn a_vision_definition_requires_its_projector_and_an_unbound_projector_stays_out() {
         assert!(validate_projector_binding(false, false).is_ok());
         assert!(validate_projector_binding(true, true).is_ok());
+        assert!(validate_projector_binding(false, true).is_ok());
         assert_eq!(
             validate_projector_binding(true, false)
                 .unwrap_err()
                 .to_string(),
             "model definition requires a projector component, but the package has none"
-        );
-        assert_eq!(
-            validate_projector_binding(false, true)
-                .unwrap_err()
-                .to_string(),
-            "package contains a projector component not bound by the model definition"
         );
     }
 }

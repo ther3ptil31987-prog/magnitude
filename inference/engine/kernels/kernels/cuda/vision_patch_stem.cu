@@ -1,7 +1,7 @@
 // vision_patch_stem: the patch projection as one GEMM per frame (K = C * P * P
-// each). A first launch converts the F32 pixels [M, C, 1 + S, P, P] to the
-// staged element (the weights' 16-bit element, or f16 for F32 weights; a
-// relative rounding of 2^-11 for f16) in frame-major rows [M, 1 + S, Kp]
+// each). A first launch converts the F32 pixels [M, C, 1 + S, P, P] to f16
+// (a relative rounding of 2^-11, whatever the weights' element: BF16 pixels
+// would round at 2^-9 ahead of every block) in frame-major rows [M, 1 + S, Kp]
 // (Kp = K rounded up to whole 16-byte chunks, the pad zero); with two frames
 // the first GEMM stores its F32 product; the last adds it, the bias and the
 // bilinear position-table blend, publishing the F32 residual stream. Bodies in
@@ -14,7 +14,7 @@ using vision::u8;
 typedef ELEMENT_OF(SEISMIC_FRAME_WEIGHT) Weight;
 typedef ELEMENT_OF(SEISMIC_BIAS) BiasElement;
 typedef ELEMENT_OF(SEISMIC_TABLE) TableElement;
-typedef typename vision::Staged<element::F16, Weight>::type Pixel;
+typedef element::F16 Pixel;
 static_assert(SEISMIC_DIM_S == 0 || vision::Same<Weight, ELEMENT_OF(SEISMIC_NEXT_FRAME_WEIGHT)>::value,
               "every frame weight shares one element");
 
@@ -47,10 +47,10 @@ struct Partial {
     }
 };
 
-// ((partial) + product (+ bias)) + the four table corners scaled by their
-// coefficients, summed in order.
+// ((partial) + product (+ bias)) + (with NT = 1) the four table corners
+// scaled by their coefficients, summed in order.
 struct Stem {
-    float *y;
+    element::Out<element::F32> y;
     u64 stride;
     const float *partial;
     const u8 *bias;
@@ -65,13 +65,16 @@ struct Stem {
         if constexpr (SEISMIC_DIM_NB == 1)
             projected = projected + element::at<BiasElement>(bias, n);
         float blended = 0.0f;
+        if constexpr (SEISMIC_DIM_NT == 1) {
 #pragma unroll
-        for (u32 i = 0; i < 4; ++i)
-            blended += element::at<TableElement>(table, (u64)indices[m * 4 + i] * columns + n) * coefficients[m * 4 + i];
+            for (u32 i = 0; i < 4; ++i)
+                blended +=
+                    element::at<TableElement>(table, (u64)indices[m * 4 + i] * columns + n) * coefficients[m * 4 + i];
+        }
         return projected + blended;
     }
     __device__ __forceinline__ void operator()(u32 m, u32 n, float first, float second) const {
-        *reinterpret_cast<float2 *>(y + (u64)m * stride + n) = make_float2(value(m, n, first), value(m, n + 1, second));
+        y.put2((u64)m * stride + n, value(m, n, first), value(m, n + 1, second));
     }
 };
 
@@ -83,7 +86,7 @@ extern "C" __global__ void vision_patch_stem_first(SEISMIC_KERNEL_PARAMS) {
 
 extern "C" __global__ void vision_patch_stem_last(SEISMIC_KERNEL_PARAMS) {
     __shared__ vision::GemmShared shared;
-    const Stem epilogue{reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)),
+    const Stem epilogue{SEISMIC_RESULT_0_OUT,
                         SEISMIC_RESULT_0_STRIDE_0,
                         PARTIAL,
                         SEISMIC_PTR(SEISMIC_BUFFER_BIAS),

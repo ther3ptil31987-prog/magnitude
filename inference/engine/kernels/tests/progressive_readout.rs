@@ -1,14 +1,21 @@
 //! The progressive head readout (`readout.seismic`) on Metal (macOS) and CUDA
 //! (elsewhere): the natives against their portable bodies (the Seismic
 //! interpreter), and certified selections against the full planes readout.
-//! Tests return early without a Metal or CUDA device.
+//! Tests return early when no device of either backend is available.
 
+mod common;
+mod declared;
+mod random;
+
+use random::Rng;
+
+use magnitude_kernels::constants::VERIFY_ROWS;
 use magnitude_kernels::{
     readout_exact_rows, readout_planes_rows, readout_refine_rows, readout_top_rows,
 };
-use seismic::{BackendName, Device, DeviceCatalog, Element, NativeSpecialization, Tensor};
+use seismic::{BackendName, Device, Element, NativeSpecialization, Tensor};
 use seismic_lang::{
-    checked::{check_source, CheckedModule, SourceFile},
+    checked::CheckedModule,
     entry::ElementBindings,
     failure::SourceTermination,
     interp::{Arg, Interpreter, OracleOutcome, OutcomeValue, TensorData},
@@ -19,49 +26,42 @@ use seismic_lang::{
 
 const EPSILON: f32 = 1e-6;
 
+/// The device under test: the first available of Metal and CUDA, or the
+/// backend `SEISMIC_TEST_BACKEND` selects (`seismic_native_tests::devices`).
 fn device() -> Option<Device> {
-    let backend = if cfg!(target_os = "macos") {
-        BackendName::Metal
-    } else {
-        BackendName::Cuda
-    };
-    DeviceCatalog::discover().ok()?.open_backend(backend).ok()
+    seismic_native_tests::devices(&[BackendName::Metal, BackendName::Cuda]).into_iter().next()
 }
 
-/// The launch of the top level's and the full pass's vocabulary projection
-/// that takes the scan parameters: Metal's library GEMV (after the full
-/// pass's stage launch), CUDA's scan (after its form launch).
-fn scan_launch(device: &Device, planes: bool) -> usize {
-    match (device.backend(), planes) {
-        (BackendName::Metal, false) => 0,
-        _ => 1,
-    }
-}
-
-/// A top level's or full pass's specialization with the scan parameters;
-/// on Metal also the first row count its batched GEMV serves (3 with four
-/// rows per simdgroup, so the batched path is exercised, else never).
-fn scan_spec(device: &Device, head: &Head, planes: bool, scan: u64, rows: u64) -> NativeSpecialization {
-    let launch = scan_launch(device, planes);
-    let spec = statics(head)
-        .with_launch_param(launch, width_param(device), scan)
-        .with_launch_param(launch, "ROWS", rows);
+/// A top level's or full pass's specialization with the scan parameters.
+/// CUDA: the `planes` form's, after the stage launch. Metal: the GEMV's tile
+/// mapping (entry-wide, every GEMV row count's), and on the full pass, whose
+/// rows past VERIFY_ROWS the batched GEMV and the GEMM serve, theirs (the top
+/// level serves only GEMV rows).
+fn scan_spec<E: seismic::Entry>(
+    device: &Device,
+    head: &Head,
+    planes: bool,
+    scan: u64,
+    rows: u64,
+) -> NativeSpecialization {
+    let spec = formed_statics(head);
     if device.backend() != BackendName::Metal {
-        return spec;
-    }
-    // Metal's every launch: the GEMV, the batched GEMV and the full pass's
-    // GEMM.
-    let (gemv, batch) = (launch, launch + 1);
-    let spec = spec
-        .with_param("BATCH_FROM", if rows == 4 { 3 } else { 9 })
-        .with_launch_param(gemv, "LANES", 32)
-        .with_launch_param(batch, "BATCH_SIMDGROUPS", scan)
-        .with_launch_param(batch, "BATCH_ROWS", rows.min(2));
-    if planes {
-        spec.with_launch_param(batch + 1, "TILE_M", 64)
-            .with_launch_param(batch + 1, "TILE_N", 64)
+        spec.with_launch_param(1, width_param(device), scan)
+            .with_launch_param(1, "ROWS", rows)
     } else {
-        spec
+        let spec = spec
+            .with_param(width_param(device), scan)
+            .with_param("ROWS", rows)
+            .with_param("LANES", 32);
+        if planes {
+            let (batch, gemm) = (common::metal_launch::<E>("batch"), common::metal_launch::<E>("gemm"));
+            spec.with_launch_param(batch, "BATCH_SIMDGROUPS", scan)
+                .with_launch_param(batch, "BATCH_ROWS", rows.min(2))
+                .with_launch_param(gemm, "TILE_M", 64)
+                .with_launch_param(gemm, "TILE_N", 64)
+        } else {
+            spec
+        }
     }
 }
 
@@ -71,21 +71,6 @@ fn width_param(device: &Device) -> &'static str {
         "SIMDGROUPS"
     } else {
         "WARPS"
-    }
-}
-
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u32 {
-        self.0 = self
-            .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        (self.0 >> 33) as u32
-    }
-    fn uniform(&mut self, low: f32, high: f32) -> f32 {
-        low + (high - low) * (self.next() as f32 / (1u64 << 31) as f32)
     }
 }
 
@@ -105,6 +90,7 @@ fn f16_value(bits: u16) -> f32 {
 struct Head {
     v: usize,
     d: usize,
+    bits: usize,
     top: Vec<u32>,
     bit3: Vec<u32>,
     rest: Vec<u32>,
@@ -116,23 +102,38 @@ struct Head {
 impl Head {
     /// Rows of random codes and scales.
     fn new(v: usize, d: usize, seed: u64) -> Self {
+        Self::with_bits(v, d, seed, 8)
+    }
+    fn with_bits(v: usize, d: usize, seed: u64, bits: usize) -> Self {
+        assert!(matches!(bits, 4 | 8));
+        let half = bits / 2;
+        let low = half - 1;
+        let per_word = 32 / half;
+        let offset = (1u32 << (bits - 1)) as f32;
         let mut rng = Rng(seed);
         let groups = d / 32;
         let mut codes = vec![0u8; v * d];
         let mut scales = vec![0u16; v * groups];
         for n in 0..v {
             for g in 0..groups {
-                scales[n * groups + g] = f16_bits(rng.uniform(0.5, 1.5) * 0.02 / (d as f32).sqrt());
+                let sign = if bits == 4 && (n + g) % 2 == 0 {
+                    -1.0
+                } else {
+                    1.0
+                };
+                scales[n * groups + g] =
+                    f16_bits(sign * rng.uniform(0.5, 1.5) * 0.02 / (d as f32).sqrt());
                 for i in 0..32 {
-                    codes[n * d + 32 * g + i] = (rng.next() % 256) as u8;
+                    codes[n * d + 32 * g + i] = (rng.next() % (1u32 << bits)) as u8;
                 }
             }
         }
-        let value =
-            |n: usize, k: usize, code: f32| f16_value(scales[n * groups + k / 32]) * (code - 128.0);
-        let mut top = vec![0u32; v * d / 8];
+        let value = |n: usize, k: usize, code: f32| {
+            f16_value(scales[n * groups + k / 32]) * (code - offset)
+        };
+        let mut top = vec![0u32; v * d * half / 32];
         let mut bit3 = vec![0u32; v * groups];
-        let mut rest = vec![0u32; v * groups * 3];
+        let mut rest = vec![0u32; v * groups * low];
         let mut exact = vec![0f32; v * d];
         let mut views = [vec![0f32; v * d], vec![0f32; v * d]];
         for n in 0..v {
@@ -140,14 +141,22 @@ impl Head {
                 let u = u32::from(codes[n * d + k]);
                 let (g, within) = (k / 32, k % 32);
                 let shift = 4 * (within % 8) + within / 8;
-                top[n * d / 8 + k / 8] |= (u >> 4) << (4 * (k % 8));
-                bit3[n * groups + g] |= ((u >> 3) & 1) << shift;
-                for j in 0..3 {
-                    rest[(n * groups + g) * 3 + j] |= ((u >> (2 - j)) & 1) << shift;
+                top[n * d / per_word + k / per_word] |= (u >> half) << (half * (k % per_word));
+                bit3[n * groups + g] |= ((u >> low) & 1) << shift;
+                for j in 0..low {
+                    rest[(n * groups + g) * low + j] |= ((u >> (low - 1 - j)) & 1) << shift;
                 }
                 exact[n * d + k] = value(n, k, u as f32);
-                views[0][n * d + k] = value(n, k, (u >> 4) as f32 * 16.0 + 7.5);
-                views[1][n * d + k] = value(n, k, (u >> 3) as f32 * 8.0 + 3.5);
+                views[0][n * d + k] = value(
+                    n,
+                    k,
+                    (u >> half) as f32 * (1u32 << half) as f32 + 0.5 * ((1u32 << half) - 1) as f32,
+                );
+                views[1][n * d + k] = value(
+                    n,
+                    k,
+                    (u >> low) as f32 * (1u32 << low) as f32 + 0.5 * ((1u32 << low) - 1) as f32,
+                );
             }
         }
         let norm =
@@ -165,6 +174,7 @@ impl Head {
         Self {
             v,
             d,
+            bits,
             top,
             bit3,
             rest,
@@ -348,11 +358,22 @@ impl Case {
         let groups = d / 32;
         let selection = &self.selection;
         Tensors {
-            hidden: tensor(device, Element::f32(), &[self.m, d], f32s(&self.hidden)),
+            // The levels read the rows as `[M, PT, D]` parts (one part).
+            hidden: tensor(device, Element::f32(), &[self.m, 1, d], f32s(&self.hidden)),
             norm: tensor(device, Element::bf16(), &[d], bf16_bytes(&self.norm)),
-            top: tensor(device, Element::u32(), &[v, d / 8], words(&head.top)),
+            top: tensor(
+                device,
+                Element::u32(),
+                &[v, groups, head.bits / 2],
+                words(&head.top),
+            ),
             bit3: tensor(device, Element::u32(), &[v, groups], words(&head.bit3)),
-            rest: tensor(device, Element::u32(), &[v, groups, 3], words(&head.rest)),
+            rest: tensor(
+                device,
+                Element::u32(),
+                &[v, groups, head.bits / 2 - 1],
+                words(&head.rest),
+            ),
             scales: tensor(
                 device,
                 Element::f16(),
@@ -406,21 +427,41 @@ fn statics(head: &Head) -> NativeSpecialization {
     NativeSpecialization::new()
         .with_static("V", head.v as u64)
         .with_static("D", head.d as u64)
+        .with_static("P", (head.bits / 2 - 1) as u64)
+}
+
+/// The statics of the entries that form their input (top, planes): one
+/// part normalized at the row width.
+fn formed_statics(head: &Head) -> NativeSpecialization {
+    statics(head)
+        .with_static("PT", 1)
+        .with_static("NM", head.d as u64)
 }
 
 /// Every level natively, each from the previous native level.
-fn run(device: &Device, head: &Head, t: &Tensors, (scan, rows, gather): Params) -> Levels {
+fn run(device: &Device, head: &Head, t: &Tensors, params: Params) -> Levels {
+    run_with_softcap(device, head, t, params, 0.0)
+}
+
+fn run_with_softcap(
+    device: &Device,
+    head: &Head,
+    t: &Tensors,
+    (scan, rows, gather): Params,
+    softcap: f32,
+) -> Levels {
     let width = width_param(device);
-    let top = readout_top_rows::native_for_device_with(
+    let top = declared::prepared(
         device,
-        readout_top_rows::Elements {
+        &readout_top_rows::native_entry_with(readout_top_rows::Elements {
             NW: Element::bf16(),
             A: Element::bf16(),
-        },
-        &scan_spec(device, head, false, scan, rows),
+        }),
+        &scan_spec::<readout_top_rows::Entry>(device, head, false, scan, rows),
     )
     .unwrap()
     .call(readout_top_rows::Args {
+        softcap,
         hidden: &t.hidden,
         norm: &t.norm,
         top: &t.top,
@@ -436,13 +477,14 @@ fn run(device: &Device, head: &Head, t: &Tensors, (scan, rows, gather): Params) 
         epsilon: EPSILON,
     })
     .unwrap();
-    let refine = readout_refine_rows::native_for_device_with(
+    let refine = declared::prepared(
         device,
-        readout_refine_rows::Elements { A: Element::bf16() },
+        &readout_refine_rows::native_entry_with(readout_refine_rows::Elements { A: Element::bf16() }),
         &statics(head).with_launch_param(0, width, gather),
     )
     .unwrap()
     .call(readout_refine_rows::Args {
+        softcap,
         features: &top.r2,
         top: &t.top,
         bit3: &t.bit3,
@@ -458,13 +500,14 @@ fn run(device: &Device, head: &Head, t: &Tensors, (scan, rows, gather): Params) 
         constrained: &t.constrained,
     })
     .unwrap();
-    let exact = readout_exact_rows::native_for_device_with(
+    let exact = declared::prepared(
         device,
-        readout_exact_rows::Elements { A: Element::bf16() },
+        &readout_exact_rows::native_entry_with(readout_exact_rows::Elements { A: Element::bf16() }),
         &statics(head).with_launch_param(0, width, gather),
     )
     .unwrap()
     .call(readout_exact_rows::Args {
+        softcap,
         features: &top.r2,
         top: &t.top,
         bit3: &t.bit3,
@@ -481,16 +524,17 @@ fn run(device: &Device, head: &Head, t: &Tensors, (scan, rows, gather): Params) 
     })
     .unwrap()
     .value;
-    let planes = readout_planes_rows::native_for_device_with(
+    let planes = declared::prepared(
         device,
-        readout_planes_rows::Elements {
+        &readout_planes_rows::native_entry_with(readout_planes_rows::Elements {
             NW: Element::bf16(),
             A: Element::bf16(),
-        },
-        &scan_spec(device, head, true, scan, rows),
+        }),
+        &scan_spec::<readout_planes_rows::Entry>(device, head, true, scan, rows),
     )
     .unwrap()
     .call(readout_planes_rows::Args {
+        softcap,
         hidden: &t.hidden,
         norm: &t.norm,
         top: &t.top,
@@ -523,7 +567,7 @@ fn progressive_selection_selects_what_the_full_readout_selects() {
     let head = Head::new(3001, 2048, 41);
     let mut rng = Rng(5);
     for peaked in [false, true] {
-        for o in [1usize, 2, 3, 5, 8] {
+        for o in [1usize, 2, 3, 4, 5, 8] {
             let case = Case::new(o, &head, peaked, &mut rng);
             let t = case.tensors(&device, &head);
             for params in [(8u64, 2u64, 8u64), (4, 1, 4), (8, 4, 4)] {
@@ -578,7 +622,8 @@ fn progressive_selection_selects_what_the_full_readout_selects() {
                                 );
                             } else {
                                 assert!(
-                                    (f64::from(exact) - f64::from(planes)).abs() <= 1e-5 * (magnitude + 1e-6),
+                                    (f64::from(exact) - f64::from(planes)).abs()
+                                        <= 1e-5 * (magnitude + 1e-6),
                                     "{context}: row {row} token {token} exact {exact} planes {planes}"
                                 );
                             }
@@ -618,28 +663,78 @@ fn progressive_selection_selects_what_the_full_readout_selects() {
     }
 }
 
-/// The full planes readout projects every row class, in blocks of eight rows:
+/// A monotone cap can turn distinct raw logits into equal F32 scores.
+/// Bounds must keep every tied competitor, including one preferred by the
+/// sampler's token tie rule, while sampled/constrained rows use the same draws.
+#[test]
+fn progressive_softcap_preserves_full_selection_and_saturated_ties() {
+    let Some(device) = device() else { return };
+    for bits in [4, 8] {
+        let head = Head::with_bits(67, 256, 41, bits);
+        let mut rng = Rng(5);
+        for rows in [1, 3] {
+            let case = Case::new(rows, &head, false, &mut rng);
+            let t = case.tensors(&device, &head);
+            for cap in [0.0, 0.001, 0.1, 30.0] {
+                let levels = run_with_softcap(&device, &head, &t, (8, 2, 8), cap);
+                for (token, (&selected, &full)) in
+                    levels.exact.iter().zip(&levels.planes).enumerate()
+                {
+                    if selected.is_finite() {
+                        assert_eq!(
+                            selected.to_bits(),
+                            full.to_bits(),
+                            "cap {cap} token {token}: survivor and full scan must publish the same dot"
+                        );
+                    }
+                }
+                for row in 0..case.o {
+                    assert_eq!(
+                        case.selection.select(row, &levels.exact, head.v),
+                        case.selection.select(row, &levels.planes, head.v),
+                        "cap {cap} row {row}: certified selection differs"
+                    );
+                    assert!(levels.threshold4[row] <= levels.threshold5[row]);
+                }
+                if cap == 0.001 {
+                    let maximum = levels.planes[..head.v]
+                        .iter()
+                        .copied()
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    let tied = levels.planes[..head.v]
+                        .iter()
+                        .filter(|&&z| z == maximum)
+                        .count();
+                    assert!(tied > 1, "the fixture must create actual published ties");
+                }
+            }
+        }
+    }
+}
+
+/// The full planes readout projects every row class, in blocks of `VERIFY_ROWS` rows:
 /// each row's logits are its features' exact dot products with the head.
 #[test]
 fn planes_readout_projects_every_row_class() {
     let Some(device) = device() else { return };
     let head = Head::new(301, 1088, 43);
     let mut rng = Rng(11);
-    for o in [9usize, 16, 21] {
+    for o in [VERIFY_ROWS as usize + 1, 16, 21] {
         let case = Case::new(o, &head, false, &mut rng);
         let t = case.tensors(&device, &head);
         let (v, d) = (head.v, head.d);
         let planes = read_f32(
-            &readout_planes_rows::native_for_device_with(
+            &declared::prepared(
                 &device,
-                readout_planes_rows::Elements {
+                &readout_planes_rows::native_entry_with(readout_planes_rows::Elements {
                     NW: Element::bf16(),
                     A: Element::bf16(),
-                },
-                &scan_spec(&device, &head, true, 4, 2),
+                }),
+                &scan_spec::<readout_planes_rows::Entry>(&device, &head, true, 4, 2),
             )
             .unwrap()
             .call(readout_planes_rows::Args {
+                softcap: 0.0,
                 hidden: &t.hidden,
                 norm: &t.norm,
                 top: &t.top,
@@ -684,33 +779,100 @@ fn planes_readout_projects_every_row_class() {
     }
 }
 
+/// Metal's batched full pass (above `VERIFY_ROWS` rows) decodes each code
+/// once for every row, where the scalar GEMV (up to `VERIFY_ROWS`) decodes it
+/// once a row; both project the same exact view. A row in a batched call (9
+/// and 16 rows), on flat and peaked rows, selects what the same row selects
+/// in the scalar call of the first `VERIFY_ROWS` rows, and each logit stays
+/// within F32 rounding of the scalar one (relative to the terms' magnitude).
+#[test]
+fn planes_batched_full_pass_selects_what_the_scalar_pass_selects() {
+    let Some(device) = device() else { return };
+    if device.backend() != BackendName::Metal {
+        return;
+    }
+    let head = Head::new(3001, 2048, 47);
+    let (v, d) = (head.v, head.d);
+    let mut rng = Rng(13);
+    let scalar_rows = VERIFY_ROWS as usize;
+    let project = |t: &Tensors, out_rows: &Tensor| {
+        read_f32(
+            &declared::prepared(
+                &device,
+                &readout_planes_rows::native_entry_with(readout_planes_rows::Elements {
+                    NW: Element::bf16(),
+                    A: Element::bf16(),
+                }),
+                &scan_spec::<readout_planes_rows::Entry>(&device, &head, true, 8, 2),
+            )
+            .unwrap()
+            .call(readout_planes_rows::Args {
+                softcap: 0.0,
+                hidden: &t.hidden,
+                norm: &t.norm,
+                top: &t.top,
+                bit3: &t.bit3,
+                rest: &t.rest,
+                scales: &t.scales,
+                out_rows,
+                epsilon: EPSILON,
+            })
+            .unwrap()
+            .value,
+        )
+    };
+    for peaked in [false, true] {
+        for o in [VERIFY_ROWS as usize + 1, 16] {
+            let case = Case::new(o, &head, peaked, &mut rng);
+            let t = case.tensors(&device, &head);
+            // The scalar GEMV serves the first `VERIFY_ROWS` rows, the
+            // batched pass all `o`.
+            let first = tensor(
+                &device,
+                Element::i32(),
+                &[scalar_rows],
+                case.out_rows[..scalar_rows].iter().flat_map(|r| r.to_le_bytes()).collect(),
+            );
+            let (scalar, batched) = (project(&t, &first), project(&t, &t.out_rows));
+            for row in 0..scalar_rows {
+                let source = case.out_rows[row] as usize;
+                let hidden = &case.hidden[source * d..(source + 1) * d];
+                let mean = hidden.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>() / d as f64;
+                let inverse = 1.0 / (mean + f64::from(EPSILON)).sqrt();
+                let features = hidden
+                    .iter()
+                    .zip(&case.norm)
+                    .map(|(x, w)| {
+                        f64::from(bf16_round(
+                            (f64::from(*x) * inverse * f64::from(bf16_round(*w))) as f32,
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                for token in 0..v {
+                    let magnitude = head
+                        .row(token)
+                        .iter()
+                        .zip(&features)
+                        .map(|(w, x)| (f64::from(*w) * x).abs())
+                        .sum::<f64>();
+                    let (a, b) = (scalar[row * v + token], batched[row * v + token]);
+                    assert!(
+                        (f64::from(a) - f64::from(b)).abs() <= 1e-5 * (magnitude + 1e-6),
+                        "peaked {peaked} O {o} row {row} token {token}: scalar {a} batched {b}"
+                    );
+                }
+                assert_eq!(
+                    case.selection.select(row, &batched, v),
+                    case.selection.select(row, &scalar, v),
+                    "peaked {peaked} O {o} row {row}: the batched pass selects differently"
+                );
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Portable bodies.
-
-fn module() -> CheckedModule {
-    let mut sources = seismic_std::sources();
-    for (path, text) in [
-        (
-            "dense_rows.seismic",
-            include_str!("../kernels/dense_rows.seismic"),
-        ),
-        (
-            "readout.seismic",
-            include_str!("../kernels/readout.seismic"),
-        ),
-        ("target.seismic", include_str!("../kernels/target.seismic")),
-        (
-            "functions.seismic",
-            include_str!("../kernels/functions.seismic"),
-        ),
-    ] {
-        sources.push(SourceFile {
-            path: path.into(),
-            text: text.into(),
-        });
-    }
-    check_source(sources).unwrap()
-}
 
 enum Input {
     Data(TensorData),
@@ -789,11 +951,17 @@ fn assert_covers(label: &str, native: &[f32], portable: &[f32], scale: f32) {
 #[test]
 fn progressive_portable_bodies_match_the_natives() {
     let Some(device) = device() else { return };
-    let module = module();
+    let module = crate::common::kernels();
+    let softcap = 30.0;
     // A vocabulary that is no multiple of 32 or of the scan's rows, and a
     // width with a partial 1,024-column chunk.
-    for (v, d) in [(67usize, 256usize), (45, 1088)] {
-        let head = Head::new(v, d, 77);
+    for (v, d, bits) in [
+        (67usize, 256usize, 4usize),
+        (67, 256, 8),
+        (45, 1088, 4),
+        (45, 1088, 8),
+    ] {
+        let head = Head::with_bits(v, d, 77, bits);
         let mut rng = Rng(9);
         let case = Case::new(3, &head, false, &mut rng);
         let (o, m, groups) = (case.o, case.m, d / 32);
@@ -801,9 +969,17 @@ fn progressive_portable_bodies_match_the_natives() {
         let words = |values: &[u32]| values.iter().map(|w| f64::from(*w)).collect::<Vec<_>>();
         let planes = || {
             vec![
-                dense(DType::U32, &[v, d / 8], words(&head.top).into_iter()),
+                dense(
+                    DType::U32,
+                    &[v, groups, head.bits / 2],
+                    words(&head.top).into_iter(),
+                ),
                 dense(DType::U32, &[v, groups], words(&head.bit3).into_iter()),
-                dense(DType::U32, &[v, groups, 3], words(&head.rest).into_iter()),
+                dense(
+                    DType::U32,
+                    &[v, groups, head.bits / 2 - 1],
+                    words(&head.rest).into_iter(),
+                ),
                 dense(
                     DType::F16,
                     &[v, groups],
@@ -840,7 +1016,7 @@ fn progressive_portable_bodies_match_the_natives() {
             (
                 dense(
                     DType::F32,
-                    &[m, d],
+                    &[m, 1, d],
                     case.hidden.iter().map(|x| f64::from(*x)),
                 ),
                 dense(
@@ -861,6 +1037,7 @@ fn progressive_portable_bodies_match_the_natives() {
         inputs.push(out_rows);
         inputs.extend(selecting());
         inputs.push(Input::F32(EPSILON));
+        inputs.push(Input::F32(softcap));
         let top = interpret(&module, "readout_top_rows", &["NW", "A"], inputs);
         let (coarse, threshold4, features, length) = (
             result(&top, 0),
@@ -887,6 +1064,7 @@ fn progressive_portable_bodies_match_the_natives() {
                 length.iter().map(|x| f64::from(*x)),
             ));
             inputs.extend(selecting());
+            inputs.push(Input::F32(softcap));
             interpret(&module, name, &["A"], inputs)
         };
         let refine = level("readout_refine_rows", &coarse, &threshold4);
@@ -897,6 +1075,7 @@ fn progressive_portable_bodies_match_the_natives() {
         inputs.extend(planes().into_iter().take(4));
         inputs.push(out_rows);
         inputs.push(Input::F32(EPSILON));
+        inputs.push(Input::F32(softcap));
         let full = result(
             &interpret(&module, "readout_planes_rows", &["NW", "A"], inputs),
             0,
@@ -907,7 +1086,7 @@ fn progressive_portable_bodies_match_the_natives() {
         let scale = full.iter().fold(0f32, |a, b| a.max(b.abs()));
         let context = format!("V {v} D {d}");
         for params in [(4u64, 1u64, 4u64), (8, 2, 8)] {
-            let levels = run(&device, &head, &t, params);
+            let levels = run_with_softcap(&device, &head, &t, params, softcap);
             assert_close(
                 &format!("{context} top logits"),
                 &levels.coarse,
@@ -944,13 +1123,14 @@ fn progressive_portable_bodies_match_the_natives() {
         let width = width_param(&device);
         let features_tensor = tensor(&device, Element::bf16(), &[o, d], bf16_bytes(&features));
         let length_tensor = tensor(&device, Element::f32(), &[o], f32s(&length));
-        let native_refine = readout_refine_rows::native_for_device_with(
+        let native_refine = declared::prepared(
             &device,
-            readout_refine_rows::Elements { A: Element::bf16() },
+            &readout_refine_rows::native_entry_with(readout_refine_rows::Elements { A: Element::bf16() }),
             &statics(&head).with_launch_param(0, width, 4),
         )
         .unwrap()
         .call(readout_refine_rows::Args {
+            softcap,
             features: &features_tensor,
             top: &t.top,
             bit3: &t.bit3,
@@ -978,13 +1158,14 @@ fn progressive_portable_bodies_match_the_natives() {
             &threshold5,
             scale,
         );
-        let native_exact = readout_exact_rows::native_for_device_with(
+        let native_exact = declared::prepared(
             &device,
-            readout_exact_rows::Elements { A: Element::bf16() },
+            &readout_exact_rows::native_entry_with(readout_exact_rows::Elements { A: Element::bf16() }),
             &statics(&head).with_launch_param(0, width, 4),
         )
         .unwrap()
         .call(readout_exact_rows::Args {
+            softcap,
             features: &features_tensor,
             top: &t.top,
             bit3: &t.bit3,
@@ -1010,193 +1191,100 @@ fn progressive_portable_bodies_match_the_natives() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Timing.
-
-const TIMING_OPTIONS: seismic::MeasureOptions = seismic::MeasureOptions {
-    samples: 9,
-    min_sample_seconds: 0.02,
-};
-
-/// Device time of every level at the 35B-A3B head (V = 248320, D = 2048) over
-/// random planes: `cargo test --release -p magnitude-kernels --test
-/// progressive_readout -- --ignored --nocapture timings`. The later levels
-/// run at given shares of surviving rows.
+/// Canonical selection changes the physical row lookup, not the projection's
+/// scale/cap semantics. Invalid sentinels must never become weight addresses.
 #[test]
-#[ignore = "timing; run explicitly on the measurement host"]
-fn progressive_timings() {
+fn prepared_full_and_indexed_share_projection_and_mask_invalid_ids() {
     let Some(device) = device() else { return };
-    let (v, d) = (248_320usize, 2048usize);
-    let groups = d / 32;
-    let mut rng = Rng(3);
-    let mut random = |count: usize| {
-        (0..count)
-            .map(|_| rng.next() ^ (rng.next() << 16))
-            .collect::<Vec<_>>()
-    };
-    let head = Head {
-        v,
-        d,
-        top: random(v * d / 8),
-        bit3: random(v * groups),
-        rest: random(v * groups * 3),
-        scales: vec![f16_bits(0.001); v * groups],
-        exact: Vec::new(),
-        radius: vec![0.01; 2 * v],
-    };
-    let width = width_param(&device);
-    let report = |label: &str, seconds: f64, bytes: f64| {
-        eprintln!(
-            "timing {label}: {:.1} us ({:.0} GB/s)",
-            seconds * 1e6,
-            bytes / seconds / 1e9
-        );
-    };
-    let top_bytes = (v * d) as f64 * (0.5 + 0.0625);
-    let full_bytes = (v * d) as f64 * 1.0625;
-    for o in [1usize, 2, 4, 8] {
-        let case = Case::new(o, &head, false, &mut Rng(o as u64));
-        let t = case.tensors(&device, &head);
-        for (scan, rows) in [(8u64, 2u64), (4, 2), (8, 4), (4, 4), (8, 1)] {
-            let spec = |planes| scan_spec(&device, &head, planes, scan, rows);
-            let top = readout_top_rows::native_for_device_with(
-                &device,
-                readout_top_rows::Elements {
-                    NW: Element::bf16(),
-                    A: Element::bf16(),
-                },
-                &spec(false),
-            )
-            .unwrap();
-            let args = readout_top_rows::Args {
-                hidden: &t.hidden,
-                norm: &t.norm,
-                top: &t.top,
-                bit3: &t.bit3,
-                rest: &t.rest,
-                scales: &t.scales,
-                radius: &t.radius,
-                out_rows: &t.out_rows,
-                draws: &t.draws,
-                temperature: &t.temperature,
-                mask: &t.mask,
-                constrained: &t.constrained,
-                epsilon: EPSILON,
-            };
-            let measured = top.measure(vec![args], &TIMING_OPTIONS).unwrap();
-            report(
-                &format!("top O {o} {width} {scan} ROWS {rows}"),
-                measured.median,
-                top_bytes,
-            );
-            let planes = readout_planes_rows::native_for_device_with(
-                &device,
-                readout_planes_rows::Elements {
-                    NW: Element::bf16(),
-                    A: Element::bf16(),
-                },
-                &spec(true),
-            )
-            .unwrap();
-            let args = readout_planes_rows::Args {
-                hidden: &t.hidden,
-                norm: &t.norm,
-                top: &t.top,
-                bit3: &t.bit3,
-                rest: &t.rest,
-                scales: &t.scales,
-                out_rows: &t.out_rows,
-                epsilon: EPSILON,
-            };
-            let measured = planes.measure(vec![args], &TIMING_OPTIONS).unwrap();
-            report(
-                &format!("planes O {o} {width} {scan} ROWS {rows}"),
-                measured.median,
-                full_bytes,
-            );
-        }
-        let features = tensor(
+    let (o, v, d, s) = (2usize, 9usize, 64usize, 5usize);
+    let features = (0..o * d)
+        .map(|i| bf16_round(((i * 13 % 31) as f32 - 15.0) / 32.0))
+        .collect::<Vec<_>>();
+    let weights = (0..v * d)
+        .map(|i| bf16_round(((i * 7 % 43) as f32 - 21.0) / 64.0))
+        .collect::<Vec<_>>();
+    let features_tensor = tensor(&device, Element::bf16(), &[o, d], bf16_bytes(&features));
+    let weight_tensor = tensor(&device, Element::bf16(), &[v, d], bf16_bytes(&weights));
+    let ids = [8i32, 2, 2, -1, 9, 0, 7, 3, i32::MAX, -17];
+    let scale_tensor = tensor(&device, Element::f32(), &[1], f32s(&[-0.75]));
+    let project = |indexed: bool, cap: f32| {
+        let columns = if indexed { s } else { v };
+        let tokens = tensor(
             &device,
-            Element::bf16(),
-            &[o, d],
-            bf16_bytes(&vec![0.01; o * d]),
+            Element::i32(),
+            &[o, usize::from(indexed), columns],
+            if indexed {
+                ids.iter().flat_map(|id| id.to_le_bytes()).collect()
+            } else {
+                Vec::new()
+            },
         );
-        let length = tensor(&device, Element::f32(), &[o], f32s(&vec![1.0; o]));
-        let floor = tensor(
+        let spec = NativeSpecialization::new()
+            .with_static("V", v as u64)
+            .with_static("D", d as u64)
+            .with_static("S", columns as u64)
+            .with_static("I", u64::from(indexed))
+            .with_static("WS", 1);
+        let spec = match device.backend() {
+            BackendName::Metal => spec
+                .with_launch_param(0, "SIMDGROUPS", 4)
+                .with_launch_param(0, "ROWS", 1)
+                .with_param("LANES", 32),
+            BackendName::Cuda => spec
+                .with_param("OPERAND", 0)
+                .with_param("KSPLIT", 4)
+                .with_launch_param(4, "ROTATE", 2),
+            _ => spec,
+        };
+        let kernel = declared::prepared(
             &device,
-            Element::f32(),
-            &[o],
-            f32s(&vec![f32::NEG_INFINITY; o]),
-        );
-        // `share` of the rows survive: finite previous logits there, -inf
-        // elsewhere, under a floor every finite row reaches.
-        for share in [1.0f64, 0.084, 0.01, 0.001] {
-            let step = (1.0 / share).round() as usize;
-            let previous = (0..o * v)
-                .map(|i| {
-                    if (i % v) % step == 0 {
-                        0.0
-                    } else {
-                        f32::NEG_INFINITY
-                    }
+            &magnitude_kernels::readout_project_rows::native_entry_with(magnitude_kernels::readout_project_rows::Elements {
+                A: Element::bf16(),
+                OW: Element::bf16(),
+            }),
+            &spec,
+        )
+        .unwrap();
+        read_f32(
+            &kernel
+                .call(magnitude_kernels::readout_project_rows::Args {
+                    features: &features_tensor,
+                    weight: &weight_tensor,
+                    token_rows: &tokens,
+                    weight_scale: &scale_tensor,
+                    softcap: cap,
                 })
-                .collect::<Vec<_>>();
-            let previous = tensor(&device, Element::f32(), &[o, v], f32s(&previous));
-            for gather in [8u64, 4] {
-                let spec = statics(&head).with_launch_param(0, width, gather);
-                let refine = readout_refine_rows::native_for_device_with(
-                    &device,
-                    readout_refine_rows::Elements { A: Element::bf16() },
-                    &spec,
-                )
-                .unwrap();
-                let args = readout_refine_rows::Args {
-                    features: &features,
-                    top: &t.top,
-                    bit3: &t.bit3,
-                    rest: &t.rest,
-                    scales: &t.scales,
-                    radius: &t.radius,
-                    coarse: &previous,
-                    floor: &floor,
-                    length: &length,
-                    draws: &t.draws,
-                    temperature: &t.temperature,
-                    mask: &t.mask,
-                    constrained: &t.constrained,
+                .unwrap()
+                .value,
+        )
+    };
+    for cap in [0.0f32, 0.1, 30.0] {
+        let full = project(false, cap);
+        let indexed = project(true, cap);
+        for row in 0..o {
+            for column in 0..s {
+                let id = ids[row * s + column];
+                let actual = indexed[row * s + column];
+                if id < 0 || id as usize >= v {
+                    assert_eq!(actual, f32::NEG_INFINITY);
+                    continue;
+                }
+                let sum = (0..d)
+                    .map(|k| features[row * d + k] * weights[id as usize * d + k])
+                    .sum::<f32>()
+                    * -0.75;
+                let expected = if cap > 0.0 {
+                    cap * (sum / cap).tanh()
+                } else {
+                    sum
                 };
-                let measured = refine.measure(vec![args], &TIMING_OPTIONS).unwrap();
-                report(
-                    &format!("refine O {o} share {share} {width} {gather}"),
-                    measured.median,
-                    (v * d) as f64 * share * (0.125 + 0.0625),
+                assert!(
+                    (actual - expected).abs() <= 2e-5,
+                    "indexed {actual} oracle {expected}"
                 );
-                let exact = readout_exact_rows::native_for_device_with(
-                    &device,
-                    readout_exact_rows::Elements { A: Element::bf16() },
-                    &spec,
-                )
-                .unwrap();
-                let args = readout_exact_rows::Args {
-                    features: &features,
-                    top: &t.top,
-                    bit3: &t.bit3,
-                    rest: &t.rest,
-                    scales: &t.scales,
-                    radius: &t.radius,
-                    fine: &previous,
-                    floor: &floor,
-                    length: &length,
-                    draws: &t.draws,
-                    temperature: &t.temperature,
-                    mask: &t.mask,
-                    constrained: &t.constrained,
-                };
-                let measured = exact.measure(vec![args], &TIMING_OPTIONS).unwrap();
-                report(
-                    &format!("exact O {o} share {share} {width} {gather}"),
-                    measured.median,
-                    (v * d) as f64 * share * 1.0625,
+                assert!(
+                    (actual - full[row * v + id as usize]).abs() <= 2e-5,
+                    "canonical projection differs between Full and Indexed"
                 );
             }
         }

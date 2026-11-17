@@ -2,13 +2,15 @@
 //! Planning ends at `PreparedKernel`; this module validates public arguments,
 //! evaluates a selected executable, owns storage, and executes its typed schedule.
 
+use crate::completion::DeviceCompletion;
 use crate::api::kernel::{
     DecodedResults, DecodedValue, EncodedArgs, EncodedWorkflowArgs, EncodedWorkflowArgument,
     PendingWorkflowResults, PrepareError, WorkflowTensorArgument,
 };
 use crate::api::tensor::TensorInner;
 use crate::api::CallError;
-use crate::memory::{MemoryCharge, MemoryDomain, MemoryReservation, MemoryUsage};
+use crate::memory::DeviceStores;
+use crate::native::NativeQueue;
 use crate::resources::{AdmissionDomain, AdmittedResources, PersistentTable};
 use crate::telemetry::{self, hex, key_bool, key_str, key_u64, Timed};
 use opentelemetry::KeyValue;
@@ -31,7 +33,7 @@ use seismic_compiler::{
     prepare_analytically, OptimizationCompletion, PlanningBudget, PreparationBudget,
 };
 use seismic_lang::checked::CheckedModule;
-use seismic_lang::entry::{CallSchema, ElementBindings, ParameterKind, TensorAccess};
+use seismic_lang::entry::{CallSchema, ElementBindings, LogicalEntry, ParameterKind, TensorAccess};
 use seismic_lang::expr::compiled::InvocationValues;
 use seismic_lang::expr::SymbolValue;
 use seismic_lang::ids::{EntryId, ModuleHash, RepresentationId, StableEntryId};
@@ -39,12 +41,14 @@ use seismic_lang::precision::PrecisionPolicy;
 use seismic_lang::registry;
 use seismic_native_target::{DeviceDescription, TargetFamily};
 use std::any::Any;
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 
 pub(crate) type Service<T, E> = <E as NativeExecutor<T>>::Device;
 pub(crate) type Buffer<T, E> = <Service<T, E> as DeviceService<T>>::Buffer;
+pub(crate) type Writable<T, E> = <Service<T, E> as DeviceService<T>>::Writable;
 
 static NEXT_DEVICE: AtomicU64 = AtomicU64::new(1);
 static NEXT_ALLOCATION: AtomicU64 = AtomicU64::new(1);
@@ -63,6 +67,18 @@ fn admitted<T>(value: Result<T, seismic_lang::expr::EvalError>) -> T {
     value.unwrap_or_else(|error| panic!("PreparedKernel coverage invariant violated: admitted evaluator was not total: {error:?}"))
 }
 
+/// How a device's analytical context is opened, on its first use: with
+/// what the backend forms its probes through, where it forms any.
+pub(crate) type AnalyticalLoader<T, E> = Box<
+    dyn Fn(
+            &Service<T, E>,
+            &E,
+            Arc<DeviceDescription<T>>,
+        ) -> Result<AnalyticalEvaluationContext<T>, seismic_compiler::errors::TargetError>
+        + Send
+        + Sync,
+>;
+
 pub(crate) struct Opened<T, E>
 where
     T: TargetFamily,
@@ -73,18 +89,15 @@ where
     device: Arc<DeviceDescription<T>>,
     executor: E,
     compiler_registry: &'static CompilerRegistry<T>,
+    /// The analytical context, or why it could not be opened: opened once
+    /// for the open device ([`Opened::analytical`]).
     analytical: std::sync::OnceLock<
         Result<AnalyticalEvaluationContext<T>, seismic_compiler::errors::TargetError>,
     >,
-    analytical_loader:
-        fn(
-            &Service<T, E>,
-            &E,
-            Arc<DeviceDescription<T>>,
-        )
-            -> Result<AnalyticalEvaluationContext<T>, seismic_compiler::errors::TargetError>,
+    analytical_loader: AnalyticalLoader<T, E>,
     cache: Mutex<HashMap<PreparationKey, Weak<Prepared<T, E>>>>,
-    memory: Arc<MemoryDomain>,
+    /// Its ledgers.
+    memory: Arc<DeviceStores>,
     admission: AdmissionDomain,
 }
 
@@ -107,15 +120,15 @@ where
         executor: E,
         compiler_registry: &'static CompilerRegistry<T>,
         device: Arc<DeviceDescription<T>>,
-        analytical_loader: fn(
-            &Service<T, E>,
-            &E,
-            Arc<DeviceDescription<T>>,
-        ) -> Result<
-            AnalyticalEvaluationContext<T>,
-            seismic_compiler::errors::TargetError,
-        >,
-        memory: Arc<MemoryDomain>,
+        analytical_loader: impl Fn(
+                &Service<T, E>,
+                &E,
+                Arc<DeviceDescription<T>>,
+            ) -> Result<AnalyticalEvaluationContext<T>, seismic_compiler::errors::TargetError>
+            + Send
+            + Sync
+            + 'static,
+        memory: Arc<DeviceStores>,
     ) -> Self {
         Self {
             identity: fresh_device_identity(),
@@ -124,12 +137,18 @@ where
             executor,
             compiler_registry,
             analytical: std::sync::OnceLock::new(),
-            analytical_loader,
+            analytical_loader: Box::new(analytical_loader),
             cache: Mutex::new(HashMap::new()),
             memory,
             admission: AdmissionDomain::new(),
         }
     }
+    /// The device's analytical context, opened by the first analytical
+    /// preparation that needs it, once for the open device: a profile whose
+    /// probes did not qualify is not measured again by every preparation.
+    /// An executor is open while a handle of it lives (`devices::catalog`),
+    /// and a load holds its devices until it ends, so the next load opens
+    /// the executor again and measures its profile again.
     fn analytical(
         &self,
     ) -> Result<&AnalyticalEvaluationContext<T>, seismic_compiler::errors::TargetError> {
@@ -169,110 +188,75 @@ where
             .lock()
             .expect("Opened preparation-cache lock poisoned while mutating private cache state")
     }
-    pub(crate) fn memory_usage(&self) -> MemoryUsage {
-        self.memory.usage()
-    }
-    pub(crate) fn set_memory_limit(&self, limit: Option<u64>) {
-        self.memory.set_limit(limit)
-    }
+    /// Charge and allocate device storage in a hazard domain of its own.
     pub(crate) fn allocate_storage(
         self: &Arc<Self>,
         bytes: u64,
         alignment: u64,
     ) -> Result<Arc<Allocation>, ExecutionError> {
-        self.allocate_storage_with(bytes, alignment, |service| {
-            service.allocate(bytes, alignment)
+        self.allocate_contract(seismic_topology::Contract::DeviceOnly, bytes, alignment, None)
+    }
+
+    /// Charge and allocate `bytes` of `contract` in the first of the kinds
+    /// it is allocated from now ([`DeviceStores::kinds`]), ordered by
+    /// `access`'s hazard domain where given (a slab its address table's, or
+    /// a table that of the storage its slabs view), otherwise by a domain
+    /// of its own. These backends allocate in exactly the kind asked
+    /// (`DeviceService::allocate`), never moving on to another.
+    pub(crate) fn allocate_contract(
+        self: &Arc<Self>,
+        contract: seismic_topology::Contract,
+        bytes: u64,
+        alignment: u64,
+        access: Option<Arc<AccessGroup>>,
+    ) -> Result<Arc<Allocation>, ExecutionError> {
+        let kind = self.memory.kinds(contract)?[0];
+        let entry = self.entry(contract);
+        allocate_in(self.allocation_limits(), &self.memory, bytes, alignment, access, || {
+            Ok((kind, buffer_storage::<T, E>(&self.service, self.service.allocate(kind, bytes, alignment, &entry)?)))
         })
     }
 
-    /// Charge and allocate storage whose buffer `make` forms, for backends
-    /// with more than one kind of memory.
-    pub(crate) fn allocate_storage_with(
-        self: &Arc<Self>,
-        bytes: u64,
-        alignment: u64,
-        make: impl FnOnce(&Service<T, E>) -> Result<Buffer<T, E>, ExecutionError>,
-    ) -> Result<Arc<Allocation>, ExecutionError> {
-        let mut reservation = reserve(&self.memory, bytes)?;
-        self.allocate_reserved_with(bytes, alignment, &mut reservation, false, make)
+    /// The ledger entry an allocation of `contract` through this device on
+    /// this thread is charged to ([`crate::memory::DeviceStores::entry`]).
+    pub(crate) fn entry(&self, contract: seismic_topology::Contract) -> Arc<dyn crate::memory::Entry> {
+        self.memory.entry(contract)
     }
 
-    /// Recommit an exclusively owned reserved allocation. The backend keeps
-    /// its physical reservation, so only growth needs a new ledger grant;
-    /// shrink releases the difference after the backend has unmapped it.
-    pub(crate) fn recommit_storage_with(
-        self: &Arc<Self>,
-        old: &Arc<Allocation>,
+    /// One block of a granule pool (`crate::pool`) of `bytes` of `kind`,
+    /// which `make` allocates with the backend's block allocator (one
+    /// native allocation, never sub-allocated, every page backed and
+    /// reading zero, charged exactly to its entry and returned to the OS or
+    /// driver when dropped), in `access`'s hazard domain.
+    pub(crate) fn allocate_block(
+        &self,
+        kind: u32,
         bytes: u64,
-        alignment: u64,
-        make: impl FnOnce(&Service<T, E>) -> Result<Buffer<T, E>, ExecutionError>,
-        undo_growth: impl Fn(&Service<T, E>, &Buffer<T, E>, u64) -> Result<(), ExecutionError>
-            + Send
-            + Sync
-            + 'static,
+        access: Arc<AccessGroup>,
+        make: impl FnOnce(&Service<T, E>) -> Result<Writable<T, E>, ExecutionError>,
     ) -> Result<Arc<Allocation>, ExecutionError> {
+        self.allocation_limits().admit_bytes(bytes)?;
+        let block = make(&self.service)?;
+        Ok(Allocation::new_in(
+            fresh_allocation_identity(),
+            bytes,
+            self.memory.path_of(kind),
+            buffer_storage::<T, E>(&self.service, block),
+            Some(access),
+        ))
+    }
+
+    fn allocation_limits(&self) -> AllocationLimits {
         let limits = self.device_description().limits();
         let natural_max = if limits.max_index_bits >= 64 {
             u64::MAX
         } else {
             (1u64 << limits.max_index_bits) - 1
         };
-        let maximum = limits.max_allocation_bytes.min(natural_max);
-        if bytes > maximum {
-            return Err(ExecutionError::AllocationCapacity {
-                required: bytes.into(),
-                available: maximum,
-            });
+        AllocationLimits {
+            max_allocation_bytes: limits.max_allocation_bytes.min(natural_max),
+            max_allocation_alignment: limits.max_allocation_alignment,
         }
-        if !alignment.is_power_of_two() || alignment > limits.max_allocation_alignment {
-            return Err(ExecutionError::ConstructionContradiction(format!(
-                "allocation alignment {alignment} exceeds target contract {}",
-                limits.max_allocation_alignment
-            )));
-        }
-        debug_assert_eq!(old.charged_bytes(), Some(old.bytes));
-        let growth = bytes.saturating_sub(old.bytes);
-        let mut grant = (growth != 0)
-            .then(|| reserve(&self.memory, growth))
-            .transpose()?;
-        let buffer = make(&self.service)?;
-        let rollback = (growth != 0).then(|| {
-            let service = self.service.clone();
-            let buffer = buffer.clone();
-            let old_bytes = old.bytes;
-            Box::new(move || undo_growth(&service, &buffer, old_bytes))
-                as Box<dyn Fn() -> Result<(), ExecutionError> + Send + Sync>
-        });
-        let storage = Box::new(TypedStorage::<T, E> {
-            service: self.service.clone(),
-            buffer,
-            read_only: false,
-        });
-        // `make` has finished the backend resize. Transfer the sole old
-        // charge only after that point; a recoverable failure leaves both
-        // the previous allocation and its charge intact.
-        let mut guard = old.charge.lock().expect("allocation charge lock poisoned");
-        let mut charge = guard
-            .take()
-            .expect("exclusive recommit must own its prior charge");
-        if growth != 0 {
-            grant
-                .as_mut()
-                .expect("growth grant exists")
-                .extend(&mut charge, growth);
-        } else {
-            charge.shrink(bytes);
-        }
-        let replacement = Allocation::new_recommitted(
-            fresh_allocation_identity(),
-            bytes,
-            charge,
-            storage,
-            old,
-            rollback,
-        );
-        drop(guard);
-        Ok(replacement)
     }
 
     pub(crate) fn allocate_read_only_storage_with(
@@ -281,46 +265,15 @@ where
         alignment: u64,
         make: impl FnOnce(&Service<T, E>) -> Result<Buffer<T, E>, ExecutionError>,
     ) -> Result<Arc<Allocation>, ExecutionError> {
-        let mut reservation = reserve(&self.memory, bytes)?;
-        self.allocate_reserved_with(bytes, alignment, &mut reservation, true, make)
-    }
-
-    pub(crate) fn allocate_reserved(
-        self: &Arc<Self>,
-        bytes: u64,
-        alignment: u64,
-        reservation: &mut MemoryReservation,
-    ) -> Result<Arc<Allocation>, ExecutionError> {
-        self.allocate_reserved_with(bytes, alignment, reservation, false, |service| {
-            service.allocate(bytes, alignment)
-        })
-    }
-
-    fn allocate_reserved_with(
-        self: &Arc<Self>,
-        bytes: u64,
-        alignment: u64,
-        reservation: &mut MemoryReservation,
-        read_only: bool,
-        make: impl FnOnce(&Service<T, E>) -> Result<Buffer<T, E>, ExecutionError>,
-    ) -> Result<Arc<Allocation>, ExecutionError> {
-        let limits = self.device_description().limits();
-        let natural_max = if limits.max_index_bits >= 64 {
-            u64::MAX
-        } else {
-            (1u64 << limits.max_index_bits) - 1
-        };
-        let limits = AllocationLimits {
-            max_allocation_bytes: limits.max_allocation_bytes.min(natural_max),
-            max_allocation_alignment: limits.max_allocation_alignment,
-        };
-        allocate_reserved(limits, bytes, alignment, reservation, || {
+        // The mapped memory is the host's, the backend's one kind.
+        let kind = self.memory.kinds(seismic_topology::Contract::DeviceOnly)?[0];
+        allocate_in(self.allocation_limits(), &self.memory, bytes, alignment, None, || {
             let buffer = make(&self.service)?;
-            Ok(Box::new(TypedStorage::<T, E> {
+            let storage: Box<dyn Storage> = Box::new(ReadOnlyStorage::<T, E> {
                 service: self.service.clone(),
                 buffer,
-                read_only,
-            }))
+            });
+            Ok((kind, storage))
         })
     }
 }
@@ -332,48 +285,48 @@ pub(crate) struct AllocationLimits {
     pub(crate) max_allocation_alignment: u64,
 }
 
-/// Reserve `bytes` in `memory` for an allocation.
-pub(crate) fn reserve(
-    memory: &Arc<MemoryDomain>,
-    bytes: u64,
-) -> Result<MemoryReservation, ExecutionError> {
-    memory
-        .reserve(bytes)
-        .map_err(|capacity| ExecutionError::AllocationCapacity {
-            required: capacity.required.into(),
-            available: capacity.available,
-        })
+impl AllocationLimits {
+    /// Refuse an allocation spanning `bytes` at `alignment` beyond these
+    /// limits.
+    fn admit(&self, bytes: u64, alignment: u64) -> Result<(), ExecutionError> {
+        self.admit_bytes(bytes)?;
+        if !alignment.is_power_of_two() || alignment > self.max_allocation_alignment {
+            return Err(ExecutionError::ConstructionContradiction(format!(
+                "allocation alignment {alignment} exceeds target contract {}",
+                self.max_allocation_alignment
+            )));
+        }
+        Ok(())
+    }
+
+    /// Refuse an allocation of `bytes` beyond the single-allocation limit.
+    pub(crate) fn admit_bytes(&self, bytes: u64) -> Result<(), ExecutionError> {
+        if bytes > self.max_allocation_bytes {
+            return Err(ExecutionError::AllocationCapacity {
+                required: bytes.into(),
+                available: self.max_allocation_bytes,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// The backend-neutral allocation core: check `bytes` and `alignment`
-/// against `limits`, form the storage with `make`, and charge it to
-/// `reservation`.
-pub(crate) fn allocate_reserved(
+/// against `limits` and form the storage with `make`, which charges its
+/// entry exactly and names the kind it landed in; it lies along that
+/// kind's access path in `memory`, ordered by `access`'s hazard domain
+/// where given.
+pub(crate) fn allocate_in(
     limits: AllocationLimits,
+    memory: &DeviceStores,
     bytes: u64,
     alignment: u64,
-    reservation: &mut MemoryReservation,
-    make: impl FnOnce() -> Result<Box<dyn Storage>, ExecutionError>,
+    access: Option<Arc<AccessGroup>>,
+    make: impl FnOnce() -> Result<(u32, Box<dyn Storage>), ExecutionError>,
 ) -> Result<Arc<Allocation>, ExecutionError> {
-    if bytes > limits.max_allocation_bytes {
-        return Err(ExecutionError::AllocationCapacity {
-            required: bytes.into(),
-            available: limits.max_allocation_bytes,
-        });
-    }
-    if !alignment.is_power_of_two() || alignment > limits.max_allocation_alignment {
-        return Err(ExecutionError::ConstructionContradiction(format!(
-            "allocation alignment {alignment} exceeds target contract {}",
-            limits.max_allocation_alignment
-        )));
-    }
-    let storage = make()?;
-    Ok(Allocation::new(
-        fresh_allocation_identity(),
-        bytes,
-        reservation.take(bytes),
-        storage,
-    ))
+    limits.admit(bytes, alignment)?;
+    let (kind, storage) = make()?;
+    Ok(Allocation::new_in(fresh_allocation_identity(), bytes, memory.path_of(kind), storage, access))
 }
 
 pub(crate) fn capability_summaries<T: TargetFamily>(device: &DeviceDescription<T>) -> Vec<String> {
@@ -399,31 +352,57 @@ pub(crate) trait Storage: Send + Sync {
     fn read_only(&self) -> bool {
         false
     }
+    /// The host address of the storage's first byte where the host reads
+    /// and writes it in place (`DeviceService::host_address`, and never for
+    /// read-only storage), valid while the storage lives.
+    fn host_address(&self) -> Option<std::ptr::NonNull<u8>>;
 }
 
+/// Storage the service allocated, which the host reads and writes.
 struct TypedStorage<T: TargetFamily, E: NativeExecutor<T>> {
     service: Arc<Service<T, E>>,
-    buffer: Buffer<T, E>,
-    read_only: bool,
+    buffer: Writable<T, E>,
 }
 
 impl<T: TargetFamily, E: NativeExecutor<T>> Storage for TypedStorage<T, E> {
     fn read(&self, offset: u64, into: &mut [u8]) -> Result<(), ExecutionError> {
-        self.service.read(&self.buffer, offset, into)
+        self.service.read(self.buffer.borrow(), offset, into)
     }
     fn write(&self, offset: u64, bytes: &[u8]) -> Result<(), ExecutionError> {
-        if self.read_only {
-            return Err(ExecutionError::SubmissionFailed(
-                "write to read-only mapped storage".into(),
-            ));
-        }
         self.service.write(&self.buffer, offset, bytes)
     }
     fn as_any(&self) -> &dyn Any {
         self
     }
+    fn host_address(&self) -> Option<std::ptr::NonNull<u8>> {
+        self.service.host_address(&self.buffer)
+    }
+}
+
+/// Read-only mapped host memory: a buffer device work binds and the host
+/// only reads, so it holds no writable form.
+struct ReadOnlyStorage<T: TargetFamily, E: NativeExecutor<T>> {
+    service: Arc<Service<T, E>>,
+    buffer: Buffer<T, E>,
+}
+
+impl<T: TargetFamily, E: NativeExecutor<T>> Storage for ReadOnlyStorage<T, E> {
+    fn read(&self, offset: u64, into: &mut [u8]) -> Result<(), ExecutionError> {
+        self.service.read(&self.buffer, offset, into)
+    }
+    fn write(&self, _: u64, _: &[u8]) -> Result<(), ExecutionError> {
+        Err(ExecutionError::SubmissionFailed(
+            "write to read-only mapped storage".into(),
+        ))
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
     fn read_only(&self) -> bool {
-        self.read_only
+        true
+    }
+    fn host_address(&self) -> Option<std::ptr::NonNull<u8>> {
+        None
     }
 }
 
@@ -431,171 +410,348 @@ impl<T: TargetFamily, E: NativeExecutor<T>> Storage for TypedStorage<T, E> {
 pub(crate) struct Allocation {
     identity: u64,
     bytes: u64,
-    charge: Mutex<Option<MemoryCharge>>,
-    // An in-place replacement is tentative while its old allocation lives.
-    // Dropping unpublished growth restores the old physical prefix and charge.
-    predecessor: Option<Weak<Allocation>>,
-    rollback_growth: Option<Box<dyn Fn() -> Result<(), ExecutionError> + Send + Sync>>,
+    /// The record tables of the views record ports bind
+    /// ([`Allocation::view_table`]), one for each record size and phase,
+    /// formed once and held with the storage they address.
+    view_tables: Mutex<Vec<ViewTable>>,
+    /// The record tables graph workspaces formed over this allocation
+    /// ([`Allocation::hold_table`]),
+    /// each part of its storage while it lives: charged and observed with
+    /// it.
+    tables: Mutex<Vec<Weak<Allocation>>>,
+    /// The access path its storage lies along: that of the kind it landed
+    /// in, whose store's ledger entry its backend charged its exact bytes
+    /// to.
+    path: seismic_topology::AccessPathId,
     storage: Box<dyn Storage>,
     access: Arc<AccessGroup>,
-    shared_access: OnceLock<Arc<AccessGroup>>,
+}
+
+/// The record table of an allocation's `records` `record`-byte records from
+/// byte `phase` ([`Allocation::view_table`]).
+struct ViewTable {
+    record: u64,
+    phase: u64,
+    records: u64,
+    table: Arc<Allocation>,
 }
 
 #[derive(Default)]
-struct AccessGroup {
+pub(crate) struct AccessGroup {
     state: Mutex<AllocationAccess>,
     changed: Condvar,
 }
 
+/// A queue of one device on which work can use an allocation. Each runs
+/// its work in submission order; they run beside each other.
+///
+/// The native queues order against each other by what their submissions
+/// touch ([`Allocation::queue_order`]); the transfer queue is ordered by its
+/// caller (`native::transfer`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeviceQueue {
+    Native(NativeQueue),
+    /// Host-to-device copies (`native::transfer`).
+    Transfer,
+}
+
+impl DeviceQueue {
+    const COUNT: usize = NativeQueue::ALL.len() + 1;
+
+    fn ordinal(self) -> usize {
+        match self {
+            Self::Native(queue) => queue as usize,
+            Self::Transfer => NativeQueue::ALL.len(),
+        }
+    }
+}
+
+/// The newest submitted work of one queue that uses an allocation, until
+/// it ends, and the newest that writes it, until it completes. A queue runs
+/// its work in submission order, so the newest fence of a kind ends after
+/// every earlier one of that queue: it is the only one of that queue access
+/// must wait for. A write that faulted stays, so what reads the allocation
+/// after it receives its fault, until a later write of the queue replaces it.
 #[derive(Default)]
-struct AllocationAccess {
-    readers: u64,
-    writer: bool,
-    /// The newest submitted device work that uses this allocation, and the
-    /// newest that writes it, until they complete. An allocation belongs to
-    /// one device, whose native submissions all run on its one queue in
-    /// submission order, so the newest fence of a kind completes after every
-    /// earlier one: it is the only one host access must wait for.
+struct QueueFences {
     last_use: Option<Arc<dyn DeviceCompletion>>,
     last_write: Option<Arc<dyn DeviceCompletion>>,
 }
 
-/// Completion of submitted device work, as allocation fences observe it.
-/// Reaching completion is independent of whether the work succeeded; its
-/// submitter reports failures.
-pub(crate) trait DeviceCompletion: Send + Sync {
-    fn is_complete(&self) -> bool;
-    /// Block until the work has finished executing.
-    fn wait_complete(&self);
-}
-
-impl AllocationAccess {
-    /// Forget completed fences. The newest use completes last, so once it
-    /// has, no device work uses the allocation.
+impl QueueFences {
+    /// Forget ended uses and completed writes. The newest use ends last, so
+    /// once it has, no work of this queue uses the allocation; a faulted
+    /// use ends it as completion does.
     fn prune(&mut self) {
-        if self
-            .last_write
-            .as_ref()
-            .is_some_and(|fence| fence.is_complete())
-        {
-            self.last_write = None;
-        }
-        if self
-            .last_use
-            .as_ref()
-            .is_some_and(|fence| fence.is_complete())
-        {
+        if self.last_use.as_ref().is_some_and(|fence| !matches!(fence.completed(), Ok(false))) {
             self.last_use = None;
+        }
+        if self.last_write.as_ref().is_some_and(|fence| matches!(fence.completed(), Ok(true))) {
             self.last_write = None;
         }
     }
-    /// The device fence host access of the given kind must wait for: a host
-    /// write waits for every device use, a host read for device writes.
+}
+
+/// The newest work of each queue still using an allocation: every device
+/// use ends once these have.
+#[derive(Default)]
+pub(crate) struct DeviceUses([Option<Arc<dyn DeviceCompletion>>; DeviceQueue::COUNT]);
+
+impl DeviceUses {
+    /// Block until every use ends, to release what they use
+    /// ([`DeviceCompletion::retire`]).
+    pub(crate) fn retire(&self) {
+        for fence in self.0.iter().flatten() {
+            fence.retire();
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.iter().all(Option::is_none)
+    }
+
+    /// Whether every use has ended (completed or faulted). Never waits.
+    pub(crate) fn ended(&self) -> bool {
+        self.0.iter().flatten().all(|fence| !matches!(fence.completed(), Ok(false)))
+    }
+}
+
+/// Who holds an allocation's permits, by kind: host access, and device
+/// work being encoded.
+#[derive(Default)]
+struct Holders {
+    readers: u64,
+    writers: u64,
+}
+
+impl Holders {
+    fn any(&self) -> bool {
+        self.readers != 0 || self.writers != 0
+    }
+
+    /// Whether access `write` conflicts with these holders: a write with
+    /// any, a read with a writer.
+    fn conflict(&self, write: bool) -> bool {
+        self.writers != 0 || (write && self.readers != 0)
+    }
+}
+
+/// An allocation's access: its permits' holders and each queue's fences.
+/// Host access excludes conflicting host access and the encoding of device
+/// work; device encodings exclude conflicting host access but not each
+/// other, each queue ordering its own work, native queues ordering against
+/// each other by their fences and the caller ordering transfers
+/// ([`Allocation::acquire_for_device`]).
+#[derive(Default)]
+struct AllocationAccess {
+    host: Holders,
+    device: Holders,
+    /// Per [`DeviceQueue`], by its ordinal.
+    queues: [QueueFences; DeviceQueue::COUNT],
+    /// Whether the protocol of the work that uses it orders its accesses
+    /// across device queues ([`Allocation::order_by_protocol`]).
+    protocol: bool,
+}
+
+impl AllocationAccess {
+    fn holders(&mut self, holder: Holder) -> &mut Holders {
+        match holder {
+            Holder::Host => &mut self.host,
+            Holder::Device => &mut self.device,
+        }
+    }
+
+    fn queue(&mut self, queue: DeviceQueue) -> &mut QueueFences {
+        &mut self.queues[queue.ordinal()]
+    }
+
+    fn prune(&mut self) {
+        self.queues.iter_mut().for_each(QueueFences::prune);
+    }
+
+    /// A device fence host access of the given kind must wait for: a host
+    /// write waits for every device use to end, a host read for device
+    /// writes to complete, of every queue.
     fn conflicting_device(&mut self, write: bool) -> Option<Arc<dyn DeviceCompletion>> {
         self.prune();
-        if write {
-            self.last_use.clone()
-        } else {
-            self.last_write.clone()
-        }
+        self.queues.iter().find_map(|fences| match write {
+            true => fences.last_use.clone(),
+            false => fences.last_write.clone(),
+        })
+    }
+
+    /// The newest use of each queue.
+    fn uses(&mut self) -> DeviceUses {
+        self.prune();
+        DeviceUses(std::array::from_fn(|queue| self.queues[queue].last_use.clone()))
     }
 }
 
 impl Allocation {
-    fn new(
+    /// The bytes the allocation's own storage lies in along its access
+    /// path: what a view's byte range is attributed from.
+    pub(crate) fn storage_path_charges(&self) -> Vec<(seismic_topology::AccessPathId, u64)> {
+        vec![(self.path, self.bytes)]
+    }
+
+    /// The bytes the allocation holds along each of its access paths: its
+    /// storage's ([`Self::storage_path_charges`]) and its record tables',
+    /// part of its storage, held and released with it.
+    pub(crate) fn path_charges(&self) -> Vec<(seismic_topology::AccessPathId, u64)> {
+        let mut charges = self.storage_path_charges();
+        for (path, bytes) in self.record_tables().iter().flat_map(|table| table.path_charges()) {
+            match charges.iter_mut().find(|(charged, _)| *charged == path) {
+                Some((_, charged)) => {
+                    *charged = charged
+                        .checked_add(bytes)
+                        .expect("an allocation's charges along a path sum within u64")
+                }
+                None => charges.push((path, bytes)),
+            }
+        }
+        charges
+    }
+    #[cfg(test)]
+    fn new(identity: u64, bytes: u64, storage: Box<dyn Storage>) -> Arc<Self> {
+        let path = seismic_topology::fixtures::recorded::rtx3090().access_paths()[0].id();
+        Self::new_in(identity, bytes, path, storage, None)
+    }
+
+    /// A fresh allocation in `access`'s hazard domain, or one of its own:
+    /// the domain is fixed at construction, before anything can use it.
+    pub(crate) fn new_in(
         identity: u64,
         bytes: u64,
-        charge: MemoryCharge,
+        path: seismic_topology::AccessPathId,
         storage: Box<dyn Storage>,
+        access: Option<Arc<AccessGroup>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             identity,
             bytes,
-            charge: Mutex::new(Some(charge)),
-            predecessor: None,
-            rollback_growth: None,
+            view_tables: Mutex::new(Vec::new()),
+            tables: Mutex::new(Vec::new()),
+            path,
             storage,
-            access: Arc::new(AccessGroup::default()),
-            shared_access: OnceLock::new(),
+            access: access.unwrap_or_default(),
         })
     }
 
-    fn new_recommitted(
-        identity: u64,
-        bytes: u64,
-        charge: MemoryCharge,
-        storage: Box<dyn Storage>,
-        predecessor: &Arc<Self>,
-        rollback_growth: Option<Box<dyn Fn() -> Result<(), ExecutionError> + Send + Sync>>,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            identity,
-            bytes,
-            charge: Mutex::new(Some(charge)),
-            predecessor: Some(Arc::downgrade(predecessor)),
-            rollback_growth,
-            storage,
-            access: Arc::new(AccessGroup::default()),
-            shared_access: OnceLock::new(),
-        })
-    }
     pub(crate) fn identity(&self) -> u64 {
         self.identity
     }
     pub(crate) fn bytes(&self) -> u64 {
         self.bytes
     }
-    pub(crate) fn charged_bytes(&self) -> Option<u64> {
-        self.charge
-            .lock()
-            .expect("allocation charge lock poisoned")
-            .as_ref()
-            .map(MemoryCharge::bytes)
+    /// The bytes the allocation holds, its record tables included: part of
+    /// its storage, held and released with it.
+    pub(crate) fn charged_bytes(&self) -> u64 {
+        self.record_tables()
+            .iter()
+            .try_fold(self.bytes, |charged, table| charged.checked_add(table.charged_bytes()))
+            .expect("an allocation's charges sum within u64")
     }
-    pub(crate) fn has_live_predecessor(&self) -> bool {
-        self.predecessor.as_ref().and_then(Weak::upgrade).is_some()
+
+    /// Hold `table`, a record table a graph workspace formed over this
+    /// allocation's records, as part of its storage while the table lives.
+    pub(crate) fn hold_table(&self, table: &Arc<Allocation>) {
+        let mut tables = self.tables.lock().expect("allocation tables lock poisoned");
+        tables.retain(|held| held.strong_count() > 0);
+        tables.push(Arc::downgrade(table));
+    }
+
+    /// The table a record port binds `count` of this fixed allocation's
+    /// `record`-byte records from byte `offset` through, and the byte of
+    /// its first entry: a table the storage holds whose entries are those
+    /// records' addresses in turn. That is the table of records of their
+    /// size and phase (`offset % record`), entry `i` record `i`'s; a single
+    /// record is also found in any held table with an entry at its address.
+    /// Formed by `form` (given the phase and the records from it) where
+    /// none is held, then held with the storage. So the tables a storage
+    /// holds are those of the record sizes and phases its views are bound
+    /// at, and a storage whose first table is of its finest records (a
+    /// streamed table's slots, held from its first by `hold_records`) holds
+    /// no other for single records at their boundaries. A view formed per
+    /// run (a landed read's rows) allocates nothing, and no table outlives
+    /// its storage's use: a table a run's view alone held would be freed
+    /// after the run's submission, waiting for every device use of the
+    /// storage it shares its access with, the run's own included.
+    pub(crate) fn view_table<E>(
+        &self,
+        record: u64,
+        offset: u64,
+        count: u64,
+        form: impl FnOnce(u64, u64) -> Result<Arc<Allocation>, E>,
+    ) -> Result<(Arc<Allocation>, u64), E> {
+        let entry = |held: &ViewTable| {
+            seismic_lang::registry::record_table_entry((offset - held.phase) / held.record)
+        };
+        let phase = offset % record;
+        let mut tables = self.view_tables.lock().expect("allocation view tables lock poisoned");
+        let spaced = tables
+            .iter()
+            .find(|held| held.record == record && held.phase == phase);
+        let single = || {
+            tables.iter().find(|held| {
+                count == 1
+                    && offset >= held.phase
+                    && (offset - held.phase) % held.record == 0
+                    && (offset - held.phase) / held.record < held.records
+            })
+        };
+        if let Some(held) = spaced.or_else(single) {
+            return Ok((held.table.clone(), entry(held)));
+        }
+        let records = (self.bytes() - phase) / record;
+        let held = ViewTable {
+            record,
+            phase,
+            records,
+            table: form(phase, records)?,
+        };
+        let found = (held.table.clone(), entry(&held));
+        tables.push(held);
+        Ok(found)
+    }
+
+    /// The record tables over this allocation's records that live: its
+    /// views' and those graph workspaces formed.
+    fn record_tables(&self) -> Vec<Arc<Allocation>> {
+        let views = self.view_tables.lock().expect("allocation view tables lock poisoned");
+        let tables = self.tables.lock().expect("allocation tables lock poisoned");
+        views
+            .iter()
+            .map(|held| held.table.clone())
+            .chain(tables.iter().filter_map(Weak::upgrade))
+            .collect()
     }
     pub(crate) fn storage(&self) -> &dyn Storage {
         &*self.storage
     }
-    fn access_group(&self) -> &AccessGroup {
-        self.shared_access
-            .get()
-            .map(Arc::as_ref)
-            .unwrap_or(&self.access)
+    pub(crate) fn access_group(&self) -> &Arc<AccessGroup> {
+        &self.access
     }
 
     pub(crate) fn access_identity(&self) -> usize {
-        self.access_group() as *const AccessGroup as usize
+        Arc::as_ptr(self.access_group()) as usize
     }
 
-    /// A slab and its address table share one hazard domain. The slab must
-    /// be unpublished when this is called; all later host and device access
-    /// to either allocation is ordered by the table's submission fence.
-    pub(crate) fn share_access_with(&self, table: &Arc<Allocation>) {
-        self.shared_access
-            .set(table.access.clone())
-            .unwrap_or_else(|_| panic!("slab access group was already assigned"));
-    }
-
-    pub(crate) fn shares_access_with(&self, table: &Arc<Allocation>) -> bool {
-        Arc::ptr_eq(
-            self.shared_access.get().unwrap_or(&self.access),
-            &table.access,
-        )
+    pub(crate) fn shares_access_with(&self, other: &Arc<Allocation>) -> bool {
+        Arc::ptr_eq(self.access_group(), other.access_group())
     }
 
     /// Host access: waits for conflicting host permits and for submitted
     /// device work that conflicts with the access (a host read waits for
-    /// device writes; a host write waits for every device use).
-    pub(crate) fn acquire(self: &Arc<Self>, write: bool) -> AllocationPermit {
+    /// device writes; a host write waits for every device use). A read
+    /// after a device write that faulted reports its fault.
+    pub(crate) fn acquire(self: &Arc<Self>, write: bool) -> Result<AllocationPermit, ExecutionError> {
         let group = self.access_group();
         let mut state = group
             .state
             .lock()
             .expect("tensor allocation access lock poisoned");
         loop {
-            if state.writer || (write && state.readers != 0) {
+            if state.host.conflict(write) || state.device.conflict(write) {
                 state = group
                     .changed
                     .wait(state)
@@ -606,47 +762,114 @@ impl Allocation {
                 break;
             };
             drop(state);
-            fence.wait_complete();
+            match write {
+                true => fence.retire(),
+                false => fence.ended()?,
+            }
             state = group
                 .state
                 .lock()
                 .expect("tensor allocation access lock poisoned");
         }
-        self.grant(state, write)
+        Ok(self.grant(state, Holder::Host, write))
     }
 
     /// Access by device work being encoded for one queue. It excludes host
     /// access for the duration of encoding but never waits for other device
-    /// work: the queue orders it. The submitter records its completion with
-    /// [`Allocation::record_device_use`] before releasing the permit.
+    /// work, nor for another encoding (of its queue or another): the queue
+    /// orders its own work, the device orders native work of different
+    /// queues by their fences ([`Self::queue_order`]), and the caller orders
+    /// transfers.
+    /// An encoding can block in the driver behind device work it follows (a
+    /// parked kernel), so no other queue's encoding may wait on it: a
+    /// transfer that answers the park would never be queued. The submitter
+    /// records its completion with [`Allocation::record_device_use`] before
+    /// releasing the permit.
     pub(crate) fn acquire_for_device(self: &Arc<Self>, write: bool) -> AllocationPermit {
         let group = self.access_group();
         let mut state = group
             .state
             .lock()
             .expect("tensor allocation access lock poisoned");
-        while state.writer || (write && state.readers != 0) {
+        while state.host.conflict(write) {
             state = group
                 .changed
                 .wait(state)
                 .expect("tensor allocation access lock poisoned while waiting");
         }
-        self.grant(state, write)
+        self.grant(state, Holder::Device, write)
     }
 
-    /// Record submitted device work so later host access orders after it.
-    /// Called in submission order: `completion` completes after every fence
+    /// Record work submitted to `queue` so later host access, and the
+    /// storage's release, order after it. Called in the queue's submission
+    /// order: `completion` completes after every fence of that queue
     /// recorded before it.
-    pub(crate) fn record_device_use(&self, completion: Arc<dyn DeviceCompletion>, write: bool) {
+    pub(crate) fn record_device_use(&self, queue: DeviceQueue, completion: Arc<dyn DeviceCompletion>, write: bool) {
         let mut state = self
             .access_group()
             .state
             .lock()
             .expect("tensor allocation access lock poisoned");
+        let fences = state.queue(queue);
         if write {
-            state.last_write = Some(completion.clone());
+            fences.last_write = Some(completion.clone());
         }
-        state.last_use = Some(completion);
+        fences.last_use = Some(completion);
+    }
+
+    /// The submitted work of the other native queue that native work on
+    /// `queue` using this allocation must follow: its newest use where the
+    /// work writes it, its newest write where the work reads it. None of
+    /// the transfer queue, which its caller orders (`native::transfer`),
+    /// nor of an allocation whose users' protocol orders it
+    /// ([`Self::order_by_protocol`]). A queue runs its work in order, so its
+    /// newest fence of a kind follows every earlier one. Read under the
+    /// device's submission order, in which native fences are recorded.
+    /// Work that reads after another queue's write that faulted receives
+    /// its fault.
+    pub(crate) fn queue_order(
+        &self,
+        queue: NativeQueue,
+        write: bool,
+    ) -> Result<Vec<Arc<dyn DeviceCompletion>>, ExecutionError> {
+        let mut state = self
+            .access_group()
+            .state
+            .lock()
+            .expect("tensor allocation access lock poisoned");
+        if state.protocol {
+            return Ok(Vec::new());
+        }
+        state.prune();
+        NativeQueue::ALL
+            .into_iter()
+            .filter(|&other| other != queue)
+            .filter_map(|other| {
+                let fences = &state.queues[DeviceQueue::Native(other).ordinal()];
+                match write {
+                    true => fences.last_use.clone(),
+                    false => fences.last_write.clone(),
+                }
+            })
+            .map(|fence| fence.completed().map(|_| fence))
+            .collect()
+    }
+
+    /// Order this fresh allocation's device accesses across queues by the
+    /// protocol of the work that uses it, not by its fences: no native
+    /// queue waits for another's use of it (host access and its release
+    /// still wait for every use). For words the host and device work
+    /// exchange whose every cross-queue order the exchange gives: a slot
+    /// one queue's work requests and another's waits on. Set before
+    /// anything uses it.
+    pub(crate) fn order_by_protocol(&self) {
+        let mut state = self
+            .access_group()
+            .state
+            .lock()
+            .expect("tensor allocation access lock poisoned");
+        assert!(state.uses().is_empty() && !state.host.any() && !state.device.any(), "a fresh allocation is unused");
+        state.protocol = true;
     }
 
     /// No submitted device work still uses this allocation.
@@ -656,88 +879,76 @@ impl Allocation {
             .state
             .lock()
             .expect("tensor allocation access lock poisoned");
-        state.prune();
-        state.last_use.is_none()
+        state.uses().is_empty()
+    }
+
+    /// The newest submitted work of each queue that still uses this
+    /// allocation: every use completes once these have.
+    pub(crate) fn last_device_uses(&self) -> DeviceUses {
+        self.access_group()
+            .state
+            .lock()
+            .expect("tensor allocation access lock poisoned")
+            .uses()
     }
 
     fn grant(
         self: &Arc<Self>,
         mut state: MutexGuard<'_, AllocationAccess>,
+        holder: Holder,
         write: bool,
     ) -> AllocationPermit {
-        if write {
-            state.writer = true;
-        } else {
-            state.readers = state
-                .readers
-                .checked_add(1)
-                .expect("tensor allocation reader count overflowed");
-        }
+        let holders = state.holders(holder);
+        let count = if write { &mut holders.writers } else { &mut holders.readers };
+        *count = count.checked_add(1).expect("tensor allocation permit count overflowed");
         drop(state);
         AllocationPermit {
             allocation: self.clone(),
+            holder,
             write,
         }
     }
 
     /// Non-blocking acquisition for a freshly allocated, unpublished buffer.
     /// Admission uses this to assert that materialization never introduces a
-    /// hidden wait after the graph transaction has claimed resources.
+    /// hidden wait after the graph transaction has claimed resources. None
+    /// where access would wait, or a read would report a write's fault.
     pub(crate) fn try_acquire(self: &Arc<Self>, write: bool) -> Option<AllocationPermit> {
         let mut state = self
             .access_group()
             .state
             .lock()
             .expect("tensor allocation access lock poisoned");
-        if state.writer
-            || (write && state.readers != 0)
-            || state.conflicting_device(write).is_some()
-        {
+        if state.host.conflict(write) || state.device.conflict(write) || state.conflicting_device(write).is_some() {
             return None;
         }
-        Some(self.grant(state, write))
+        Some(self.grant(state, Holder::Host, write))
     }
 }
 
 impl Drop for Allocation {
     /// Storage is released only after every submitted device use finishes.
     fn drop(&mut self) {
-        let state = self
+        let uses = self
             .access_group()
             .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let fence = state.last_use.clone();
-        drop(state);
-        if let Some(fence) = fence {
-            fence.wait_complete();
-        }
-        // The caller publishes by dropping the predecessor after all planes
-        // are ready. If it is still live, this replacement was abandoned.
-        let Some(old) = self.predecessor.as_ref().and_then(Weak::upgrade) else {
-            return;
-        };
-        if let Some(rollback) = self.rollback_growth.as_ref() {
-            rollback()
-                .unwrap_or_else(|error| panic!("CUDA in-place growth rollback failed: {error}"));
-        } else {
-            assert_eq!(self.bytes, old.bytes, "discarded in-place shrink");
-        }
-        let mut charge = self
-            .charge
-            .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-            .expect("discarded recommit must own its charge");
-        charge.shrink(old.bytes);
-        let mut prior = old.charge.lock().expect("allocation charge lock poisoned");
-        assert!(prior.is_none(), "recommit predecessor already has a charge");
-        *prior = Some(charge);
+            .uses();
+        uses.retire();
     }
+}
+
+/// Whose permit: host access, or device work being encoded.
+#[derive(Clone, Copy)]
+enum Holder {
+    Host,
+    Device,
 }
 
 pub(crate) struct AllocationPermit {
     allocation: Arc<Allocation>,
+    holder: Holder,
     write: bool,
 }
 
@@ -775,18 +986,9 @@ impl Drop for AllocationPermit {
             .state
             .lock()
             .expect("tensor allocation access lock poisoned while releasing");
-        if self.write {
-            assert!(
-                state.writer,
-                "write permit released without an active writer"
-            );
-            state.writer = false;
-        } else {
-            state.readers = state
-                .readers
-                .checked_sub(1)
-                .expect("read permit released without an active reader");
-        }
+        let holders = state.holders(self.holder);
+        let count = if self.write { &mut holders.writers } else { &mut holders.readers };
+        *count = count.checked_sub(1).expect("a permit released that was never granted");
         group.changed.notify_all();
     }
 }
@@ -794,18 +996,32 @@ impl Drop for AllocationPermit {
 pub(crate) fn typed_buffer<T: TargetFamily, E: NativeExecutor<T>>(
     allocation: &Allocation,
 ) -> &Buffer<T, E> {
-    &allocation.storage.as_any().downcast_ref::<TypedStorage<T, E>>()
+    let storage = allocation.storage.as_any();
+    storage
+        .downcast_ref::<TypedStorage<T, E>>()
+        .map(|storage| storage.buffer.borrow())
+        .or_else(|| storage.downcast_ref::<ReadOnlyStorage<T, E>>().map(|storage| &storage.buffer))
         .unwrap_or_else(|| panic!("Tensor allocation backend invariant violated after successful WrongDevice validation"))
-        .buffer
 }
 
-pub(crate) fn write_zeros(storage: &dyn Storage, byte_len: u64) -> Result<(), ExecutionError> {
+/// Writable storage of `buffer`, which `service` reads and writes.
+pub(crate) fn buffer_storage<T: TargetFamily, E: NativeExecutor<T>>(
+    service: &Arc<Service<T, E>>,
+    buffer: Writable<T, E>,
+) -> Box<dyn Storage> {
+    Box::new(TypedStorage::<T, E> {
+        service: service.clone(),
+        buffer,
+    })
+}
+
+pub(crate) fn write_zeros(storage: &dyn Storage, start: u64, byte_len: u64) -> Result<(), ExecutionError> {
     const CHUNK: usize = 1 << 20;
     let zeros = vec![0u8; CHUNK.min(usize::try_from(byte_len).unwrap_or(CHUNK))];
     let mut offset = 0u64;
     while offset < byte_len {
         let length = usize::try_from((byte_len - offset).min(CHUNK as u64)).unwrap_or(CHUNK);
-        storage.write(offset, &zeros[..length])?;
+        storage.write(start + offset, &zeros[..length])?;
         offset += length as u64;
     }
     Ok(())
@@ -823,8 +1039,7 @@ pub(crate) fn prepare<T, E, C>(
     opened: &Arc<Opened<T, E>>,
     compiler: &C,
     native_context: &C::Context,
-    module: &CheckedModule,
-    entry: EntryId,
+    logical: LogicalEntry,
     bindings: ElementBindings,
     public_device: &Arc<crate::api::device::DeviceInner>,
     options: PreparationOptions,
@@ -834,9 +1049,6 @@ where
     E: NativeExecutor<T>,
     C: seismic_native_target::NativeCompiler<T, Handle = E::Handle>,
 {
-    let logical = module
-        .entry(entry, &bindings)
-        .map_err(PrepareError::Source)?;
     let key = PreparationKey {
         module: logical.module_hash(),
         entry: logical.identity(),
@@ -895,48 +1107,54 @@ where
         preparation_budget.native_compile_wall_time = feedback.search_time;
     }
     let planning_budget = PlanningBudget::default();
-    let (kernel, feedback_report) = match options.evaluation {
-        EvaluationMethod::Analytical => {
-            let analytical = opened.analytical().map_err(|error| {
-                PrepareError::Preparation(
-                    seismic_compiler::errors::PreparationError::NativeCompilation(
-                        seismic_native_target::NativeCompilationError::ToolchainFailure(
-                            error.to_string(),
+    // Past its deadline, preparation stops at its next step boundary; what it
+    // had constructed is dropped, and only the typed expiry is returned.
+    let deadline = options.deadline;
+    let evaluated = seismic_lang::cancellation::within(deadline, || {
+        Ok::<_, PrepareError>(match options.evaluation {
+            EvaluationMethod::Analytical => {
+                let analytical = opened.analytical().map_err(|error| {
+                    PrepareError::Preparation(
+                        seismic_compiler::errors::PreparationError::ExecutionProfileUnavailable(
+                            error,
                         ),
-                    ),
+                    )
+                })?;
+                let kernel = prepare_analytically(
+                    logical,
+                    analytical,
+                    opened.compiler_registry,
+                    compiler,
+                    native_context,
+                    &options.precision,
+                    &preparation_budget,
+                    &planning_budget,
                 )
-            })?;
-            let kernel = prepare_analytically(
-                logical,
-                analytical,
-                opened.compiler_registry,
-                compiler,
-                native_context,
-                &options.precision,
-                &preparation_budget,
-                &planning_budget,
-            )
-            .map_err(PrepareError::Preparation)?;
-            (kernel, None)
-        }
-        EvaluationMethod::Feedback(feedback_options) => {
-            let observer = feedback::Observer::new(opened.clone(), public_device.clone());
-            let (campaign, kernel) = FeedbackPreparation::start(
-                logical,
-                opened.device_description(),
-                opened.compiler_registry,
-                compiler,
-                native_context,
-                &options.precision,
-                &preparation_budget,
-                &planning_budget,
-                observer,
-                feedback_options,
-            )
-            .map_err(PrepareError::Preparation)?;
-            (kernel, Some(campaign.report().clone()))
-        }
-    };
+                .map_err(PrepareError::Preparation)?;
+                (kernel, None)
+            }
+            EvaluationMethod::Feedback(feedback_options) => {
+                let observer = feedback::Observer::new(opened.clone(), public_device.clone());
+                let (campaign, kernel) = FeedbackPreparation::start(
+                    logical,
+                    opened.device_description(),
+                    opened.compiler_registry,
+                    compiler,
+                    native_context,
+                    &options.precision,
+                    &preparation_budget,
+                    &planning_budget,
+                    observer,
+                    feedback_options,
+                )
+                .map_err(PrepareError::Preparation)?;
+                (kernel, Some(campaign.report().clone()))
+            }
+        })
+    });
+    let (kernel, feedback_report) = evaluated.map_err(|_| {
+        PrepareError::Preparation(seismic_compiler::errors::PreparationError::Expired)
+    })??;
     span.attribute(key_u64("seismic.variants", kernel.variants().len() as u64));
     let planning_report = kernel.planning_report();
     span.attribute(key_str(
@@ -1378,19 +1596,14 @@ pub(crate) fn collect_native_access(
     merged.into_values().collect()
 }
 
-fn copy_between<T: TargetFamily, E: NativeExecutor<T>>(
-    service: &Service<T, E>,
-    source: &Buffer<T, E>,
-    destination: &Buffer<T, E>,
-    bytes: u64,
-) -> Result<(), ExecutionError> {
+fn copy_between(source: &Allocation, destination: &Allocation, bytes: u64) -> Result<(), ExecutionError> {
     const CHUNK: usize = 1 << 20;
     let mut scratch = vec![0u8; CHUNK.min(usize::try_from(bytes).unwrap_or(CHUNK))];
     let mut offset = 0u64;
     while offset < bytes {
         let length = usize::try_from((bytes - offset).min(CHUNK as u64)).unwrap_or(CHUNK);
-        service.read(source, offset, &mut scratch[..length])?;
-        service.write(destination, offset, &scratch[..length])?;
+        source.storage.read(offset, &mut scratch[..length])?;
+        destination.storage.write(offset, &scratch[..length])?;
         offset += length as u64;
     }
     Ok(())
@@ -1406,7 +1619,7 @@ mod feedback;
 #[cfg(test)]
 mod physical_slot_tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     struct EmptyStorage;
     impl Storage for EmptyStorage {
@@ -1419,151 +1632,232 @@ mod physical_slot_tests {
         fn as_any(&self) -> &dyn Any {
             self
         }
+        fn host_address(&self) -> Option<std::ptr::NonNull<u8>> {
+            None
+        }
     }
 
     struct PendingUse(Arc<AtomicBool>);
     impl DeviceCompletion for PendingUse {
-        fn is_complete(&self) -> bool {
-            self.0.load(Ordering::SeqCst)
+        fn completed(&self) -> Result<bool, ExecutionError> {
+            Ok(self.0.load(Ordering::SeqCst))
         }
-        fn wait_complete(&self) {
-            assert!(self.is_complete(), "test releases the fence before storage");
+        fn ended(&self) -> Result<(), ExecutionError> {
+            assert!(self.completed()?, "test releases the fence before storage");
+            Ok(())
+        }
+    }
+
+    /// Transfer-queue work, pending until a waiter completes it.
+    #[derive(Default)]
+    struct TransferBatch {
+        done: AtomicBool,
+        waited: AtomicBool,
+    }
+    struct TransferFence(Arc<TransferBatch>);
+    impl DeviceCompletion for TransferFence {
+        fn completed(&self) -> Result<bool, ExecutionError> {
+            Ok(self.0.done.load(Ordering::SeqCst))
+        }
+        fn ended(&self) -> Result<(), ExecutionError> {
+            self.0.waited.store(true, Ordering::SeqCst);
+            self.0.done.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn transfer_beside_finished_compute(allocation: &Allocation, write: bool) -> Arc<TransferBatch> {
+        allocation.record_device_use(DeviceQueue::Native(NativeQueue::Compute), Arc::new(PendingUse(Arc::new(AtomicBool::new(true)))), true);
+        let batch = Arc::new(TransferBatch::default());
+        allocation.record_device_use(DeviceQueue::Transfer, Arc::new(TransferFence(batch.clone())), write);
+        batch
+    }
+
+    #[test]
+    fn dropping_an_allocation_waits_for_its_in_flight_transfer() {
+        let allocation = Allocation::new(1, 8, Box::new(EmptyStorage));
+        let batch = transfer_beside_finished_compute(&allocation, true);
+        assert!(!allocation.device_idle(), "a transfer still uses it");
+        drop(allocation);
+        assert!(batch.waited.load(Ordering::SeqCst), "storage outlives the transfer");
+    }
+
+    #[test]
+    fn host_access_waits_for_an_in_flight_transfer() {
+        let source = Allocation::new(1, 8, Box::new(EmptyStorage));
+        let destination = Allocation::new(2, 8, Box::new(EmptyStorage));
+        let read = transfer_beside_finished_compute(&source, false);
+        let written = transfer_beside_finished_compute(&destination, true);
+        // A host read of the source does not wait for the copy reading it.
+        drop(source.acquire(false).unwrap());
+        assert!(!read.waited.load(Ordering::SeqCst));
+        drop(source.acquire(true).unwrap());
+        assert!(read.waited.load(Ordering::SeqCst), "a host write waits for the copy's read");
+        drop(destination.acquire(false).unwrap());
+        assert!(written.waited.load(Ordering::SeqCst), "a host read waits for the copy's write");
+    }
+
+    /// Device work that ended with a fault.
+    struct FaultedUse;
+    impl DeviceCompletion for FaultedUse {
+        fn completed(&self) -> Result<bool, ExecutionError> {
+            Err(ExecutionError::SubmissionFailed("faulted".into()))
+        }
+        fn ended(&self) -> Result<(), ExecutionError> {
+            self.completed().map(drop)
         }
     }
 
     #[test]
+    fn a_faulted_write_ends_its_use_and_fails_what_reads_after_it() {
+        let allocation = Allocation::new(1, 8, Box::new(EmptyStorage));
+        allocation.record_device_use(DeviceQueue::Native(NativeQueue::Fill), Arc::new(FaultedUse), true);
+        assert!(allocation.device_idle(), "a fault ends the use");
+        assert!(allocation.acquire(false).is_err(), "a host read receives the fault");
+        assert!(allocation.queue_order(NativeQueue::Compute, false).is_err(), "a device read receives the fault");
+        assert_eq!(allocation.queue_order(NativeQueue::Compute, true).unwrap().len(), 0, "a write follows no ended use");
+        drop(allocation.acquire(true).unwrap());
+    }
+
+    /// Native work orders against the other native queue by what it
+    /// touches: a write follows the other queue's newest use, a read its
+    /// newest write; completed work, its own queue's, the transfer queue's
+    /// (its caller's to order) and a protocol-ordered allocation's impose
+    /// nothing.
+    #[test]
+    fn native_work_follows_the_other_native_queues_conflicting_fences() {
+        let allocation = Allocation::new(1, 8, Box::new(EmptyStorage));
+        let pending = || Arc::new(PendingUse(Arc::new(AtomicBool::new(false))));
+        let order = |queue, write| allocation.queue_order(queue, write).unwrap().len();
+        // Compute reads it; a fill read follows nothing, a fill write the read.
+        let read = pending();
+        allocation.record_device_use(DeviceQueue::Native(NativeQueue::Compute), read.clone(), false);
+        assert_eq!(order(NativeQueue::Fill, false), 0, "reads do not conflict");
+        assert_eq!(order(NativeQueue::Fill, true), 1, "a write follows the other queue's read");
+        assert_eq!(order(NativeQueue::Compute, true), 0, "a queue orders its own work");
+        // A fill writes it; compute reads and writes follow it.
+        allocation.record_device_use(DeviceQueue::Native(NativeQueue::Fill), pending(), true);
+        assert_eq!(order(NativeQueue::Compute, false), 1, "a read follows the other queue's write");
+        assert_eq!(order(NativeQueue::Compute, true), 1);
+        // The transfer queue's work is its caller's to order.
+        allocation.record_device_use(DeviceQueue::Transfer, pending(), true);
+        assert_eq!(order(NativeQueue::Compute, true), 1, "no transfer fence orders native work");
+        // Completed work orders nothing.
+        read.0.store(true, Ordering::SeqCst);
+        assert_eq!(order(NativeQueue::Fill, true), 0, "the compute read completed");
+        // Words whose users' protocol orders them order no queue.
+        let words = Allocation::new(2, 8, Box::new(EmptyStorage));
+        words.order_by_protocol();
+        words.record_device_use(DeviceQueue::Native(NativeQueue::Fill), pending(), true);
+        assert!(words.queue_order(NativeQueue::Compute, true).unwrap().is_empty());
+        assert!(!words.device_idle(), "host access still waits for every use");
+        // Pending test fences are forgotten before the storage is released.
+        for held in [&allocation, &words] {
+            let mut state = held.access_group().state.lock().unwrap();
+            state.queues.iter_mut().for_each(|fences| *fences = QueueFences::default());
+        }
+    }
+
+    /// A transfer is encoded while compute work is being encoded into the
+    /// same allocation (a step's submission, which can block in the driver
+    /// behind a parked kernel the transfer answers): device encodings never
+    /// exclude each other. Host access still excludes both.
+    #[test]
+    fn a_device_encoding_never_waits_for_another_queues_encoding() {
+        let allocation = Allocation::new(1, 8, Box::new(EmptyStorage));
+        let compute = allocation.acquire_for_device(true);
+        let transfer = allocation.acquire_for_device(true);
+        assert!(allocation.try_acquire(false).is_none(), "host access waits for an encoding");
+        drop(compute);
+        assert!(allocation.try_acquire(false).is_none(), "host access waits for every encoding");
+        drop(transfer);
+        let host = allocation.try_acquire(false).expect("host access once no encoding holds");
+        let waiting = {
+            let allocation = allocation.clone();
+            std::thread::spawn(move || drop(allocation.acquire_for_device(true)))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(!waiting.is_finished(), "a device write waits for a host read");
+        drop(host);
+        waiting.join().unwrap();
+    }
+
+    #[test]
     fn slab_and_table_share_one_hazard_group() {
-        let memory = MemoryDomain::new(crate::memory::PoolLedger::new());
-        let mut reservation = memory.reserve(16).unwrap();
-        let table = Allocation::new(1, 8, reservation.take(8), Box::new(EmptyStorage));
-        let slab = Allocation::new(2, 8, reservation.take(8), Box::new(EmptyStorage));
-        slab.share_access_with(&table);
+        let table = Allocation::new(1, 8, Box::new(EmptyStorage));
+        let slab = Allocation::new_in(2, 8, table.path, Box::new(EmptyStorage), Some(table.access_group().clone()));
         assert_eq!(table.access_identity(), slab.access_identity());
         let merged = crate::native::merge_access([(table.clone(), false), (slab.clone(), true)]);
         assert_eq!(merged.len(), 1);
         assert!(merged[0].1);
         drop(merged);
         let done = Arc::new(AtomicBool::new(false));
-        table.record_device_use(Arc::new(PendingUse(done.clone())), false);
+        table.record_device_use(DeviceQueue::Native(NativeQueue::Compute), Arc::new(PendingUse(done.clone())), false);
         assert!(slab.try_acquire(true).is_none());
         assert!(slab.try_acquire(false).is_some());
         done.store(true, Ordering::SeqCst);
         assert!(slab.try_acquire(true).is_some());
         drop(slab);
         drop(table);
-        assert_eq!(memory.usage().charged, 0);
-    }
-
-    #[test]
-    fn discarded_in_place_growth_restores_predecessor_charge() {
-        let memory = MemoryDomain::new(crate::memory::PoolLedger::new());
-        let mut initial = memory.reserve(8).unwrap();
-        let old = Allocation::new(1, 8, initial.take(8), Box::new(EmptyStorage));
-        drop(initial);
-        let mut growth = memory.reserve(8).unwrap();
-        let mut charge = old.charge.lock().unwrap().take().unwrap();
-        growth.extend(&mut charge, 8);
-        drop(growth);
-        let rollbacks = Arc::new(AtomicUsize::new(0));
-        let observed = rollbacks.clone();
-        let tentative = Allocation::new_recommitted(
-            2,
-            16,
-            charge,
-            Box::new(EmptyStorage),
-            &old,
-            Some(Box::new(move || {
-                observed.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            })),
-        );
-        assert_eq!(memory.usage().charged, 16);
-        assert_eq!(old.charged_bytes(), None);
-        drop(tentative);
-        assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
-        assert_eq!(old.charged_bytes(), Some(8));
-        assert_eq!(memory.usage().charged, 8);
-        drop(old);
-        assert_eq!(memory.usage().charged, 0);
-
-        let mut initial = memory.reserve(8).unwrap();
-        let old = Allocation::new(3, 8, initial.take(8), Box::new(EmptyStorage));
-        drop(initial);
-        let mut growth = memory.reserve(8).unwrap();
-        let mut charge = old.charge.lock().unwrap().take().unwrap();
-        growth.extend(&mut charge, 8);
-        drop(growth);
-        let published = Allocation::new_recommitted(
-            4,
-            16,
-            charge,
-            Box::new(EmptyStorage),
-            &old,
-            Some(Box::new(|| panic!("published growth must not roll back"))),
-        );
-        drop(old);
-        assert_eq!(published.charged_bytes(), Some(16));
-        drop(published);
-        assert_eq!(memory.usage().charged, 0);
     }
 
     #[test]
     fn admitted_slot_owns_backing_charge_and_exclusive_access() {
-        let memory = MemoryDomain::new(crate::memory::PoolLedger::new());
-        let mut reservation = memory.reserve(16).unwrap();
-        let allocation = Allocation::new(1, 16, reservation.take(16), Box::new(EmptyStorage));
+        let allocation = Allocation::new(1, 16, Box::new(EmptyStorage));
         let weak = Arc::downgrade(&allocation);
-        let permit = allocation.acquire(true);
-        let resources = AdmittedResources::new(reservation, vec![permit]);
+        let permit = allocation.acquire(true).unwrap();
+        let resources = AdmittedResources::new(vec![permit]);
         drop(allocation);
-        assert_eq!(memory.usage().charged, 16);
         assert!(resources.allocation(1).try_acquire(false).is_none());
         assert!(resources
             .access(resources.allocation(1))
             .owns(resources.allocation(1)));
         drop(resources);
         assert!(weak.upgrade().is_none());
-        assert_eq!(memory.usage().charged, 0);
     }
 
     #[test]
-    fn native_allocation_owner_enforces_target_limits_without_leaking_reservation() {
-        let catalog = crate::devices::Catalog::discover().unwrap();
-        let device = catalog.open_backend(registry::BackendName::Cpu).unwrap();
+    fn native_allocation_owner_enforces_target_limits_without_charging() {
+        let devices = crate::devices::Devices::discover(&[]).unwrap();
+        let id = devices.executor_of(registry::BackendName::Cpu).unwrap();
+        let tally = crate::memory::Tally::unbounded(seismic_topology::StoreIdentity::HostRam);
+        let device = devices.open_own(id, Default::default(), vec![Arc::new(tally.clone())]).unwrap();
         let crate::backends::OpenedKind::Cpu(opened) = &device.kind else {
             unreachable!()
         };
-        let baseline = opened.memory_usage().charged;
+        let baseline = tally.held();
         let maximum = opened.device_description().limits().max_allocation_bytes;
+        // An allocation beyond the target's limit is refused before the
+        // backend allocates or charges anything.
         let error = opened
             .allocate_storage(maximum.checked_add(1).unwrap(), 4)
             .err()
-            .expect("target limit is enforced before allocating");
-        assert!(
-            matches!(error, ExecutionError::AllocationCapacity { required, available } if required == (maximum + 1).into() && available == maximum)
-        );
-        assert_eq!(opened.memory_usage().charged, baseline);
+            .expect("an allocation beyond the target limit is refused before allocating");
+        assert!(matches!(
+            error,
+            ExecutionError::AllocationCapacity { required, available }
+                if required == (maximum + 1).into() && available == maximum
+        ));
+        assert_eq!(tally.held(), baseline);
         assert!(matches!(
             opened.allocate_storage(4, 0),
             Err(ExecutionError::ConstructionContradiction(_))
         ));
-        assert_eq!(opened.memory_usage().charged, baseline);
+        assert_eq!(tally.held(), baseline);
     }
 
     #[test]
     fn reached_slots_release_dead_capacity_and_preserve_live_permits_on_refusal() {
-        let memory = MemoryDomain::new(crate::memory::PoolLedger::new());
-        let mut resources = AdmittedResources::new(memory.reserve(0).unwrap(), vec![]);
+        let mut resources = AdmittedResources::new(vec![]);
         resources.set_reached_budget(24);
         resources.declare_private(100);
         resources.declare_private(101);
         let make = |id, bytes| {
-            let mut reservation = memory.reserve(bytes).unwrap();
-            Allocation::new(id, bytes, reservation.take(bytes), Box::new(EmptyStorage))
+            Allocation::new(id, bytes, Box::new(EmptyStorage))
         };
         let first = make(1, 16);
         resources.check_reached_capacity(16).unwrap();
-        resources.install_private(100, first.acquire(true));
+        resources.install_private(100, first.acquire(true).unwrap());
         drop(first);
         assert_eq!(
             resources.check_reached_capacity(16),
@@ -1578,75 +1872,59 @@ mod physical_slot_tests {
             .try_acquire(false)
             .is_none());
         resources.retire_private(100);
-        assert_eq!(memory.usage().charged, 0);
         resources.check_reached_capacity(24).unwrap();
         let second = make(2, 24);
-        resources.install_private(101, second.acquire(true));
+        resources.install_private(101, second.acquire(true).unwrap());
         drop(second);
-        assert_eq!(memory.usage().charged, 24);
         assert_eq!(resources.reached_allocated(), 40);
         drop(resources);
-        assert_eq!(memory.usage().charged, 0);
     }
 
     #[test]
     fn completed_dead_bank_releases_device_capacity_without_releasing_live_bank() {
-        let memory = MemoryDomain::new(crate::memory::PoolLedger::new());
-        memory.set_limit(Some(24));
-        let mut resources = AdmittedResources::new(memory.reserve(0).unwrap(), vec![]);
+        let mut resources = AdmittedResources::new(vec![]);
         resources.set_reached_budget(24);
         for slot in [100, 101, 102] {
             resources.declare_private(slot);
         }
         let make = |id, bytes| {
-            let mut reservation = memory.reserve(bytes).unwrap();
-            Allocation::new(id, bytes, reservation.take(bytes), Box::new(EmptyStorage))
+            Allocation::new(id, bytes, Box::new(EmptyStorage))
         };
         let dead = make(1, 16);
         let live = make(2, 8);
-        resources.install_private(100, dead.acquire(true));
-        resources.install_private(101, live.acquire(true));
+        resources.install_private(100, dead.acquire(true).unwrap());
+        resources.install_private(101, live.acquire(true).unwrap());
         let pending = dead.clone();
         drop(dead);
         drop(live);
-        assert!(memory.reserve(16).is_err());
         assert!(resources.check_reached_capacity(16).is_err());
-        assert_eq!(memory.usage().charged, 24);
         // The compiler's successful prefix completion precedes this release;
         // backend references and the slot's permit must both be gone.
         drop(pending);
         resources.retire_private(100);
-        assert_eq!(memory.usage().charged, 8);
         resources.check_reached_capacity(16).unwrap();
         let replacement = make(3, 16);
-        resources.install_private(102, replacement.acquire(true));
+        resources.install_private(102, replacement.acquire(true).unwrap());
         drop(replacement);
-        assert_eq!(memory.usage().charged, 24);
         assert!(resources
             .private_backing(101)
             .unwrap()
             .try_acquire(false)
             .is_none());
-        assert!(memory.reserve(1).is_err());
         drop(resources);
-        assert_eq!(memory.usage().charged, 0);
     }
 
     #[test]
     fn published_backing_survives_slot_release_without_retaining_its_permit() {
-        let memory = MemoryDomain::new(crate::memory::PoolLedger::new());
-        let mut reservation = memory.reserve(16).unwrap();
-        let allocation = Allocation::new(1, 16, reservation.take(16), Box::new(EmptyStorage));
-        let resources = AdmittedResources::new(reservation, vec![allocation.acquire(true)]);
+        let allocation = Allocation::new(1, 16, Box::new(EmptyStorage));
+        let resources = AdmittedResources::new(vec![allocation.acquire(true).unwrap()]);
         drop(allocation);
         let published = resources.allocation(1).clone();
         drop(resources);
-        assert_eq!(memory.usage().charged, 16);
         let read = published
             .try_acquire(false)
             .expect("completed run released its exclusive access");
         drop(read);
         drop(published);
-        assert_eq!(memory.usage().charged, 0);
     }
 }

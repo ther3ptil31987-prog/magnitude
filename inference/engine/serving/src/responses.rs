@@ -19,7 +19,7 @@ use futures_util::StreamExt;
 use magnitude_chat::output::{Completion, Output, OutputEvent, Progress, Termination};
 use magnitude_chat::request::{
     AssistantTurn, Conversation, Entry, GenerationControls, OutputFormat, PromptCache,
-    SamplingControls, ToolCall, ToolDefinition, ToolExchange, ToolResultPart, Tools, UserPart,
+    ToolCall, ToolDefinition, ToolExchange, ToolResultPart, Tools, UserPart,
 };
 use magnitude_chat::schema::JsonSchema;
 use magnitude_chat::{ChatInput, EndOfGeneration, GenerationRequest, ReasoningIntent, ToolChoice};
@@ -36,6 +36,7 @@ use crate::chat::{
     progress_value,
 };
 use crate::error::{ApiError, ApiErrorBody, ErrorResponse, ServingError};
+use crate::sampling::{SamplingRequest, sampling};
 use crate::source::{GenerationEvent, GenerationStream, LoadProgress, ModelLoadProgress};
 use crate::{Serving, include_progress, media, unix_timestamp, with_request_id};
 
@@ -346,7 +347,14 @@ pub struct ResponseProjection {
     metadata: Map<String, Value>,
 }
 
-type ToolProjection = (usize, String, String, String, String);
+struct ToolProjection {
+    output_index: usize,
+    item_id: String,
+    call_id: String,
+    name: String,
+    arguments: String,
+    finished: bool,
+}
 
 pub(crate) struct StreamProjector {
     id: String,
@@ -447,7 +455,10 @@ impl StreamProjector {
 
     async fn observe(&mut self, event: OutputEvent) -> Result<(), ProjectionError> {
         match event {
-            OutputEvent::Started | OutputEvent::ToolCallFinished { .. } => {}
+            OutputEvent::Started => {}
+            OutputEvent::ToolCallFinished { index } => {
+                self.tool_call(index)?.finished = true;
+            }
             OutputEvent::ReasoningDelta(text) => {
                 let index = match self.reasoning_output_index {
                     Some(index) => index,
@@ -511,13 +522,14 @@ impl StreamProjector {
                 let item_id = format!("fc_{id}");
                 self.tool_calls.insert(
                     index,
-                    (
+                    ToolProjection {
                         output_index,
-                        item_id.clone(),
-                        id.clone(),
-                        name.clone(),
-                        String::new(),
-                    ),
+                        item_id: item_id.clone(),
+                        call_id: id.clone(),
+                        name: name.clone(),
+                        arguments: String::new(),
+                        finished: false,
+                    },
                 );
                 let item = function_call_item(item_id, "in_progress", id, name, String::new());
                 self.send(
@@ -528,13 +540,9 @@ impl StreamProjector {
             }
             OutputEvent::ToolInputDelta { index, fragment } => {
                 let (output_index, item_id) = {
-                    let entry = self.tool_calls.get_mut(&index).ok_or_else(|| {
-                        ProjectionError::Failed(ServingError::Internal(
-                            "tool input arrived before tool start".into(),
-                        ))
-                    })?;
-                    entry.4.push_str(&fragment);
-                    (entry.0, entry.1.clone())
+                    let entry = self.tool_call(index)?;
+                    entry.arguments.push_str(&fragment);
+                    (entry.output_index, entry.item_id.clone())
                 };
                 self.send(
                     "response.function_call_arguments.delta",
@@ -548,8 +556,18 @@ impl StreamProjector {
         Ok(())
     }
 
+    fn tool_call(&mut self, index: usize) -> Result<&mut ToolProjection, ProjectionError> {
+        self.tool_calls.get_mut(&index).ok_or_else(|| {
+            ProjectionError::Failed(ServingError::Internal(
+                "tool event arrived before tool start".into(),
+            ))
+        })
+    }
+
     /// Close every output item in `output_index` order, so the order a client
-    /// observes items concluding is the order of the response's `output`.
+    /// observes items concluding is the order of the response's `output`. A
+    /// call the output limit cut off concludes `incomplete` and, as in a
+    /// complete response, is not part of `output`.
     async fn finish(&mut self, completion: &Completion) -> Result<(), Disconnected> {
         let mut closing: Vec<(usize, Vec<(&'static str, Value)>, Value)> = Vec::new();
         if let Some(index) = self.reasoning_output_index {
@@ -592,22 +610,30 @@ impl StreamProjector {
             ];
             closing.push((index, events, item));
         }
-        for (output_index, item_id, call_id, name, arguments) in self.tool_calls.values() {
+        let mut cut_off = Vec::new();
+        for call in self.tool_calls.values() {
+            let status = if call.finished { "completed" } else { "incomplete" };
             let item = serde_json::to_value(function_call_item(
-                item_id.clone(),
-                "completed",
-                call_id.clone(),
-                name.clone(),
-                arguments.clone(),
+                call.item_id.clone(),
+                status,
+                call.call_id.clone(),
+                call.name.clone(),
+                call.arguments.clone(),
             ))
             .expect("output item is serializable");
-            let events = vec![(
-                "response.function_call_arguments.done",
-                serde_json::json!({
-                    "item_id": item_id, "output_index": output_index, "arguments": arguments,
-                }),
-            )];
-            closing.push((*output_index, events, item));
+            let events = if call.finished {
+                vec![(
+                    "response.function_call_arguments.done",
+                    serde_json::json!({
+                        "item_id": call.item_id, "output_index": call.output_index,
+                        "arguments": call.arguments,
+                    }),
+                )]
+            } else {
+                cut_off.push(call.output_index);
+                Vec::new()
+            };
+            closing.push((call.output_index, events, item));
         }
         closing.sort_by_key(|(index, _, _)| *index);
         let mut items = Vec::with_capacity(closing.len());
@@ -620,7 +646,9 @@ impl StreamProjector {
                 serde_json::json!({ "output_index": index, "item": item }),
             )
             .await?;
-            items.push(item);
+            if !cut_off.contains(&index) {
+                items.push(item);
+            }
         }
         let output = Value::Array(items.clone());
         let incomplete = completion.termination == Termination::OutputLimit;
@@ -1116,7 +1144,12 @@ pub fn adapt(request: ResponseCreateRequest) -> Result<AdaptedResponseRequest, A
                 .ok_or_else(|| ApiError::invalid("max_output_tokens must be positive"))
         })
         .transpose()?;
-    let sampling = openai_sampling(request.temperature, request.top_p, request.seed)?;
+    let sampling = sampling(SamplingRequest {
+        temperature: request.temperature,
+        top_p: request.top_p,
+        seed: request.seed,
+        ..SamplingRequest::default()
+    })?;
     Ok(AdaptedResponseRequest {
         model: request.model,
         request: GenerationRequest {
@@ -1137,55 +1170,6 @@ pub fn adapt(request: ResponseCreateRequest) -> Result<AdaptedResponseRequest, A
             },
         },
         projection,
-    })
-}
-
-/// Responses sampling: OpenAI defaults.
-fn openai_sampling(
-    temperature: Option<f32>,
-    top_p: Option<f32>,
-    seed: Option<u32>,
-) -> Result<SamplingControls, ApiError> {
-    let temperature = temperature.unwrap_or(0.8);
-    let top_p = top_p.unwrap_or(0.95);
-    sampling(temperature, top_p, seed)
-}
-
-/// The seed a request samples with: the caller's, or a fresh one, so an
-/// identical request without a seed samples anew rather than repeating
-/// the same draws (and the same failure) on every retry.
-pub(crate) fn request_seed(seed: Option<u32>) -> u64 {
-    seed.map(u64::from).unwrap_or_else(|| {
-        use std::hash::{BuildHasher, Hasher};
-        std::collections::hash_map::RandomState::new().build_hasher().finish()
-    })
-}
-
-/// Validated temperature and top-p with identity shaping otherwise.
-pub(crate) fn sampling(
-    temperature: f32,
-    top_p: f32,
-    seed: Option<u32>,
-) -> Result<SamplingControls, ApiError> {
-    if !temperature.is_finite() || !(0.0..=2.0).contains(&temperature) {
-        return Err(ApiError::invalid(
-            "temperature must be finite and between 0 and 2",
-        ));
-    }
-    if !top_p.is_finite() || !(0.0..=1.0).contains(&top_p) || top_p == 0.0 {
-        return Err(ApiError::invalid(
-            "top_p must be finite, greater than 0 and at most 1",
-        ));
-    }
-    Ok(SamplingControls {
-        temperature,
-        top_p,
-        top_k: 0,
-        min_p: 0.0,
-        repetition_penalty: 1.0,
-        presence_penalty: 0.0,
-        frequency_penalty: 0.0,
-        seed: request_seed(seed),
     })
 }
 

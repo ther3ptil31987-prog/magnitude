@@ -13,6 +13,19 @@ export const JsonValue: S.Schema<JsonValue, JsonValue> = S.suspend(
     S.Union(S.String, S.Number, S.Boolean, S.Null, S.Array(JsonValue), S.Record({ key: S.String, value: JsonValue })),
 )
 
+export const AddedModel = S.Struct({
+  path: S.suspend(
+    (): S.Schema<HuggingFaceArtifactSelector, HuggingFaceArtifactSelectorEncoded> => HuggingFaceArtifactSelector,
+  ),
+  projector: S.optionalWith(S.String, { exact: true, as: "Option" }),
+  repository: S.suspend(
+    (): S.Schema<HuggingFaceRepositoryId, HuggingFaceRepositoryIdEncoded> => HuggingFaceRepositoryId,
+  ),
+  revision: S.String,
+})
+export type AddedModel = S.Schema.Type<typeof AddedModel>
+export type AddedModelEncoded = S.Schema.Encoded<typeof AddedModel>
+
 export const AllowedToolRequest = S.Struct({
   function: S.suspend((): S.Schema<FunctionNameRequest, FunctionNameRequestEncoded> => FunctionNameRequest),
   type: S.suspend((): S.Schema<FunctionType, FunctionTypeEncoded> => FunctionType),
@@ -130,6 +143,216 @@ export const AssessmentEnvironmentId = S.String
 export type AssessmentEnvironmentId = S.Schema.Type<typeof AssessmentEnvironmentId>
 export type AssessmentEnvironmentIdEncoded = S.Schema.Encoded<typeof AssessmentEnvironmentId>
 
+export const AttachedDrafter = S.Struct({
+  method: S.optionalWith(
+    S.suspend((): S.Schema<SpeculativeMethod, SpeculativeMethodEncoded> => SpeculativeMethod),
+    { exact: true, as: "Option" },
+  ),
+  reference: S.suspend((): S.Schema<DrafterReference, DrafterReferenceEncoded> => DrafterReference),
+  state: S.suspend((): S.Schema<AttachedDrafterState, AttachedDrafterStateEncoded> => AttachedDrafterState),
+  updateAvailable: S.Boolean,
+})
+export type AttachedDrafter = S.Schema.Type<typeof AttachedDrafter>
+export type AttachedDrafterEncoded = S.Schema.Encoded<typeof AttachedDrafter>
+
+export const AttachedDrafterState = S.Union(
+  S.extend(S.TaggedStruct("Ready", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(S.TaggedStruct("NotInstalled", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(
+    S.TaggedStruct("Rejected", {
+      detail: S.String,
+      reasons: S.Array(S.suspend((): S.Schema<UnsupportedReason, UnsupportedReasonEncoded> => UnsupportedReason)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type AttachedDrafterState = S.Schema.Type<typeof AttachedDrafterState>
+export type AttachedDrafterStateEncoded = S.Schema.Encoded<typeof AttachedDrafterState>
+
+export const CandidateDrafter = S.Struct({
+  method: S.suspend((): S.Schema<SpeculativeMethod, SpeculativeMethodEncoded> => SpeculativeMethod),
+  reference: S.suspend((): S.Schema<DrafterReference, DrafterReferenceEncoded> => DrafterReference),
+})
+export type CandidateDrafter = S.Schema.Type<typeof CandidateDrafter>
+export type CandidateDrafterEncoded = S.Schema.Encoded<typeof CandidateDrafter>
+
+export const CandidateFile = S.Struct({
+  path: S.String,
+  sizeBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type CandidateFile = S.Schema.Type<typeof CandidateFile>
+export type CandidateFileEncoded = S.Schema.Encoded<typeof CandidateFile>
+
+export const CandidateInspection = S.Struct({
+  developer: S.optionalWith(
+    S.suspend((): S.Schema<ModelDeveloper, ModelDeveloperEncoded> => ModelDeveloper),
+    { exact: true, as: "Option" },
+  ),
+  displayName: S.String,
+  license: S.optionalWith(S.String, { exact: true, as: "Option" }),
+  projector: S.optionalWith(
+    S.suspend((): S.Schema<CandidateFile, CandidateFileEncoded> => CandidateFile),
+    { exact: true, as: "Option" },
+  ),
+  source: S.suspend((): S.Schema<CandidateSource, CandidateSourceEncoded> => CandidateSource),
+  unsupportedArchitecture: S.optionalWith(
+    S.Array(S.suspend((): S.Schema<UnsupportedReason, UnsupportedReasonEncoded> => UnsupportedReason)),
+    { exact: true, as: "Option" },
+  ),
+  variantOf: S.optionalWith(
+    S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
+    { exact: true, as: "Option" },
+  ),
+  versions: S.Array(S.suspend((): S.Schema<CandidateVersion, CandidateVersionEncoded> => CandidateVersion)),
+})
+export type CandidateInspection = S.Schema.Type<typeof CandidateInspection>
+export type CandidateInspectionEncoded = S.Schema.Encoded<typeof CandidateInspection>
+
+export const CandidateInspectionEvent = S.Union(
+  S.extend(
+    S.TaggedStruct("Progress", {
+      progress: S.suspend(
+        (): S.Schema<CandidateInspectionProgress, CandidateInspectionProgressEncoded> => CandidateInspectionProgress,
+      ),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Inspected", {
+      inspection: S.suspend((): S.Schema<CandidateInspection, CandidateInspectionEncoded> => CandidateInspection),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type CandidateInspectionEvent = S.Schema.Type<typeof CandidateInspectionEvent>
+export type CandidateInspectionEventEncoded = S.Schema.Encoded<typeof CandidateInspectionEvent>
+
+export const CandidateInspectionPhase = S.Union(
+  S.extend(
+    S.TaggedStruct("ReadingHeaders", {
+      completed: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      total: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("CheckingVersions", {
+      completed: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      total: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("CheckingDrafters", {
+      completed: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      total: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      version: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type CandidateInspectionPhase = S.Schema.Type<typeof CandidateInspectionPhase>
+export type CandidateInspectionPhaseEncoded = S.Schema.Encoded<typeof CandidateInspectionPhase>
+
+export const CandidateInspectionProgress = S.Struct({
+  phase: S.suspend((): S.Schema<CandidateInspectionPhase, CandidateInspectionPhaseEncoded> => CandidateInspectionPhase),
+  versions: S.Array(
+    S.suspend((): S.Schema<CandidateVersionProgress, CandidateVersionProgressEncoded> => CandidateVersionProgress),
+  ),
+})
+export type CandidateInspectionProgress = S.Schema.Type<typeof CandidateInspectionProgress>
+export type CandidateInspectionProgressEncoded = S.Schema.Encoded<typeof CandidateInspectionProgress>
+
+export const CandidateInspectionRequest = S.Union(
+  S.extend(
+    S.TaggedStruct("HuggingFace", {
+      repository: S.suspend(
+        (): S.Schema<HuggingFaceRepositoryId, HuggingFaceRepositoryIdEncoded> => HuggingFaceRepositoryId,
+      ),
+      revision: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Local", {
+      path: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type CandidateInspectionRequest = S.Schema.Type<typeof CandidateInspectionRequest>
+export type CandidateInspectionRequestEncoded = S.Schema.Encoded<typeof CandidateInspectionRequest>
+
+export const CandidateSource = S.Union(
+  S.extend(
+    S.TaggedStruct("HuggingFace", {
+      commit: S.String,
+      repository: S.suspend(
+        (): S.Schema<HuggingFaceRepositoryId, HuggingFaceRepositoryIdEncoded> => HuggingFaceRepositoryId,
+      ),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Local", {
+      path: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type CandidateSource = S.Schema.Type<typeof CandidateSource>
+export type CandidateSourceEncoded = S.Schema.Encoded<typeof CandidateSource>
+
+export const CandidateVersion = S.Struct({
+  assessment: S.optionalWith(
+    S.suspend((): S.Schema<ModelAssessment, ModelAssessmentEncoded> => ModelAssessment),
+    { exact: true, as: "Option" },
+  ),
+  catalogModel: S.optionalWith(
+    S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
+    { exact: true, as: "Option" },
+  ),
+  downloadBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  drafter: S.optionalWith(
+    S.suspend((): S.Schema<DrafterCandidate, DrafterCandidateEncoded> => DrafterCandidate),
+    { exact: true, as: "Option" },
+  ),
+  files: S.Array(S.suspend((): S.Schema<CandidateFile, CandidateFileEncoded> => CandidateFile)),
+  label: S.String,
+  modelId: S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
+  onThisComputer: S.optionalWith(
+    S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
+    { exact: true, as: "Option" },
+  ),
+  recommended: S.Boolean,
+  sizeBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type CandidateVersion = S.Schema.Type<typeof CandidateVersion>
+export type CandidateVersionEncoded = S.Schema.Encoded<typeof CandidateVersion>
+
+export const CandidateVersionProgress = S.Struct({
+  assessment: S.optionalWith(
+    S.suspend((): S.Schema<ModelAssessment, ModelAssessmentEncoded> => ModelAssessment),
+    { exact: true, as: "Option" },
+  ),
+  label: S.String,
+  sizeBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type CandidateVersionProgress = S.Schema.Type<typeof CandidateVersionProgress>
+export type CandidateVersionProgressEncoded = S.Schema.Encoded<typeof CandidateVersionProgress>
+
+export const CatalogComponent = S.Union(S.Literal("Projector"), S.Literal("Drafter"))
+export type CatalogComponent = S.Schema.Type<typeof CatalogComponent>
+export type CatalogComponentEncoded = S.Schema.Encoded<typeof CatalogComponent>
+
+export const CatalogDrafter = S.Struct({
+  method: S.suspend((): S.Schema<SpeculativeMethod, SpeculativeMethodEncoded> => SpeculativeMethod),
+  repository: S.String,
+  sizeBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type CatalogDrafter = S.Schema.Type<typeof CatalogDrafter>
+export type CatalogDrafterEncoded = S.Schema.Encoded<typeof CatalogDrafter>
+
 export const CatalogInstallationAdmission = S.Union(
   S.extend(S.TaggedStruct("Current", {}), S.Record({ key: S.String, value: JsonValue })),
   S.extend(
@@ -223,6 +446,7 @@ export type CatalogInstallationProgressEncoded = S.Schema.Encoded<typeof Catalog
 export const CatalogInstallationRemoval = S.Union(
   S.extend(
     S.TaggedStruct("Removed", {
+      keptComponents: S.Array(S.suspend((): S.Schema<CatalogComponent, CatalogComponentEncoded> => CatalogComponent)),
       reclaimedBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
     }),
     S.Record({ key: S.String, value: JsonValue }),
@@ -257,18 +481,34 @@ export const CatalogInstallationsResponse = S.extend(
 export type CatalogInstallationsResponse = S.Schema.Type<typeof CatalogInstallationsResponse>
 export type CatalogInstallationsResponseEncoded = S.Schema.Encoded<typeof CatalogInstallationsResponse>
 
+export const CatalogMissingComponent = S.Struct({
+  component: S.suspend((): S.Schema<CatalogComponent, CatalogComponentEncoded> => CatalogComponent),
+  downloadBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type CatalogMissingComponent = S.Schema.Type<typeof CatalogMissingComponent>
+export type CatalogMissingComponentEncoded = S.Schema.Encoded<typeof CatalogMissingComponent>
+
 export const CatalogModel = S.Struct({
+  aliases: S.optionalWith(S.Array(S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId)), {
+    exact: true,
+    as: "Option",
+  }),
   description: S.String,
   desired: S.suspend((): S.Schema<ReadyModel, ReadyModelEncoded> => ReadyModel),
+  developer: S.suspend((): S.Schema<ModelDeveloper, ModelDeveloperEncoded> => ModelDeveloper),
   displayName: S.String,
-  fidelityRank: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  drafter: S.optionalWith(
+    S.suspend((): S.Schema<CatalogDrafter, CatalogDrafterEncoded> => CatalogDrafter),
+    { exact: true, as: "Option" },
+  ),
+  drafterWithheld: S.Boolean,
   id: S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
-  intelligence: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   license: S.String,
   localState: S.suspend((): S.Schema<CatalogModelState, CatalogModelStateEncoded> => CatalogModelState),
   parameterization: S.suspend(
     (): S.Schema<ModelParameterization, ModelParameterizationEncoded> => ModelParameterization,
   ),
+  quant: S.suspend((): S.Schema<CatalogQuant, CatalogQuantEncoded> => CatalogQuant),
   quantizationAware: S.Boolean,
   releaseDate: S.suspend((): S.Schema<ModelReleaseDate, ModelReleaseDateEncoded> => ModelReleaseDate),
   sourceUrls: S.Array(S.String),
@@ -283,6 +523,7 @@ export type CatalogModelSelection = S.Schema.Type<typeof CatalogModelSelection>
 export type CatalogModelSelectionEncoded = S.Schema.Encoded<typeof CatalogModelSelection>
 
 export const CatalogModelsResponse = S.Struct({
+  families: S.Array(S.suspend((): S.Schema<ModelFamily, ModelFamilyEncoded> => ModelFamily)),
   models: S.Array(S.suspend((): S.Schema<CatalogModel, CatalogModelEncoded> => CatalogModel)),
   reconciliationComplete: S.Boolean,
   revision: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
@@ -296,6 +537,10 @@ export const CatalogModelState = S.Union(
     S.TaggedStruct("Installed", {
       effective: S.suspend((): S.Schema<EffectiveModel, EffectiveModelEncoded> => EffectiveModel),
       installation: S.suspend((): S.Schema<ModelInstallation, ModelInstallationEncoded> => ModelInstallation),
+      missingComponents: S.Array(
+        S.suspend((): S.Schema<CatalogMissingComponent, CatalogMissingComponentEncoded> => CatalogMissingComponent),
+      ),
+      storedComponents: S.Array(S.suspend((): S.Schema<CatalogComponent, CatalogComponentEncoded> => CatalogComponent)),
       updateState: S.suspend((): S.Schema<CatalogModelUpdate, CatalogModelUpdateEncoded> => CatalogModelUpdate),
     }),
     S.Record({ key: S.String, value: JsonValue }),
@@ -308,6 +553,7 @@ export const CatalogModelUpdate = S.Union(
   S.extend(S.TaggedStruct("Current", {}), S.Record({ key: S.String, value: JsonValue })),
   S.extend(
     S.TaggedStruct("Available", {
+      parts: S.Array(S.suspend((): S.Schema<CatalogUpdatePart, CatalogUpdatePartEncoded> => CatalogUpdatePart)),
       requiredDownloadBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
     }),
     S.Record({ key: S.String, value: JsonValue }),
@@ -328,19 +574,28 @@ export const CatalogOptimizationProgress = S.Struct({
 export type CatalogOptimizationProgress = S.Schema.Type<typeof CatalogOptimizationProgress>
 export type CatalogOptimizationProgressEncoded = S.Schema.Encoded<typeof CatalogOptimizationProgress>
 
-export const CatalogOptimizationStage = S.Union(S.Literal("preparing"), S.Literal("tuning"))
+export const CatalogOptimizationStage = S.Union(S.Literal("waiting"), S.Literal("preparing"), S.Literal("tuning"))
 export type CatalogOptimizationStage = S.Schema.Type<typeof CatalogOptimizationStage>
 export type CatalogOptimizationStageEncoded = S.Schema.Encoded<typeof CatalogOptimizationStage>
+
+export const CatalogQuant = S.Struct({
+  name: S.String,
+  repository: S.String,
+})
+export type CatalogQuant = S.Schema.Type<typeof CatalogQuant>
+export type CatalogQuantEncoded = S.Schema.Encoded<typeof CatalogQuant>
 
 export const CatalogSupport = S.Union(
   S.extend(
     S.Struct({
+      intelligence: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
       level: S.Literal("supported"),
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
   S.extend(
     S.Struct({
+      intelligence: S.optionalWith(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), { exact: true, as: "Option" }),
       level: S.Literal("disabled"),
       reason: S.String,
     }),
@@ -348,6 +603,7 @@ export const CatalogSupport = S.Union(
   ),
   S.extend(
     S.Struct({
+      intelligence: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
       level: S.Literal("deprecated"),
       reason: S.String,
       replacement: S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
@@ -358,6 +614,10 @@ export const CatalogSupport = S.Union(
 )
 export type CatalogSupport = S.Schema.Type<typeof CatalogSupport>
 export type CatalogSupportEncoded = S.Schema.Encoded<typeof CatalogSupport>
+
+export const CatalogUpdatePart = S.Union(S.Literal("Model"), S.Literal("Projector"), S.Literal("Drafter"))
+export type CatalogUpdatePart = S.Schema.Type<typeof CatalogUpdatePart>
+export type CatalogUpdatePartEncoded = S.Schema.Encoded<typeof CatalogUpdatePart>
 
 export const ChatCompletionChoice = S.Struct({
   finish_reason: S.String,
@@ -404,6 +664,10 @@ export type ChatCompletionMessageEncoded = S.Schema.Encoded<typeof ChatCompletio
 export const ChatCompletionProgress = S.Union(
   S.extend(
     S.Struct({
+      details: S.optionalWith(
+        S.suspend((): S.Schema<ModelLoadDetails, ModelLoadDetailsEncoded> => ModelLoadDetails),
+        { exact: true, as: "Option" },
+      ),
       fraction: S.Number,
       phase: S.Literal("model_loading"),
       stage: S.suspend((): S.Schema<ModelLoadStage, ModelLoadStageEncoded> => ModelLoadStage),
@@ -650,6 +914,18 @@ export const ChunkToolCall = S.Struct({
 export type ChunkToolCall = S.Schema.Type<typeof ChunkToolCall>
 export type ChunkToolCallEncoded = S.Schema.Encoded<typeof ChunkToolCall>
 
+export const ColdExperts = S.Union(
+  S.extend(S.TaggedStruct("Disk", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(
+    S.TaggedStruct("HostRam", {
+      cacheBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type ColdExperts = S.Schema.Type<typeof ColdExperts>
+export type ColdExpertsEncoded = S.Schema.Encoded<typeof ColdExperts>
+
 export const CompletionFunctionCall = S.Struct({
   arguments: S.String,
   name: S.String,
@@ -799,20 +1075,43 @@ export const CountTokensResponse = S.extend(
 export type CountTokensResponse = S.Schema.Type<typeof CountTokensResponse>
 export type CountTokensResponseEncoded = S.Schema.Encoded<typeof CountTokensResponse>
 
-export const DefaultGenerationSettings = S.Struct({
-  n_ctx: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+export const CustomModel = S.Struct({
+  developer: S.optionalWith(
+    S.suspend((): S.Schema<ModelDeveloper, ModelDeveloperEncoded> => ModelDeveloper),
+    { exact: true, as: "Option" },
+  ),
+  displayName: S.String,
+  drafter: S.optionalWith(
+    S.suspend((): S.Schema<AttachedDrafter, AttachedDrafterEncoded> => AttachedDrafter),
+    { exact: true, as: "Option" },
+  ),
+  drafterPending: S.Boolean,
+  files: S.Array(S.suspend((): S.Schema<CustomModelFile, CustomModelFileEncoded> => CustomModelFile)),
+  license: S.optionalWith(S.String, { exact: true, as: "Option" }),
+  modelId: S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
+  origin: S.suspend((): S.Schema<CustomModelOrigin, CustomModelOriginEncoded> => CustomModelOrigin),
+  profile: S.suspend((): S.Schema<ServingProfile, ServingProfileEncoded> => ServingProfile),
+  projector: S.optionalWith(
+    S.suspend((): S.Schema<CustomModelFile, CustomModelFileEncoded> => CustomModelFile),
+    { exact: true, as: "Option" },
+  ),
+  recommendedDrafter: S.optionalWith(
+    S.suspend((): S.Schema<DrafterCandidate, DrafterCandidateEncoded> => DrafterCandidate),
+    { exact: true, as: "Option" },
+  ),
+  sizeBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  state: S.suspend((): S.Schema<CustomModelState, CustomModelStateEncoded> => CustomModelState),
+  updateCommit: S.optionalWith(S.String, { exact: true, as: "Option" }),
+  variantLabel: S.optionalWith(S.String, { exact: true, as: "Option" }),
+  variantOf: S.optionalWith(
+    S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
+    { exact: true, as: "Option" },
+  ),
 })
-export type DefaultGenerationSettings = S.Schema.Type<typeof DefaultGenerationSettings>
-export type DefaultGenerationSettingsEncoded = S.Schema.Encoded<typeof DefaultGenerationSettings>
+export type CustomModel = S.Schema.Type<typeof CustomModel>
+export type CustomModelEncoded = S.Schema.Encoded<typeof CustomModel>
 
-export const DiscoveredModel = S.Struct({
-  id: S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
-  state: S.suspend((): S.Schema<DiscoveredModelState, DiscoveredModelStateEncoded> => DiscoveredModelState),
-})
-export type DiscoveredModel = S.Schema.Type<typeof DiscoveredModel>
-export type DiscoveredModelEncoded = S.Schema.Encoded<typeof DiscoveredModel>
-
-export const DiscoveredModelCatalogAttribution = S.Union(
+export const CustomModelCatalogAttribution = S.Union(
   S.extend(S.TaggedStruct("NotInCatalog", {}), S.Record({ key: S.String, value: JsonValue })),
   S.extend(
     S.TaggedStruct("Failed", {
@@ -821,23 +1120,47 @@ export const DiscoveredModelCatalogAttribution = S.Union(
     S.Record({ key: S.String, value: JsonValue }),
   ),
 )
-export type DiscoveredModelCatalogAttribution = S.Schema.Type<typeof DiscoveredModelCatalogAttribution>
-export type DiscoveredModelCatalogAttributionEncoded = S.Schema.Encoded<typeof DiscoveredModelCatalogAttribution>
+export type CustomModelCatalogAttribution = S.Schema.Type<typeof CustomModelCatalogAttribution>
+export type CustomModelCatalogAttributionEncoded = S.Schema.Encoded<typeof CustomModelCatalogAttribution>
 
-export const DiscoveredModelsResponse = S.Struct({
-  models: S.Array(S.suspend((): S.Schema<DiscoveredModel, DiscoveredModelEncoded> => DiscoveredModel)),
-  reconciliationComplete: S.Boolean,
-  revision: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+export const CustomModelFile = S.Struct({
+  path: S.String,
+  sizeBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
 })
-export type DiscoveredModelsResponse = S.Schema.Type<typeof DiscoveredModelsResponse>
-export type DiscoveredModelsResponseEncoded = S.Schema.Encoded<typeof DiscoveredModelsResponse>
+export type CustomModelFile = S.Schema.Type<typeof CustomModelFile>
+export type CustomModelFileEncoded = S.Schema.Encoded<typeof CustomModelFile>
 
-export const DiscoveredModelState = S.Union(
+export const CustomModelOrigin = S.Union(
+  S.extend(
+    S.TaggedStruct("Added", {
+      commit: S.String,
+      repository: S.suspend(
+        (): S.Schema<HuggingFaceRepositoryId, HuggingFaceRepositoryIdEncoded> => HuggingFaceRepositoryId,
+      ),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Found", {
+      source: S.suspend((): S.Schema<FoundSource, FoundSourceEncoded> => FoundSource),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type CustomModelOrigin = S.Schema.Type<typeof CustomModelOrigin>
+export type CustomModelOriginEncoded = S.Schema.Encoded<typeof CustomModelOrigin>
+
+export const CustomModelPart = S.Union(S.Literal("Drafter"), S.Literal("Update"))
+export type CustomModelPart = S.Schema.Type<typeof CustomModelPart>
+export type CustomModelPartEncoded = S.Schema.Encoded<typeof CustomModelPart>
+
+export const CustomModelState = S.Union(
+  S.extend(S.TaggedStruct("NotInstalled", {}), S.Record({ key: S.String, value: JsonValue })),
   S.extend(
     S.TaggedStruct("Ready", {
       catalogAttribution: S.suspend(
-        (): S.Schema<DiscoveredModelCatalogAttribution, DiscoveredModelCatalogAttributionEncoded> =>
-          DiscoveredModelCatalogAttribution,
+        (): S.Schema<CustomModelCatalogAttribution, CustomModelCatalogAttributionEncoded> =>
+          CustomModelCatalogAttribution,
       ),
       installation: S.suspend(
         (): S.Schema<ResolvedModelInstallation, ResolvedModelInstallationEncoded> => ResolvedModelInstallation,
@@ -856,8 +1179,14 @@ export const DiscoveredModelState = S.Union(
     S.Record({ key: S.String, value: JsonValue }),
   ),
 )
-export type DiscoveredModelState = S.Schema.Type<typeof DiscoveredModelState>
-export type DiscoveredModelStateEncoded = S.Schema.Encoded<typeof DiscoveredModelState>
+export type CustomModelState = S.Schema.Type<typeof CustomModelState>
+export type CustomModelStateEncoded = S.Schema.Encoded<typeof CustomModelState>
+
+export const DefaultGenerationSettings = S.Struct({
+  n_ctx: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type DefaultGenerationSettings = S.Schema.Type<typeof DefaultGenerationSettings>
+export type DefaultGenerationSettingsEncoded = S.Schema.Encoded<typeof DefaultGenerationSettings>
 
 export const DownloadFailure = S.Union(
   S.extend(S.TaggedStruct("Interrupted", {}), S.Record({ key: S.String, value: JsonValue })),
@@ -872,6 +1201,12 @@ export const DownloadFailure = S.Union(
   S.extend(S.TaggedStruct("NetworkUnavailable", {}), S.Record({ key: S.String, value: JsonValue })),
   S.extend(S.TaggedStruct("LocalStorageFailure", {}), S.Record({ key: S.String, value: JsonValue })),
   S.extend(S.TaggedStruct("CorruptDownload", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(
+    S.TaggedStruct("HuggingFaceAccessRequired", {
+      access: S.suspend((): S.Schema<HuggingFaceAccess, HuggingFaceAccessEncoded> => HuggingFaceAccess),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
   S.extend(
     S.TaggedStruct("Internal", {
       message: S.String,
@@ -892,6 +1227,146 @@ export const DownloadStage = S.Union(
 )
 export type DownloadStage = S.Schema.Type<typeof DownloadStage>
 export type DownloadStageEncoded = S.Schema.Encoded<typeof DownloadStage>
+
+export const DrafterAttachment = S.Struct({
+  drafter: S.suspend((): S.Schema<DrafterChoice, DrafterChoiceEncoded> => DrafterChoice),
+  modelId: S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
+})
+export type DrafterAttachment = S.Schema.Type<typeof DrafterAttachment>
+export type DrafterAttachmentEncoded = S.Schema.Encoded<typeof DrafterAttachment>
+
+export const DrafterCandidate = S.Struct({
+  automatic: S.Boolean,
+  category: S.suspend((): S.Schema<DrafterCategory, DrafterCategoryEncoded> => DrafterCategory),
+  label: S.String,
+  lineage: S.suspend((): S.Schema<DrafterLineage, DrafterLineageEncoded> => DrafterLineage),
+  method: S.optionalWith(
+    S.suspend((): S.Schema<SpeculativeMethod, SpeculativeMethodEncoded> => SpeculativeMethod),
+    { exact: true, as: "Option" },
+  ),
+  name: S.String,
+  onThisComputer: S.Boolean,
+  reference: S.suspend((): S.Schema<DrafterReference, DrafterReferenceEncoded> => DrafterReference),
+  sizeBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  verdict: S.suspend((): S.Schema<DrafterVerdict, DrafterVerdictEncoded> => DrafterVerdict),
+})
+export type DrafterCandidate = S.Schema.Type<typeof DrafterCandidate>
+export type DrafterCandidateEncoded = S.Schema.Encoded<typeof DrafterCandidate>
+
+export const DrafterCandidatesRequest = S.Union(
+  S.extend(
+    S.TaggedStruct("Candidate", {
+      candidate: S.suspend((): S.Schema<ModelCandidate, ModelCandidateEncoded> => ModelCandidate),
+      other: S.optionalWith(S.String, { exact: true, as: "Option" }),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Model", {
+      modelId: S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
+      other: S.optionalWith(S.String, { exact: true, as: "Option" }),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type DrafterCandidatesRequest = S.Schema.Type<typeof DrafterCandidatesRequest>
+export type DrafterCandidatesRequestEncoded = S.Schema.Encoded<typeof DrafterCandidatesRequest>
+
+export const DrafterCandidatesResponse = S.Struct({
+  candidates: S.Array(S.suspend((): S.Schema<DrafterCandidate, DrafterCandidateEncoded> => DrafterCandidate)),
+  entered: S.optionalWith(
+    S.suspend((): S.Schema<DrafterReference, DrafterReferenceEncoded> => DrafterReference),
+    { exact: true, as: "Option" },
+  ),
+})
+export type DrafterCandidatesResponse = S.Schema.Type<typeof DrafterCandidatesResponse>
+export type DrafterCandidatesResponseEncoded = S.Schema.Encoded<typeof DrafterCandidatesResponse>
+
+export const DrafterCategory = S.Union(
+  S.Literal("NextToModel"),
+  S.Literal("CatalogDrafter"),
+  S.Literal("BuiltIn"),
+  S.Literal("Other"),
+)
+export type DrafterCategory = S.Schema.Type<typeof DrafterCategory>
+export type DrafterCategoryEncoded = S.Schema.Encoded<typeof DrafterCategory>
+
+export const DrafterChoice = S.Union(
+  S.extend(S.TaggedStruct("Auto", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(S.TaggedStruct("None", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(
+    S.TaggedStruct("Reference", {
+      reference: S.suspend((): S.Schema<DrafterReference, DrafterReferenceEncoded> => DrafterReference),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type DrafterChoice = S.Schema.Type<typeof DrafterChoice>
+export type DrafterChoiceEncoded = S.Schema.Encoded<typeof DrafterChoice>
+
+export const DrafterLineage = S.Union(
+  S.Literal("Exact"),
+  S.Literal("Lineage"),
+  S.Literal("Fingerprint"),
+  S.Literal("None"),
+)
+export type DrafterLineage = S.Schema.Type<typeof DrafterLineage>
+export type DrafterLineageEncoded = S.Schema.Encoded<typeof DrafterLineage>
+
+export const DrafterPruning = S.Struct({
+  freedBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  removed: S.Array(S.suspend((): S.Schema<ModelPackageId, ModelPackageIdEncoded> => ModelPackageId)),
+})
+export type DrafterPruning = S.Schema.Type<typeof DrafterPruning>
+export type DrafterPruningEncoded = S.Schema.Encoded<typeof DrafterPruning>
+
+export const DrafterReference = S.Union(
+  S.extend(
+    S.TaggedStruct("Catalog", {
+      modelId: S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(S.TaggedStruct("Embedded", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(
+    S.TaggedStruct("HuggingFace", {
+      commit: S.String,
+      path: S.String,
+      repository: S.suspend(
+        (): S.Schema<HuggingFaceRepositoryId, HuggingFaceRepositoryIdEncoded> => HuggingFaceRepositoryId,
+      ),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Local", {
+      path: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type DrafterReference = S.Schema.Type<typeof DrafterReference>
+export type DrafterReferenceEncoded = S.Schema.Encoded<typeof DrafterReference>
+
+export const DrafterVerdict = S.Union(
+  S.extend(S.TaggedStruct("None", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(
+    S.TaggedStruct("Bound", {
+      memoryBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      method: S.suspend((): S.Schema<SpeculativeMethod, SpeculativeMethodEncoded> => SpeculativeMethod),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Rejected", {
+      detail: S.String,
+      reasons: S.Array(S.suspend((): S.Schema<UnsupportedReason, UnsupportedReasonEncoded> => UnsupportedReason)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type DrafterVerdict = S.Schema.Type<typeof DrafterVerdict>
+export type DrafterVerdictEncoded = S.Schema.Encoded<typeof DrafterVerdict>
 
 export const EffectiveModel = S.Union(
   S.extend(
@@ -946,6 +1421,21 @@ export type ErrorResponseEncoded = S.Schema.Encoded<typeof ErrorResponse>
 export const ExecutionBackend = S.Union(S.Literal("cpu"), S.Literal("metal"), S.Literal("cuda"), S.Literal("vulkan"))
 export type ExecutionBackend = S.Schema.Type<typeof ExecutionBackend>
 export type ExecutionBackendEncoded = S.Schema.Encoded<typeof ExecutionBackend>
+
+export const FoundSource = S.Union(
+  S.extend(S.TaggedStruct("HuggingFaceCache", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(S.TaggedStruct("LmStudio", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(S.TaggedStruct("LlamaCpp", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(S.TaggedStruct("Ollama", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(
+    S.TaggedStruct("Folder", {
+      path: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type FoundSource = S.Schema.Type<typeof FoundSource>
+export type FoundSourceEncoded = S.Schema.Encoded<typeof FoundSource>
 
 export const FunctionCallOutput = S.Union(
   S.String,
@@ -1033,23 +1523,29 @@ export const GrammarTriggerResponse = S.Union(
 export type GrammarTriggerResponse = S.Schema.Type<typeof GrammarTriggerResponse>
 export type GrammarTriggerResponseEncoded = S.Schema.Encoded<typeof GrammarTriggerResponse>
 
-export const HardwareDevice = S.Struct({
-  backend: S.suspend((): S.Schema<ExecutionBackend, ExecutionBackendEncoded> => ExecutionBackend),
-  description: S.String,
-  id: S.suspend((): S.Schema<HardwareDeviceId, HardwareDeviceIdEncoded> => HardwareDeviceId),
-  kind: S.suspend((): S.Schema<HardwareDeviceKind, HardwareDeviceKindEncoded> => HardwareDeviceKind),
-  memory_limit: S.optionalWith(
+export const HardwareAccessPath = S.Struct({
+  executor: S.suspend((): S.Schema<HardwareDeviceId, HardwareDeviceIdEncoded> => HardwareDeviceId),
+  grant: S.optionalWith(
     S.Union(
       S.Null,
-      S.suspend((): S.Schema<HardwareDeviceMemoryLimit, HardwareDeviceMemoryLimitEncoded> => HardwareDeviceMemoryLimit),
+      S.suspend((): S.Schema<HardwareGrant, HardwareGrantEncoded> => HardwareGrant),
     ),
     { exact: true, as: "Option" },
   ),
-  name: S.String,
-  unavailable_reason: S.optionalWith(S.String, { exact: true, as: "Option" }),
+  id: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  store: S.suspend((): S.Schema<MemoryDomainId, MemoryDomainIdEncoded> => MemoryDomainId),
 })
-export type HardwareDevice = S.Schema.Type<typeof HardwareDevice>
-export type HardwareDeviceEncoded = S.Schema.Encoded<typeof HardwareDevice>
+export type HardwareAccessPath = S.Schema.Type<typeof HardwareAccessPath>
+export type HardwareAccessPathEncoded = S.Schema.Encoded<typeof HardwareAccessPath>
+
+export const HardwareBackendDiagnostic = S.Struct({
+  message: S.String,
+  source: S.suspend(
+    (): S.Schema<HardwareDiagnosticSource, HardwareDiagnosticSourceEncoded> => HardwareDiagnosticSource,
+  ),
+})
+export type HardwareBackendDiagnostic = S.Schema.Type<typeof HardwareBackendDiagnostic>
+export type HardwareBackendDiagnosticEncoded = S.Schema.Encoded<typeof HardwareBackendDiagnostic>
 
 export const HardwareDeviceId = S.String
 export type HardwareDeviceId = S.Schema.Type<typeof HardwareDeviceId>
@@ -1065,79 +1561,197 @@ export const HardwareDeviceKind = S.Union(
 export type HardwareDeviceKind = S.Schema.Type<typeof HardwareDeviceKind>
 export type HardwareDeviceKindEncoded = S.Schema.Encoded<typeof HardwareDeviceKind>
 
-export const HardwareDeviceMemoryLimit = S.Struct({
+export const HardwareDeviceMemory = S.Struct({
   current_free_bytes: S.optionalWith(S.Union(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), S.Null), {
     exact: true,
     as: "Option",
   }),
-  kind: S.suspend(
-    (): S.Schema<HardwareDeviceMemoryLimitKind, HardwareDeviceMemoryLimitKindEncoded> => HardwareDeviceMemoryLimitKind,
+  physical_device_id: S.suspend(
+    (): S.Schema<HardwarePhysicalDeviceId, HardwarePhysicalDeviceIdEncoded> => HardwarePhysicalDeviceId,
   ),
-  stable_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  total_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  store: S.suspend((): S.Schema<HardwareStore, HardwareStoreEncoded> => HardwareStore),
 })
-export type HardwareDeviceMemoryLimit = S.Schema.Type<typeof HardwareDeviceMemoryLimit>
-export type HardwareDeviceMemoryLimitEncoded = S.Schema.Encoded<typeof HardwareDeviceMemoryLimit>
+export type HardwareDeviceMemory = S.Schema.Type<typeof HardwareDeviceMemory>
+export type HardwareDeviceMemoryEncoded = S.Schema.Encoded<typeof HardwareDeviceMemory>
 
-export const HardwareDeviceMemoryLimitKind = S.Literal("recommended_working_set")
-export type HardwareDeviceMemoryLimitKind = S.Schema.Type<typeof HardwareDeviceMemoryLimitKind>
-export type HardwareDeviceMemoryLimitKindEncoded = S.Schema.Encoded<typeof HardwareDeviceMemoryLimitKind>
+export const HardwareDiagnosticSource = S.Union(
+  S.extend(
+    S.Struct({
+      backend: S.suspend((): S.Schema<ExecutionBackend, ExecutionBackendEncoded> => ExecutionBackend),
+      type: S.Literal("backend"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      type: S.Literal("adapters"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type HardwareDiagnosticSource = S.Schema.Type<typeof HardwareDiagnosticSource>
+export type HardwareDiagnosticSourceEncoded = S.Schema.Encoded<typeof HardwareDiagnosticSource>
 
-export const HardwareMemoryDomain = S.Struct({
-  current_free_bytes: S.optionalWith(S.Union(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), S.Null), {
+export const HardwareExecutor = S.Struct({
+  availability: S.suspend(
+    (): S.Schema<HardwareExecutorAvailability, HardwareExecutorAvailabilityEncoded> => HardwareExecutorAvailability,
+  ),
+  backend: S.suspend((): S.Schema<ExecutionBackend, ExecutionBackendEncoded> => ExecutionBackend),
+  description: S.String,
+  device_placement: S.Array(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0))),
+  id: S.suspend((): S.Schema<HardwareDeviceId, HardwareDeviceIdEncoded> => HardwareDeviceId),
+  name: S.String,
+  upload_placement: S.Array(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0))),
+})
+export type HardwareExecutor = S.Schema.Type<typeof HardwareExecutor>
+export type HardwareExecutorEncoded = S.Schema.Encoded<typeof HardwareExecutor>
+
+export const HardwareExecutorAvailability = S.Union(
+  S.extend(
+    S.Struct({
+      stable_capacity_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      type: S.Literal("available"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      reason: S.String,
+      type: S.Literal("unavailable"),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type HardwareExecutorAvailability = S.Schema.Type<typeof HardwareExecutorAvailability>
+export type HardwareExecutorAvailabilityEncoded = S.Schema.Encoded<typeof HardwareExecutorAvailability>
+
+export const HardwareGrant = S.Struct({
+  basis: S.suspend((): S.Schema<HardwareReportedBy, HardwareReportedByEncoded> => HardwareReportedBy),
+  bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  remaining_bytes: S.optionalWith(S.Union(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), S.Null), {
     exact: true,
     as: "Option",
   }),
-  devices: S.Array(S.suspend((): S.Schema<HardwareDevice, HardwareDeviceEncoded> => HardwareDevice)),
-  id: S.suspend((): S.Schema<MemoryDomainId, MemoryDomainIdEncoded> => MemoryDomainId),
-  kind: S.suspend((): S.Schema<HardwareMemoryDomainKind, HardwareMemoryDomainKindEncoded> => HardwareMemoryDomainKind),
-  shares_system_memory: S.Boolean,
-  stable_capacity_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  total_capacity_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
 })
-export type HardwareMemoryDomain = S.Schema.Type<typeof HardwareMemoryDomain>
-export type HardwareMemoryDomainEncoded = S.Schema.Encoded<typeof HardwareMemoryDomain>
+export type HardwareGrant = S.Schema.Type<typeof HardwareGrant>
+export type HardwareGrantEncoded = S.Schema.Encoded<typeof HardwareGrant>
 
-export const HardwareMemoryDomainKind = S.Union(
-  S.Literal("system"),
-  S.Literal("physical_device"),
-  S.Literal("unified_memory"),
+export const HardwareHostRam = S.Struct({
+  current_free_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  store: S.suspend((): S.Schema<HardwareStore, HardwareStoreEncoded> => HardwareStore),
+})
+export type HardwareHostRam = S.Schema.Type<typeof HardwareHostRam>
+export type HardwareHostRamEncoded = S.Schema.Encoded<typeof HardwareHostRam>
+
+export const HardwarePhysicalDevice = S.Struct({
+  executors: S.Array(S.suspend((): S.Schema<HardwareExecutor, HardwareExecutorEncoded> => HardwareExecutor)),
+  id: S.suspend((): S.Schema<HardwarePhysicalDeviceId, HardwarePhysicalDeviceIdEncoded> => HardwarePhysicalDeviceId),
+  kind: S.suspend((): S.Schema<HardwareDeviceKind, HardwareDeviceKindEncoded> => HardwareDeviceKind),
+})
+export type HardwarePhysicalDevice = S.Schema.Type<typeof HardwarePhysicalDevice>
+export type HardwarePhysicalDeviceEncoded = S.Schema.Encoded<typeof HardwarePhysicalDevice>
+
+export const HardwarePhysicalDeviceId = S.String
+export type HardwarePhysicalDeviceId = S.Schema.Type<typeof HardwarePhysicalDeviceId>
+export type HardwarePhysicalDeviceIdEncoded = S.Schema.Encoded<typeof HardwarePhysicalDeviceId>
+
+export const HardwareReportedBy = S.Union(
+  S.Literal("linux_mem_total"),
+  S.Literal("mac_os_memsize"),
+  S.Literal("windows_total_phys"),
+  S.Literal("linux_mem_available"),
+  S.Literal("mach_movable_pages"),
+  S.Literal("mac_os_free_pages"),
+  S.Literal("windows_physical_and_commit"),
+  S.Literal("cpu_address_space"),
+  S.Literal("metal_max_buffer_length"),
+  S.Literal("metal_recommended_working_set"),
+  S.Literal("metal_working_set_unallocated"),
+  S.Literal("cuda_total_memory"),
+  S.Literal("cuda_usable_memory"),
+  S.Literal("cuda_free"),
+  S.Literal("vulkan_heap"),
+  S.Literal("vulkan_heap_budget"),
+  S.Literal("vulkan_heaps"),
+  S.Literal("vulkan_heaps_beyond_dedicated"),
+  S.Literal("vulkan_max_allocation"),
+  S.Literal("cuda_total_beyond_dedicated"),
+  S.Literal("metal_working_set_beyond_dedicated"),
+  S.Literal("dxgi_dedicated_memory"),
+  S.Literal("linux_sysfs_cache"),
+  S.Literal("mac_os_sysctl_cache"),
+  S.Literal("windows_processor_cache"),
+  S.Literal("cuda_l2_cache"),
+  S.Literal("filesystem_size"),
+  S.Literal("filesystem_available"),
 )
-export type HardwareMemoryDomainKind = S.Schema.Type<typeof HardwareMemoryDomainKind>
-export type HardwareMemoryDomainKindEncoded = S.Schema.Encoded<typeof HardwareMemoryDomainKind>
+export type HardwareReportedBy = S.Schema.Type<typeof HardwareReportedBy>
+export type HardwareReportedByEncoded = S.Schema.Encoded<typeof HardwareReportedBy>
 
 export const HardwareSnapshot = S.Struct({
+  access_paths: S.Array(S.suspend((): S.Schema<HardwareAccessPath, HardwareAccessPathEncoded> => HardwareAccessPath)),
   architecture: S.String,
+  backend_diagnostics: S.optionalWith(
+    S.Array(
+      S.suspend((): S.Schema<HardwareBackendDiagnostic, HardwareBackendDiagnosticEncoded> => HardwareBackendDiagnostic),
+    ),
+    { exact: true, as: "Option" },
+  ),
   captured_at: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   cpu_model: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
-  enabled_backends: S.Array(S.suspend((): S.Schema<ExecutionBackend, ExecutionBackendEncoded> => ExecutionBackend)),
-  logical_cores: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  memory_domains: S.Array(
-    S.suspend((): S.Schema<HardwareMemoryDomain, HardwareMemoryDomainEncoded> => HardwareMemoryDomain),
+  device_memory: S.Array(
+    S.suspend((): S.Schema<HardwareDeviceMemory, HardwareDeviceMemoryEncoded> => HardwareDeviceMemory),
   ),
+  host_ram: S.suspend((): S.Schema<HardwareHostRam, HardwareHostRamEncoded> => HardwareHostRam),
+  logical_cores: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   native_build: S.String,
   physical_cores: S.optionalWith(S.Union(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), S.Null), {
     exact: true,
     as: "Option",
   }),
+  physical_devices: S.Array(
+    S.suspend((): S.Schema<HardwarePhysicalDevice, HardwarePhysicalDeviceEncoded> => HardwarePhysicalDevice),
+  ),
   platform: S.String,
-  system_memory: S.suspend((): S.Schema<HardwareSystemMemory, HardwareSystemMemoryEncoded> => HardwareSystemMemory),
+  selected_executor: S.suspend((): S.Schema<HardwareDeviceId, HardwareDeviceIdEncoded> => HardwareDeviceId),
   system_product_name: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
   topology_fingerprint: S.String,
+  transfer_paths: S.Array(
+    S.suspend((): S.Schema<HardwareTransferPath, HardwareTransferPathEncoded> => HardwareTransferPath),
+  ),
+  volumes: S.Array(S.suspend((): S.Schema<HardwareVolume, HardwareVolumeEncoded> => HardwareVolume)),
 })
 export type HardwareSnapshot = S.Schema.Type<typeof HardwareSnapshot>
 export type HardwareSnapshotEncoded = S.Schema.Encoded<typeof HardwareSnapshot>
 
-export const HardwareSystemMemory = S.Struct({
-  abort_reserve_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+export const HardwareStore = S.Struct({
   allocation_capacity_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  allocation_headroom_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  assess_reserve_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  physical_available_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  physical_capacity_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  capacity_basis: S.suspend((): S.Schema<HardwareReportedBy, HardwareReportedByEncoded> => HardwareReportedBy),
+  id: S.suspend((): S.Schema<MemoryDomainId, MemoryDomainIdEncoded> => MemoryDomainId),
+  total_capacity_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
 })
-export type HardwareSystemMemory = S.Schema.Type<typeof HardwareSystemMemory>
-export type HardwareSystemMemoryEncoded = S.Schema.Encoded<typeof HardwareSystemMemory>
+export type HardwareStore = S.Schema.Type<typeof HardwareStore>
+export type HardwareStoreEncoded = S.Schema.Encoded<typeof HardwareStore>
+
+export const HardwareTransferPath = S.Struct({
+  executor: S.suspend((): S.Schema<HardwareDeviceId, HardwareDeviceIdEncoded> => HardwareDeviceId),
+  from: S.suspend((): S.Schema<MemoryDomainId, MemoryDomainIdEncoded> => MemoryDomainId),
+  to: S.suspend((): S.Schema<MemoryDomainId, MemoryDomainIdEncoded> => MemoryDomainId),
+})
+export type HardwareTransferPath = S.Schema.Type<typeof HardwareTransferPath>
+export type HardwareTransferPathEncoded = S.Schema.Encoded<typeof HardwareTransferPath>
+
+export const HardwareVolume = S.Struct({
+  current_free_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  roles: S.Array(S.suspend((): S.Schema<HardwareVolumeRole, HardwareVolumeRoleEncoded> => HardwareVolumeRole)),
+  store: S.suspend((): S.Schema<HardwareStore, HardwareStoreEncoded> => HardwareStore),
+})
+export type HardwareVolume = S.Schema.Type<typeof HardwareVolume>
+export type HardwareVolumeEncoded = S.Schema.Encoded<typeof HardwareVolume>
+
+export const HardwareVolumeRole = S.Union(S.Literal("model_store"), S.Literal("kernel_cache"))
+export type HardwareVolumeRole = S.Schema.Type<typeof HardwareVolumeRole>
+export type HardwareVolumeRoleEncoded = S.Schema.Encoded<typeof HardwareVolumeRole>
 
 export const HealthResponse = S.Struct({
   apiVersion: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
@@ -1150,7 +1764,39 @@ export const HealthResponse = S.Struct({
 export type HealthResponse = S.Schema.Type<typeof HealthResponse>
 export type HealthResponseEncoded = S.Schema.Encoded<typeof HealthResponse>
 
+export const HuggingFaceAccess = S.Union(S.Literal("SignIn"), S.Literal("AcceptTerms"))
+export type HuggingFaceAccess = S.Schema.Type<typeof HuggingFaceAccess>
+export type HuggingFaceAccessEncoded = S.Schema.Encoded<typeof HuggingFaceAccess>
+
+export const HuggingFaceArtifactSelector = S.String
+export type HuggingFaceArtifactSelector = S.Schema.Type<typeof HuggingFaceArtifactSelector>
+export type HuggingFaceArtifactSelectorEncoded = S.Schema.Encoded<typeof HuggingFaceArtifactSelector>
+
+export const HuggingFaceBaseRelation = S.Union(
+  S.Literal("quantized"),
+  S.Literal("finetune"),
+  S.Literal("merge"),
+  S.Literal("adapter"),
+  S.Literal("unknown"),
+)
+export type HuggingFaceBaseRelation = S.Schema.Type<typeof HuggingFaceBaseRelation>
+export type HuggingFaceBaseRelationEncoded = S.Schema.Encoded<typeof HuggingFaceBaseRelation>
+
+export const HuggingFaceCredential = S.Struct({
+  token: S.optionalWith(S.String, { exact: true, as: "Option" }),
+})
+export type HuggingFaceCredential = S.Schema.Type<typeof HuggingFaceCredential>
+export type HuggingFaceCredentialEncoded = S.Schema.Encoded<typeof HuggingFaceCredential>
+
+export const HuggingFaceModelBase = S.Struct({
+  relation: S.suspend((): S.Schema<HuggingFaceBaseRelation, HuggingFaceBaseRelationEncoded> => HuggingFaceBaseRelation),
+  repository: S.String,
+})
+export type HuggingFaceModelBase = S.Schema.Type<typeof HuggingFaceModelBase>
+export type HuggingFaceModelBaseEncoded = S.Schema.Encoded<typeof HuggingFaceModelBase>
+
 export const HuggingFaceModelSearchRequest = S.Struct({
+  cursor: S.optionalWith(S.String, { exact: true, as: "Option" }),
   limit: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   query: S.String,
 })
@@ -1158,26 +1804,31 @@ export type HuggingFaceModelSearchRequest = S.Schema.Type<typeof HuggingFaceMode
 export type HuggingFaceModelSearchRequestEncoded = S.Schema.Encoded<typeof HuggingFaceModelSearchRequest>
 
 export const HuggingFaceModelSearchResult = S.Struct({
+  architecture: S.optionalWith(S.String, { exact: true, as: "Option" }),
+  base: S.optionalWith(
+    S.suspend((): S.Schema<HuggingFaceModelBase, HuggingFaceModelBaseEncoded> => HuggingFaceModelBase),
+    { exact: true, as: "Option" },
+  ),
   commit: S.String,
-  downloads: S.optionalWith(S.Union(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), S.Null), {
-    exact: true,
-    as: "Option",
-  }),
+  developer: S.optionalWith(
+    S.suspend((): S.Schema<ModelDeveloper, ModelDeveloperEncoded> => ModelDeveloper),
+    { exact: true, as: "Option" },
+  ),
+  downloads: S.optionalWith(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), { exact: true, as: "Option" }),
   gated: S.Boolean,
-  last_modified: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
-  likes: S.optionalWith(S.Union(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), S.Null), {
-    exact: true,
-    as: "Option",
-  }),
+  lastModified: S.optionalWith(S.String, { exact: true, as: "Option" }),
+  likes: S.optionalWith(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), { exact: true, as: "Option" }),
   private: S.Boolean,
   repository: S.String,
   tags: S.Array(S.String),
+  versionCount: S.optionalWith(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1)), { exact: true, as: "Option" }),
 })
 export type HuggingFaceModelSearchResult = S.Schema.Type<typeof HuggingFaceModelSearchResult>
 export type HuggingFaceModelSearchResultEncoded = S.Schema.Encoded<typeof HuggingFaceModelSearchResult>
 
 export const HuggingFaceModelSearchResults = S.Struct({
-  models: S.Array(
+  nextCursor: S.optionalWith(S.String, { exact: true, as: "Option" }),
+  results: S.Array(
     S.suspend(
       (): S.Schema<HuggingFaceModelSearchResult, HuggingFaceModelSearchResultEncoded> => HuggingFaceModelSearchResult,
     ),
@@ -1186,13 +1837,68 @@ export const HuggingFaceModelSearchResults = S.Struct({
 export type HuggingFaceModelSearchResults = S.Schema.Type<typeof HuggingFaceModelSearchResults>
 export type HuggingFaceModelSearchResultsEncoded = S.Schema.Encoded<typeof HuggingFaceModelSearchResults>
 
+export const HuggingFaceRecommendedVersion = S.Struct({
+  assessment: S.suspend((): S.Schema<ModelAssessment, ModelAssessmentEncoded> => ModelAssessment),
+  downloadBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  label: S.String,
+  modelId: S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
+  sizeBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type HuggingFaceRecommendedVersion = S.Schema.Type<typeof HuggingFaceRecommendedVersion>
+export type HuggingFaceRecommendedVersionEncoded = S.Schema.Encoded<typeof HuggingFaceRecommendedVersion>
+
+export const HuggingFaceRepositoryCheck = S.Union(
+  S.extend(S.TaggedStruct("NotAModel", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(
+    S.TaggedStruct("Model", {
+      architecture: S.optionalWith(S.String, { exact: true, as: "Option" }),
+      base: S.optionalWith(
+        S.suspend((): S.Schema<HuggingFaceModelBase, HuggingFaceModelBaseEncoded> => HuggingFaceModelBase),
+        { exact: true, as: "Option" },
+      ),
+      developer: S.optionalWith(
+        S.suspend((): S.Schema<ModelDeveloper, ModelDeveloperEncoded> => ModelDeveloper),
+        { exact: true, as: "Option" },
+      ),
+      recommended: S.optionalWith(
+        S.suspend(
+          (): S.Schema<HuggingFaceRecommendedVersion, HuggingFaceRecommendedVersionEncoded> =>
+            HuggingFaceRecommendedVersion,
+        ),
+        { exact: true, as: "Option" },
+      ),
+      unsupported: S.Array(S.suspend((): S.Schema<UnsupportedReason, UnsupportedReasonEncoded> => UnsupportedReason)),
+      variantOf: S.optionalWith(
+        S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
+        { exact: true, as: "Option" },
+      ),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type HuggingFaceRepositoryCheck = S.Schema.Type<typeof HuggingFaceRepositoryCheck>
+export type HuggingFaceRepositoryCheckEncoded = S.Schema.Encoded<typeof HuggingFaceRepositoryCheck>
+
+export const HuggingFaceRepositoryCheckRequest = S.Struct({
+  architecture: S.optionalWith(S.String, { exact: true, as: "Option" }),
+  commit: S.String,
+  repository: S.String,
+  restricted: S.Boolean,
+})
+export type HuggingFaceRepositoryCheckRequest = S.Schema.Type<typeof HuggingFaceRepositoryCheckRequest>
+export type HuggingFaceRepositoryCheckRequestEncoded = S.Schema.Encoded<typeof HuggingFaceRepositoryCheckRequest>
+
 export const HuggingFaceRepositoryFile = S.Struct({
   content: S.suspend((): S.Schema<ContentIdentity, ContentIdentityEncoded> => ContentIdentity),
   path: S.String,
-  size_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  sizeBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
 })
 export type HuggingFaceRepositoryFile = S.Schema.Type<typeof HuggingFaceRepositoryFile>
 export type HuggingFaceRepositoryFileEncoded = S.Schema.Encoded<typeof HuggingFaceRepositoryFile>
+
+export const HuggingFaceRepositoryId = S.String
+export type HuggingFaceRepositoryId = S.Schema.Type<typeof HuggingFaceRepositoryId>
+export type HuggingFaceRepositoryIdEncoded = S.Schema.Encoded<typeof HuggingFaceRepositoryId>
 
 export const HuggingFaceRepositoryRequest = S.Struct({
   repository: S.String,
@@ -1202,23 +1908,17 @@ export type HuggingFaceRepositoryRequest = S.Schema.Type<typeof HuggingFaceRepos
 export type HuggingFaceRepositoryRequestEncoded = S.Schema.Encoded<typeof HuggingFaceRepositoryRequest>
 
 export const HuggingFaceRepositorySnapshot = S.Struct({
-  base_models: S.Array(S.String),
+  baseModels: S.Array(S.String),
   commit: S.String,
-  downloads: S.optionalWith(S.Union(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), S.Null), {
-    exact: true,
-    as: "Option",
-  }),
+  downloads: S.optionalWith(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), { exact: true, as: "Option" }),
   gated: S.Boolean,
-  gguf_files: S.Array(
+  ggufFiles: S.Array(
     S.suspend((): S.Schema<HuggingFaceRepositoryFile, HuggingFaceRepositoryFileEncoded> => HuggingFaceRepositoryFile),
   ),
-  last_modified: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
-  license: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
-  license_url: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
-  likes: S.optionalWith(S.Union(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), S.Null), {
-    exact: true,
-    as: "Option",
-  }),
+  lastModified: S.optionalWith(S.String, { exact: true, as: "Option" }),
+  license: S.optionalWith(S.String, { exact: true, as: "Option" }),
+  licenseUrl: S.optionalWith(S.String, { exact: true, as: "Option" }),
+  likes: S.optionalWith(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), { exact: true, as: "Option" }),
   private: S.Boolean,
   repository: S.String,
   tags: S.Array(S.String),
@@ -1228,9 +1928,6 @@ export type HuggingFaceRepositorySnapshotEncoded = S.Schema.Encoded<typeof Huggi
 
 export const IcnBinaryIdentity = S.Struct({
   api_version: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1)),
-  backends: S.Array(S.suspend((): S.Schema<ExecutionBackend, ExecutionBackendEncoded> => ExecutionBackend)).pipe(
-    S.minItems(1),
-  ),
   capabilities: S.Array(S.String).pipe(S.minItems(1)),
   native_build: S.String.pipe(S.minLength(1)),
   profile: S.String.pipe(S.minLength(1)),
@@ -1257,52 +1954,6 @@ export type IcnParentCommandEncoded = S.Schema.Encoded<typeof IcnParentCommand>
 export const IcnParentCommandType = S.Literal("shutdown")
 export type IcnParentCommandType = S.Schema.Type<typeof IcnParentCommandType>
 export type IcnParentCommandTypeEncoded = S.Schema.Encoded<typeof IcnParentCommandType>
-
-export const IcnStartupBackend = S.Union(
-  S.extend(
-    S.Struct({
-      hardwareLabel: S.String,
-      type: S.Literal("cpu"),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.Struct({
-      hardwareLabel: S.String,
-      type: S.Literal("metal"),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.Struct({
-      hardwareLabel: S.String,
-      type: S.Literal("cuda"),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(
-    S.Struct({
-      hardwareLabel: S.String,
-      type: S.Literal("vulkan"),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-)
-export type IcnStartupBackend = S.Schema.Type<typeof IcnStartupBackend>
-export type IcnStartupBackendEncoded = S.Schema.Encoded<typeof IcnStartupBackend>
-
-export const IcnStartupProgressRecord = S.Struct({
-  backend: S.suspend((): S.Schema<IcnStartupBackend, IcnStartupBackendEncoded> => IcnStartupBackend),
-  type: S.suspend(
-    (): S.Schema<IcnStartupProgressRecordType, IcnStartupProgressRecordTypeEncoded> => IcnStartupProgressRecordType,
-  ),
-})
-export type IcnStartupProgressRecord = S.Schema.Type<typeof IcnStartupProgressRecord>
-export type IcnStartupProgressRecordEncoded = S.Schema.Encoded<typeof IcnStartupProgressRecord>
-
-export const IcnStartupProgressRecordType = S.Literal("preparing_backend")
-export type IcnStartupProgressRecordType = S.Schema.Type<typeof IcnStartupProgressRecordType>
-export type IcnStartupProgressRecordTypeEncoded = S.Schema.Encoded<typeof IcnStartupProgressRecordType>
 
 export const IcnStartupRecord = S.Struct({
   apiVersion: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1)),
@@ -1368,9 +2019,10 @@ export type InferenceResourceInvalidationEncoded = S.Schema.Encoded<typeof Infer
 export const InferenceResourceTopic = S.Union(
   S.Literal("hardware"),
   S.Literal("catalog"),
-  S.Literal("discovery"),
+  S.Literal("local-models"),
   S.Literal("model-assessments"),
   S.Literal("catalog-installations"),
+  S.Literal("downloads"),
   S.Literal("instances"),
 )
 export type InferenceResourceTopic = S.Schema.Type<typeof InferenceResourceTopic>
@@ -1384,9 +2036,160 @@ export const JsonSchemaRequest = S.Struct({
 export type JsonSchemaRequest = S.Schema.Type<typeof JsonSchemaRequest>
 export type JsonSchemaRequestEncoded = S.Schema.Encoded<typeof JsonSchemaRequest>
 
+export const KernelStatic = S.Struct({
+  name: S.String,
+  value: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type KernelStatic = S.Schema.Type<typeof KernelStatic>
+export type KernelStaticEncoded = S.Schema.Encoded<typeof KernelStatic>
+
+export const KernelTuningOperation = S.Union(
+  S.Literal("discovery"),
+  S.Literal("form"),
+  S.Literal("measure"),
+  S.Literal("promote"),
+  S.Literal("confirm"),
+)
+export type KernelTuningOperation = S.Schema.Type<typeof KernelTuningOperation>
+export type KernelTuningOperationEncoded = S.Schema.Encoded<typeof KernelTuningOperation>
+
+export const KernelTuningWork = S.extend(
+  S.Struct({
+    entry: S.String,
+    operation: S.suspend((): S.Schema<KernelTuningOperation, KernelTuningOperationEncoded> => KernelTuningOperation),
+  }),
+  S.Record({ key: S.String, value: JsonValue }),
+)
+export type KernelTuningWork = S.Schema.Type<typeof KernelTuningWork>
+export type KernelTuningWorkEncoded = S.Schema.Encoded<typeof KernelTuningWork>
+
+export const KnownUnsupportedReason = S.Union(
+  S.extend(
+    S.TaggedStruct("Architecture", {
+      architecture: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("WeightTypes", {
+      types: S.Array(S.suspend((): S.Schema<WeightTypeCount, WeightTypeCountEncoded> => WeightTypeCount)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("RopeScaling", {
+      kind: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("UnrecognizedTensor", {
+      name: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("UnrecognizedMetadata", {
+      key: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("MissingMetadata", {
+      key: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Tokenizer", {
+      model: S.String,
+      pre: S.optionalWith(S.String, { exact: true, as: "Option" }),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(S.TaggedStruct("ChatTemplate", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(
+    S.TaggedStruct("KernelDomain", {
+      backend: S.String,
+      entry: S.String,
+      statics: S.Array(S.suspend((): S.Schema<KernelStatic, KernelStaticEncoded> => KernelStatic)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Backend", {
+      backend: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("TargetMismatch", {
+      detail: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(S.TaggedStruct("TiedOutputHead", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(
+    S.TaggedStruct("DraftArchitecture", {
+      architecture: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(S.TaggedStruct("Unreadable", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(S.TaggedStruct("UnsupportedFormat", {}), S.Record({ key: S.String, value: JsonValue })),
+)
+export type KnownUnsupportedReason = S.Schema.Type<typeof KnownUnsupportedReason>
+export type KnownUnsupportedReasonEncoded = S.Schema.Encoded<typeof KnownUnsupportedReason>
+
+export const LabId = S.String
+export type LabId = S.Schema.Type<typeof LabId>
+export type LabIdEncoded = S.Schema.Encoded<typeof LabId>
+
+export const LocalModelRemoval = S.Struct({
+  freedBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  modelId: S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
+  removed: S.Boolean,
+})
+export type LocalModelRemoval = S.Schema.Type<typeof LocalModelRemoval>
+export type LocalModelRemovalEncoded = S.Schema.Encoded<typeof LocalModelRemoval>
+
+export const LocalModelsConfiguration = S.Struct({
+  added: S.Array(S.suspend((): S.Schema<AddedModel, AddedModelEncoded> => AddedModel)),
+  drafters: S.Array(S.suspend((): S.Schema<DrafterAttachment, DrafterAttachmentEncoded> => DrafterAttachment)),
+  hidden: S.Array(S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId)),
+  roots: S.Array(S.suspend((): S.Schema<ModelRoot, ModelRootEncoded> => ModelRoot)),
+})
+export type LocalModelsConfiguration = S.Schema.Type<typeof LocalModelsConfiguration>
+export type LocalModelsConfigurationEncoded = S.Schema.Encoded<typeof LocalModelsConfiguration>
+
+export const LocalModelsResponse = S.Struct({
+  hidden: S.Array(S.suspend((): S.Schema<CustomModel, CustomModelEncoded> => CustomModel)),
+  models: S.Array(S.suspend((): S.Schema<CustomModel, CustomModelEncoded> => CustomModel)),
+  reconciliationComplete: S.Boolean,
+  revision: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  unsupported: S.Array(
+    S.suspend((): S.Schema<UnsupportedLocalModel, UnsupportedLocalModelEncoded> => UnsupportedLocalModel),
+  ),
+})
+export type LocalModelsResponse = S.Schema.Type<typeof LocalModelsResponse>
+export type LocalModelsResponseEncoded = S.Schema.Encoded<typeof LocalModelsResponse>
+
+export const MeasurementState = S.Union(
+  S.extend(S.TaggedStruct("Unmeasured", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(S.TaggedStruct("Measuring", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(S.TaggedStruct("Measured", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(
+    S.TaggedStruct("Failed", {
+      retryAt: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type MeasurementState = S.Schema.Type<typeof MeasurementState>
+export type MeasurementStateEncoded = S.Schema.Encoded<typeof MeasurementState>
+
 export const MemoryAssessment = S.Struct({
   capacityBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  compatibilityReserveBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   memoryDomainId: S.suspend((): S.Schema<MemoryDomainId, MemoryDomainIdEncoded> => MemoryDomainId),
   remainingBytes: S.Number.pipe(S.int()),
   requiredBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
@@ -1394,19 +2197,24 @@ export const MemoryAssessment = S.Struct({
 export type MemoryAssessment = S.Schema.Type<typeof MemoryAssessment>
 export type MemoryAssessmentEncoded = S.Schema.Encoded<typeof MemoryAssessment>
 
+export const MemoryBreakdown = S.Struct({
+  contextBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  overheadBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  weightsBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type MemoryBreakdown = S.Schema.Type<typeof MemoryBreakdown>
+export type MemoryBreakdownEncoded = S.Schema.Encoded<typeof MemoryBreakdown>
+
 export const MemoryDomainId = S.String
 export type MemoryDomainId = S.Schema.Type<typeof MemoryDomainId>
 export type MemoryDomainIdEncoded = S.Schema.Encoded<typeof MemoryDomainId>
 
-export const MemoryShortage = S.Union(
-  S.extend(
-    S.TaggedStruct("Blocked", {
-      availableBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-      requiredBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(S.TaggedStruct("UnderPressure", {}), S.Record({ key: S.String, value: JsonValue })),
+export const MemoryShortage = S.extend(
+  S.TaggedStruct("Blocked", {
+    availableBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    requiredBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  }),
+  S.Record({ key: S.String, value: JsonValue }),
 )
 export type MemoryShortage = S.Schema.Type<typeof MemoryShortage>
 export type MemoryShortageEncoded = S.Schema.Encoded<typeof MemoryShortage>
@@ -1489,11 +2297,14 @@ export const ModelAssessment = S.Union(
   S.extend(
     S.TaggedStruct("Fits", {
       assessmentId: S.suspend((): S.Schema<ModelAssessmentId, ModelAssessmentIdEncoded> => ModelAssessmentId),
+      drafter: S.suspend((): S.Schema<DrafterVerdict, DrafterVerdictEncoded> => DrafterVerdict),
       memory: S.Array(S.suspend((): S.Schema<MemoryAssessment, MemoryAssessmentEncoded> => MemoryAssessment)),
-      performance: S.Array(
-        S.suspend((): S.Schema<PerformanceEvidence, PerformanceEvidenceEncoded> => PerformanceEvidence),
-      ),
+      memoryBreakdown: S.suspend((): S.Schema<MemoryBreakdown, MemoryBreakdownEncoded> => MemoryBreakdown),
+      placement: S.suspend((): S.Schema<ModelPlacement, ModelPlacementEncoded> => ModelPlacement),
       profile: S.suspend((): S.Schema<ServingProfile, ServingProfileEncoded> => ServingProfile),
+      projector: S.suspend((): S.Schema<ProjectorVerdict, ProjectorVerdictEncoded> => ProjectorVerdict),
+      residency: S.suspend((): S.Schema<ModelResidency, ModelResidencyEncoded> => ModelResidency),
+      served: S.suspend((): S.Schema<ServingProfile, ServingProfileEncoded> => ServingProfile),
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
@@ -1501,16 +2312,23 @@ export const ModelAssessment = S.Union(
     S.TaggedStruct("DoesNotFit", {
       assessmentId: S.suspend((): S.Schema<ModelAssessmentId, ModelAssessmentIdEncoded> => ModelAssessmentId),
       deficitBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      drafter: S.suspend((): S.Schema<DrafterVerdict, DrafterVerdictEncoded> => DrafterVerdict),
       limitingResource: S.String,
       memory: S.Array(S.suspend((): S.Schema<MemoryAssessment, MemoryAssessmentEncoded> => MemoryAssessment)),
       profile: S.suspend((): S.Schema<ServingProfile, ServingProfileEncoded> => ServingProfile),
+      projector: S.suspend((): S.Schema<ProjectorVerdict, ProjectorVerdictEncoded> => ProjectorVerdict),
+      shortfall: S.suspend((): S.Schema<ServingProfile, ServingProfileEncoded> => ServingProfile),
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
   S.extend(
     S.TaggedStruct("Unsupported", {
-      failure: S.suspend((): S.Schema<ModelFailure, ModelFailureEncoded> => ModelFailure),
-      profile: S.suspend((): S.Schema<ServingProfile, ServingProfileEncoded> => ServingProfile),
+      detail: S.String,
+      profile: S.optionalWith(
+        S.suspend((): S.Schema<ServingProfile, ServingProfileEncoded> => ServingProfile),
+        { exact: true, as: "Option" },
+      ),
+      reasons: S.Array(S.suspend((): S.Schema<UnsupportedReason, UnsupportedReasonEncoded> => UnsupportedReason)),
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
@@ -1552,6 +2370,10 @@ export const ModelAssessmentEntryState = S.Union(
   S.extend(
     S.TaggedStruct("Assessed", {
       capabilities: S.suspend((): S.Schema<ModelCapabilities, ModelCapabilitiesEncoded> => ModelCapabilities),
+      fingerprint: S.optionalWith(
+        S.suspend((): S.Schema<ModelFingerprint, ModelFingerprintEncoded> => ModelFingerprint),
+        { exact: true, as: "Option" },
+      ),
       profiles: S.Array(S.suspend((): S.Schema<ModelAssessment, ModelAssessmentEncoded> => ModelAssessment)),
       templateFingerprint: S.String,
     }),
@@ -1570,12 +2392,13 @@ export const ModelAssessmentsSnapshot = S.Struct({
   catalog: S.suspend(
     (): S.Schema<ModelAssessmentDomainSnapshot, ModelAssessmentDomainSnapshotEncoded> => ModelAssessmentDomainSnapshot,
   ),
-  discovered: S.suspend(
+  custom: S.suspend(
     (): S.Schema<ModelAssessmentDomainSnapshot, ModelAssessmentDomainSnapshotEncoded> => ModelAssessmentDomainSnapshot,
   ),
   environmentId: S.suspend(
     (): S.Schema<AssessmentEnvironmentId, AssessmentEnvironmentIdEncoded> => AssessmentEnvironmentId,
   ),
+  measurement: S.suspend((): S.Schema<MeasurementState, MeasurementStateEncoded> => MeasurementState),
   revision: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
 })
 export type ModelAssessmentsSnapshot = S.Schema.Type<typeof ModelAssessmentsSnapshot>
@@ -1590,7 +2413,7 @@ export const ModelAssessmentSubject = S.Union(
     S.Record({ key: S.String, value: JsonValue }),
   ),
   S.extend(
-    S.TaggedStruct("Discovery", {
+    S.TaggedStruct("Custom", {
       modelId: S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
     }),
     S.Record({ key: S.String, value: JsonValue }),
@@ -1598,6 +2421,21 @@ export const ModelAssessmentSubject = S.Union(
 )
 export type ModelAssessmentSubject = S.Schema.Type<typeof ModelAssessmentSubject>
 export type ModelAssessmentSubjectEncoded = S.Schema.Encoded<typeof ModelAssessmentSubject>
+
+export const ModelCandidate = S.Struct({
+  drafter: S.optionalWith(
+    S.suspend((): S.Schema<CandidateDrafter, CandidateDrafterEncoded> => CandidateDrafter),
+    { exact: true, as: "Option" },
+  ),
+  projector: S.optionalWith(
+    S.suspend((): S.Schema<CandidateFile, CandidateFileEncoded> => CandidateFile),
+    { exact: true, as: "Option" },
+  ),
+  source: S.suspend((): S.Schema<CandidateSource, CandidateSourceEncoded> => CandidateSource),
+  target: S.Array(S.String),
+})
+export type ModelCandidate = S.Schema.Type<typeof ModelCandidate>
+export type ModelCandidateEncoded = S.Schema.Encoded<typeof ModelCandidate>
 
 export const ModelCapabilities = S.Struct({
   reasoning: S.suspend(
@@ -1610,6 +2448,77 @@ export const ModelCapabilities = S.Struct({
 export type ModelCapabilities = S.Schema.Type<typeof ModelCapabilities>
 export type ModelCapabilitiesEncoded = S.Schema.Encoded<typeof ModelCapabilities>
 
+export const ModelDeveloper = S.Struct({
+  country: S.String,
+  lab: S.suspend((): S.Schema<LabId, LabIdEncoded> => LabId),
+  name: S.String,
+})
+export type ModelDeveloper = S.Schema.Type<typeof ModelDeveloper>
+export type ModelDeveloperEncoded = S.Schema.Encoded<typeof ModelDeveloper>
+
+export const ModelDownload = S.Struct({
+  bundle: S.suspend((): S.Schema<ServableModelBundle, ServableModelBundleEncoded> => ServableModelBundle),
+  forModel: S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
+  id: S.suspend((): S.Schema<ModelDownloadId, ModelDownloadIdEncoded> => ModelDownloadId),
+  state: S.suspend((): S.Schema<ModelDownloadState, ModelDownloadStateEncoded> => ModelDownloadState),
+})
+export type ModelDownload = S.Schema.Type<typeof ModelDownload>
+export type ModelDownloadEncoded = S.Schema.Encoded<typeof ModelDownload>
+
+export const ModelDownloadId = S.String
+export type ModelDownloadId = S.Schema.Type<typeof ModelDownloadId>
+export type ModelDownloadIdEncoded = S.Schema.Encoded<typeof ModelDownloadId>
+
+export const ModelDownloadsResponse = S.extend(
+  S.Struct({
+    downloads: S.Array(S.suspend((): S.Schema<ModelDownload, ModelDownloadEncoded> => ModelDownload)),
+  }),
+  S.Record({ key: S.String, value: JsonValue }),
+)
+export type ModelDownloadsResponse = S.Schema.Type<typeof ModelDownloadsResponse>
+export type ModelDownloadsResponseEncoded = S.Schema.Encoded<typeof ModelDownloadsResponse>
+
+export const ModelDownloadState = S.Union(
+  S.extend(
+    S.TaggedStruct("Pending", {
+      completedBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      totalBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Downloading", {
+      bytesPerSecond: S.optionalWith(S.Union(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), S.Null), {
+        exact: true,
+        as: "Option",
+      }),
+      completedBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      stage: S.suspend((): S.Schema<DownloadStage, DownloadStageEncoded> => DownloadStage),
+      totalBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(S.TaggedStruct("Completed", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(
+    S.TaggedStruct("Failed", {
+      acknowledged: S.Boolean,
+      completedBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      failure: S.suspend((): S.Schema<DownloadFailure, DownloadFailureEncoded> => DownloadFailure),
+      totalBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Cancelled", {
+      completedBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      totalBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type ModelDownloadState = S.Schema.Type<typeof ModelDownloadState>
+export type ModelDownloadStateEncoded = S.Schema.Encoded<typeof ModelDownloadState>
+
 export const ModelFailure = S.Struct({
   code: S.String,
   message: S.String,
@@ -1617,6 +2526,96 @@ export const ModelFailure = S.Struct({
 })
 export type ModelFailure = S.Schema.Type<typeof ModelFailure>
 export type ModelFailureEncoded = S.Schema.Encoded<typeof ModelFailure>
+
+export const ModelFamily = S.Struct({
+  architectures: S.Array(S.String),
+  developer: S.suspend((): S.Schema<ModelDeveloper, ModelDeveloperEncoded> => ModelDeveloper),
+  name: S.String,
+  status: S.suspend((): S.Schema<ModelFamilyStatus, ModelFamilyStatusEncoded> => ModelFamilyStatus),
+})
+export type ModelFamily = S.Schema.Type<typeof ModelFamily>
+export type ModelFamilyEncoded = S.Schema.Encoded<typeof ModelFamily>
+
+export const ModelFamilyStatus = S.Union(S.Literal("Supported"), S.Literal("ComingSoon"))
+export type ModelFamilyStatus = S.Schema.Type<typeof ModelFamilyStatus>
+export type ModelFamilyStatusEncoded = S.Schema.Encoded<typeof ModelFamilyStatus>
+
+export const ModelFile = S.Struct({
+  id: S.suspend((): S.Schema<ModelFileId, ModelFileIdEncoded> => ModelFileId),
+  path: S.String,
+  role: S.suspend((): S.Schema<ModelFileRole, ModelFileRoleEncoded> => ModelFileRole),
+  sha256: S.String,
+  sizeBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  tensorStorageBytes: S.optionalWith(S.Union(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), S.Null), {
+    exact: true,
+    as: "Option",
+  }),
+})
+export type ModelFile = S.Schema.Type<typeof ModelFile>
+export type ModelFileEncoded = S.Schema.Encoded<typeof ModelFile>
+
+export const ModelFileId = S.String
+export type ModelFileId = S.Schema.Type<typeof ModelFileId>
+export type ModelFileIdEncoded = S.Schema.Encoded<typeof ModelFileId>
+
+export const ModelFileRelationship = S.Union(
+  S.extend(
+    S.TaggedStruct("Shard", {
+      count: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      fileId: S.suspend((): S.Schema<ModelFileId, ModelFileIdEncoded> => ModelFileId),
+      index: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("ProjectorFor", {
+      projectorFileId: S.suspend((): S.Schema<ModelFileId, ModelFileIdEncoded> => ModelFileId),
+      weightsFileId: S.suspend((): S.Schema<ModelFileId, ModelFileIdEncoded> => ModelFileId),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("MtpFor", {
+      mtpFileId: S.suspend((): S.Schema<ModelFileId, ModelFileIdEncoded> => ModelFileId),
+      weightsFileId: S.suspend((): S.Schema<ModelFileId, ModelFileIdEncoded> => ModelFileId),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("DraftFor", {
+      draftFileId: S.suspend((): S.Schema<ModelFileId, ModelFileIdEncoded> => ModelFileId),
+      method: S.suspend((): S.Schema<SpeculativeMethod, SpeculativeMethodEncoded> => SpeculativeMethod),
+      weightsFileId: S.suspend((): S.Schema<ModelFileId, ModelFileIdEncoded> => ModelFileId),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type ModelFileRelationship = S.Schema.Type<typeof ModelFileRelationship>
+export type ModelFileRelationshipEncoded = S.Schema.Encoded<typeof ModelFileRelationship>
+
+export const ModelFileRole = S.Union(
+  S.Literal("weights"),
+  S.Literal("projector"),
+  S.Literal("draft"),
+  S.Literal("mtp"),
+  S.Literal("auxiliary"),
+)
+export type ModelFileRole = S.Schema.Type<typeof ModelFileRole>
+export type ModelFileRoleEncoded = S.Schema.Encoded<typeof ModelFileRole>
+
+export const ModelFingerprint = S.Struct({
+  architecture: S.String,
+  blockCount: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  embeddingLength: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  expertCount: S.optionalWith(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), { exact: true, as: "Option" }),
+  headCount: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  headCountKv: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  keyLength: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  tokenizerDigest: S.String,
+  vocabSize: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type ModelFingerprint = S.Schema.Type<typeof ModelFingerprint>
+export type ModelFingerprintEncoded = S.Schema.Encoded<typeof ModelFingerprint>
 
 export const ModelId = S.String
 export type ModelId = S.Schema.Type<typeof ModelId>
@@ -1646,11 +2645,7 @@ export const ModelInstallation = S.Union(
 export type ModelInstallation = S.Schema.Type<typeof ModelInstallation>
 export type ModelInstallationEncoded = S.Schema.Encoded<typeof ModelInstallation>
 
-export const ModelInstallationOwnership = S.Union(
-  S.Literal("Magnitude"),
-  S.Literal("ExternalHuggingFace"),
-  S.Literal("Mixed"),
-)
+export const ModelInstallationOwnership = S.Union(S.Literal("Magnitude"), S.Literal("External"), S.Literal("Mixed"))
 export type ModelInstallationOwnership = S.Schema.Type<typeof ModelInstallationOwnership>
 export type ModelInstallationOwnershipEncoded = S.Schema.Encoded<typeof ModelInstallationOwnership>
 
@@ -1666,6 +2661,11 @@ export const ModelInstanceAllocation = S.Struct({
   contextWindowTokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   memoryDomains: S.Array(
     S.suspend((): S.Schema<ModelInstanceMemoryDomain, ModelInstanceMemoryDomainEncoded> => ModelInstanceMemoryDomain),
+  ),
+  promptGroupPlaces: S.suspend((): S.Schema<PromptGroupPlaces, PromptGroupPlacesEncoded> => PromptGroupPlaces),
+  streaming: S.optionalWith(
+    S.suspend((): S.Schema<ModelStreamingStatus, ModelStreamingStatusEncoded> => ModelStreamingStatus),
+    { exact: true, as: "Option" },
   ),
 })
 export type ModelInstanceAllocation = S.Schema.Type<typeof ModelInstanceAllocation>
@@ -1714,6 +2714,7 @@ export const ModelInstanceLifecycle = S.Union(
       allocation: S.suspend(
         (): S.Schema<ModelInstanceAllocation, ModelInstanceAllocationEncoded> => ModelInstanceAllocation,
       ),
+      device: S.suspend((): S.Schema<ModelLoadDevice, ModelLoadDeviceEncoded> => ModelLoadDevice),
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
@@ -1765,6 +2766,33 @@ export const ModelInstancesSnapshot = S.Struct({
 export type ModelInstancesSnapshot = S.Schema.Type<typeof ModelInstancesSnapshot>
 export type ModelInstancesSnapshotEncoded = S.Schema.Encoded<typeof ModelInstancesSnapshot>
 
+export const ModelLoadDetails = S.Union(
+  S.extend(
+    S.Struct({
+      budget_ms: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      elapsed_ms: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      formed_programs: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      kind: S.Literal("tuning"),
+      measured_configurations: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      work: S.optionalWith(
+        S.suspend((): S.Schema<KernelTuningWork, KernelTuningWorkEncoded> => KernelTuningWork),
+        { exact: true, as: "Option" },
+      ),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.Struct({
+      completed_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      kind: S.Literal("weights"),
+      total_bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type ModelLoadDetails = S.Schema.Type<typeof ModelLoadDetails>
+export type ModelLoadDetailsEncoded = S.Schema.Encoded<typeof ModelLoadDetails>
+
 export const ModelLoadDevice = S.Struct({
   backend: S.suspend((): S.Schema<ExecutionBackend, ExecutionBackendEncoded> => ExecutionBackend),
   id: S.suspend((): S.Schema<HardwareDeviceId, HardwareDeviceIdEncoded> => HardwareDeviceId),
@@ -1804,6 +2832,55 @@ export const ModelMetadata = S.Struct({
 export type ModelMetadata = S.Schema.Type<typeof ModelMetadata>
 export type ModelMetadataEncoded = S.Schema.Encoded<typeof ModelMetadata>
 
+export const ModelPackage = S.Struct({
+  files: S.Array(S.suspend((): S.Schema<ModelFile, ModelFileEncoded> => ModelFile)),
+  id: S.suspend((): S.Schema<ModelPackageId, ModelPackageIdEncoded> => ModelPackageId),
+  properties: S.suspend((): S.Schema<ModelPackageProperties, ModelPackagePropertiesEncoded> => ModelPackageProperties),
+  relationships: S.Array(
+    S.suspend((): S.Schema<ModelFileRelationship, ModelFileRelationshipEncoded> => ModelFileRelationship),
+  ),
+  source: S.suspend((): S.Schema<ModelPackageSource, ModelPackageSourceEncoded> => ModelPackageSource),
+})
+export type ModelPackage = S.Schema.Type<typeof ModelPackage>
+export type ModelPackageEncoded = S.Schema.Encoded<typeof ModelPackage>
+
+export const ModelPackageId = S.String
+export type ModelPackageId = S.Schema.Type<typeof ModelPackageId>
+export type ModelPackageIdEncoded = S.Schema.Encoded<typeof ModelPackageId>
+
+export const ModelPackageProperties = S.Struct({
+  architecture: S.String,
+  format: S.String,
+  intrinsicModelId: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
+  intrinsicQualityId: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
+  maximumContextLength: S.optionalWith(S.Union(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), S.Null), {
+    exact: true,
+    as: "Option",
+  }),
+  quantization: S.String,
+  quantizationName: S.String,
+})
+export type ModelPackageProperties = S.Schema.Type<typeof ModelPackageProperties>
+export type ModelPackagePropertiesEncoded = S.Schema.Encoded<typeof ModelPackageProperties>
+
+export const ModelPackageSource = S.Union(
+  S.extend(
+    S.TaggedStruct("HuggingFace", {
+      repository: S.String,
+      revision: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Local", {
+      path: S.String,
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type ModelPackageSource = S.Schema.Type<typeof ModelPackageSource>
+export type ModelPackageSourceEncoded = S.Schema.Encoded<typeof ModelPackageSource>
+
 export const ModelParameterization = S.Union(
   S.extend(
     S.Struct({
@@ -1823,6 +2900,33 @@ export const ModelParameterization = S.Union(
 )
 export type ModelParameterization = S.Schema.Type<typeof ModelParameterization>
 export type ModelParameterizationEncoded = S.Schema.Encoded<typeof ModelParameterization>
+
+export const ModelPerformance = S.Union(
+  S.extend(S.TaggedStruct("Pending", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(
+    S.TaggedStruct("Unavailable", {
+      failure: S.suspend((): S.Schema<ModelFailure, ModelFailureEncoded> => ModelFailure),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Estimated", {
+      samples: S.Array(S.suspend((): S.Schema<PerformanceEvidence, PerformanceEvidenceEncoded> => PerformanceEvidence)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type ModelPerformance = S.Schema.Type<typeof ModelPerformance>
+export type ModelPerformanceEncoded = S.Schema.Encoded<typeof ModelPerformance>
+
+export const ModelPlacement = S.Struct({
+  deviceBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  diskBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  hostBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  lookupDiskBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type ModelPlacement = S.Schema.Type<typeof ModelPlacement>
+export type ModelPlacementEncoded = S.Schema.Encoded<typeof ModelPlacement>
 
 export const ModelReasoningCapabilities = S.Struct({
   defaultEffort: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
@@ -1846,6 +2950,43 @@ export const ModelReleaseReason = S.Union(
 export type ModelReleaseReason = S.Schema.Type<typeof ModelReleaseReason>
 export type ModelReleaseReasonEncoded = S.Schema.Encoded<typeof ModelReleaseReason>
 
+export const ModelResidency = S.Union(
+  S.extend(
+    S.TaggedStruct("Resident", {
+      performance: S.suspend((): S.Schema<ModelPerformance, ModelPerformanceEncoded> => ModelPerformance),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Streamed", {
+      bank: S.suspend((): S.Schema<StreamedBank, StreamedBankEncoded> => StreamedBank),
+      floorPerformance: S.suspend((): S.Schema<ModelPerformance, ModelPerformanceEncoded> => ModelPerformance),
+      performance: S.suspend((): S.Schema<ModelPerformance, ModelPerformanceEncoded> => ModelPerformance),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type ModelResidency = S.Schema.Type<typeof ModelResidency>
+export type ModelResidencyEncoded = S.Schema.Encoded<typeof ModelResidency>
+
+export const ModelRoot = S.Struct({
+  enabled: S.Boolean,
+  kind: S.suspend((): S.Schema<ModelRootKind, ModelRootKindEncoded> => ModelRootKind),
+  path: S.String,
+})
+export type ModelRoot = S.Schema.Type<typeof ModelRoot>
+export type ModelRootEncoded = S.Schema.Encoded<typeof ModelRoot>
+
+export const ModelRootKind = S.Union(
+  S.Literal("HuggingFaceCache"),
+  S.Literal("LmStudio"),
+  S.Literal("LlamaCpp"),
+  S.Literal("Ollama"),
+  S.Literal("Folder"),
+)
+export type ModelRootKind = S.Schema.Type<typeof ModelRootKind>
+export type ModelRootKindEncoded = S.Schema.Encoded<typeof ModelRootKind>
+
 export const ModelStoppingAllocation = S.Union(
   S.extend(
     S.TaggedStruct("Planned", {
@@ -1867,6 +3008,26 @@ export const ModelStoppingAllocation = S.Union(
 )
 export type ModelStoppingAllocation = S.Schema.Type<typeof ModelStoppingAllocation>
 export type ModelStoppingAllocationEncoded = S.Schema.Encoded<typeof ModelStoppingAllocation>
+
+export const ModelStreamingStatus = S.Struct({
+  ceilingSlots: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  diskBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  experts: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1)),
+  floorSlots: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  host: S.optionalWith(
+    S.suspend((): S.Schema<StreamingHostStatus, StreamingHostStatusEncoded> => StreamingHostStatus),
+    { exact: true, as: "Option" },
+  ),
+  lastResize: S.optionalWith(
+    S.suspend((): S.Schema<StreamingResize, StreamingResizeEncoded> => StreamingResize),
+    { exact: true, as: "Option" },
+  ),
+  slots: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  tables: S.Array(S.suspend((): S.Schema<StreamingTableStatus, StreamingTableStatusEncoded> => StreamingTableStatus)),
+  tiers: S.Array(S.suspend((): S.Schema<StreamingTierStatus, StreamingTierStatusEncoded> => StreamingTierStatus)),
+})
+export type ModelStreamingStatus = S.Schema.Type<typeof ModelStreamingStatus>
+export type ModelStreamingStatusEncoded = S.Schema.Encoded<typeof ModelStreamingStatus>
 
 export const NamedFunctionCallRequest = S.Struct({
   arguments: S.String,
@@ -1962,6 +3123,27 @@ export const PerformanceEvidence = S.Struct({
 })
 export type PerformanceEvidence = S.Schema.Type<typeof PerformanceEvidence>
 export type PerformanceEvidenceEncoded = S.Schema.Encoded<typeof PerformanceEvidence>
+
+export const ProjectorVerdict = S.Union(
+  S.extend(S.TaggedStruct("None", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(S.TaggedStruct("Bound", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(
+    S.TaggedStruct("Rejected", {
+      detail: S.String,
+      reasons: S.Array(S.suspend((): S.Schema<UnsupportedReason, UnsupportedReasonEncoded> => UnsupportedReason)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type ProjectorVerdict = S.Schema.Type<typeof ProjectorVerdict>
+export type ProjectorVerdictEncoded = S.Schema.Encoded<typeof ProjectorVerdict>
+
+export const PromptGroupPlaces = S.Struct({
+  capacity: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1)),
+  held: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1)),
+})
+export type PromptGroupPlaces = S.Schema.Type<typeof PromptGroupPlaces>
+export type PromptGroupPlacesEncoded = S.Schema.Encoded<typeof PromptGroupPlaces>
 
 export const PromptTokensDetails = S.Struct({
   cached_tokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
@@ -2571,24 +3753,143 @@ export const Role = S.Union(S.Literal("system"), S.Literal("user"), S.Literal("a
 export type Role = S.Schema.Type<typeof Role>
 export type RoleEncoded = S.Schema.Encoded<typeof Role>
 
+export const ServableModelBundle = S.Union(
+  S.extend(
+    S.TaggedStruct("Standalone", {
+      package: S.suspend((): S.Schema<ModelPackage, ModelPackageEncoded> => ModelPackage),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("SpeculativeDecoding", {
+      draftSource: S.suspend(
+        (): S.Schema<SpeculativeDraftSource, SpeculativeDraftSourceEncoded> => SpeculativeDraftSource,
+      ),
+      method: S.suspend((): S.Schema<SpeculativeMethod, SpeculativeMethodEncoded> => SpeculativeMethod),
+      target: S.suspend((): S.Schema<ModelPackage, ModelPackageEncoded> => ModelPackage),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type ServableModelBundle = S.Schema.Type<typeof ServableModelBundle>
+export type ServableModelBundleEncoded = S.Schema.Encoded<typeof ServableModelBundle>
+
 export const ServingProfile = S.Struct({
   contextLength: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
 })
 export type ServingProfile = S.Schema.Type<typeof ServingProfile>
 export type ServingProfileEncoded = S.Schema.Encoded<typeof ServingProfile>
 
+export const SpeculativeDraftSource = S.Union(
+  S.extend(S.TaggedStruct("Embedded", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(
+    S.TaggedStruct("Separate", {
+      draft: S.suspend((): S.Schema<ModelPackage, ModelPackageEncoded> => ModelPackage),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type SpeculativeDraftSource = S.Schema.Type<typeof SpeculativeDraftSource>
+export type SpeculativeDraftSourceEncoded = S.Schema.Encoded<typeof SpeculativeDraftSource>
+
 export const SpeculativeMethod = S.Union(
   S.extend(S.TaggedStruct("Mtp", {}), S.Record({ key: S.String, value: JsonValue })),
   S.extend(S.TaggedStruct("DFlash", {}), S.Record({ key: S.String, value: JsonValue })),
   S.extend(S.TaggedStruct("DFlash2", {}), S.Record({ key: S.String, value: JsonValue })),
   S.extend(S.TaggedStruct("DSpark", {}), S.Record({ key: S.String, value: JsonValue })),
+  S.extend(S.TaggedStruct("LiLiCorr", {}), S.Record({ key: S.String, value: JsonValue })),
 )
 export type SpeculativeMethod = S.Schema.Type<typeof SpeculativeMethod>
 export type SpeculativeMethodEncoded = S.Schema.Encoded<typeof SpeculativeMethod>
 
+export const StartModelDownloadRequest = S.Struct({
+  modelId: S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
+  part: S.optionalWith(
+    S.suspend((): S.Schema<CustomModelPart, CustomModelPartEncoded> => CustomModelPart),
+    { exact: true, as: "Option" },
+  ),
+})
+export type StartModelDownloadRequest = S.Schema.Type<typeof StartModelDownloadRequest>
+export type StartModelDownloadRequestEncoded = S.Schema.Encoded<typeof StartModelDownloadRequest>
+
+export const StartModelDownloadResponse = S.extend(
+  S.Struct({
+    download: S.optionalWith(
+      S.suspend((): S.Schema<ModelDownload, ModelDownloadEncoded> => ModelDownload),
+      { exact: true, as: "Option" },
+    ),
+  }),
+  S.Record({ key: S.String, value: JsonValue }),
+)
+export type StartModelDownloadResponse = S.Schema.Type<typeof StartModelDownloadResponse>
+export type StartModelDownloadResponseEncoded = S.Schema.Encoded<typeof StartModelDownloadResponse>
+
 export const StopRequest = S.Union(S.String, S.Array(S.String))
 export type StopRequest = S.Schema.Type<typeof StopRequest>
 export type StopRequestEncoded = S.Schema.Encoded<typeof StopRequest>
+
+export const StreamedBank = S.Struct({
+  coldExperts: S.suspend((): S.Schema<ColdExperts, ColdExpertsEncoded> => ColdExperts),
+  experts: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1)),
+  floorSlots: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  slots: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type StreamedBank = S.Schema.Type<typeof StreamedBank>
+export type StreamedBankEncoded = S.Schema.Encoded<typeof StreamedBank>
+
+export const StreamingHostStatus = S.Struct({
+  bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  ceilingSlots: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  lastResize: S.optionalWith(
+    S.suspend((): S.Schema<StreamingResize, StreamingResizeEncoded> => StreamingResize),
+    { exact: true, as: "Option" },
+  ),
+  memoryDomainId: S.suspend((): S.Schema<MemoryDomainId, MemoryDomainIdEncoded> => MemoryDomainId),
+  slots: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type StreamingHostStatus = S.Schema.Type<typeof StreamingHostStatus>
+export type StreamingHostStatusEncoded = S.Schema.Encoded<typeof StreamingHostStatus>
+
+export const StreamingResize = S.Union(
+  S.extend(
+    S.TaggedStruct("Shrank", {
+      atUnixMs: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      by: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1)),
+      to: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+  S.extend(
+    S.TaggedStruct("Grew", {
+      atUnixMs: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+      by: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1)),
+      from: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+    }),
+    S.Record({ key: S.String, value: JsonValue }),
+  ),
+)
+export type StreamingResize = S.Schema.Type<typeof StreamingResize>
+export type StreamingResizeEncoded = S.Schema.Encoded<typeof StreamingResize>
+
+export const StreamingTableStatus = S.Struct({
+  bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  ceilingRecords: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1)),
+  floorRecords: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  lastResize: S.optionalWith(
+    S.suspend((): S.Schema<StreamingResize, StreamingResizeEncoded> => StreamingResize),
+    { exact: true, as: "Option" },
+  ),
+  records: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type StreamingTableStatus = S.Schema.Type<typeof StreamingTableStatus>
+export type StreamingTableStatusEncoded = S.Schema.Encoded<typeof StreamingTableStatus>
+
+export const StreamingTierStatus = S.Struct({
+  bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  memoryDomainId: S.suspend((): S.Schema<MemoryDomainId, MemoryDomainIdEncoded> => MemoryDomainId),
+})
+export type StreamingTierStatus = S.Schema.Type<typeof StreamingTierStatus>
+export type StreamingTierStatusEncoded = S.Schema.Encoded<typeof StreamingTierStatus>
 
 export const StreamOptions = S.Struct({
   include_usage: S.optionalWith(S.Boolean, { exact: true, as: "Option" }),
@@ -2720,6 +4021,35 @@ export const ToolResultContent = S.Union(
 export type ToolResultContent = S.Schema.Type<typeof ToolResultContent>
 export type ToolResultContentEncoded = S.Schema.Encoded<typeof ToolResultContent>
 
+export const UnrecognizedUnsupportedReason = S.extend(
+  S.Struct({
+    _tag: S.String,
+    detail: S.optionalWith(S.String, { exact: true, as: "Option" }),
+  }),
+  S.Record({ key: S.String, value: JsonValue }),
+)
+export type UnrecognizedUnsupportedReason = S.Schema.Type<typeof UnrecognizedUnsupportedReason>
+export type UnrecognizedUnsupportedReasonEncoded = S.Schema.Encoded<typeof UnrecognizedUnsupportedReason>
+
+export const UnsupportedLocalModel = S.Struct({
+  detail: S.String,
+  displayName: S.String,
+  origin: S.suspend((): S.Schema<CustomModelOrigin, CustomModelOriginEncoded> => CustomModelOrigin),
+  path: S.String,
+  reasons: S.Array(S.suspend((): S.Schema<UnsupportedReason, UnsupportedReasonEncoded> => UnsupportedReason)),
+})
+export type UnsupportedLocalModel = S.Schema.Type<typeof UnsupportedLocalModel>
+export type UnsupportedLocalModelEncoded = S.Schema.Encoded<typeof UnsupportedLocalModel>
+
+export const UnsupportedReason = S.Union(
+  S.suspend((): S.Schema<KnownUnsupportedReason, KnownUnsupportedReasonEncoded> => KnownUnsupportedReason),
+  S.suspend(
+    (): S.Schema<UnrecognizedUnsupportedReason, UnrecognizedUnsupportedReasonEncoded> => UnrecognizedUnsupportedReason,
+  ),
+)
+export type UnsupportedReason = S.Schema.Type<typeof UnsupportedReason>
+export type UnsupportedReasonEncoded = S.Schema.Encoded<typeof UnsupportedReason>
+
 export const Usage = S.Struct({
   completion_tokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   prompt_tokens: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
@@ -2746,3 +4076,10 @@ export type UsageResponseEncoded = S.Schema.Encoded<typeof UsageResponse>
 export const Value = JsonValue
 export type Value = S.Schema.Type<typeof Value>
 export type ValueEncoded = S.Schema.Encoded<typeof Value>
+
+export const WeightTypeCount = S.Struct({
+  ggmlType: S.String,
+  tensorCount: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type WeightTypeCount = S.Schema.Type<typeof WeightTypeCount>
+export type WeightTypeCountEncoded = S.Schema.Encoded<typeof WeightTypeCount>

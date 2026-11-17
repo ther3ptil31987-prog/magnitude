@@ -3,6 +3,9 @@
 mod acceptance;
 mod controls;
 mod dflash;
+mod draft_budget;
+mod draft_control;
+mod draft_transition;
 mod method;
 mod mtp;
 mod plain;
@@ -11,9 +14,16 @@ mod shaping;
 pub use acceptance::accept_prefix;
 pub use controls::{EndOfGeneration, ReasoningBudget};
 pub use dflash::DFlash;
+pub use draft_budget::{DraftBudget, DraftPolicy};
+pub use draft_control::{
+    DraftController, DraftLoad, DraftOutlook, RoundChoice, TimedLaunch, share_rows,
+};
+pub use draft_transition::{
+    CATCH_UP_ROWS, DraftHeadCall, DraftHistory, DraftRoundState, DraftTargetTransition,
+};
 pub use magnitude_artifacts::{BoundaryRule, InputLayout, InputSpan};
 pub use magnitude_executor::{
-    Demand, FeatureReader, FeatureRef, Operation, Priming, RequestId, Sampling, SelectSpec,
+    Demand, FeatureReader, FeatureRef, LaunchDuration, Operation, Priming, RequestId, Sampling, SelectSpec,
     Shaping, TokenId, WorkKind,
 };
 pub use method::{
@@ -275,6 +285,7 @@ pub struct Generation {
     accepted_position: usize,
     reconciliation_target: usize,
     resident: bool,
+    reusable_prefixes: bool,
     finish: Option<FinishReason>,
     method_factory: Arc<dyn Method>,
     method: Box<dyn MethodState>,
@@ -315,7 +326,7 @@ impl Generation {
         let GenerationSeed {
             prompt,
             layout,
-            options,
+            mut options,
             constraint,
         } = seed;
         if method_factory.identity().is_empty()
@@ -323,8 +334,19 @@ impl Generation {
         {
             return Err("generation method factory does not match request policy".into());
         }
+        // Media rows enter the target from the projector under placeholder
+        // tokens. A drafter reading the target's history sees them through
+        // the target; one embedding every prompt token cannot enter them, so
+        // such a request generates without drafting.
+        let method_factory: Arc<dyn Method> = if method_factory.embeds_prompt_tokens()
+            && layout.spans().iter().any(|span| !span.language_history)
+        {
+            options.method = MethodChoice::Plain;
+            Arc::new(Plain)
+        } else {
+            method_factory
+        };
         let finish = (options.max_tokens == 0).then_some(FinishReason::Length);
-        let method = method_factory.create(None)?;
         let constraint = controls::Controlled::compose(
             constraint,
             options.end_of_generation,
@@ -333,6 +355,7 @@ impl Generation {
             options.reasoning_budget.as_ref(),
             options.vocabulary,
         )?;
+        let method = method_factory.create(None)?;
         Ok(Self {
             prompt,
             layout,
@@ -345,6 +368,7 @@ impl Generation {
             accepted_position: 0,
             reconciliation_target: 0,
             resident: false,
+            reusable_prefixes: true,
             finish,
             method_factory,
             method,
@@ -363,6 +387,12 @@ impl Generation {
     }
     pub fn accepted_position(&self) -> usize {
         self.accepted_position
+    }
+    /// The numerical position the accepted path reconciles to: every accepted
+    /// token except a successor sampled from the last context row, which no
+    /// later row reads.
+    pub fn reconciled_position(&self) -> usize {
+        self.accepted_position.min(self.options.context_limit)
     }
     pub fn causal_progress(&self) -> CausalProgress {
         CausalProgress {
@@ -388,6 +418,11 @@ impl Generation {
             draft_n_accepted: self.draft_stats.accepted,
         }
     }
+    /// The method this request generates under: the load's, or plain for a
+    /// request whose media rows its drafter cannot enter.
+    pub fn method_choice(&self) -> MethodChoice {
+        self.options.method
+    }
     pub fn method_identity(&self) -> &str {
         self.method_factory.identity()
     }
@@ -397,8 +432,29 @@ impl Generation {
     pub fn method_reclaimable(&self) -> u64 {
         self.method.reclaimable()
     }
+    /// Declare before residency whether another request may reuse an intermediate
+    /// prefix. Reusable histories must be complete at every boundary: a peer can
+    /// introduce a branch point after this request has begun prefilling.
+    pub fn set_prefix_reuse(&mut self, reusable: bool) -> Result<(), String> {
+        if self.resident || self.resident_position != 0 || !self.generated.is_empty() {
+            return Err("prefix reuse must be declared before generation starts".into());
+        }
+        self.reusable_prefixes = reusable;
+        Ok(())
+    }
+
+    fn priming_horizon(&self, boundary: usize) -> usize {
+        if self.reusable_prefixes {
+            boundary
+        } else {
+            self.prompt.len() + self.generated.len()
+        }
+    }
     /// Export owned method state for prefix retention.
     pub fn method_checkpoint(&self) -> Result<MethodCheckpoint, String> {
+        if !self.reusable_prefixes {
+            return Err("request does not retain reusable prefixes".into());
+        }
         if !self.resident {
             return Err("method checkpoint requires resident state".into());
         }
@@ -502,9 +558,14 @@ impl Generation {
         }
         let position = self.resident_position;
         if position < self.reconciliation_target {
-            let end = self
-                .layout
-                .chunk_end(position, self.reconciliation_target, allowance)?;
+            // A replay from inside the prompt ends at the prompt end: the executor admits
+            // target rows only within, or wholly past, the prepared input.
+            let target = if position < self.prompt.len() {
+                self.reconciliation_target.min(self.prompt.len())
+            } else {
+                self.reconciliation_target
+            };
+            let end = self.layout.chunk_end(position, target, allowance)?;
             return Ok(RoundPlan::Replay { end });
         }
         if position < self.prompt.len() {
@@ -593,7 +654,13 @@ impl Generation {
                     .iter()
                     .take_while(|token| !self.options.stop_tokens.contains(token))
                     .copied()
-                    .collect();
+                    .collect::<Vec<_>>();
+                // A round that verifies nothing publishes its feature only
+                // where its method reads it.
+                let verify_demand = match proposal.is_empty() && !self.method.taps() {
+                    true => Demand::NONE,
+                    false => requirements.verify_demand,
+                };
                 RoundState::verification(
                     *self.generated.last().unwrap(),
                     proposal,
@@ -604,7 +671,7 @@ impl Generation {
                     self.options.sampling,
                     self.options.shaping,
                     self.options.seed,
-                    requirements,
+                    verify_demand,
                 )?
             }
         };
@@ -622,14 +689,20 @@ impl Generation {
         drafter: Option<usize>,
     ) -> Result<RoundState, String> {
         let requirements = self.method_factory.requires();
+        let successor_dependent = self.method_factory.priming_requires_successor();
         let prime = drafter
             .filter(|_| requirements.head && requirements.prefill_demand.contains(Demand::FEATURES))
             .map(|drafter| Priming {
-                tokens: self.prompt[position + 1..(end + 1).min(self.prompt.len())].to_vec(),
+                tokens: if successor_dependent {
+                    self.prompt[drafter + 1..end].to_vec()
+                } else {
+                    self.prompt[position + 1..(end + 1).min(self.prompt.len())].to_vec()
+                },
+                boundary: successor_dependent,
                 position: drafter,
-                draft_from: self.prompt.len() + self.generated.len(),
+                draft_from: self.priming_horizon(end),
             })
-            .filter(|prime| !prime.tokens.is_empty());
+            .filter(|prime| prime.boundary || !prime.tokens.is_empty());
         let finishing = end == self.prompt.len();
         let tokens = self.prompt[position..end].to_vec();
         let forced = if finishing {
@@ -661,33 +734,37 @@ impl Generation {
         &self,
         forward: &RoundForward,
         request: RequestId,
-        allowance: usize,
-    ) -> Result<Option<Operation>, String> {
+        chunk_rows: usize,
+        stop: Option<usize>,
+        chunks: usize,
+    ) -> Result<Vec<Operation>, String> {
         if forward.kind != WorkKind::Prefill
             || !forward.selects.is_empty()
             || forward.committed != forward.tokens.len()
             || !self.layout.spans().is_empty()
             || self.finish.is_some()
-            || allowance == 0
         {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         let position = self.resident_position + forward.tokens.len();
-        if position < self.reconciliation_target || position >= self.prompt.len() {
-            return Ok(None);
+        if position < self.reconciliation_target {
+            return Ok(Vec::new());
         }
-        let drafter = forward
+        let mut drafter = forward
             .prime
             .as_ref()
             .map(|prime| prime.position + prime.tokens.len());
-        let end = self
-            .layout
-            .chunk_end(position, self.prompt.len(), allowance)?;
-        self.prefill_round(position, end, drafter)?
-            .forward()
-            .clone()
-            .into_operation(request, position, None)
-            .map(Some)
+        // The last chunk ends the prompt, the one that selects.
+        let mut planned = Vec::new();
+        for chunk in self.layout.group_chunks(position, chunk_rows, stop, chunks)? {
+            let next = self.prefill_round(chunk.start, chunk.end, drafter)?.forward().clone();
+            drafter = next
+                .prime
+                .as_ref()
+                .map(|prime| prime.position + prime.tokens.len());
+            planned.push(next.into_operation(request, chunk.start, None)?);
+        }
+        Ok(planned)
     }
 
     /// One selection per proposal, keyed like the target's selection of the
@@ -729,13 +806,11 @@ impl Generation {
     /// commits the input row that produced a successor, not the successor row
     /// itself. This fact is independent of why a checkpoint is requested.
     pub fn pending_reconciliation(&self) -> Option<PendingReconciliation> {
-        let progress = self.causal_progress();
-        (self.resident && progress.resident_position < progress.accepted_position).then_some(
-            PendingReconciliation {
-                start: progress.resident_position,
-                end: progress.accepted_position,
-            },
-        )
+        let end = self.reconciled_position();
+        (self.resident && self.resident_position < end).then_some(PendingReconciliation {
+            start: self.resident_position,
+            end,
+        })
     }
 
     /// Advance accepted successors without selecting or publishing another
@@ -836,7 +911,7 @@ impl Generation {
         else {
             return Err("only a head transaction reconciles into method state".into());
         };
-        if let magnitude_executor::Outcome::Head { proposals } = outcome {
+        if let magnitude_executor::Outcome::Head { proposals, .. } = outcome {
             if proposals.iter().any(|selected| {
                 selected.status > 2
                     || (selected.status == 0
@@ -857,6 +932,26 @@ impl Generation {
                 accepted_rows: tokens.len(),
             },
         })
+    }
+
+    /// A launch carrying this request's work finished in `duration`: `rows`
+    /// rows of `sequences` requests. Call it before the launch's outcome is
+    /// reconciled.
+    pub fn timed(
+        &mut self,
+        launch: TimedLaunch,
+        duration: Option<LaunchDuration>,
+        sequences: usize,
+        rows: usize,
+    ) {
+        self.method.timed(launch, duration, sequences, rows);
+    }
+
+    /// The drafted block this request's next target round verifies, when
+    /// its method chooses how much of it to verify. Requests sharing a
+    /// launch share its rows by these ([`share_rows`]).
+    pub fn draft_outlook(&self) -> Option<DraftOutlook> {
+        self.method.outlook()
     }
 
     pub fn commit_method_transition(&mut self, transition: PreparedMethodTransition) {
@@ -932,31 +1027,22 @@ impl Generation {
         let effects = match acceptance.method_update {
             MethodUpdate::None => MethodEffects::default(),
             MethodUpdate::Prime => {
-                if self
-                    .method_factory
-                    .requires()
-                    .prefill_demand
-                    .contains(Demand::FEATURES)
-                    && features.is_none()
-                {
-                    return Err("prefill method requires target features".into());
+                if round.forward().demand.contains(Demand::FEATURES) && features.is_none() {
+                    return Err("prompt chunk demanded target features it did not return".into());
                 }
-                match features {
-                    Some(features) => method.prime(
-                        request,
-                        &acceptance.inputs,
-                        acceptance.emitted.first().copied(),
-                        features,
-                        self.prompt.len() + self.generated.len(),
-                        round
-                            .forward()
-                            .prime
-                            .as_ref()
-                            .map_or(0, |prime| prime.tokens.len()),
-                        reader,
-                    )?,
-                    None => MethodEffects::default(),
-                }
+                method.prime(
+                    request,
+                    &acceptance.inputs,
+                    acceptance.emitted.first().copied(),
+                    features,
+                    self.priming_horizon(self.resident_position + acceptance.committed_rows),
+                    round
+                        .forward()
+                        .prime
+                        .as_ref()
+                        .map(|prime| prime.tokens.len()),
+                    reader,
+                )?
             }
             MethodUpdate::Observe => {
                 let next = *acceptance
@@ -1152,25 +1238,47 @@ impl StartedRound {
         &self.generation
     }
 
+    /// See [`Generation::timed`].
+    pub fn timed(
+        &mut self,
+        launch: TimedLaunch,
+        duration: Option<LaunchDuration>,
+        sequences: usize,
+        rows: usize,
+    ) {
+        self.generation.timed(launch, duration, sequences, rows);
+    }
+
     pub fn round_forward(&self) -> &RoundForward {
         self.round.forward()
+    }
+
+    /// Whether the decode queued behind this round's target step publishes
+    /// its feature (`MethodState::publishes_behind`).
+    pub fn publishes_behind(&self) -> bool {
+        self.generation.method.publishes_behind()
     }
 
     pub fn round_publication_bound(&self) -> usize {
         self.round.publication_bound()
     }
 
-    /// The prompt chunk of at most `allowance` rows that follows this round
-    /// once it commits, when that is known now: the round is a prompt chunk
-    /// that selects nothing, and the prompt is plain text (a conditioned
-    /// span's rows need its encoding).
+    /// The prompt chunks that follow this round once it commits, when they
+    /// are known now: the round is a prompt chunk that selects nothing, and
+    /// the prompt is plain text (a conditioned span's rows need its
+    /// encoding). At most `chunks` of them, each of at most `chunk_rows` rows
+    /// and none past `stop`: the chunks a lookahead or a chain queues behind
+    /// it. Each chunk's drafter entry follows the one before it; planning
+    /// ends with the chunk that selects the first token.
     pub fn planned_prefill(
         &self,
         request: RequestId,
-        allowance: usize,
-    ) -> Result<Option<Operation>, String> {
+        chunk_rows: usize,
+        stop: Option<usize>,
+        chunks: usize,
+    ) -> Result<Vec<Operation>, String> {
         self.generation
-            .planned_prefill(self.round.forward(), request, allowance)
+            .planned_prefill(self.round.forward(), request, chunk_rows, stop, chunks)
     }
 
     /// Prepare acceptance, grammar, method effects, counters, and publication
@@ -1205,6 +1313,16 @@ impl StartedRound {
         let mut generation = self.generation;
         generation.evicted()?;
         Ok(generation)
+    }
+
+    /// Discard the round, its physical outcome aborted (its sequence's
+    /// accepted state returned), to run it again: the generation is as it
+    /// was before the round, unfinished, and starts it anew. Starting a
+    /// round changes the generation only by its method's proposal, which a
+    /// re-run proposes again; its sampling is seeded by position, so the
+    /// round's output is the same.
+    pub fn abandon(self) -> Generation {
+        self.generation
     }
 
     /// Discard the round without committing or publishing it.
@@ -1270,6 +1388,7 @@ fn method_matches_choice(choice: MethodChoice, method: &dyn Method) -> bool {
                 && requirements
                     == (MethodRequirements {
                         prefill_demand: Demand::NONE,
+                        closing_demand: Demand::NONE,
                         verify_demand: Demand::NONE,
                         head: false,
                     })
@@ -1282,7 +1401,10 @@ fn method_matches_choice(choice: MethodChoice, method: &dyn Method) -> bool {
             proposals > 0
                 && method.identity().starts_with(prefix)
                 && requirements.head
-                && requirements.prefill_demand.contains(Demand::FEATURES)
+                // The first draft's anchor is selected by the closing
+                // chunk's final feature, whichever demand returns it.
+                && (requirements.prefill_demand | requirements.closing_demand)
+                    .contains(Demand::FEATURES)
                 && requirements.verify_demand.contains(Demand::FEATURES)
                 && usize::from(proposals) <= method.proposals()
         }
@@ -1306,6 +1428,9 @@ mod method_choice_tests {
         fn requires(&self) -> MethodRequirements {
             self.requirements
         }
+        fn embeds_prompt_tokens(&self) -> bool {
+            false
+        }
         fn proposals(&self) -> usize {
             self.proposals
         }
@@ -1323,6 +1448,7 @@ mod method_choice_tests {
             identity: "plain",
             requirements: MethodRequirements {
                 prefill_demand: Demand::NONE,
+                closing_demand: Demand::NONE,
                 verify_demand: Demand::NONE,
                 head: false,
             },
@@ -1338,6 +1464,7 @@ mod method_choice_tests {
             identity: "mtp:fixture:3",
             requirements: MethodRequirements {
                 prefill_demand: Demand::FEATURES,
+                closing_demand: Demand::NONE,
                 verify_demand: Demand::FEATURES,
                 head: true,
             },
@@ -1355,5 +1482,27 @@ mod method_choice_tests {
             MethodChoice::Mtp { proposals: 0 },
             &mtp
         ));
+
+        // A head reading the target's history demands only the closing
+        // chunk's features; a head demanding no prompt features cannot draft.
+        let reading = Descriptor {
+            identity: "mtp:fixture:3",
+            requirements: MethodRequirements {
+                prefill_demand: Demand::NONE,
+                closing_demand: Demand::FEATURES,
+                verify_demand: Demand::FEATURES,
+                head: true,
+            },
+            proposals: 3,
+        };
+        assert!(method_matches_choice(MethodChoice::Mtp { proposals: 3 }, &reading));
+        let blind = Descriptor {
+            requirements: MethodRequirements {
+                closing_demand: Demand::NONE,
+                ..reading.requirements
+            },
+            ..reading
+        };
+        assert!(!method_matches_choice(MethodChoice::Mtp { proposals: 3 }, &blind));
     }
 }

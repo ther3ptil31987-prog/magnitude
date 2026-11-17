@@ -1,8 +1,8 @@
 //! The worker pool of one CPU device: its participants, job publication,
 //! work-item claiming, and the barriers participants meet at.
 //!
-//! The pool has one participant per physical performance core
-//! ([`Workers::host`]). The submitting thread is participant 0 and works
+//! The pool has one participant per performance core the process may keep
+//! busy ([`crate::open_host`]). The submitting thread is participant 0 and works
 //! alongside the pool's threads (participants 1..): a job runs on every
 //! participant and the submitter returns once every participant has left
 //! it, so the frame, buffer table, words and scratch the job borrows stay
@@ -28,7 +28,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::Thread;
 
-use crate::buffer::{AllocationFailure, Buffer};
+use crate::buffer::WritableBuffer;
+use seismic_compiler::errors::ExecutionError;
+use seismic_memory::entry::Entry;
 use crate::profile::SCRATCH_ALIGNMENT;
 
 /// Chunks each active participant's share of a native step's items is split
@@ -194,6 +196,21 @@ impl TeamBarrier {
         }
         !self.cancelled.load(Ordering::Acquire)
     }
+}
+
+/// Discards the instructions this core fetched before it observed the
+/// launch it is about to run. The launch's kernel may be code compiled at
+/// an address this core ran other code at: compilation invalidated the
+/// instruction caches (`CoherentCode`), but on aarch64 a core only stops
+/// executing what it already fetched at a context synchronization, which a
+/// participant that spun rather than parked has not passed. x86 instruction
+/// fetch is coherent with data writes.
+fn synchronize_instructions() {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: an instruction synchronization barrier has no operands.
+    unsafe {
+        core::arch::asm!("isb")
+    };
 }
 
 /// The host entry a workgroup barrier compiles to.
@@ -393,18 +410,19 @@ fn work(shared: &Shared, ordinal: usize) {
     }
 }
 
-fn grow(scratch: &mut Option<Buffer>, bytes: u64) -> Result<(), AllocationFailure> {
+/// Grow `scratch` to at least `bytes`, a new buffer charged to `entry`.
+fn grow(scratch: &mut Option<WritableBuffer>, bytes: u64, entry: &Arc<dyn Entry>) -> Result<(), ExecutionError> {
     if scratch
         .as_ref()
         .is_some_and(|scratch| scratch.len() >= bytes)
     {
         return Ok(());
     }
-    *scratch = Some(Buffer::new(bytes, SCRATCH_ALIGNMENT)?);
+    *scratch = Some(WritableBuffer::new(bytes, SCRATCH_ALIGNMENT, entry)?);
     Ok(())
 }
 
-fn scratch_pointer(scratch: &Option<Buffer>) -> *mut u8 {
+fn scratch_pointer(scratch: &Option<WritableBuffer>) -> *mut u8 {
     scratch
         .as_ref()
         .map(|scratch| scratch.data_pointer())
@@ -413,7 +431,7 @@ fn scratch_pointer(scratch: &Option<Buffer>) -> *mut u8 {
 
 /// One participant's scratch of each class, with its current base address.
 struct Scratch {
-    buffer: Option<Buffer>,
+    buffer: Option<WritableBuffer>,
     base: *mut u8,
 }
 
@@ -425,8 +443,8 @@ impl Scratch {
         }
     }
 
-    fn grow(&mut self, bytes: u64) -> Result<(), AllocationFailure> {
-        grow(&mut self.buffer, bytes)?;
+    fn grow(&mut self, bytes: u64, entry: &Arc<dyn Entry>) -> Result<(), ExecutionError> {
+        grow(&mut self.buffer, bytes, entry)?;
         self.base = scratch_pointer(&self.buffer);
         Ok(())
     }
@@ -457,7 +475,14 @@ impl NativeStep {
 /// before it.
 pub trait NativeSteps: Sync {
     fn count(&self) -> usize;
+    /// Step `index`; its `items` the most it runs, which fixes its
+    /// participants before any step runs.
     fn step(&self, index: usize) -> NativeStep;
+    /// The items step `index` runs, at most its `items`: read once every
+    /// earlier step completed, so an earlier step may have written them.
+    fn items(&self, index: usize) -> u64 {
+        self.step(index).items
+    }
     /// Runs work item `item` of step `index` with its private bytes.
     fn run(&self, index: usize, item: u64, shared: &mut [u8]);
 }
@@ -526,12 +551,13 @@ impl Job for NativeJob<'_> {
                 // `ordinal` owns chunk `ordinal`; the chunks past the first
                 // `active` are claimed. A step with no more chunks than
                 // participants touches no shared counter.
-                let chunk = (step.items / (active as u64 * CLAIMS_PER_PARTICIPANT)).max(1);
-                let chunks = step.items.div_ceil(chunk);
+                let items = self.steps.items(index);
+                let chunk = (items / (active as u64 * CLAIMS_PER_PARTICIPANT)).max(1);
+                let chunks = items.div_ceil(chunk);
                 let mut claim = ordinal as u64;
                 while claim < chunks && !shared.cancelled() {
                     let first = claim * chunk;
-                    for item in first..(first + chunk).min(step.items) {
+                    for item in first..(first + chunk).min(items) {
                         self.steps.run(index, item, bytes);
                     }
                     claim =
@@ -569,6 +595,7 @@ impl Job for LaunchJob {
         if team >= self.teams {
             return;
         }
+        synchronize_instructions();
         let team_state = &shared.teams[team];
         let (team_scratch, my_scratch, my_registers) = unsafe {
             (
@@ -651,19 +678,39 @@ pub struct Workers {
 // driven through `&mut self` by one submitter at a time.
 unsafe impl Send for Workers {}
 
+/// A pool the process's CPU devices share, one job at a time
+/// ([`crate::open_host`]). A job that panics is resumed on its submitter
+/// only after every participant has left it, and every job sets up the
+/// state it runs from, so the pool is as ready for the next job as after
+/// one that returned: the panic is that job's alone, and the lock does not
+/// pass it on to every later user of the pool as poison.
+pub struct SharedWorkers(Mutex<Workers>);
+
+impl SharedWorkers {
+    pub fn new(workers: Workers) -> Self {
+        Self(Mutex::new(workers))
+    }
+
+    /// The pool, once no other job holds it.
+    pub fn lock(&self) -> MutexGuard<'_, Workers> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 /// Why a launch could not be submitted to the pool.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LaunchFailure {
     /// Workgroup or participant scratch could not be grown to the launch's
-    /// size.
-    Scratch(AllocationFailure),
+    /// size: its entry refused it, or the host did.
+    Scratch(ExecutionError),
 }
 
 impl Workers {
     /// A pool of `count` participants (at least one): the submitting thread
     /// and `count - 1` pool threads.
     pub fn new(count: usize) -> Result<Self, std::io::Error> {
-        let count = count.clamp(1, (1 << PARTICIPANT_BITS) - 1);
+        const _: () = assert!(seismic_lang::forms::CPU_MAX_UNITS < 1 << PARTICIPANT_BITS);
+        let count = count.clamp(1, seismic_lang::forms::CPU_MAX_UNITS as usize);
         let shared = Arc::new(Shared {
             participants: count,
             published: AtomicU64::new(0),
@@ -712,11 +759,6 @@ impl Workers {
             register_bases: dangling(),
             steps: Vec::new(),
         })
-    }
-
-    /// One participant per physical performance core of the host.
-    pub fn host() -> Result<Self, std::io::Error> {
-        Self::new(performance_cores()?)
     }
 
     /// Participants, the submitting thread included.
@@ -773,9 +815,11 @@ impl Workers {
     /// Runs `workgroups` workgroups of `team_size` threads each and returns
     /// after all complete. `team_size` is at most the participant count: the
     /// profile bounds every workgroup by it, so a larger value contradicts
-    /// the private prepared-kernel constructor (§13.3.6).
+    /// the private prepared-kernel constructor (§13.3.6). Scratch the launch
+    /// grows is charged to `charged`, and held by the pool.
     pub fn run(
         &mut self,
+        charged: &Arc<dyn Entry>,
         entry: LaunchEntry,
         frame: &LaunchFrame,
         workgroups: u64,
@@ -803,7 +847,7 @@ impl Workers {
             .take(teams)
         {
             scratch
-                .grow(workgroup_scratch_bytes)
+                .grow(workgroup_scratch_bytes, charged)
                 .map_err(LaunchFailure::Scratch)?;
             *base = scratch.base;
         }
@@ -815,7 +859,7 @@ impl Workers {
             .take(members)
         {
             scratch
-                .grow(participant_scratch_bytes)
+                .grow(participant_scratch_bytes, charged)
                 .map_err(LaunchFailure::Scratch)?;
             *base = scratch.base;
         }
@@ -826,7 +870,7 @@ impl Workers {
             .take(members)
         {
             scratch
-                .grow(register_scratch_bytes)
+                .grow(register_scratch_bytes, charged)
                 .map_err(LaunchFailure::Scratch)?;
             *base = scratch.base;
         }
@@ -856,7 +900,8 @@ impl Workers {
     /// participants of each step claim its items and meet the next step's
     /// participants after it. Only the participants some step uses are
     /// woken; a job whose steps each have one runs on the submitter alone.
-    pub fn run_native(&mut self, steps: &dyn NativeSteps) -> Result<(), LaunchFailure> {
+    /// Scratch the job grows is charged to `charged`, and held by the pool.
+    pub fn run_native(&mut self, charged: &Arc<dyn Entry>, steps: &dyn NativeSteps) -> Result<(), LaunchFailure> {
         let count = steps.count();
         if count == 0 {
             return Ok(());
@@ -873,7 +918,7 @@ impl Workers {
             shared_bytes = shared_bytes.max(step.shared_bytes);
         }
         for (scratch, base) in self.worker_scratch.iter_mut().zip(&mut self.worker_bases) {
-            scratch.grow(shared_bytes).map_err(LaunchFailure::Scratch)?;
+            scratch.grow(shared_bytes, charged).map_err(LaunchFailure::Scratch)?;
             *base = scratch.base;
         }
         if self.steps.len() < count {
@@ -910,65 +955,6 @@ impl Drop for Workers {
             let _ = thread.join();
         }
     }
-}
-
-/// Physical performance cores available to this process: SMT siblings count
-/// once and efficiency cores are excluded, since a second hardware thread on
-/// a saturated core or a slower core delays every barrier.
-fn performance_cores() -> Result<usize, std::io::Error> {
-    let available = std::thread::available_parallelism()?.get();
-    Ok(physical_performance_cores().map_or(available, |cores| cores.min(available)))
-}
-
-#[cfg(target_os = "macos")]
-fn physical_performance_cores() -> Option<usize> {
-    fn sysctl(name: &std::ffi::CStr) -> Option<usize> {
-        let mut value: i32 = 0;
-        let mut size = std::mem::size_of::<i32>();
-        // SAFETY: `value` and `size` describe a writable i32 as the named
-        // integer sysctls require.
-        let status = unsafe {
-            libc::sysctlbyname(
-                name.as_ptr(),
-                (&mut value as *mut i32).cast(),
-                &mut size,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        (status == 0 && value > 0).then_some(value as usize)
-    }
-    // `perflevel0` is the performance cluster on hybrid parts; Intel Macs
-    // have no performance levels.
-    sysctl(c"hw.perflevel0.physicalcpu").or_else(|| sysctl(c"hw.physicalcpu"))
-}
-
-#[cfg(target_os = "linux")]
-fn physical_performance_cores() -> Option<usize> {
-    use std::collections::BTreeSet;
-    let read = |path: &str| std::fs::read_to_string(path).ok();
-    // Hybrid Intel parts list their performance cores here.
-    let performance = read("/sys/devices/cpu_core/cpus").map(|list| parse_cpu_list(list.trim()));
-    let online = parse_cpu_list(read("/sys/devices/system/cpu/online")?.trim());
-    let mut cores = BTreeSet::new();
-    for cpu in online {
-        if performance
-            .as_ref()
-            .is_some_and(|performance| !performance.contains(&cpu))
-        {
-            continue;
-        }
-        let siblings = read(&format!(
-            "/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
-        ))?;
-        cores.insert(siblings.trim().to_owned());
-    }
-    (!cores.is_empty()).then_some(cores.len())
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn physical_performance_cores() -> Option<usize> {
-    None
 }
 
 /// Asks the scheduler to keep the calling pool thread on performance cores.
@@ -1026,24 +1012,14 @@ impl Drop for SubmitterClass {
     }
 }
 
-/// CPU numbers of a sysfs list such as `0-3,8,10-11`.
-#[cfg(target_os = "linux")]
-fn parse_cpu_list(list: &str) -> Vec<usize> {
-    list.split(',')
-        .filter(|range| !range.is_empty())
-        .flat_map(|range| {
-            let (first, last) = range.split_once('-').unwrap_or((range, range));
-            match (first.parse::<usize>(), last.parse::<usize>()) {
-                (Ok(first), Ok(last)) => first..=last,
-                _ => 1..=0,
-            }
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What the tests' scratch is charged to.
+    fn charged() -> Arc<dyn Entry> {
+        Arc::new(seismic_memory::entry::Tally::unbounded(seismic_topology::StoreIdentity::HostRam))
+    }
 
     pub(super) static PARKS: AtomicU64 = AtomicU64::new(0);
 
@@ -1098,7 +1074,7 @@ mod tests {
         let mut workers = Workers::new(4).expect("pool");
         for round in 0..50 {
             let job = counting(&workers, &[37, 0, 5, 128, 1, 64 + round]);
-            workers.run_native(&job).expect("run");
+            workers.run_native(&charged(), &job).expect("run");
             assert!(job.ordered.load(Ordering::SeqCst));
             for hits in &job.hits {
                 assert!(hits.iter().all(|hit| hit.load(Ordering::SeqCst) == 1));
@@ -1110,7 +1086,7 @@ mod tests {
     fn a_single_participant_pool_runs_on_the_submitter() {
         let mut workers = Workers::new(1).expect("pool");
         let job = counting(&workers, &[3, 4]);
-        workers.run_native(&job).expect("run");
+        workers.run_native(&charged(), &job).expect("run");
         assert!(job
             .hits
             .iter()
@@ -1138,14 +1114,17 @@ mod tests {
                 }
             }
         }
-        let mut workers = Workers::new(3).expect("pool");
+        // Held as the process's devices hold it: the panic unwinds through
+        // the lock, and the next job still takes the pool.
+        let workers = SharedWorkers::new(Workers::new(3).expect("pool"));
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            workers.run_native(&Panicking).expect("run")
+            workers.lock().run_native(&charged(), &Panicking).expect("run")
         }));
         let payload = caught.expect_err("the panic reaches the submitter");
         assert_eq!(payload.downcast_ref::<&str>(), Some(&"item failed"));
+        let mut workers = workers.lock();
         let job = counting(&workers, &[9, 9, 9]);
-        workers.run_native(&job).expect("run");
+        workers.run_native(&charged(), &job).expect("run");
         assert!(job
             .hits
             .iter()
@@ -1160,7 +1139,7 @@ mod tests {
             // Long enough for every pool thread to exhaust its spin and park.
             std::thread::sleep(std::time::Duration::from_millis(20));
             let job = counting(&workers, &[16, 16]);
-            workers.run_native(&job).expect("run");
+            workers.run_native(&charged(), &job).expect("run");
             assert!(job
                 .hits
                 .iter()
@@ -1173,7 +1152,7 @@ mod tests {
     fn an_idle_pool_parks_every_thread() {
         let mut workers = Workers::new(4).expect("pool");
         let job = counting(&workers, &[16, 16]);
-        workers.run_native(&job).expect("run");
+        workers.run_native(&charged(), &job).expect("run");
         let parked = || {
             workers.shared.parked[1..]
                 .iter()
@@ -1212,7 +1191,8 @@ mod tests {
                 std::hint::black_box(item);
             }
         }
-        let mut workers = Workers::host().expect("pool");
+        let quota = std::thread::available_parallelism().expect("host parallelism");
+        let mut workers = Workers::new(quota.get()).expect("pool");
         let count = workers.count();
         for items in [2, 3, 4, 6, 8, 12] {
             // Samples of about 5 ms, as the tuner takes them.
@@ -1224,7 +1204,7 @@ mod tests {
             let mut samples = (0..15)
                 .map(|_| {
                     let started = std::time::Instant::now();
-                    workers.run_native(&job).expect("run");
+                    workers.run_native(&charged(), &job).expect("run");
                     started.elapsed().as_secs_f64()
                 })
                 .collect::<Vec<_>>();
@@ -1253,7 +1233,7 @@ mod tests {
             let mut samples = (0..12)
                 .map(|_| {
                     let started = std::time::Instant::now();
-                    workers.run_native(&job).expect("run");
+                    workers.run_native(&charged(), &job).expect("run");
                     started.elapsed().as_secs_f64() / job.steps as f64 * 1e6
                 })
                 .collect::<Vec<_>>();
@@ -1268,15 +1248,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_host_pool_counts_physical_performance_cores() {
-        let cores = performance_cores().expect("host parallelism");
-        assert!(cores >= 1);
-        assert!(
-            cores
-                <= std::thread::available_parallelism()
-                    .expect("host parallelism")
-                    .get()
-        );
-    }
 }

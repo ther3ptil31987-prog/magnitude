@@ -6,6 +6,7 @@ use serde_json::json;
 
 const QWEN: &str = include_str!("assets/Qwen-Qwen3-0.6B.jinja");
 const QWEN35: &str = include_str!("assets/Qwen3.5-4B.jinja");
+const QWEN36: &str = include_str!("assets/Qwen3.6-35B-A3B.jinja");
 
 fn request() -> Request {
     let mut request = Request::new(vec![json!({"role":"user","content":"Hello"})], 946684800);
@@ -211,4 +212,108 @@ fn required_tools_fail_explicitly_and_every_schema_prepares() {
             reason: RelaxationReason::Unenforced,
         }]
     );
+}
+
+/// Qwen3.5's prompt opens reasoning and the model ends without closing it. The
+/// stream has already published that text as reasoning; ending the output
+/// closes the reasoning instead of reading it again as content.
+#[test]
+fn natural_end_inside_published_reasoning_keeps_it() {
+    let output = "He is the capital city of Australia.";
+    for request in [
+        Request::new(
+            vec![json!({"role":"user","content":"What is the capital city of Australia? Reply with one word."})],
+            0,
+        ),
+        request(),
+    ] {
+        let plan = Template::new(QWEN35, &Default::default())
+            .unwrap()
+            .prepare(&request)
+            .unwrap();
+        assert!(plan.description().prompt.ends_with("<think>\n"));
+        let bytes = output.as_bytes();
+        for split in 0..=bytes.len() {
+            let mut stream = plan.stream(4096).unwrap();
+            let mut result = Transcript::default();
+            result.accept(stream.feed(&bytes[..split]).unwrap());
+            result.accept(stream.feed(&bytes[split..]).unwrap());
+            result.accept(stream.finish(TerminalCause::Natural).unwrap());
+            assert_eq!(
+                result,
+                Transcript {
+                    reasoning: output.into(),
+                    finish: Some(TerminalCause::Natural),
+                    ..Default::default()
+                },
+                "split {split}"
+            );
+        }
+    }
+    // A call the model leaves open is still not a natural completion.
+    let plan = Template::new(QWEN35, &Default::default())
+        .unwrap()
+        .prepare(&request())
+        .unwrap();
+    let mut stream = plan.stream(4096).unwrap();
+    stream
+        .feed(b"consider</think>\n\n<tool_call>\n<function=search>\n<parameter=query>\nhel")
+        .unwrap();
+    assert!(stream.finish(TerminalCause::Natural).is_err());
+}
+
+/// The prompts of two consecutive tasks: the first mid-task, after a tool
+/// result, and the second at the next user message, after the first task's
+/// final reply. `arguments` are the caller's template arguments.
+fn two_task_prompts(source: &str, arguments: serde_json::Value) -> (String, String) {
+    let template = Template::new(source, &Default::default()).unwrap();
+    let first_task = vec![
+        json!({"role":"user","content":"Find the release notes."}),
+        json!({"role":"assistant","content":"","reasoning_content":"I should search first.",
+            "tool_calls":[{"id":"call_0","type":"function",
+                "function":{"name":"search","arguments":{"query":"release notes"}}}]}),
+        json!({"role":"tool","tool_call_id":"call_0","content":"Release 1.2 fixes the cache."}),
+    ];
+    let mut second_task = first_task.clone();
+    second_task.extend([
+        json!({"role":"assistant","content":"Release 1.2 fixes the cache.",
+            "reasoning_content":"The result answers the question."}),
+        json!({"role":"user","content":"Now summarize it."}),
+    ]);
+    let prompt = |messages: Vec<serde_json::Value>| {
+        let mut request = request();
+        request.messages = messages;
+        request.template_arguments = arguments.as_object().unwrap().clone();
+        template
+            .prepare(&request)
+            .unwrap()
+            .description()
+            .prompt
+            .clone()
+    };
+    (prompt(first_task), prompt(second_task))
+}
+
+#[test]
+fn templates_reading_preserve_thinking_keep_prompts_append_only_across_user_messages() {
+    let (first, second) = two_task_prompts(QWEN36, json!({}));
+    assert!(first.contains("I should search first."));
+    assert!(second.starts_with(&first), "{first:?}\n{second:?}");
+    assert!(second.contains("The result answers the question."));
+
+    let (first, second) = two_task_prompts(QWEN36, json!({"preserve_thinking": false}));
+    assert!(first.contains("I should search first."));
+    assert!(!second.contains("I should search first."));
+    assert!(!second.contains("The result answers the question."));
+}
+
+#[test]
+fn templates_without_preserve_thinking_render_unchanged() {
+    assert!(!QWEN35.contains("preserve_thinking"));
+    let defaults = two_task_prompts(QWEN35, json!({}));
+    assert_eq!(
+        defaults,
+        two_task_prompts(QWEN35, json!({"preserve_thinking": false}))
+    );
+    assert!(!defaults.1.contains("I should search first."));
 }

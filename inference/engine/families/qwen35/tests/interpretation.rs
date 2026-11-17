@@ -1,17 +1,19 @@
 use magnitude_artifacts::{
-    gguf::{ByteOrder, Directory, Encoding, Metadata, Scalar, TensorDescriptor, Value},
     ArtifactIdentity, PackageIdentity,
+    gguf::{Array, ByteOrder, Directory, Encoding, Metadata, Scalar, TensorDescriptor, Value},
 };
 use magnitude_artifacts::{
-    media::{DType, PreparedMedia, PreparedTensor},
     ImageProcessor, InputLayout, TokenId,
+    media::{DType, PreparedMedia, PreparedTensor},
 };
 use magnitude_family_contracts::{
-    AttentionGate, GateFunction, ImportTransform, InputNorm, ModelInputAdapter, Operator,
-    OutputForm, PositionSampling, RecurrentHeadMapping, RowRange, TokenPlan, VisionResize,
+    AttentionGate, GateFunction, HeadComponent, HeadHistory, HeadInput, ImportTransform, InputNorm,
+    ModelInputAdapter, Operator, OutputForm, PositionSampling, RecurrentHeadMapping, RowRange,
+    TokenPlan, VisionOperator, VisionResize,
 };
-use magnitude_family_qwen35::inputs::{QwenImageTokens, QwenInputAdapter};
-use magnitude_family_qwen35::{describe_projector, inspect_components, recognize, Architecture};
+use magnitude_family_qwen::describe_projector;
+use magnitude_family_qwen::inputs::{QwenImageTokens, QwenInputAdapter};
+use magnitude_family_qwen35::{Architecture, FAMILY_IDS, inspect_components, recognize};
 
 fn directory(routed: bool) -> Directory {
     let architecture = if routed { "qwen35moe" } else { "qwen35" };
@@ -39,7 +41,15 @@ fn directory(routed: bool) -> Directory {
         ("expert_used_count", 2),
         ("expert_feed_forward_length", 6),
         ("expert_shared_feed_forward_length", 8),
-    ] {
+    ]
+    .into_iter()
+    // A dense header has a feed-forward width and a routed one expert
+    // widths.
+    .filter(|(name, _)| match *name {
+        "feed_forward_length" => !routed,
+        name if name.starts_with("expert_") => routed,
+        _ => true,
+    }) {
         metadata.push(Metadata {
             name: format!("{architecture}.{name}"),
             value: Value::Scalar(Scalar::Unsigned(value)),
@@ -56,12 +66,7 @@ fn directory(routed: bool) -> Directory {
     }
     metadata.push(Metadata {
         name: format!("{architecture}.rope.dimension_sections"),
-        value: Value::Array(vec![
-            Scalar::Unsigned(1),
-            Scalar::Unsigned(1),
-            Scalar::Unsigned(0),
-            Scalar::Unsigned(0),
-        ]),
+        value: Value::Array(vec![1_u64, 1, 0, 0].into()),
     });
 
     let mut tensors = Vec::new();
@@ -181,9 +186,6 @@ fn routed_mtp_directory() -> Directory {
     let mut directory = directory(true);
     directory
         .metadata
-        .retain(|item| item.name != "qwen35moe.feed_forward_length");
-    directory
-        .metadata
         .iter_mut()
         .find(|item| item.name == "qwen35moe.block_count")
         .unwrap()
@@ -239,10 +241,40 @@ fn routed_mtp_head_uses_expert_roles_without_dense_intermediate_metadata() {
     assert_eq!(model.decoder.blocks.len(), 2);
     let head = model.head.unwrap();
     assert_eq!(head.depth(), 1);
-    let sublayers = &head.blocks[0].block.sublayers;
+    let [block] = head.blocks[0].blocks.as_slice() else {
+        panic!("a Qwen3.5 MTP head block is one decoder block");
+    };
+    let sublayers = &block.sublayers;
     assert!(matches!(sublayers[0].op, Operator::Attention(_)));
     assert!(matches!(sublayers[1].op, Operator::RoutedFfn(_)));
 }
+
+#[test]
+fn routed_header_ignores_the_dense_feed_forward_width() {
+    let inspect = |directory: &Directory| {
+        inspect_components(
+            directory,
+            None,
+            PackageIdentity {
+                target: ArtifactIdentity([9; 32]),
+                projector: None,
+            },
+        )
+        .unwrap()
+    };
+    let without = inspect(&routed_mtp_directory());
+    for width in [0, 12] {
+        let mut directory = routed_mtp_directory();
+        directory.metadata.push(Metadata {
+            name: "qwen35moe.feed_forward_length".into(),
+            value: Value::Scalar(Scalar::Unsigned(width)),
+        });
+        assert_eq!(inspect(&directory), without);
+    }
+}
+
+/// The synthetic projector's feature width, the synthetic target's embedding width.
+const PROJECTOR_WIDTH: u64 = 8;
 
 fn projector() -> Directory {
     let scalar = |name: &str, value: Scalar| Metadata {
@@ -269,7 +301,8 @@ fn projector() -> Directory {
         scalar("clip.vision.patch_size", Scalar::Unsigned(2)),
         scalar("clip.vision.spatial_merge_size", Scalar::Unsigned(2)),
         scalar("clip.vision.image_size", Scalar::Unsigned(4)),
-        scalar("clip.vision.projection_dim", Scalar::Unsigned(6)),
+        // Features of the decoder's width (`embedding_length`).
+        scalar("clip.vision.projection_dim", Scalar::Unsigned(PROJECTOR_WIDTH)),
         scalar(
             "clip.vision.attention.layer_norm_epsilon",
             Scalar::Float(1e-6),
@@ -277,15 +310,15 @@ fn projector() -> Directory {
         scalar("clip.use_gelu", Scalar::Bool(true)),
         Metadata {
             name: "clip.vision.image_mean".into(),
-            value: Value::Array(vec![Scalar::Float(0.5); 3]),
+            value: Value::Array(vec![0.5_f64; 3].into()),
         },
         Metadata {
             name: "clip.vision.image_std".into(),
-            value: Value::Array(vec![Scalar::Float(0.5); 3]),
+            value: Value::Array(vec![0.5_f64; 3].into()),
         },
         Metadata {
             name: "clip.vision.is_deepstack_layers".into(),
-            value: Value::Array(vec![Scalar::Bool(false)]),
+            value: Value::Array(vec![false].into()),
         },
     ];
     metadata.shrink_to_fit();
@@ -320,8 +353,8 @@ fn projector() -> Directory {
         ("v.post_ln.bias", vec![4]),
         ("mm.0.weight", vec![16, 16]),
         ("mm.0.bias", vec![16]),
-        ("mm.2.weight", vec![6, 16]),
-        ("mm.2.bias", vec![6]),
+        ("mm.2.weight", vec![8, 16]),
+        ("mm.2.bias", vec![8]),
     ] {
         add(name, &shape);
     }
@@ -379,11 +412,13 @@ fn binds_dense_and_routed_geometry_to_semantic_roles() {
                 matches!(block.sublayers[1].op, Operator::RoutedFfn(_)),
                 routed
             );
-            assert!(block
-                .sublayers
-                .iter()
-                .all(|sublayer| sublayer.output == OutputForm::Residual
-                    && matches!(sublayer.input, InputNorm::Rms(_))));
+            assert!(
+                block
+                    .sublayers
+                    .iter()
+                    .all(|sublayer| sublayer.output == OutputForm::Residual
+                        && matches!(sublayer.input, InputNorm::Rms(_)))
+            );
         }
     }
 }
@@ -392,29 +427,112 @@ fn binds_dense_and_routed_geometry_to_semantic_roles() {
 fn rejects_wrong_shapes_and_unbound_family_roles() {
     let mut wrong_shape = directory(false);
     wrong_shape.tensors[2].shape[0] += 1;
-    assert!(inspect_components(
-        &wrong_shape,
-        None,
-        PackageIdentity {
-            target: ArtifactIdentity([0; 32]),
-            projector: None
-        }
-    )
-    .is_err());
+    assert!(
+        inspect_components(
+            &wrong_shape,
+            None,
+            PackageIdentity {
+                target: ArtifactIdentity([0; 32]),
+                projector: None
+            }
+        )
+        .is_err()
+    );
 
     let mut unbound = directory(false);
     let mut extra = unbound.tensors[2].clone();
     extra.name = "blk.0.unbound.weight".into();
     unbound.tensors.push(extra);
-    assert!(inspect_components(
-        &unbound,
-        None,
-        PackageIdentity {
-            target: ArtifactIdentity([0; 32]),
-            projector: None
+    assert!(
+        inspect_components(
+            &unbound,
+            None,
+            PackageIdentity {
+                target: ArtifactIdentity([0; 32]),
+                projector: None
+            }
+        )
+        .is_err()
+    );
+}
+
+/// `attention.recurrent_layers` as current llama.cpp conversions write it:
+/// one flag per stored block, the prediction block last and not recurrent.
+/// It binds the layer order the interval places, alone or beside it, and is
+/// refused when it contradicts the interval or flags a prediction block.
+#[test]
+fn recurrent_layer_flags_bind_the_layer_order_the_interval_places() {
+    let identity = PackageIdentity {
+        target: ArtifactIdentity([3; 32]),
+        projector: None,
+    };
+    let with_flags = |flags: &[bool], interval: bool| {
+        let mut directory = mtp_directory();
+        if !interval {
+            directory
+                .metadata
+                .retain(|metadata| metadata.name != "qwen35.full_attention_interval");
         }
-    )
-    .is_err());
+        directory.metadata.push(Metadata {
+            name: "qwen35.attention.recurrent_layers".into(),
+            value: Value::Array(flags.to_vec().into()),
+        });
+        inspect_components(&directory, None, identity)
+    };
+    let derived = inspect_components(&mtp_directory(), None, identity).unwrap();
+    assert_eq!(with_flags(&[true, false, false], true).unwrap(), derived);
+    assert_eq!(with_flags(&[true, false, false], false).unwrap(), derived);
+    for (flags, interval, expected) in [
+        (&[false, true, false][..], true, "full_attention_interval 2"),
+        (&[true, false, true][..], true, "prediction blocks"),
+        (&[true, false, true][..], false, "prediction blocks"),
+        (&[true, false][..], true, "each of the 3 blocks"),
+    ] {
+        let refused = with_flags(flags, interval).unwrap_err();
+        assert_eq!(
+            refused.reasons,
+            [
+                magnitude_artifacts::UnsupportedReason::UnrecognizedMetadata {
+                    key: "qwen35.attention.recurrent_layers".into()
+                }
+            ]
+        );
+        assert!(refused.detail.contains(expected), "{}", refused.detail);
+    }
+}
+
+/// A conversion that dropped the MTP weights but still counts their block in
+/// `block_count`, `nextn_predict_layers` and `attention.recurrent_layers`
+/// (mradermacher's Abliterix Qwen3.5 2B quants) runs its decoder without a
+/// built-in head. A prediction block stored only in part is refused.
+#[test]
+fn declared_prediction_blocks_with_no_stored_tensor_leave_the_decoder_headless() {
+    let identity = PackageIdentity {
+        target: ArtifactIdentity([3; 32]),
+        projector: None,
+    };
+    let dropped = |kept: &[&str]| {
+        let mut directory = mtp_directory();
+        directory.tensors.retain(|tensor| {
+            !tensor.name.starts_with("blk.2.")
+                || kept.iter().any(|name| tensor.name == format!("blk.2.{name}"))
+        });
+        directory.metadata.push(Metadata {
+            name: "qwen35.attention.recurrent_layers".into(),
+            value: Value::Array(vec![true, false, false].into()),
+        });
+        inspect_components(&directory, None, identity)
+    };
+    let headless = dropped(&[]).unwrap();
+    let plain = inspect_components(&directory(false), None, identity).unwrap();
+    assert_eq!(headless.head, None);
+    assert_eq!(headless.decoder, plain.decoder);
+    let partial = dropped(&["nextn.enorm.weight"]).unwrap_err();
+    assert!(
+        partial.detail.contains("missing weight \"blk.2."),
+        "{}",
+        partial.detail
+    );
 }
 
 #[test]
@@ -431,7 +549,12 @@ fn binds_every_mtp_role_outside_the_target_geometry() {
     assert_eq!(model.decoder.blocks.len(), 2);
     let head = model.head.unwrap();
     assert_eq!(head.depth(), 1);
-    assert_eq!(head.blocks[0].combine.shape, [8, 16]);
+    let HeadInput::Combine { combine, .. } = &head.blocks[0].input else {
+        panic!("a Qwen3.5 MTP head combines its input at the target's width");
+    };
+    assert_eq!(combine.shape, [8, 16]);
+    assert_eq!(head.history, HeadHistory::Own);
+    assert_eq!(head.component, HeadComponent::Target);
 
     let mut malformed = mtp_directory();
     malformed
@@ -440,15 +563,17 @@ fn binds_every_mtp_role_outside_the_target_geometry() {
         .find(|tensor| tensor.name == "blk.2.nextn.eh_proj.weight")
         .unwrap()
         .shape[1] = 15;
-    assert!(inspect_components(
-        &malformed,
-        None,
-        PackageIdentity {
-            target: ArtifactIdentity([3; 32]),
-            projector: None
-        }
-    )
-    .is_err());
+    assert!(
+        inspect_components(
+            &malformed,
+            None,
+            PackageIdentity {
+                target: ArtifactIdentity([3; 32]),
+                projector: None
+            }
+        )
+        .is_err()
+    );
 
     let mut unqualified_depth = mtp_directory();
     unqualified_depth
@@ -457,23 +582,25 @@ fn binds_every_mtp_role_outside_the_target_geometry() {
         .find(|metadata| metadata.name == "qwen35.nextn_predict_layers")
         .unwrap()
         .value = Value::Scalar(Scalar::Unsigned(2));
-    assert!(inspect_components(
-        &unqualified_depth,
-        None,
-        PackageIdentity {
-            target: ArtifactIdentity([3; 32]),
-            projector: None
-        }
-    )
-    .is_err());
+    assert!(
+        inspect_components(
+            &unqualified_depth,
+            None,
+            PackageIdentity {
+                target: ArtifactIdentity([3; 32]),
+                projector: None
+            }
+        )
+        .is_err()
+    );
 }
 
 #[test]
 fn projector_description_validates_roles_and_fused_qkv_ranges() {
     let projector = projector();
-    let vision = describe_projector(&projector).unwrap();
+    let vision = describe_projector(&projector, PROJECTOR_WIDTH).unwrap();
     assert_eq!(
-        vision.stem.positions().sampling,
+        vision.stem.positions().expect("position table").sampling,
         PositionSampling::AlignedCorners { side: 2 }
     );
     assert_eq!(vision.stem.frames(), 2);
@@ -489,7 +616,9 @@ fn projector_description_validates_roles_and_fused_qkv_ranges() {
     assert_eq!(processor.merge, 2);
     assert_eq!(processor.frames, 2);
     // The fused QKV projection and its bias are imported as three row ranges.
-    let attention = &vision.blocks[0].attention;
+    let VisionOperator::Attention(attention) = &vision.blocks[0].operator else {
+        panic!("Qwen vision blocks attend");
+    };
     for (part, linear) in [&attention.query, &attention.key, &attention.value]
         .into_iter()
         .enumerate()
@@ -522,8 +651,8 @@ fn projector_description_validates_roles_and_fused_qkv_ranges() {
         Some(ArtifactIdentity([2; 32]))
     );
 
-    // A derived target (a quantization) names its own file and its base
-    // model; the projector pairs with the base model.
+    // A derived target (a finetune) may name any base model: the projector
+    // pairs by its output width, never by names.
     let mut derived = directory(false);
     for (name, value) in [
         ("general.name", "fixture-Q4_K_M"),
@@ -544,7 +673,18 @@ fn projector_description_validates_roles_and_fused_qkv_ranges() {
         name: "general.base_model.0.name".into(),
         value: Value::Scalar(Scalar::String("other".into())),
     });
-    assert!(inspect_components(&derived, Some(&projector), identity).is_err());
+    assert!(inspect_components(&derived, Some(&projector), identity.clone()).is_ok());
+    let mut narrow = projector.clone();
+    for metadata in &mut narrow.metadata {
+        if metadata.name == "clip.vision.projection_dim" {
+            metadata.value = Value::Scalar(Scalar::Unsigned(6));
+        }
+    }
+    let refused = inspect_components(&derived, Some(&narrow), identity).unwrap_err();
+    assert!(
+        matches!(refused.reasons.as_slice(), [magnitude_artifacts::UnsupportedReason::TargetMismatch { .. }]),
+        "{refused:?}"
+    );
 
     let mut malformed = projector;
     malformed.tensors.push(TensorDescriptor {
@@ -554,7 +694,7 @@ fn projector_description_validates_roles_and_fused_qkv_ranges() {
         offset: 0,
         nbytes: 4,
     });
-    assert!(describe_projector(&malformed).is_err());
+    assert!(describe_projector(&malformed, PROJECTOR_WIDTH).is_err());
 }
 
 #[test]
@@ -570,7 +710,7 @@ fn projector_pixel_bounds_override_processor_defaults() {
             value: Value::Scalar(Scalar::Unsigned(4_096)),
         },
     ]);
-    let vision = describe_projector(&projector).unwrap();
+    let vision = describe_projector(&projector, PROJECTOR_WIDTH).unwrap();
     assert_eq!(
         vision.preprocessing.resize,
         VisionResize::PixelBounds {
@@ -586,7 +726,7 @@ fn projector_deepstack_metadata_is_optional_but_rejects_enabled_layers() {
     without_deepstack
         .metadata
         .retain(|metadata| metadata.name != "clip.vision.is_deepstack_layers");
-    assert!(describe_projector(&without_deepstack).is_ok());
+    assert!(describe_projector(&without_deepstack, PROJECTOR_WIDTH).is_ok());
 
     let mut enabled = projector();
     enabled
@@ -594,8 +734,8 @@ fn projector_deepstack_metadata_is_optional_but_rejects_enabled_layers() {
         .iter_mut()
         .find(|metadata| metadata.name == "clip.vision.is_deepstack_layers")
         .unwrap()
-        .value = Value::Array(vec![Scalar::Bool(true)]);
-    assert!(describe_projector(&enabled).is_err());
+        .value = Value::Array(vec![true].into());
+    assert!(describe_projector(&enabled, PROJECTOR_WIDTH).is_err());
 }
 
 #[test]
@@ -622,7 +762,7 @@ fn projector_rejects_malformed_shapes_for_every_role_class() {
             .unwrap()
             .shape[0] += 1;
         assert!(
-            describe_projector(&malformed).is_err(),
+            describe_projector(&malformed, PROJECTOR_WIDTH).is_err(),
             "malformed projector role {name:?} was accepted"
         );
     }
@@ -672,9 +812,10 @@ fn qwen_adapter_closes_token_and_vision_coordinates() {
         },
     )
     .unwrap();
-    let adapter = QwenInputAdapter::new(Some(
-        QwenImageTokens::new(TokenId(99), TokenId(98), TokenId(100)).unwrap(),
-    ));
+    let adapter = QwenInputAdapter::new(
+        FAMILY_IDS,
+        Some(QwenImageTokens::new(TokenId(99), TokenId(98), TokenId(100)).unwrap()),
+    );
     let tokens = vec![TokenId(98), TokenId(99), TokenId(100), TokenId(7)];
     let plan = TokenPlan::new(
         tokens.clone(),
@@ -733,9 +874,10 @@ fn qwen_adapter_prepares_a_repeated_image_once_for_every_placement() {
         },
     )
     .unwrap();
-    let adapter = QwenInputAdapter::new(Some(
-        QwenImageTokens::new(TokenId(99), TokenId(98), TokenId(100)).unwrap(),
-    ));
+    let adapter = QwenInputAdapter::new(
+        FAMILY_IDS,
+        Some(QwenImageTokens::new(TokenId(99), TokenId(98), TokenId(100)).unwrap()),
+    );
     let placeholder = [TokenId(98), TokenId(99), TokenId(100)];
     let tokens = [&placeholder[..], &[TokenId(7)], &placeholder[..]].concat();
     let plan = TokenPlan::new(
@@ -789,9 +931,10 @@ fn prepared_input_holds_exactly_the_images_its_spans_place() {
         },
     )
     .unwrap();
-    let adapter = QwenInputAdapter::new(Some(
-        QwenImageTokens::new(TokenId(99), TokenId(98), TokenId(100)).unwrap(),
-    ));
+    let adapter = QwenInputAdapter::new(
+        FAMILY_IDS,
+        Some(QwenImageTokens::new(TokenId(99), TokenId(98), TokenId(100)).unwrap()),
+    );
     let tokens = vec![TokenId(98), TokenId(99), TokenId(100), TokenId(7)];
     let plan = TokenPlan::new(
         tokens.clone(),
@@ -833,9 +976,10 @@ fn qwen_adapter_rejects_media_with_wrong_processor_identity() {
         },
     )
     .unwrap();
-    let adapter = QwenInputAdapter::new(Some(
-        QwenImageTokens::new(TokenId(99), TokenId(98), TokenId(100)).unwrap(),
-    ));
+    let adapter = QwenInputAdapter::new(
+        FAMILY_IDS,
+        Some(QwenImageTokens::new(TokenId(99), TokenId(98), TokenId(100)).unwrap()),
+    );
     let tokens = vec![TokenId(98), TokenId(99), TokenId(100)];
     let plan = TokenPlan::new(
         tokens.clone(),

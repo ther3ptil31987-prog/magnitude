@@ -1,5 +1,5 @@
-//! Interpretation of every LFM2 catalog variant's real GGUF header
-//! (`inference/validation/results/catalog-headers/`).
+//! Interpretation of the LFM2.5 2.6B and 8B-A1B releases' real GGUF headers,
+//! pinned artifacts outside the catalog (`headers::artifact`).
 
 use magnitude_artifacts::{
     gguf::{Directory, Scalar, Value},
@@ -7,44 +7,15 @@ use magnitude_artifacts::{
 };
 use magnitude_family_contracts::{
     AttentionGate, Block, ExitNorm, ExpertSelection, HeadNorm, ImportTransform, InputNorm,
-    ModelDefinition, ModelInputAdapter, Operator, OutputForm, Rotary, RowRange, ScoreFunction,
-    TokenPlan,
+    ModelDefinition, ModelInputAdapter, Operator, OutputForm, QueryProjection, Rotary, RowRange,
+    ScoreFunction, TokenPlan,
 };
 use magnitude_family_common::{headers, TextInput};
 use magnitude_family_lfm2::{inspect_components, recognize, Architecture};
 
-struct Variant {
-    model: String,
-    role: String,
-    directory: Directory,
-}
-
-/// Every LFM2 catalog target. The dump records integers without their GGUF
-/// type: scalar integers are stored unsigned, integer arrays (per-layer
-/// `head_count_kv`) as INT32, as gguf-py writes them.
-fn catalog() -> Vec<Variant> {
-    headers::index()
-        .into_iter()
-        .filter(|(model, role, _)| model.starts_with("lfm2") && role.starts_with("target"))
-        .map(|(model, role, file)| {
-            let mut directory = headers::directory(&file);
-            for entry in &mut directory.metadata {
-                if let Value::Array(values) = &mut entry.value {
-                    for value in values {
-                        if let Scalar::Unsigned(integer) = *value {
-                            *value = Scalar::Signed(integer as i64);
-                        }
-                    }
-                }
-            }
-            Variant {
-                model,
-                role,
-                directory,
-            }
-        })
-        .collect()
-}
+/// The two models the geometry brief documents (`expected`); the catalog's
+/// 24B-A2B binds in `released_24b.rs`.
+const MODELS: [&str; 2] = ["lfm2.5-2.6b", "lfm2.5-8b-a1b"];
 
 fn identity() -> PackageIdentity {
     PackageIdentity {
@@ -57,16 +28,12 @@ fn inspect(directory: &Directory) -> Result<ModelDefinition, String> {
     inspect_components(directory, None, identity()).map_err(|error| error.to_string())
 }
 
+/// The model's Q4_K_M release.
 fn variant(model: &str) -> Directory {
-    catalog()
-        .into_iter()
-        .find(|variant| variant.model == model && variant.role == "target-gguf_q4")
-        .expect("catalog variant")
-        .directory
+    headers::artifact(&format!("{model}-q4"))
 }
 
-/// Geometry the catalog models are documented to have
-/// (`specs/26-09-26/model-family-support/briefs/lfm2.md` §2).
+/// Geometry the models are documented to have.
 struct Expected {
     architecture: Architecture,
     layers: usize,
@@ -94,7 +61,7 @@ fn expected(model: &str) -> Expected {
             leading_dense: 2,
             rope_base: 5.0e6,
         },
-        other => panic!("unexpected catalog model {other}"),
+        other => panic!("unexpected model {other}"),
     }
 }
 
@@ -118,7 +85,10 @@ fn check_block(block: &Block, index: usize, expected: &Expected, directory: &Dir
                 (32, 8, 64)
             );
             assert_eq!(attention.gate, AttentionGate::None);
-            assert_eq!(attention.query.shape, [2048, 2048]);
+            assert!(matches!(
+                &attention.query,
+                QueryProjection::Full(query) if query.shape == [2048, 2048]
+            ));
             assert!(matches!(&attention.query_norm, HeadNorm::Rms(norm) if norm.weight.shape == [64]));
             assert_eq!(attention.scale, 1.0 / 8.0);
             let Rotary::Table { pairs, .. } = &attention.rotary else {
@@ -182,19 +152,12 @@ fn check_block(block: &Block, index: usize, expected: &Expected, directory: &Dir
 }
 
 #[test]
-fn every_catalog_variant_binds_its_documented_geometry() {
-    let catalog = catalog();
-    assert_eq!(catalog.len(), 8, "four quantizations of two models");
-    for Variant {
-        model,
-        role,
-        directory,
-    } in &catalog
-    {
+fn every_release_binds_its_documented_geometry() {
+    for model in MODELS {
+        let directory = &variant(model);
         let expected = expected(model);
         assert_eq!(recognize(directory).unwrap(), expected.architecture);
-        let definition =
-            inspect(directory).unwrap_or_else(|error| panic!("{model} {role}: {error}"));
+        let definition = inspect(directory).unwrap_or_else(|error| panic!("{model}: {error}"));
         assert!(definition.deferred_forms().is_empty());
         let decoder = &definition.decoder;
         assert_eq!(
@@ -275,14 +238,14 @@ fn rejects_unknown_and_malformed_metadata() {
         "lfm2.attention.sliding_window",
         Value::Scalar(Scalar::Unsigned(4096)),
     );
-    assert!(inspect(&sliding).unwrap_err().contains("not understood"));
+    assert!(inspect(&sliding).unwrap_err().contains("unknown metadata"));
 
     let scaled = with_metadata(
         variant("lfm2.5-8b-a1b"),
         "lfm2moe.expert_weights_scale",
         Value::Scalar(Scalar::Float(2.5)),
     );
-    assert!(inspect(&scaled).unwrap_err().contains("not understood"));
+    assert!(inspect(&scaled).unwrap_err().contains("unknown metadata"));
 
     // Expert keys belong to the routed architecture only.
     let routed_key = with_metadata(
@@ -290,7 +253,7 @@ fn rejects_unknown_and_malformed_metadata() {
         "lfm2.expert_count",
         Value::Scalar(Scalar::Unsigned(32)),
     );
-    assert!(inspect(&routed_key).unwrap_err().contains("not understood"));
+    assert!(inspect(&routed_key).unwrap_err().contains("unknown metadata"));
 
     let scalar_kv = with_metadata(
         variant("lfm2.5-2.6b"),
@@ -302,16 +265,16 @@ fn rejects_unknown_and_malformed_metadata() {
     let short_kv = with_metadata(
         variant("lfm2.5-2.6b"),
         "lfm2.attention.head_count_kv",
-        Value::Array(vec![Scalar::Unsigned(0); 29]),
+        Value::Array(vec![0_u64; 29].into()),
     );
     assert!(inspect(&short_kv).unwrap_err().contains("one entry per layer"));
 
-    let mut negative = vec![Scalar::Signed(0); 30];
-    negative[2] = Scalar::Signed(-8);
+    let mut negative = vec![0_i64; 30];
+    negative[2] = -8;
     let negative_kv = with_metadata(
         variant("lfm2.5-2.6b"),
         "lfm2.attention.head_count_kv",
-        Value::Array(negative),
+        Value::Array(negative.into()),
     );
     assert!(inspect(&negative_kv).unwrap_err().contains("nonnegative"));
 
@@ -341,15 +304,15 @@ fn rejects_unknown_and_malformed_metadata() {
 fn the_layer_pattern_follows_the_key_head_array() {
     // The array alone decides each layer's operator: reading layer 2 as a
     // conv layer demands conv weights the file does not have.
-    let mut pattern = vec![Scalar::Unsigned(0); 30];
+    let mut pattern = vec![0_u64; 30];
     for layer in [2, 5, 9, 13, 17, 21, 24, 27] {
-        pattern[layer] = Scalar::Unsigned(8);
+        pattern[layer] = 8;
     }
-    pattern[2] = Scalar::Unsigned(0);
+    pattern[2] = 0;
     let directory = with_metadata(
         variant("lfm2.5-2.6b"),
         "lfm2.attention.head_count_kv",
-        Value::Array(pattern),
+        Value::Array(pattern.into()),
     );
     // Layer 2 is now read as a conv layer, which has no in_proj.
     assert!(inspect(&directory)
@@ -361,7 +324,11 @@ fn the_layer_pattern_follows_the_key_head_array() {
 fn a_projector_is_rejected() {
     let directory = variant("lfm2.5-2.6b");
     let error = inspect_components(&directory, Some(&directory), identity()).unwrap_err();
-    assert!(error.to_string().contains("no projector"));
+    assert!(error.to_string().contains("no vision projector"));
+    assert!(matches!(
+        error.reasons.as_slice(),
+        [magnitude_artifacts::UnsupportedReason::TargetMismatch { .. }]
+    ));
 }
 
 #[test]

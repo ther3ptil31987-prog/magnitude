@@ -1,0 +1,987 @@
+// The GEMV row classes of the packed projection family (activation rows up
+// to VERIFY_ROWS): the GEMV over lane groups, its walk by
+// packet class and its form over row tiles (`projection.h` describes the
+// family, its row classes and the in-threadgroup prologue they share with the
+// batched GEMV).
+//
+// Its own header so that a library that runs no GEMV (a GEMM's, a batched
+// GEMV's) compiles none of this text: a library is compiled whole, and what
+// it does not run should not be part of it. The includer includes
+// `projection.h` first.
+
+namespace projection {
+// ---------------------------------------------------------------------------
+// GEMV.
+//
+// Each weight is decoded once to F32 (`fma(scale, code, bias)`, one rounding,
+// the dequantized value of the portable body) and multiplies every activation
+// row with one FMA, in column order (a factored decoder's exact codes do,
+// and each step's sum is scaled once: `gemv_factored`). A lane's sum
+// therefore depends only on the packets it owns (LANES), never on M, R or SG:
+// every row of an M-row GEMV is bit-identical to the same row computed alone.
+
+// Threadgroup memory of one GEMV, a `threadgroup uchar *` bound at
+// [[threadgroup(0)]]: the staged activations. A GEMV launch over K columns
+// and M rows declares
+//   shared_bytes (min(ceil_div(K, 32) * B, 448) * 64)
+// with B = min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1), the row count
+// rounded up to its instantiated bound MAXM (`PROJECTION_FOR_ROWS`): at most
+// `gemv_stage_packet_rows` staged packet rows of `gemv_packet_row_bytes`.
+constant constexpr uint gemv_stage_packet_rows = 448;
+constant constexpr uint gemv_packet_row_bytes = 4 * 16;
+
+// The staged word of chunk-local packet p, step s (columns 32p + 8s ..) and
+// activation row m, in a chunk of `count` packets: rows, then steps, with the
+// packets innermost. The lanes of a group own consecutive packets and read
+// the same step and row together, so their words are consecutive. Packets
+// outermost (the rows of a step adjacent) would put those lanes 64 * MAXM
+// bytes apart, in a few banks of the threadgroup memory, so every row a GEMV
+// adds would cost a conflicted read per step.
+inline uint gemv_word(uint p, uint s, uint m, uint count) {
+    return (m * 4u + s) * count + p;
+}
+
+// Stage packets first .. first + count of MAXM activation rows (rows at or
+// past m_rows are zero); all threads of the threadgroup (whole simdgroups)
+// take part, one thread per eight columns. The eight activation values of
+// chunk-local packet p, step s and row m are one uint4 in A storage at
+// words[gemv_word(p, s, m, count)].
+template <uint MAXM, typename In>
+inline void gemv_stage(thread const In &in, uint m_rows, uint first, uint count, threadgroup uint4 *words,
+    uint thread_index, uint threads) {
+    typedef typename In::activation A;
+    for (uint item = thread_index; item < 4u * MAXM * count; item += threads) {
+        uint step = item & 3u, packet = item >> 2;
+        uint m = packet / count, local = packet - m * count;
+        float4 even = float4(0.0f), odd = float4(0.0f);
+        if (m < m_rows)
+            in.load8(m, 32u * (first + local) + 8u * step, 0.0f, even, odd);
+        words[gemv_word(local, step, m, count)] = A::pack8(even, odd);
+    }
+}
+
+// The R weight rows of a lane group (and, paired, of the second tensor)
+// from `first_row` (a multiple of R below `rows`), located once
+// (`Weights::locate`), rows of one tile from the first
+// (`Weights::together`). DERIVED: the group's one row is named instead, and
+// its lanes derive it at each load.
+template <typename W, typename U, bool PAIRED, uint R, bool DERIVED = false>
+struct gemv_rows {
+    typename Weights<W>::located a[R];
+    typename Weights<U>::located b[R];
+    uint only;
+    void locate(thread const Weights<W> &w, thread const Weights<U> &u, uint first_row, uint rows) {
+        static_assert(!DERIVED || R == 1u, "a lane derives one row");
+        if (DERIVED) {
+            only = min(first_row, rows - 1);
+            return;
+        }
+        const bool a_together = w.template together<R>(rows);
+        const bool b_together = PAIRED && u.template together<R>(rows);
+        PROJECTION_UNROLL
+        for (uint r = 0; r < R; ++r) {
+            uint n = min(first_row + r, rows - 1);
+            if (r > 0 && a_together)
+                a[r] = Weights<W>::after(a[0], r);
+            else
+                a[r] = w.locate(n);
+            if (PAIRED) {
+                if (r > 0 && b_together)
+                    b[r] = Weights<U>::after(b[0], r);
+                else
+                    b[r] = u.locate(n);
+            }
+        }
+    }
+};
+
+// One packet of R weight rows (and, paired, of R rows of the second tensor).
+template <typename W, typename U, bool PAIRED, uint R>
+struct gemv_packets {
+    typename W::packet a[R];
+    typename U::packet b[R];
+    template <bool DERIVED>
+    void load(thread const Weights<W> &w, thread const Weights<U> &u,
+        thread const gemv_rows<W, U, PAIRED, R, DERIVED> &at, uint p) {
+        if (DERIVED) {
+            a[0] = w.packet(at.only, p);
+            if (PAIRED)
+                b[0] = u.packet(at.only, p);
+            return;
+        }
+        PROJECTION_UNROLL
+        for (uint r = 0; r < R; ++r) {
+            a[r] = w.packet(at.a[r], p);
+            if (PAIRED)
+                b[r] = u.packet(at.b[r], p);
+        }
+    }
+};
+
+// acc += the eight products of one step, in column order.
+inline float gemv_step_dot(float acc, float4 we, float4 wo, float4 xe, float4 xo) {
+    PROJECTION_UNROLL
+    for (uint j = 0; j < 4; ++j) {
+        acc = metal::fma(we[j], xe[j], acc);
+        acc = metal::fma(wo[j], xo[j], acc);
+    }
+    return acc;
+}
+
+// Whether a packet decoder is factored (`W::factored()`): its `codes` are
+// a step's values over one `factor` of that step, exactly, so a step's eight
+// products are summed over its codes and scaled once, where any other
+// decoder's are summed over its values (`fma(scale, code, bias)` a weight).
+template <typename T>
+struct gemv_void {
+    typedef void type;
+};
+template <typename W, typename = void>
+struct gemv_factored {
+    static constant constexpr bool value = false;
+};
+template <typename W>
+struct gemv_factored<W, typename gemv_void<decltype(&W::factored)>::type> {
+    static constant constexpr bool value = W::factored();
+};
+
+// Step `step`'s eight weights of packet k as its decoder sums them: its
+// codes where it is factored, else its values.
+template <typename W>
+inline void gemv_step_weights(thread const typename W::packet &k, uint step, thread float4 &even, thread float4 &odd) {
+    if constexpr (gemv_factored<W>::value)
+        W::codes(k, step, even, odd);
+    else
+        W::values(k, step, even, odd);
+}
+
+// acc plus step `step`'s products of packet k (its `gemv_step_weights`).
+template <typename W>
+inline float gemv_step_add(float acc, thread const typename W::packet &k, uint step, float4 we, float4 wo, float4 xe,
+    float4 xo) {
+    if constexpr (gemv_factored<W>::value)
+        return metal::fma(W::factor(k, step), gemv_step_dot(0.0f, we, wo, xe, xo), acc);
+    else
+        return gemv_step_dot(acc, we, wo, xe, xo);
+}
+
+// Accumulate one loaded packet (chunk-local `local` of a chunk of `count`)
+// into the accumulators of all MAXM staged rows.
+template <typename W, typename U, bool PAIRED, uint R, uint MAXM, typename A>
+inline void gemv_accumulate(thread float (&acc)[R][MAXM], thread float (&acc2)[R][MAXM],
+    thread const gemv_packets<W, U, PAIRED, R> &packets, uint local, uint count, threadgroup const uint4 *words) {
+    PROJECTION_UNROLL
+    for (uint step = 0; step < 4; ++step) {
+        float4 ae[R], ao[R], be[R], bo[R];
+        PROJECTION_UNROLL
+        for (uint r = 0; r < R; ++r) {
+            gemv_step_weights<W>(packets.a[r], step, ae[r], ao[r]);
+            if (PAIRED)
+                gemv_step_weights<U>(packets.b[r], step, be[r], bo[r]);
+        }
+        PROJECTION_UNROLL
+        for (uint m = 0; m < MAXM; ++m) {
+            float4 xe, xo;
+            A::split8(words[gemv_word(local, step, m, count)], xe, xo);
+            PROJECTION_UNROLL
+            for (uint r = 0; r < R; ++r) {
+                acc[r][m] = gemv_step_add<W>(acc[r][m], packets.a[r], step, ae[r], ao[r], xe, xo);
+                if (PAIRED)
+                    acc2[r][m] = gemv_step_add<U>(acc2[r][m], packets.b[r], step, be[r], bo[r], xe, xo);
+            }
+        }
+    }
+}
+
+// Weight rows of one GEMV threadgroup (segmented entries map threadgroups to
+// segments by it).
+template <uint SG, uint R, uint LANES>
+constexpr uint gemv_threadgroup_rows() {
+    return SG * R * (32u / LANES);
+}
+
+// Sum of `value` over the LANES lanes of this lane's group.
+template <uint LANES>
+inline float gemv_group_sum(float value) {
+    if (LANES == 32)
+        return simd_sum(value);
+    for (ushort offset = LANES / 2; offset > 0; offset >>= 1)
+        value += simd_shuffle_xor(value, offset);
+    return value;
+}
+
+// Publishes a GEMV lane group's sums. Plain and paired epilogues get (m, n)
+// from the lane that owns it. A column epilogue (`store_column(m, n, sums)`,
+// plain only) gets from that lane every activation row's sum of output n,
+// which each lane of the group holds after the group sums: the convolution
+// along the rows of `gated_delta_project_convolved`.
+template <bool COLUMNS>
+struct gemv_emit;
+template <>
+struct gemv_emit<false> {
+    // Whether each lane emits at most one output, so the lane loads that
+    // output's epilogue values ahead (`early`).
+    template <bool PAIRED, uint R, uint MAXM, uint LANES>
+    static constexpr bool ahead() {
+        return !PAIRED && R * MAXM <= LANES;
+    }
+    template <bool PAIRED, uint R, uint MAXM, uint LANES, typename Out>
+    static void run(thread const Out &out, thread float (&acc)[R][MAXM], thread float (&acc2)[R][MAXM],
+        uint m_rows, uint rows, uint first_row, uint sub, thread const typename early<Out>::values &loaded) {
+        for (uint r = 0; r < R; ++r) {
+            for (uint m = 0; m < MAXM; ++m) {
+                if (m < m_rows) {
+                    float total = gemv_group_sum<LANES>(acc[r][m]);
+                    float total2 = PAIRED ? gemv_group_sum<LANES>(acc2[r][m]) : 0.0f;
+                    if (sub == (r * MAXM + m) % LANES && first_row + r < rows) {
+                        if constexpr (ahead<PAIRED, R, MAXM, LANES>())
+                            early<Out>::store(out, m, first_row + r, total, loaded);
+                        else
+                            emit<PAIRED>::run(out, m, first_row + r, total, total2);
+                    }
+                }
+            }
+        }
+    }
+};
+template <>
+struct gemv_emit<true> {
+    template <bool PAIRED, uint R, uint MAXM, uint LANES>
+    static constexpr bool ahead() {
+        return false;
+    }
+    template <bool PAIRED, uint R, uint MAXM, uint LANES, typename Out>
+    static void run(thread const Out &out, thread float (&acc)[R][MAXM], thread float (&)[R][MAXM],
+        uint m_rows, uint rows, uint first_row, uint sub, thread const typename early<Out>::values &) {
+        static_assert(!PAIRED, "a column epilogue is plain");
+        for (uint r = 0; r < R; ++r) {
+            float column[MAXM];
+            for (uint m = 0; m < MAXM; ++m) {
+                column[m] = 0.0f;
+                if (m < m_rows)
+                    column[m] = gemv_group_sum<LANES>(acc[r][m]);
+            }
+            for (uint m = 0; m < MAXM; ++m) {
+                if (m < m_rows && sub == (r * MAXM + m) % LANES && first_row + r < rows)
+                    out.store_column(m, first_row + r, column);
+            }
+        }
+    }
+};
+
+// One GEMV threadgroup of SG simdgroups. A simdgroup is 32 / LANES lane
+// groups; lane group g of simdgroup sg owns the R weight rows from
+// ((tile * SG + sg) * (32 / LANES) + g) * R, and its lanes own the packets
+// sub, sub + LANES, ... of those rows. The prologue output is staged per
+// threadgroup in chunks of at most `gemv_stage_packet_rows / MAXM` packets
+// (a multiple of LANES). Weight packets are double-buffered in registers: a
+// lane loads its next packet before accumulating the current one, and its
+// first packet before the staging, so the weight stream never waits on it.
+// `first_packet` is the stored packet of the GEMV's packet 0: a GEMV over a
+// range of whole packets of the weight rows (K split by stream in
+// `stream_mix_down`) reads packets first_packet .. first_packet +
+// ceil(k / 32) - 1, the rows' stored length unchanged. It is the call's
+// argument, not a field of the weight view, so no other reader of a view
+// (the GEMMs among them) carries it.
+template <typename W, typename U, bool PAIRED, uint R, uint MAXM, uint LANES, bool COLUMNS = false, typename In,
+    typename Out>
+inline void gemv_body(thread const In &in, thread const Out &out, thread const Weights<W> &w,
+    thread const Weights<U> &u, uint m_rows, uint rows, uint k, uint tile,
+    threadgroup uchar *shared, uint simdgroups, uint sg, uint lane, uint first_packet = 0) {
+    static_assert(LANES == 32 || LANES == 16 || LANES == 8, "a GEMV lane group is 8, 16 or 32 lanes");
+    typedef typename In::activation A;
+    uint group = lane / LANES, sub = lane % LANES;
+    uint first_row = ((tile * simdgroups + sg) * (32u / LANES) + group) * R;
+    bool active = first_row < rows;
+    uint packets = (k + 31u) / 32u;
+    // A lane group of one row derives it at each load: across four activation
+    // rows' accumulators the located row costs more than the arithmetic
+    // (`Weights::locate`).
+    gemv_rows<W, U, PAIRED, R, (R == 1u)> at;
+    gemv_packets<W, U, PAIRED, R> current, next;
+    if (active) {
+        at.locate(w, u, first_row, rows);
+        if (sub < packets)
+            current.load(w, u, at, first_packet + sub);
+    }
+    // The epilogue values of the output this lane emits, with its first
+    // packet (`early`): lane sub emits output r * MAXM + m == sub.
+    typename early<Out>::values loaded = {};
+    if (gemv_emit<COLUMNS>::template ahead<PAIRED, R, MAXM, LANES>() && active && sub < R * MAXM
+        && sub % MAXM < m_rows && first_row + sub / MAXM < rows)
+        loaded = early<Out>::load(out, sub % MAXM, first_row + sub / MAXM);
+    uint chunk = min(packets, (gemv_stage_packet_rows / MAXM) / LANES * LANES);
+    threadgroup uint4 *words = reinterpret_cast<threadgroup uint4 *>(shared);
+    float acc[R][MAXM], acc2[R][MAXM];
+    for (uint r = 0; r < R; ++r)
+        for (uint m = 0; m < MAXM; ++m)
+            acc[r][m] = acc2[r][m] = 0.0f;
+    for (uint first = 0; first < packets; first += chunk) {
+        uint count = min(chunk, packets - first);
+        // A threadgroup may run several GEMVs in turn: the previous chunk's or
+        // call's reads of the threadgroup memory finish before this one
+        // writes it.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        gemv_stage<MAXM>(in, m_rows, first, count, words, sg * 32u + lane, simdgroups * 32u);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (active) {
+            for (uint local = sub; local < count; local += LANES) {
+                if (first + local + LANES < packets)
+                    next.load(w, u, at, first_packet + first + local + LANES);
+                gemv_accumulate<W, U, PAIRED, R, MAXM, A>(acc, acc2, current, local, count, words);
+                current = next;
+            }
+        }
+    }
+    gemv_emit<COLUMNS>::template run<PAIRED, R, MAXM, LANES>(out, acc, acc2, m_rows, rows, first_row, sub, loaded);
+}
+
+template <typename W, uint SG, uint R, uint MAXM, uint LANES = 32, typename In, typename Out>
+inline void gemv(thread const In &in, thread const Out &out, thread const Weights<W> &w,
+    uint m_rows, uint rows, uint k, uint tile, threadgroup uchar *shared, uint sg, uint lane) {
+    gemv_body<W, W, false, R, MAXM, LANES>(in, out, w, w, m_rows, rows, k, tile, shared, SG, sg, lane);
+}
+
+template <typename W, uint R, uint MAXM, uint LANES = 32, typename In, typename Out>
+inline void gemv_runtime(thread const In &in, thread const Out &out, thread const Weights<W> &w,
+    uint m_rows, uint rows, uint k, uint tile, threadgroup uchar *shared,
+    uint simdgroups, uint sg, uint lane, uint first_packet = 0) {
+    gemv_body<W, W, false, R, MAXM, LANES>(in, out, w, w, m_rows, rows, k, tile, shared,
+        simdgroups, sg, lane, first_packet);
+}
+
+template <typename G, typename U, uint R, uint MAXM, uint LANES = 32, typename In, typename Out>
+inline void gemv_paired_runtime(thread const In &in, thread const Out &out, thread const Weights<G> &gate,
+    thread const Weights<U> &up, uint m_rows, uint rows, uint k, uint tile,
+    threadgroup uchar *shared, uint simdgroups, uint sg, uint lane) {
+    gemv_body<G, U, true, R, MAXM, LANES>(in, out, gate, up, m_rows, rows, k, tile, shared,
+        simdgroups, sg, lane);
+}
+
+// ---------------------------------------------------------------------------
+// The row mapping's GEMV walked by packet class (`rows32` weights): a form
+// selected by the launch, with the row mapping's results.
+//
+// The threadgroup keeps the row mapping's SG * R * 32 / LANES weight rows
+// and its LANES partial sums per row (class c: packets c, c + LANES, ... in
+// column order), but its lanes are regrouped: with `span` = SG * 32 / LANES
+// row groups in the threadgroup, lanes b * span .. b * span + span - 1 of
+// simdgroup sg are those row groups at class sg + b * SG. A simdgroup's
+// lanes are then consecutive rows of a tile at the same packet, so its code
+// loads are runs of adjacent bytes in lane order, where the row mapping asks
+// for LANES separate cache lines a kilobyte apart at every step (on the M1,
+// `dense_expand` over Q8_0 at one row: 438 against 420 µs).
+//
+// A row's class sums then sit in different simdgroups. `gemv_group_sum`
+// pairs classes c and c + LANES / 2 first, then by halving offsets: the
+// levels down to offset SG pair lanes of one simdgroup, and the levels below
+// pair simdgroups, each a round of the threadgroup memory. Every result is
+// therefore bit-identical to the row mapping's with the same LANES. The
+// rounds cost a barrier each, which the walk repays for one or two
+// activation rows on the M1 and not on the M4 Pro.
+
+// Whether the class walk serves: R consecutive rows of a tile per lane, a
+// class per simdgroup and lane block, lane groups `gemv_group_sum` adds by
+// its own tree (32 lanes are `simd_sum`'s order, which the walk cannot
+// reproduce), and the staged activations' threadgroup memory holding a float
+// per row, activation row and tensor of every simdgroup.
+template <typename W, typename U, bool PAIRED, uint R, uint MAXM, uint LANES>
+inline bool gemv_classes_serve(thread const Weights<W> &w, thread const Weights<U> &u, uint rows, uint packets,
+    uint simdgroups) {
+    return w.template together<R>(rows) && (!PAIRED || u.template together<R>(rows)) && LANES < 32u &&
+        simdgroups <= LANES &&
+        8u * MAXM * simdgroups * (simdgroups * 32u / LANES) * R <=
+            min(packets * MAXM, gemv_stage_packet_rows) * gemv_packet_row_bytes;
+}
+
+template <typename W, typename U, bool PAIRED, uint R, uint MAXM, uint LANES, typename In, typename Out>
+inline void gemv_classes(thread const In &in, thread const Out &out, thread const Weights<W> &w,
+    thread const Weights<U> &u, uint m_rows, uint rows, uint k, uint tile,
+    threadgroup uchar *shared, uint simdgroups, uint sg, uint lane) {
+    typedef typename In::activation A;
+    uint threads = simdgroups * 32u, thread_index = sg * 32u + lane;
+    uint span = threads / LANES;
+    uint sub = sg + (lane / span) * simdgroups, within = lane % span;
+    uint first_row = (tile * span + within) * R;
+    bool active = first_row < rows;
+    uint packets = (k + 31u) / 32u;
+    gemv_rows<W, U, PAIRED, R> at;
+    gemv_packets<W, U, PAIRED, R> current, next;
+    if (active) {
+        at.locate(w, u, first_row, rows);
+        if (sub < packets)
+            current.load(w, u, at, sub);
+    }
+    uint chunk = min(packets, (gemv_stage_packet_rows / MAXM) / LANES * LANES);
+    threadgroup uint4 *words = reinterpret_cast<threadgroup uint4 *>(shared);
+    float acc[R][MAXM], acc2[R][MAXM];
+    for (uint r = 0; r < R; ++r)
+        for (uint m = 0; m < MAXM; ++m)
+            acc[r][m] = acc2[r][m] = 0.0f;
+    for (uint first = 0; first < packets; first += chunk) {
+        uint count = min(chunk, packets - first);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        gemv_stage<MAXM>(in, m_rows, first, count, words, thread_index, threads);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (active) {
+            for (uint local = sub; local < count; local += LANES) {
+                if (first + local + LANES < packets)
+                    next.load(w, u, at, first + local + LANES);
+                gemv_accumulate<W, U, PAIRED, R, MAXM, A>(acc, acc2, current, local, count, words);
+                current = next;
+            }
+        }
+    }
+    // The levels that pair classes of one simdgroup.
+    PROJECTION_UNROLL
+    for (uint r = 0; r < R; ++r) {
+        PROJECTION_UNROLL
+        for (uint m = 0; m < MAXM; ++m) {
+            for (ushort offset = 16; offset >= span; offset >>= 1) {
+                acc[r][m] += simd_shuffle_xor(acc[r][m], offset);
+                if (PAIRED)
+                    acc2[r][m] += simd_shuffle_xor(acc2[r][m], offset);
+            }
+        }
+    }
+    // The levels that pair simdgroups: every simdgroup publishes its rows'
+    // sums, and at the level of offset `o` simdgroup c < o adds simdgroup
+    // c + o's and publishes the result for the next level. The sums stay in
+    // the walk's registers. The staged activations are read before the sums
+    // overwrite them.
+    threadgroup float *sums = reinterpret_cast<threadgroup float *>(shared);
+    const uint plane = simdgroups * span * R, mine = (sg * span + within) * R;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane < span) {
+        PROJECTION_UNROLL
+        for (uint r = 0; r < R; ++r) {
+            PROJECTION_UNROLL
+            for (uint m = 0; m < MAXM; ++m) {
+                if (m < m_rows) {
+                    sums[(2u * m) * plane + mine + r] = acc[r][m];
+                    if (PAIRED)
+                        sums[(2u * m + 1u) * plane + mine + r] = acc2[r][m];
+                }
+            }
+        }
+    }
+    for (uint offset = simdgroups / 2u; offset > 0u; offset >>= 1) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg < offset && lane < span) {
+            const uint other = mine + offset * span * R;
+            PROJECTION_UNROLL
+            for (uint r = 0; r < R; ++r) {
+                PROJECTION_UNROLL
+                for (uint m = 0; m < MAXM; ++m) {
+                    if (m < m_rows) {
+                        acc[r][m] += sums[(2u * m) * plane + other + r];
+                        sums[(2u * m) * plane + mine + r] = acc[r][m];
+                        if (PAIRED) {
+                            acc2[r][m] += sums[(2u * m + 1u) * plane + other + r];
+                            sums[(2u * m + 1u) * plane + mine + r] = acc2[r][m];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    PROJECTION_UNROLL
+    for (uint r = 0; r < R; ++r) {
+        PROJECTION_UNROLL
+        for (uint m = 0; m < MAXM; ++m) {
+            if (m < m_rows && first_row + r < rows && sg == 0u && lane < span)
+                emit<PAIRED>::run(out, m, first_row + r, acc[r][m], acc2[r][m]);
+        }
+    }
+}
+
+// The GEMV by the packets' recipe (`gemv_recipe`): the threadgroup's rows
+// (at most `gemv_recipe_rows_max`) staged once a chunk in their A storage,
+// quarter-major per row ([row][quarter][packet]) so a simdgroup's reads are
+// contiguous, in chunks of whole lane strides that fit the GEMV's declared
+// staging (`gemv_stage_packet_rows` packet rows of four words). A simdgroup
+// keeps the row mapping's R * 32 / LANES weight rows, each summed by all 32
+// lanes, lane l taking packets l, l + 32, .. of each chunk in order, then
+// `simd_sum`.
+constant constexpr uint gemv_recipe_rows_max = 8;
+
+template <typename W, uint R, uint LANES, typename In, typename Out>
+inline void gemv_recipe_rows(thread const In &x, thread const Out &out, thread const Weights<W> &w, uint rows,
+    uint n, uint k, uint tile, threadgroup uchar *shared, uint simdgroups, uint sg, uint lane) {
+    typedef typename In::activation activation;
+    static_assert(gemv_stage_packet_rows / gemv_recipe_rows_max >= 32u, "the staging holds a lane stride of every row");
+    const uint groups = k / 32u;
+    const uint capacity = gemv_stage_packet_rows;
+    const uint chunk = rows * groups <= capacity ? groups : capacity / rows / 32u * 32u;
+    threadgroup uint4 *stage = reinterpret_cast<threadgroup uint4 *>(shared);
+    const uint tid = sg * 32u + lane, threads = simdgroups * 32u;
+    constexpr uint outputs = R * 32u / LANES;
+    const uint first = (tile * simdgroups + sg) * outputs;
+    float acc[outputs][gemv_recipe_rows_max] = {};
+    for (uint start = 0; start < groups; start += chunk) {
+        const uint count = min(chunk, groups - start);
+        // The rows' squares (first chunk) or the previous chunk's reads
+        // finish before this chunk is staged.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint item = tid; item < rows * count * 4u; item += threads) {
+            const uint m = item / (count * 4u), word = item % (count * 4u);
+            const uint g = word / 4u, q = word % 4u;
+            float4 even, odd;
+            x.load8(m, (start + g) * 32u + q * 8u, 0.0f, even, odd);
+            stage[(m * 4u + q) * count + g] = activation::pack8(even, odd);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        PROJECTION_UNROLL
+        for (uint r = 0; r < outputs; ++r) {
+            const uint row = first + r;
+            if (row >= n)
+                break;
+            for (uint g = lane; g < count; g += 32u) {
+                const auto packet = w.packet(row, start + g);
+                const auto codes = gemv_recipe<W>::decode(packet);
+                PROJECTION_UNROLL
+                for (uint m = 0; m < gemv_recipe_rows_max; ++m) {
+                    if (m >= rows)
+                        break;
+                    float4 even[4], odd[4];
+                    PROJECTION_UNROLL
+                    for (uint q = 0; q < 4u; ++q)
+                        activation::split8(stage[(m * 4u + q) * count + g], even[q], odd[q]);
+                    acc[r][m] += gemv_recipe<W>::dot(packet, codes, even, odd);
+                }
+            }
+        }
+    }
+    PROJECTION_UNROLL
+    for (uint r = 0; r < outputs; ++r) {
+        const uint row = first + r;
+        if (row >= n)
+            break;
+        PROJECTION_UNROLL
+        for (uint m = 0; m < gemv_recipe_rows_max; ++m) {
+            if (m >= rows)
+                break;
+            const float sum = simd_sum(acc[r][m]);
+            if (lane == 0u)
+                out.store(m, row, sum);
+        }
+    }
+}
+
+// The row GEMV of a launch whose form parameter may select the class walk
+// (CLASSES): the walk where it serves, the row mapping otherwise.
+template <typename W, typename U, bool PAIRED, uint R, uint MAXM, uint LANES, bool CLASSES, typename In,
+    typename Out>
+inline void gemv_form(thread const In &in, thread const Out &out, thread const Weights<W> &w,
+    thread const Weights<U> &u, uint m_rows, uint rows, uint k, uint tile,
+    threadgroup uchar *shared, uint simdgroups, uint sg, uint lane) {
+    if (CLASSES && gemv_classes_serve<W, U, PAIRED, R, MAXM, LANES>(w, u, rows, (k + 31u) / 32u, simdgroups)) {
+        gemv_classes<W, U, PAIRED, R, MAXM, LANES>(in, out, w, u, m_rows, rows, k, tile, shared, simdgroups, sg,
+            lane);
+        return;
+    }
+    gemv_body<W, U, PAIRED, R, MAXM, LANES>(in, out, w, u, m_rows, rows, k, tile, shared, simdgroups, sg, lane);
+}
+
+// ---------------------------------------------------------------------------
+// The GEMV over row tiles (`rows32` weights): a form of its own, selected
+// by the launch. A native's GEMV launches of every row class take it
+// together, under the one TILED they all read, so a row is computed in one
+// form whichever class serves it.
+//
+// A thread owns one weight row. The threadgroup keeps the row mapping's
+// SG * R * 32 / LANES weight rows, so a row has LANES / R threads, thread
+// t = sg * 32 + lane owning row t % rows-of-the-threadgroup: the lanes of a
+// simdgroup are consecutive rows of one tile at the same packets, their code
+// loads are adjacent, and they walk the packets in step, so every lane reads
+// its row's coefficient planes once per run of packets (`packets::Block`).
+//
+// Summation order. A row's packets are split into LANES contiguous ranges,
+// in column order and as evenly as they divide (the first packets % LANES
+// ranges hold one packet more). A range is summed in column order from zero,
+// and the LANES range sums are added pairwise (`gemv_pair_sum`: neighbours
+// first). A thread owns R neighbouring ranges and adds them itself; the rest
+// crosses the threadgroup, since a row's threads are in different
+// simdgroups. The order depends on the row's packet count and LANES only,
+// never on M or on how the ranges are staged: every row of an M-row call in
+// this form is bit-identical to the same row computed alone in this form. It
+// is not the row mapping's order.
+//
+// The activations are staged in chunks of the same window of every range
+// (`gemv_chunk`), so all threads work in every chunk. The launch's
+// threadgroup memory holds, besides the staged activations, one float per
+// thread and tensor: a launch of SG simdgroups declares
+//   shared_bytes (max(<the GEMV staging above>, SG * 128))
+// (SG * 256 for a paired GEMV).
+
+// A row's packets split into `ranges` contiguous ranges: range s holds the
+// `length(s)` packets from `start(s)`.
+struct gemv_split {
+    uint ranges;
+    uint base;    // packets of every range
+    uint extra;   // ranges holding one more
+    uint start(uint range) const { return range * base + min(range, extra); }
+    uint length(uint range) const { return base + (range < extra ? 1u : 0u); }
+    uint longest() const { return base + min(extra, 1u); }
+};
+
+// One staged chunk: the at most `window` packets from `offset` of every
+// range, a range's packets in consecutive slots and the ranges in order.
+struct gemv_chunk {
+    gemv_split split;
+    uint offset;
+    uint longer;    // staged packets of a range holding one more
+    uint shorter;   // staged packets of the other ranges
+    uint count(uint range) const { return range < split.extra ? longer : shorter; }
+    uint slot(uint range) const {
+        return range < split.extra ? range * longer : split.extra * longer + (range - split.extra) * shorter;
+    }
+    uint slots() const { return split.extra * longer + (split.ranges - split.extra) * shorter; }
+    // The row packet staged in `slot`.
+    uint packet(uint slot) const {
+        uint head = split.extra * longer;
+        uint range, at;
+        if (slot < head) {
+            range = slot / longer;
+            at = slot - range * longer;
+        } else {
+            range = (slot - head) / shorter;
+            at = slot - head - range * shorter;
+            range += split.extra;
+        }
+        return split.start(range) + offset + at;
+    }
+};
+inline gemv_chunk gemv_chunk_at(gemv_split split, uint offset, uint window) {
+    uint longer = split.base + 1u > offset ? min(split.base + 1u - offset, window) : 0u;
+    uint shorter = split.base > offset ? min(split.base - offset, window) : 0u;
+    return gemv_chunk{split, offset, longer, shorter};
+}
+
+// Stage a chunk of MAXM activation rows as `gemv_stage` does, slot q of the
+// chunk at words[gemv_word(q, s, m, chunk.slots())].
+template <uint MAXM, typename In>
+inline void gemv_stage_chunk(thread const In &in, uint m_rows, gemv_chunk chunk, threadgroup uint4 *words,
+    uint thread_index, uint threads) {
+    typedef typename In::activation A;
+    uint count = chunk.slots();
+    for (uint item = thread_index; item < 4u * MAXM * count; item += threads) {
+        uint step = item & 3u, packet = item >> 2;
+        uint m = packet / count, slot = packet - m * count;
+        float4 even = float4(0.0f), odd = float4(0.0f);
+        if (m < m_rows)
+            in.load8(m, 32u * chunk.packet(slot) + 8u * step, 0.0f, even, odd);
+        words[gemv_word(slot, step, m, count)] = A::pack8(even, odd);
+    }
+}
+
+// The sum of COUNT values in a pairwise tree, neighbours first.
+template <uint COUNT>
+inline float gemv_pair_sum(thread float (&v)[COUNT]) {
+    PROJECTION_UNROLL
+    for (uint width = 1; width < COUNT; width *= 2) {
+        PROJECTION_UNROLL
+        for (uint i = 0; i < COUNT; i += 2 * width)
+            v[i] += v[i + width];
+    }
+    return v[0];
+}
+
+// One contiguous range of a row's packets, walked in order: the packet being
+// accumulated, the one loaded ahead of it, and the row's coefficient run.
+template <typename W>
+struct gemv_walk {
+    uint next;   // the packet loaded ahead
+    uint end;
+    typename W::packet current, ahead;
+    typename packets::Block<W>::state run;
+};
+
+// Load the walk's next packet ahead (none past the range's end) and step.
+template <typename W>
+inline void gemv_walk_load(thread gemv_walk<W> &walk, thread const Weights<W> &w,
+    thread const typename Weights<W>::located &at, bool first) {
+    if (walk.next < walk.end) {
+        if (first || walk.next % packets::Block<W>::packets == 0u)
+            walk.run = w.run(at, walk.next);
+        walk.ahead = w.packet(at, walk.next, walk.run);
+    }
+    walk.next += 1u;
+}
+
+template <typename W, typename U, bool PAIRED, uint R, uint MAXM, uint LANES, typename In, typename Out>
+inline void gemv_tile_row(thread const In &in, thread const Out &out, thread const Weights<W> &w,
+    thread const Weights<U> &u, uint m_rows, uint rows, uint k, uint tile, threadgroup uchar *shared,
+    uint simdgroups, uint sg, uint lane) {
+    static_assert(LANES == 32 || LANES == 16 || LANES == 8, "a GEMV row has 8, 16 or 32 packet ranges");
+    static_assert(LANES % R == 0, "a thread owns a whole share of its row's ranges");
+    static_assert(gemv_stage_packet_rows / MAXM >= LANES, "a chunk stages a packet of every range");
+    typedef typename In::activation A;
+    constexpr uint sharers = LANES / R;
+    uint threads = simdgroups * 32u, thread_index = sg * 32u + lane;
+    uint span = threads / sharers;
+    uint within = thread_index % span, share = thread_index / span;
+    // A thread past the last weight row computes that row and emits nothing.
+    bool active = tile * span + within < rows;
+    uint n = min(tile * span + within, rows - 1u);
+    uint packets = (k + 31u) / 32u;
+    gemv_split split{LANES, packets / LANES, packets % LANES};
+    typename Weights<W>::located a_at = w.locate(n);
+    typename Weights<U>::located b_at = u.locate(n);
+    gemv_walk<W> a[R];
+    gemv_walk<U> b[R];
+    PROJECTION_UNROLL
+    for (uint j = 0; j < R; ++j) {
+        uint range = share * R + j;
+        a[j].next = split.start(range);
+        a[j].end = a[j].next + split.length(range);
+        gemv_walk_load(a[j], w, a_at, true);
+        if (PAIRED) {
+            b[j].next = a[j].next - 1u;
+            b[j].end = a[j].end;
+            gemv_walk_load(b[j], u, b_at, true);
+        }
+    }
+    constexpr uint window = (gemv_stage_packet_rows / MAXM) / LANES;
+    threadgroup uint4 *words = reinterpret_cast<threadgroup uint4 *>(shared);
+    float acc[R][MAXM], acc2[R][MAXM];
+    PROJECTION_UNROLL
+    for (uint j = 0; j < R; ++j) {
+        PROJECTION_UNROLL
+        for (uint m = 0; m < MAXM; ++m)
+            acc[j][m] = acc2[j][m] = 0.0f;
+    }
+    for (uint offset = 0; offset < split.longest(); offset += window) {
+        gemv_chunk chunk = gemv_chunk_at(split, offset, window);
+        // A threadgroup may run several GEMVs in turn: the previous chunk's or
+        // call's reads of the threadgroup memory finish before this one
+        // writes it.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        gemv_stage_chunk<MAXM>(in, m_rows, chunk, words, thread_index, threads);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint slots = chunk.slots();
+        for (uint at = 0; at < (split.extra == 0u ? chunk.shorter : chunk.longer); ++at) {
+            PROJECTION_UNROLL
+            for (uint j = 0; j < R; ++j) {
+                uint range = share * R + j;
+                if (at < chunk.count(range)) {
+                    a[j].current = a[j].ahead;
+                    gemv_walk_load(a[j], w, a_at, false);
+                    if (PAIRED) {
+                        b[j].current = b[j].ahead;
+                        gemv_walk_load(b[j], u, b_at, false);
+                    }
+                    PROJECTION_UNROLL
+                    for (uint step = 0; step < 4; ++step) {
+                        float4 ae, ao, be, bo;
+                        gemv_step_weights<W>(a[j].current, step, ae, ao);
+                        if (PAIRED)
+                            gemv_step_weights<U>(b[j].current, step, be, bo);
+                        PROJECTION_UNROLL
+                        for (uint m = 0; m < MAXM; ++m) {
+                            float4 xe, xo;
+                            A::split8(words[gemv_word(chunk.slot(range) + at, step, m, slots)], xe, xo);
+                            acc[j][m] = gemv_step_add<W>(acc[j][m], a[j].current, step, ae, ao, xe, xo);
+                            if (PAIRED)
+                                acc2[j][m] = gemv_step_add<U>(acc2[j][m], b[j].current, step, be, bo, xe, xo);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Each activation row's sums cross the threadgroup in a round of their
+    // own: every thread publishes its ranges' sum and the row's first thread
+    // adds them.
+    threadgroup float *sums = reinterpret_cast<threadgroup float *>(shared);
+    PROJECTION_UNROLL
+    for (uint m = 0; m < MAXM; ++m) {
+        if (m < m_rows) {
+            float own[R], own2[R];
+            PROJECTION_UNROLL
+            for (uint j = 0; j < R; ++j) {
+                own[j] = acc[j][m];
+                own2[j] = acc2[j][m];
+            }
+            // The staged activations (and the previous round) are read
+            // before the sums overwrite them.
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            sums[thread_index] = gemv_pair_sum<R>(own);
+            if (PAIRED)
+                sums[threads + thread_index] = gemv_pair_sum<R>(own2);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (active && share == 0u) {
+                float part[sharers], part2[sharers];
+                PROJECTION_UNROLL
+                for (uint s = 0; s < sharers; ++s) {
+                    part[s] = sums[within + s * span];
+                    part2[s] = PAIRED ? sums[threads + within + s * span] : 0.0f;
+                }
+                emit<PAIRED>::run(out, m, n, gemv_pair_sum<sharers>(part), gemv_pair_sum<sharers>(part2));
+            }
+        }
+    }
+}
+
+// Whether a GEMV over `w` takes the tile form.
+template <typename W>
+inline bool gemv_tile_row_serves(thread const Weights<W> &w) {
+    return w.tile() > 1u;
+}
+
+// Row-window views for running unordered segments of a mixed ordered GEMV in
+// 2-row windows with register-held RMS inverses (`0` static threadgroup bytes).
+template <typename RawIn>
+struct RegPairOrderedNorm {
+    typedef typename RawIn::activation activation;
+    RawIn raw;
+    uint first_row;
+    float inv0, inv1;
+    uint width() const { return raw.width(); }
+    void load8(uint m, uint k, float, thread float4 &even, thread float4 &odd) const {
+        raw.load8(first_row + m, k, m == 0u ? inv0 : inv1, even, odd);
+    }
+};
+
+template <typename RawIn, uint MAXM>
+struct RegOrderedNorm {
+    typedef typename RawIn::activation activation;
+    RawIn raw;
+    float inv[MAXM];
+    uint width() const { return raw.width(); }
+    void load8(uint m, uint k, float, thread float4 &even, thread float4 &odd) const {
+        raw.load8(m, k, inv[m], even, odd);
+    }
+};
+
+template <uint MAXM>
+struct RegGlobals {
+    float g[MAXM];
+    float at(uint m) const { return g[m]; }
+};
+
+template <typename W, typename U, bool PAIRED, uint R, uint LANES, uint SIMDGROUPS, typename RawIn, typename Out>
+inline void gemv_prestaged_one(thread const RawIn &raw, thread const Out &out, thread const Weights<W> &w,
+    thread const Weights<U> &u, uint rows, uint k, uint tile, threadgroup uchar *shared, uint sg, uint lane) {
+    static_assert(LANES == 32 || LANES == 16 || LANES == 8, "a GEMV lane group is 8, 16 or 32 lanes");
+    typedef typename RawIn::activation A;
+    const uint group = lane / LANES, sub = lane % LANES;
+    const uint first_row = ((tile * SIMDGROUPS + sg) * (32u / LANES) + group) * R;
+    const bool active = first_row < rows;
+    const uint packets = k >> 5u;
+    gemv_rows<W, U, PAIRED, R, (R == 1u)> at;
+    gemv_packets<W, U, PAIRED, R> current;
+    if (active) {
+        at.locate(w, u, first_row, rows);
+        if (sub < packets)
+            current.load(w, u, at, sub);
+    }
+    typename early<Out>::values loaded = {};
+    if (gemv_emit<false>::template ahead<PAIRED, R, 1u, LANES>() && active && sub < R && first_row + sub < rows)
+        loaded = early<Out>::load(out, 0u, first_row + sub);
+    threadgroup uint4 *words = reinterpret_cast<threadgroup uint4 *>(shared);
+    if (!ordered_stage_single_gemv_words<SIMDGROUPS>(raw, k, shared, sg, lane)) {
+        threadgroup float *smem_inv = reinterpret_cast<threadgroup float *>(shared);
+        raw.ordered_inverses(1u, smem_inv, sg, lane, SIMDGROUPS);
+        const float inv0 = smem_inv[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const RegPairOrderedNorm<RawIn> in{raw, 0u, inv0, inv0};
+        gemv_stage<1u>(in, 1u, 0u, packets, words, sg * 32u + lane, SIMDGROUPS * 32u);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float acc[R][1], acc2[R][1];
+    PROJECTION_UNROLL
+    for (uint r = 0; r < R; ++r)
+        acc[r][0] = acc2[r][0] = 0.0f;
+    if (active) {
+        for (uint local = sub; local < packets; local += LANES) {
+            gemv_packets<W, U, PAIRED, R> next;
+            if (local + LANES < packets)
+                next.load(w, u, at, local + LANES);
+            gemv_accumulate<W, U, PAIRED, R, 1u, A>(acc, acc2, current, local, packets, words);
+            current = next;
+        }
+    }
+    gemv_emit<false>::template run<PAIRED, R, 1u, LANES>(out, acc, acc2, 1u, rows, first_row, sub, loaded);
+}
+
+template <typename W0, typename W1, bool PAIRED, uint ROWS, uint MAXM, uint LANES, bool NVFP4, uint SIMDGROUPS,
+    typename RawIn, typename Out>
+inline void unordered_from_ordered_maxm_run(thread const RawIn &raw, thread const Out &out,
+    thread const Weights<W0> &w0, thread const Weights<W1> &w1, uint m, uint n, uint k, uint tile,
+    threadgroup uchar *shared, uint sg, uint lane) {
+    if constexpr (!NVFP4 && !gemv_recipe<W0>::value) {
+        if constexpr (MAXM == 1u) {
+            if (m == 1u && k > 0u && (k & 31u) == 0u && (k >> 5u) <= gemv_stage_packet_rows) {
+                gemv_prestaged_one<W0, W1, PAIRED, ROWS, LANES, SIMDGROUPS>(
+                    raw, out, w0, w1, n, k, tile, shared, sg, lane);
+                return;
+            }
+        }
+        constexpr uint min_shared_bytes = (MAXM == 1u) ? 1024u : ((MAXM == 2u) ? 1536u : ((MAXM == 4u) ? 2560u : 4608u));
+        const uint avail_bytes = metal::max(min_shared_bytes, metal::min(((k + 31u) >> 5u) * MAXM, 448u) * 64u);
+        threadgroup float *smem = reinterpret_cast<threadgroup float *>(shared);
+        raw.ordered_inverses_sram(m, smem, smem, avail_bytes >> 2u, sg, lane, SIMDGROUPS);
+        RegOrderedNorm<RawIn, MAXM> input{raw, {}};
+        PROJECTION_UNROLL
+        for (uint r = 0; r < MAXM; ++r)
+            input.inv[r] = (r < m) ? smem[r] : 0.0f;
+        gemv_body<W0, W1, PAIRED, ROWS, MAXM, LANES>(
+            input, out, w0, w1, m, n, k, tile, shared, SIMDGROUPS, sg, lane);
+    } else {
+        constexpr uint min_shared_bytes = (MAXM == 1u) ? 1024u : ((MAXM == 2u) ? 1536u : ((MAXM == 4u) ? 2560u : 4608u));
+        const uint avail_bytes = metal::max(min_shared_bytes, metal::min(((k + 31u) >> 5u) * MAXM, 448u) * 64u);
+        threadgroup float *smem = reinterpret_cast<threadgroup float *>(shared);
+        raw.ordered_inverses_sram(m, smem, smem, avail_bytes >> 2u, sg, lane, SIMDGROUPS);
+        RegOrderedNorm<RawIn, MAXM> input{raw, {}};
+        PROJECTION_UNROLL
+        for (uint r = 0; r < MAXM; ++r)
+            input.inv[r] = (r < m) ? smem[r] : 0.0f;
+        if constexpr (NVFP4) {
+            operands<true>::rows(input, m, k, smem, SIMDGROUPS, sg, lane);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            RegGlobals<MAXM> rg = {};
+            PROJECTION_UNROLL
+            for (uint r = 0; r < MAXM; ++r)
+                rg.g[r] = (r < m) ? smem[r] : 0.0f;
+            const Nvfp4Rows<RegOrderedNorm<RawIn, MAXM>, RegGlobals<MAXM>> x{input, rg};
+            if constexpr (gemv_recipe<W0>::value)
+                gemv_recipe_rows<W0, ROWS, LANES>(x, out, w0, m, n, k, tile, shared, SIMDGROUPS, sg, lane);
+            else
+                gemv_body<W0, W1, PAIRED, ROWS, MAXM, LANES>(
+                    x, out, w0, w1, m, n, k, tile, shared, SIMDGROUPS, sg, lane);
+        } else {
+            gemv_recipe_rows<W0, ROWS, LANES>(input, out, w0, m, n, k, tile, shared, SIMDGROUPS, sg, lane);
+        }
+    }
+}
+
+// Instantiate a GEMV body for the activation-row bound MAXM in {1, 2, 4, 8}.
+#define PROJECTION_FOR_ROWS(rows, ...)                                          \
+    do {                                                                        \
+        if ((rows) <= 1) { constexpr uint MAXM = 1; __VA_ARGS__; }              \
+        else if ((rows) <= 2) { constexpr uint MAXM = 2; __VA_ARGS__; }         \
+        else if ((rows) <= 4) { constexpr uint MAXM = 4; __VA_ARGS__; }         \
+        else { constexpr uint MAXM = 8; __VA_ARGS__; }                          \
+    } while (0)
+
+// The same in the launches of an entry that launches its GEMV per row count,
+// one for one activation row, one for two and one for three up to VERIFY_ROWS
+// (at most 8): each instantiates only the bounds it runs. A kernel holds the
+// registers of every bound it instantiates, and a kernel that also holds a
+// wider body's runs slower for bounds it never takes (on the M1 10% at one
+// row beside the 8-row body, and 10% at two rows beside the 4- and 8-row
+// bodies: `dense_output` over Q4_K 254 against 281 µs). A wrapper body names
+// its launch's count, PROJECTION_FOR_<count>_ROWS.
+#define PROJECTION_FOR_ONE_ROWS(rows, ...)                                      \
+    do { constexpr uint MAXM = 1; __VA_ARGS__; } while (0)
+#define PROJECTION_FOR_PAIR_ROWS(rows, ...)                                     \
+    do { constexpr uint MAXM = 2; __VA_ARGS__; } while (0)
+static_assert(SEISMIC_CONST_VERIFY_ROWS <= 8, "the GEMV bodies serve at most 8 rows");
+#define PROJECTION_FOR_SEVERAL_ROWS(rows, ...)                                  \
+    do {                                                                        \
+        if ((rows) <= 4) { constexpr uint MAXM = 4; __VA_ARGS__; }              \
+        else { constexpr uint MAXM = 8; __VA_ARGS__; }                          \
+    } while (0)
+
+} // namespace projection

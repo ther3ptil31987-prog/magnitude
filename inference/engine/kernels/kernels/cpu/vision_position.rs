@@ -2,6 +2,7 @@
 // work item per row, the row plus the blend of its four position-table rows
 // (in corner order), all F32.
 
+#[inline(always)]
 fn vision_position<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
     let h = cx.dim_h() as usize;
@@ -19,8 +20,8 @@ fn vision_position<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64;
     let source = cx.arg_source().row([row, 0]);
     let result = cx.result_0();
     // SAFETY: each work item writes its own row.
-    let out = unsafe { result.span_mut([row, 0], h) };
+    let mut out = unsafe { result.span_mut([row, 0], h) };
     for ((target, value), blended) in out.iter_mut().zip(source).zip(blended.iter()) {
-        *target = value + blended;
+        target.set(value + blended);
     }
 }

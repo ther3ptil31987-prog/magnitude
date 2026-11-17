@@ -1,6 +1,6 @@
 //! Host storage used by the semantic oracle.
 
-use crate::reference_math::{float_literal, ReferenceScalar};
+use crate::reference_math::{ReferenceScalar, float_literal};
 
 use crate::ids::RepresentationId;
 use crate::registry::{self, DecodeStep, PlaneEncoding, RepresentationKind};
@@ -143,6 +143,26 @@ impl TensorData {
         }
     }
 
+    /// The encoded bytes of whole trailing matrices `records` of encoded
+    /// storage: each matrix is the encoded bytes of its own `[N, K]` shape,
+    /// consecutive in the storage (`registry::record_writable`).
+    pub(super) fn record_bytes(&mut self, records: std::ops::Range<usize>) -> Option<&mut [u8]> {
+        let Self::Encoded {
+            representation,
+            shape,
+            bytes,
+        } = self
+        else {
+            return None;
+        };
+        let leading = shape.len().checked_sub(2)?;
+        let record = encoded_bytes(*representation, &shape[leading..]).ok()?;
+        if record.checked_mul(element_count(&shape[..leading]).ok()?) != Some(bytes.len()) {
+            return None;
+        }
+        bytes.get_mut(records.start * record..records.end * record)
+    }
+
     pub fn representation(&self) -> RepresentationId {
         match self {
             Self::Dense { representation, .. } | Self::Encoded { representation, .. } => {
@@ -162,6 +182,33 @@ impl TensorData {
     pub fn values(&self) -> Result<Vec<f64>, String> {
         let count = self.shape().iter().product();
         Ok((0..count).map(|index| self.read(index)).collect())
+    }
+
+    /// One registry decode component of every element, in row-major order.
+    pub fn components(&self, role: registry::QuantizedComponent) -> Result<Vec<f64>, String> {
+        let Self::Encoded {
+            representation,
+            shape,
+            bytes,
+        } = self
+        else {
+            return Err("decode components exist only for packed representations".into());
+        };
+        let recipe = registry::decode_recipe(
+            *representation,
+            registry::representation_info(*representation).decoded,
+        )
+        .ok_or("the representation has no decode recipe")?;
+        if recipe.component(role).is_none() {
+            return Err(format!(
+                "the representation has no `{}` component",
+                role.name()
+            ));
+        }
+        let count: usize = shape.iter().product();
+        Ok((0..count)
+            .map(|flat| decode(*representation, shape, bytes, flat, Some(role)).to_f64())
+            .collect())
     }
 
     pub(super) fn read(&self, flat: usize) -> f64 {
@@ -184,8 +231,24 @@ impl TensorData {
                 representation,
                 shape,
                 bytes,
-            } => decode(*representation, shape, bytes, flat),
+            } => decode(*representation, shape, bytes, flat, None),
         }
+    }
+
+    pub(super) fn read_component(
+        &self,
+        flat: usize,
+        role: registry::QuantizedComponent,
+    ) -> ReferenceScalar {
+        let Self::Encoded {
+            representation,
+            shape,
+            bytes,
+        } = self
+        else {
+            unreachable!("checked component needs encoded storage")
+        };
+        decode(*representation, shape, bytes, flat, Some(role))
     }
 
     pub(super) fn write(&mut self, flat: usize, value: ReferenceScalar) {
@@ -272,35 +335,9 @@ pub(super) fn encoded_bytes(
     representation: RepresentationId,
     shape: &[usize],
 ) -> Result<usize, String> {
-    let (last, outer) = shape
-        .split_last()
-        .ok_or("encoded representation requires rank at least one")?;
-    let rows = outer.iter().try_fold(1u64, |value, axis| {
-        value
-            .checked_mul(*axis as u64)
-            .ok_or("tensor size overflow")
-    })?;
-    let bytes = match &registry::representation_info(representation).kind {
-        RepresentationKind::Packed(layout) => layout
-            .bytes(rows, *last as u64)
-            .ok_or("packed tensor size overflow")?,
-        RepresentationKind::PackedRows(layout) => layout
-            .bytes(
-                &shape
-                    .iter()
-                    .map(|extent| *extent as u64)
-                    .collect::<Vec<_>>(),
-            )
-            .ok_or("row-layout tensor size overflow or rank below its layout's")?,
-        RepresentationKind::External(layout) => rows
-            .checked_mul((*last as u64).div_ceil(u64::from(layout.logical_group)))
-            .and_then(|packets| packets.checked_mul(u64::from(layout.packet_size)))
-            .ok_or("external tensor size overflow")?,
-        RepresentationKind::Dense(dtype) => rows
-            .checked_mul(*last as u64)
-            .and_then(|elements| elements.checked_mul(u64::from(dtype.bytes())))
-            .ok_or("dense tensor size overflow")?,
-    };
+    let extents: Vec<u64> = shape.iter().map(|extent| *extent as u64).collect();
+    let bytes = registry::canonical_bytes(representation, &extents)
+        .ok_or("tensor size overflow, or rank below its representation's")?;
     usize::try_from(bytes).map_err(|_| "tensor is not host-addressable".to_owned())
 }
 
@@ -309,8 +346,15 @@ fn decode(
     shape: &[usize],
     bytes: &[u8],
     flat: usize,
+    component: Option<registry::QuantizedComponent>,
 ) -> ReferenceScalar {
     let info = registry::representation_info(representation);
+    if let Some(registry::DecodeComponent::Constant(value)) = component.and_then(|role| {
+        registry::decode_recipe(representation, info.decoded)
+            .and_then(|recipe| recipe.component(role))
+    }) {
+        return value;
+    }
     let storage = match &info.kind {
         RepresentationKind::Packed(layout) => PlaneStorage::Packet {
             layout,
@@ -367,8 +411,25 @@ fn decode(
                 interpretation,
                 ..
             } => ReferenceScalar::I32(
-                interpretation.decode(temporaries[recipe.ordinal(*raw)].bits(), *bits),
+                interpretation.decode(temporaries[recipe.ordinal(*raw)].bits() as u32, *bits),
             ),
+            DecodeStep::SignedCode { code, raw, bit, .. } => crate::reference_math::evaluate(
+                &crate::reference_math::signed_code_recipe(*bit),
+                &[
+                    temporaries[recipe.ordinal(*code)],
+                    temporaries[recipe.ordinal(*raw)],
+                ],
+            )
+            .expect("a signed code is total"),
+            DecodeStep::ReadPlaneLane { plane, .. } => {
+                ReferenceScalar::U32(recipe.planes()[*plane as usize].lane(local))
+            }
+            DecodeStep::InterpretGridCode {
+                raw, lane, grid, ..
+            } => ReferenceScalar::I32(grid.code(
+                temporaries[recipe.ordinal(*raw)].bits() as u32,
+                temporaries[recipe.ordinal(*lane)].bits() as u32,
+            )),
             DecodeStep::DecodeFloatCode { raw, format, .. } => {
                 let scalar = crate::reference_math::float_code_recipe(*format);
                 crate::reference_math::evaluate(&scalar, &[temporaries[recipe.ordinal(*raw)]])
@@ -377,6 +438,7 @@ fn decode(
             DecodeStep::ConvertToF32 { from, .. } => {
                 super::scalar::cast(DType::F32, temporaries[recipe.ordinal(*from)])
             }
+            DecodeStep::Constant { value, .. } => *value,
             DecodeStep::Multiply { left, right, .. } => super::scalar::binary(
                 crate::syntax::ast::BinaryOp::Mul,
                 temporaries[recipe.ordinal(*left)],
@@ -410,7 +472,16 @@ fn decode(
         let into = step.defines();
         temporaries[recipe.ordinal(into)] = value;
     }
-    temporaries[recipe.ordinal(recipe.output())]
+    match component {
+        None => temporaries[recipe.ordinal(recipe.output())],
+        Some(role) => match recipe
+            .component(role)
+            .expect("checked representation supports role")
+        {
+            registry::DecodeComponent::Temporary(temp) => temporaries[recipe.ordinal(temp)],
+            registry::DecodeComponent::Constant(value) => value,
+        },
+    }
 }
 
 /// Where the packet-form planes of one packed tensor live: interleaved per
@@ -448,7 +519,10 @@ impl PlaneStorage<'_> {
     ) -> ReferenceScalar {
         let schema = &self.packet().planes[plane];
         let (first, width) = match &schema.encoding {
-            PlaneEncoding::Packed { .. } | PlaneEncoding::FloatCode { .. } => {
+            PlaneEncoding::Packed { .. }
+            | PlaneEncoding::Grid(_)
+            | PlaneEncoding::SignedLocal { .. }
+            | PlaneEncoding::FloatCode { .. } => {
                 (entry as u32 * schema.entry_bits, schema.entry_bits)
             }
             PlaneEncoding::Dense(dtype) => (entry as u32 * dtype.bytes() * 8, dtype.bytes() * 8),
@@ -476,9 +550,10 @@ impl PlaneStorage<'_> {
             }
         };
         match &schema.encoding {
-            PlaneEncoding::Packed { .. } | PlaneEncoding::FloatCode { .. } => {
-                ReferenceScalar::U32(raw)
-            }
+            PlaneEncoding::Packed { .. }
+            | PlaneEncoding::Grid(_)
+            | PlaneEncoding::SignedLocal { .. }
+            | PlaneEncoding::FloatCode { .. } => ReferenceScalar::U32(raw),
             PlaneEncoding::Dense(dtype) => {
                 read_dense(*dtype, &raw.to_le_bytes()[..dtype.bytes() as usize])
             }
@@ -501,9 +576,9 @@ pub(super) fn write_bits(bytes: &mut [u8], first: usize, width: u32, value: u32)
 }
 
 fn read_dense(dtype: DType, bytes: &[u8]) -> ReferenceScalar {
-    let mut payload = [0; 4];
+    let mut payload = [0; 8];
     payload[..bytes.len()].copy_from_slice(bytes);
-    ReferenceScalar::from_bits(dtype, u32::from_le_bytes(payload))
+    ReferenceScalar::from_bits(dtype, u64::from_le_bytes(payload))
 }
 
 pub(super) fn scalar_from_number(dtype: DType, value: f64) -> ReferenceScalar {
@@ -513,6 +588,7 @@ pub(super) fn scalar_from_number(dtype: DType, value: f64) -> ReferenceScalar {
         match dtype {
             DType::I32 => ReferenceScalar::I32(value as i32),
             DType::U32 => ReferenceScalar::U32(value as u32),
+            DType::U64 => ReferenceScalar::U64(value as u64),
             DType::Bool => ReferenceScalar::Bool(value != 0.0),
             _ => unreachable!(),
         }
@@ -568,6 +644,7 @@ mod tests {
             DType::BF16,
             DType::I32,
             DType::U32,
+            DType::U64,
             DType::Bool,
         ] {
             let representation = registry::dense(dtype);

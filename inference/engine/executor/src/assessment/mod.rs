@@ -2,29 +2,86 @@
 //!
 //! Every model is assessed analytically from its headers and
 //! allocation-free execution plan: memory fit ([`assess`]), and decode speed
-//! at each requested depth from its decode demand ([`demand`]) over the
-//! device's memory bandwidth ([`bandwidth`], [`costs`], [`estimate`]). No
-//! model is loaded and nothing runs on the device.
+//! at each requested depth ([`estimate`]) from its per-call decode demand
+//! ([`demand`], each call's launches from its entry's declaration,
+//! [`launches`]) over its executor's measured kernel costs
+//! ([`executor_costs`]). No model is loaded and nothing runs on a device:
+//! the costs derive from measurements the measurement job recorded. A
+//! streamed decode is priced from the plan's structure through the one step
+//! model ([`streamed`]), on the machine's stored figures and the one generic
+//! miss model; a load prices its own bank on the same step, beside what its
+//! decode read this session ([`DecodePrice`]). What the
+//! measurement job measures is assessment's standing requests, fixed per
+//! backend, then what loads request of it at runtime ([`requests`]).
 
 pub mod assess;
-pub mod bandwidth;
 #[cfg(test)]
 mod catalog;
-pub mod costs;
+#[cfg(test)]
+mod draft_traces;
+pub mod cost;
 pub mod demand;
 pub mod estimate;
+pub mod executor_costs;
 #[cfg(test)]
 pub(crate) mod fixtures;
+pub mod launches;
+#[cfg(feature = "machine-line")]
+pub mod line;
+pub mod miss_model;
+pub mod misses;
+#[cfg(test)]
+mod parity;
+#[cfg(test)]
+mod target_outlines;
+pub mod priced;
+pub mod requests;
+pub mod step;
+pub mod streamed;
+pub mod streaming;
+pub mod streaming_costs;
+#[cfg(test)]
+mod vision_traces;
+#[cfg(any(test, feature = "fixtures"))]
+pub mod synthetic;
 
 pub use assess::{
-    assess_execution, finish_execution_assessment, prepare_execution_assessment, AssessmentRequest,
-    DomainFit, ExecutionAssessment, PreparedExecutionAssessment,
+    assess_execution_fit, decode_demand, decode_pricing, decode_step, estimate_execution, execution_memory_charge, StructuralCharge,
+    prepare_execution_assessment, AssessmentRequest, ColdSource, DomainFit, ExecutionAssessment,
+    ExecutionFit, ExecutionShortfall, ExpertShares, FileOnly, MemoryBreakdown, ModelPlacement, PreparedExecutionAssessment, Residency,
 };
-pub use bandwidth::{normalize_name, resolve_bandwidth, BandwidthSource, DeviceBandwidth, DeviceClass};
-pub use costs::{DecodeCosts, DECODE_COSTS};
-pub use demand::{DecodeDemand, HistoryRead};
+pub use demand::{Bytes, Call, DecodeDemand, Experts, Flops, HistoryRead, Work};
 pub use estimate::{
-    estimate_performance, performance_depths, step_seconds, PerformanceEstimate, StepSeconds,
+    estimate_decode, form_seconds, performance_depths, step_seconds, CallSeconds, ExpertPass, PerformanceEstimate, Pricing,
+    StepSeconds,
+};
+pub use executor_costs::{
+    ChainCost, CostWalk, Derived, ExecutorCosts, ExecutorCostsError, FormatRates, Held, HistoryCosts, HistoryLine,
+    MatrixCosts, MeasuredCost, Measurement, OperandStorage, Placement, Placements, Required, RouteCosts, StoredCosts,
+    WeightRate, HISTORY_LAYOUTS, MEASUREMENT_SECONDS,
+};
+pub use launches::{Declarations, Kernel, Launches, Words};
+#[cfg(feature = "machine-line")]
+pub use line::{Line, MachineLine, MachineLineError, Operand, Peak, Rate, Rows, Stream, Sweep};
+pub use cost::{
+    BankLines, CpuLines, CpuLinesError, StoredCpuSite, ExpertLines, Exposed, GpuLines, Hits, HostLines, HostLinesError, LandingLine, LineError, Miss, Nanoseconds, Pass,
+    PassLine, RowCost, RowLine, Sample, ServedMisses, Site, SiteLines,
+};
+pub use priced::Priced;
+pub(crate) use streaming_costs::CpuForm;
+#[cfg(feature = "machine-line")]
+pub use requests::line_outstanding;
+pub use requests::{Outstanding, PointRequest, PointRequests, SiteRequest, Waiter};
+pub use step::{LayerLoad, Lead, ReadAhead, StepInputs, StepTime};
+pub use streamed::{DecodePrice, FormSeconds, LayerReads, LiveDecode, StreamedError, StreamedFigures, StreamedLayers};
+pub use misses::{Anticipated, HeldSlots, HintCounts, LayerStep, StreamedStep, TableCurve, TableRange};
+pub use streaming::{
+    GroupLayerTerms, GroupUnion, Notice, Stages,
+};
+pub use streaming_costs::{
+    CeilingError, ConvertCosts, ConvertForm, FileLine, MemoryCosts, MemoryError, RecordLine,
+    CONVERTED_RECORDS,
+    CpuCosts, GraphMemory, ReadLine, ReadLineError, RequestReads, StorageCosts, StorageError, TierCopyCosts, TierCopyError, TierCopyPoint, StoredVolume, VolumeCosts,
 };
 
 use crate::GraphError;
@@ -42,6 +99,14 @@ pub enum AssessmentError {
     Demand(String),
     /// The model's graphs could not be built on the planned backend.
     Graph(GraphError),
+    /// The load's kernel inventory could not be formed on the backend.
+    Catalog(crate::CatalogError),
+    /// The backend has no native implementation of an entry the load
+    /// prepares.
+    Unimplemented {
+        entry: &'static str,
+        backend: seismic::BackendName,
+    },
     /// A memory observation or fit bound could not be established.
     Memory(String),
 }
@@ -55,7 +120,19 @@ impl fmt::Display for AssessmentError {
                 write!(formatter, "assessment graph construction failed: {error}")
             }
             Self::Memory(message) => write!(formatter, "assessment memory bound failed: {message}"),
+            Self::Catalog(error) => write!(formatter, "assessment demand failed: {error}"),
+            Self::Unimplemented { entry, backend } => write!(
+                formatter,
+                "assessment demand failed: `{entry}` has no native implementation for {}",
+                backend.as_str()
+            ),
         }
+    }
+}
+
+impl From<crate::PlanError> for AssessmentError {
+    fn from(error: crate::PlanError) -> Self {
+        Self::Plan(error.to_string())
     }
 }
 

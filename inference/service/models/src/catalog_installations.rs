@@ -7,17 +7,19 @@ use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use magnitude_service_contracts::InventoryError;
 use magnitude_service_contracts::models::{
-    CatalogInstallationAdmission, CatalogInstallationOperation, CatalogInstallationOperationId,
+    CatalogComponent, CatalogInstallationAdmission, CatalogInstallationOperation,
+    CatalogInstallationOperationId,
     CatalogInstallationOperationState, CatalogInstallationProgress, CatalogInstallationRemoval,
     CatalogInstallationRetentionReason, CatalogInstallations, CatalogInstallationsInvalidation,
     CatalogInstallationsResponse, CatalogModelOptimizer, CatalogOptimizationProgress,
-    CatalogPackageRemover, ModelDownload, ModelDownloadId, ModelDownloadState, ModelDownloads,
-    ModelId, StartModelDownloadRequest,
+    CatalogPackageRemover, CustomModelPart, ModelDownload, ModelDownloadId, ModelDownloadState,
+    ModelDownloads, ModelId, ParsedModelId, ServableModelBundle,
 };
 
 use crate::ManagedModelDownloads;
 use crate::catalog_models::reject_unavailable;
 use crate::model_domains::ModelDomainResolver;
+use crate::requested_downloads::{RequestedDownload, RequestedPart};
 
 #[derive(Debug, Clone)]
 struct OperationBinding {
@@ -29,7 +31,8 @@ struct OperationBinding {
 
 /// Catalog installations: a download, then kernel tuning for the installed model. Each admitted
 /// installation has one job that follows its download and, once the download is verified and
-/// published, runs the optimizer. The operation is `Optimizing` while that runs.
+/// published, runs the optimizer. The operation is `Optimizing` until the optimizer ends, its
+/// progress `Waiting` while the job waits for the device, and `Completed` once it has ended.
 pub struct ManagedCatalogInstallations {
     this: Weak<Self>,
     resolver: Arc<ModelDomainResolver>,
@@ -37,7 +40,7 @@ pub struct ManagedCatalogInstallations {
     remover: Arc<dyn CatalogPackageRemover>,
     optimizer: Arc<dyn CatalogModelOptimizer>,
     operations: RwLock<Vec<OperationBinding>>,
-    jobs: Mutex<HashMap<CatalogInstallationOperationId, tokio::task::JoinHandle<()>>>,
+    jobs: Mutex<HashMap<CatalogInstallationOperationId, magnitude_service_utils::owner::Owner>>,
     mutations: tokio::sync::Mutex<()>,
     revision: Arc<AtomicU64>,
     changes: tokio::sync::broadcast::Sender<CatalogInstallationsInvalidation>,
@@ -137,23 +140,26 @@ impl ManagedCatalogInstallations {
             .await;
     }
 
-    /// Stop the operation's optimization, if it is optimizing, and wait until it has stopped.
-    /// Returns whether it was optimizing.
+    /// Stop the operation's optimization, if it is optimizing or waiting for the device to, and
+    /// wait until it has stopped. Returns whether it was.
     async fn stop_optimization(&self, id: &CatalogInstallationOperationId) -> Result<bool, InventoryError> {
-        if self.binding(id)?.optimization.is_none() {
-            return Ok(false);
-        }
+        let optimizing = match self.operation(id).await?.state {
+            CatalogInstallationOperationState::Optimizing { .. } => true,
+            CatalogInstallationOperationState::Completed => false,
+            _ => return Ok(false),
+        };
         let job = self
             .jobs
             .lock()
             .expect("catalog installation job lock")
             .remove(id);
+        let stopped = optimizing || job.is_some();
         if let Some(job) = job {
             job.abort();
-            let _ = job.await;
+            job.ended().await;
         }
         self.set_optimization(id, None);
-        Ok(true)
+        Ok(stopped)
     }
 
     fn binding(
@@ -198,8 +204,39 @@ impl ManagedCatalogInstallations {
         id: &ModelId,
     ) -> Result<CatalogInstallationAdmission, InventoryError> {
         let _mutation = self.mutations.lock().await;
-        let definition = self.resolver.catalog_definition(id)?;
-        reject_unavailable(id, definition)?;
+        reject_unavailable(id, self.resolver.catalog_definition(id)?)?;
+        self.reject_active(id).await?;
+        let bundle = self.resolver.desired_catalog_configuration(id)?.bundle;
+        let requested = RequestedDownload {
+            model: id.clone(),
+            part: None,
+        };
+        self.admit(id, bundle, requested).await
+    }
+
+    /// Fetches only one component a found exact target lacks; the found weights stay where they
+    /// are and the rest of the bundle is untouched.
+    pub(crate) async fn install_component(
+        &self,
+        id: &ModelId,
+        component: CatalogComponent,
+    ) -> Result<CatalogInstallationAdmission, InventoryError> {
+        let _mutation = self.mutations.lock().await;
+        reject_unavailable(id, self.resolver.catalog_definition(id)?)?;
+        self.reject_active(id).await?;
+        match self.resolver.catalog_component_download(id, component)? {
+            Some(bundle) => {
+                let requested = RequestedDownload {
+                    model: id.clone(),
+                    part: Some(component.into()),
+                };
+                self.admit(id, bundle, requested).await
+            }
+            None => Ok(CatalogInstallationAdmission::Current),
+        }
+    }
+
+    async fn reject_active(&self, id: &ModelId) -> Result<(), InventoryError> {
         let existing_operation_ids = self
             .operations
             .read()
@@ -223,11 +260,18 @@ impl ManagedCatalogInstallations {
                 });
             }
         }
+        Ok(())
+    }
+
+    async fn admit(
+        &self,
+        id: &ModelId,
+        bundle: ServableModelBundle,
+        requested: RequestedDownload,
+    ) -> Result<CatalogInstallationAdmission, InventoryError> {
         let started = self
             .downloads
-            .start(StartModelDownloadRequest {
-                bundle: definition.configuration.bundle.clone(),
-            })
+            .start_requested(bundle, id.clone(), requested)
             .await?;
         let Some(download) = started.download else {
             self.cleanup_model(id).await?;
@@ -247,7 +291,7 @@ impl ManagedCatalogInstallations {
         let this = self.this.upgrade().expect("catalog installations are alive while in use");
         // Held across the spawn, so a job that ends at once removes its own entry after it.
         let mut jobs = self.jobs.lock().expect("catalog installation job lock");
-        let job = tokio::spawn(this.run(operation_id.clone(), binding));
+        let job = magnitude_service_utils::owner::spawn("a catalog installation", this.run(operation_id.clone(), binding));
         jobs.insert(operation_id.clone(), job);
         drop(jobs);
         Ok(CatalogInstallationAdmission::Admitted { operation_id })
@@ -293,21 +337,78 @@ impl ManagedCatalogInstallations {
                 retryable: false,
             });
         }
-        if plan.externally_owned {
-            return Ok(CatalogInstallationRemoval::Retained {
-                reason: CatalogInstallationRetentionReason::ExternalOwnership,
-            });
-        }
+        // Remove ends every download requested for the model, whatever it keeps, so none resumes.
+        self.downloads.forget_requests_for(id);
         if plan.shared {
             return Ok(CatalogInstallationRemoval::Retained {
                 reason: CatalogInstallationRetentionReason::SharedMaterial,
+            });
+        }
+        // A found target with nothing of Magnitude's is another app's to keep; with stored parts,
+        // removal deletes those no other model needs, even none.
+        if plan.externally_owned && !plan.stores_packages {
+            return Ok(CatalogInstallationRemoval::Retained {
+                reason: CatalogInstallationRetentionReason::ExternalOwnership,
             });
         }
         let reclaimed_bytes = self
             .remover
             .remove_catalog_packages(plan.package_ids)
             .await?;
-        Ok(CatalogInstallationRemoval::Removed { reclaimed_bytes })
+        Ok(CatalogInstallationRemoval::Removed {
+            reclaimed_bytes,
+            kept_components: plan.kept_components,
+        })
+    }
+
+    /// Admits again every download requested before a restart that has not ended, once the files
+    /// on this computer are known, by resolving its intent now: a catalog installation or
+    /// component through the current catalog, a custom model's part through the current
+    /// local-models configuration. A request already admitted again meanwhile is left alone, and
+    /// one with nothing left to fetch, or that can no longer be admitted (its model, added model or
+    /// drafter choice is gone), ends.
+    pub async fn resume_requested_downloads(&self) {
+        if let Err(error) = self.resolver.inventory.ensure_installed_model_inventory().await {
+            tracing::warn!(%error, "resuming requested downloads before the model inventory is complete");
+        }
+        for requested in self.downloads.unresumed_requests() {
+            if !self.downloads.is_unresumed(&requested) {
+                continue;
+            }
+            let model = &requested.model;
+            let admitted = match (model.parsed(), requested.part) {
+                (ParsedModelId::Catalog { .. }, None) => self.install(model).await.map(drop),
+                (ParsedModelId::Catalog { .. }, Some(RequestedPart::Projector)) => self
+                    .install_component(model, CatalogComponent::Projector)
+                    .await
+                    .map(drop),
+                (ParsedModelId::Catalog { .. }, Some(RequestedPart::Drafter)) => self
+                    .install_component(model, CatalogComponent::Drafter)
+                    .await
+                    .map(drop),
+                (_, Some(RequestedPart::Projector))
+                | (ParsedModelId::Catalog { .. }, Some(RequestedPart::Update)) => {
+                    Err(InventoryError::InvalidRequest(format!(
+                        "{model} has no such part to download"
+                    )))
+                }
+                (_, None) => self.downloads.start_custom(model.clone(), None).await.map(drop),
+                (_, Some(RequestedPart::Drafter)) => self
+                    .downloads
+                    .start_custom(model.clone(), Some(CustomModelPart::Drafter))
+                    .await
+                    .map(drop),
+                (_, Some(RequestedPart::Update)) => self
+                    .downloads
+                    .start_custom(model.clone(), Some(CustomModelPart::Update))
+                    .await
+                    .map(drop),
+            };
+            if let Err(error) = admitted {
+                tracing::warn!(%error, ?requested, "a requested download could not be resumed");
+            }
+            self.downloads.forget_unresumed_request(&requested);
+        }
     }
 }
 

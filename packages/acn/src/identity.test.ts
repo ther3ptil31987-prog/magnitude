@@ -6,7 +6,7 @@ import { makeHealthResponse } from "./identity";
 describe("ACN identity", () => {
   it("exposes the exact registry owner identity through health", () => {
     expect(
-      makeHealthResponse("1.2.3", { _tag: "Ready" }, "owner-1", 1234, 42)
+      makeHealthResponse("1.2.3", { _tag: "Ready", hardware: Option.none() }, "owner-1", 1234, 42)
     ).toEqual({
       service: "magnitude-acn",
       version: "1.2.3",
@@ -14,7 +14,7 @@ describe("ACN identity", () => {
       rpcVersion: MAGNITUDE_RPC_VERSION,
       id: "owner-1",
       pid: 1234,
-      state: { _tag: "Ready" },
+      state: { _tag: "Ready", hardware: Option.none() },
     });
   });
 
@@ -28,6 +28,7 @@ describe("ACN identity", () => {
             _tag: "Starting",
             activity: "Resolving",
             progress: Option.none(),
+            retry: Option.none(),
           },
           "owner-1",
           1234
@@ -55,6 +56,7 @@ describe("ACN identity", () => {
               unit: "Bytes",
               attempt: Option.some(1),
             }),
+            retry: Option.none(),
           },
           "owner-1",
           1234

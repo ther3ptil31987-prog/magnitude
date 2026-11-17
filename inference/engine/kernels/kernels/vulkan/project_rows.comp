@@ -1,6 +1,12 @@
 // project_rows: the plain projection of the A rows `source`, published in Y.
-// The Vulkan form of `metal/project_rows.metal` over
-// `lib/projection/projection.glsl`; the GEMM class may split K.
+// The Vulkan form of `metal/project_rows.metal` on the `dense` projection
+// (`lib/projection/operator.glsl`); the GEMM class may split K. A grouped
+// weight (G > 1) runs group g at grid z (z = g in the GEMV and finalize
+// launches, z = g * SPLIT + part in the GEMM) over its K source columns, its
+// N weight rows and output columns, and its own G-th of the split partials.
+#define KERNEL_W0 SEISMIC_WEIGHT
+// The projection's decoding launches stage their weights' tables (`packets.glsl`).
+#define PACKETS_STAGED_TABLES 1
 #include "lib/core/activation.glsl"
 #if SEISMIC_STATIC_WS != 0
 #define PROJECTION_SCALED
@@ -12,98 +18,68 @@
 #else
 #error "project_rows requires a bf16 or f16 activation"
 #endif
-#if defined(SEISMIC_ELEMENT_Y_REPRESENTATION_F32)
-#define PROJECT_PUBLISHED ELEMENT_F32
-#elif defined(SEISMIC_ELEMENT_Y_REPRESENTATION_BF16)
-#define PROJECT_PUBLISHED ELEMENT_BF16
-#elif defined(SEISMIC_ELEMENT_Y_REPRESENTATION_F16)
-#define PROJECT_PUBLISHED ELEMENT_F16
+// The weight's operand rows (the source rows, or NVFP4 operands): the GEMV
+// forms them while staging, the stage launch into the scratch the GEMM reads.
+#if defined(SEISMIC_WEIGHT_OPERANDS_NVFP4)
+#define PROJECT_OPERANDS PROJECTION_OPERANDS_NVFP4
 #else
-#error "project_rows requires a dense published element"
+#define PROJECT_OPERANDS PROJECTION_OPERANDS_ROUNDED
 #endif
 
-#if defined(SEISMIC_WEIGHT_REPRESENTATION_Q4K)
-#define WEIGHT_KIND PACKETS_Q4K
-#define WEIGHT_GEOMETRY PACKETS_ROWS16_Q4K(SEISMIC_WEIGHT)
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_Q5K)
-#define WEIGHT_KIND PACKETS_Q5K
-#define WEIGHT_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_WEIGHT)
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_Q6K)
-#define WEIGHT_KIND PACKETS_Q6K
-#define WEIGHT_GEOMETRY PACKETS_ROWS16_HIGH(SEISMIC_WEIGHT)
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_Q8G32S)
-#define WEIGHT_KIND PACKETS_Q8
-#define WEIGHT_GEOMETRY PACKETS_ROWS16_Q8(SEISMIC_WEIGHT)
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_IQ4G32)
-#define WEIGHT_KIND PACKETS_IQ4
-#define WEIGHT_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_WEIGHT)
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_Q4G32S)
-#define WEIGHT_KIND PACKETS_Q4G32S
-#define WEIGHT_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_WEIGHT)
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_MXFP4G32)
-#define WEIGHT_KIND PACKETS_MXFP4
-#define WEIGHT_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_WEIGHT)
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_NVFP4G16)
-#define WEIGHT_KIND PACKETS_NVFP4
-#define WEIGHT_GEOMETRY PACKETS_ROWS16_C4(SEISMIC_WEIGHT)
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_Q5G32S)
-#define WEIGHT_KIND PACKETS_Q5G32S
-#define WEIGHT_GEOMETRY PACKETS_ROWS16_Q5(SEISMIC_WEIGHT)
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_Q5G32)
-#define WEIGHT_KIND PACKETS_Q5G32
-#define WEIGHT_GEOMETRY PACKETS_ROWS16_Q5(SEISMIC_WEIGHT)
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_BF16)
-#define WEIGHT_KIND PACKETS_BF16
-#define WEIGHT_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_WEIGHT, 2)
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_F16)
-#define WEIGHT_KIND PACKETS_F16
-#define WEIGHT_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_WEIGHT, 2)
-#elif defined(SEISMIC_WEIGHT_REPRESENTATION_F32)
-#define WEIGHT_KIND PACKETS_F32
-#define WEIGHT_GEOMETRY PACKETS_ROWS16_DENSE(SEISMIC_WEIGHT, 4)
-#else
-#error "unsupported project_rows weight representation"
-#endif
-#if defined(SEISMIC_WEIGHT_KIND_PACKED) && !defined(SEISMIC_WEIGHT_LAYOUT_ROWS16)
-#error "project_rows requires the rows16 layout for weight"
-#endif
 
-projection_prologue project_rows_input() {
-    return projection_plain(PROJECT_ACT, SEISMIC_PTR(SEISMIC_BUFFER_SOURCE), SEISMIC_SOURCE_STRIDE_0,
-        SEISMIC_SOURCE_STRIDE_1, uint(SEISMIC_DIM_K), 0ul);
+#define PROJECTION_SINGLE
+#define PROJECTION_M uint(SEISMIC_DIM_M)
+#define PROJECTION_N uint(SEISMIC_DIM_N)
+#define PROJECTION_K uint(SEISMIC_DIM_K)
+#define PROJECTION_G SEISMIC_DIM_G
+#define PROJECTION_NORM PROJECTION_NORM_NONE
+#define PROJECTION_STAGED SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED)
+#define PROJECTION_SPLIT SEISMIC_TUNE_SPLIT
+#define PROJECTION_PARTIALS SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS)
+
+// Group `g`'s source rows: its K columns of each row.
+projection_prologue project_rows_source(uint g) {
+    return projection_plain(PROJECT_ACT,
+        SEISMIC_PTR(SEISMIC_BUFFER_SOURCE)
+            + uint64_t(g) * SEISMIC_DIM_K * SEISMIC_SOURCE_STRIDE_1 * uint64_t(ELEMENT_BYTES(PROJECT_ACT)),
+        SEISMIC_SOURCE_STRIDE_0, SEISMIC_SOURCE_STRIDE_1, uint(SEISMIC_DIM_K), 0ul);
 }
 
-projection_epilogue project_rows_output() {
-    return projection_scaled(projection_store(PROJECT_PUBLISHED, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER),
-        SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, 0ul),
+// Group `g`'s source rows as the weight's operands.
+projection_prologue projected_input(uint g) { return projection_operands(project_rows_source(g), PROJECT_OPERANDS); }
+
+// The rows the GEMM reads: the source rows, or the operands the stage launch
+// formed (one group).
+projection_prologue projected_rows(uint g) {
+#if defined(SEISMIC_WEIGHT_OPERANDS_NVFP4)
+    return projection_plain(PROJECT_ACT, PROJECTION_STAGED, SEISMIC_DIM_K, 1ul, uint(SEISMIC_DIM_K), 0ul);
+#else
+    return project_rows_source(g);
+#endif
+}
+
+// Group `g`'s output columns.
+projection_epilogue projected_output(uint g) {
+    return projection_scaled(projection_store(SEISMIC_RESULT_0_OUT,
+        SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, uint64_t(g) * SEISMIC_DIM_N),
         projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT_SCALE), SEISMIC_DIM_WS, 0ul, 0ul), 1.0);
 }
 
-projection_weights project_rows_weight() {
-    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT), WEIGHT_GEOMETRY, uint(SEISMIC_DIM_K), 0ul);
+// Group `g`'s N weight rows.
+projection_weights projected_weight(uint g) {
+    projection_weights w =
+        projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT), PACKETS_W0_ROWS, uint(SEISMIC_DIM_K), 0ul, 1ul, 0u);
+    w.base += uint64_t(g) * SEISMIC_DIM_N * w.geometry.stride;
+    return w;
 }
 
-void project_rows_gemv() {
-    const projection_weights w = project_rows_weight();
-    projection_gemv(WEIGHT_KIND, WEIGHT_KIND, false, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, PROJECTION_NORM_NONE,
-        project_rows_input(), project_rows_output(), w, w, uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_N),
-        uint(SEISMIC_DIM_K), gl_WorkGroupID.x);
-}
+#include "lib/projection/operator.glsl"
 
-void project_rows_gemm() {
-    const uint m = uint(SEISMIC_DIM_M), n = uint(SEISMIC_DIM_N);
-#if SEISMIC_TUNE_SPLIT == 1
-    projection_gemm(WEIGHT_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N,
-        project_rows_input(), project_rows_output(), project_rows_weight(), m, n, uint(SEISMIC_DIM_K),
-        gl_WorkGroupID.y, gl_WorkGroupID.x, 0xffffffffu);
-#else
-    projection_gemm_part(WEIGHT_KIND, SEISMIC_TUNE_TILE_M, SEISMIC_TUNE_TILE_N, SEISMIC_TUNE_SUB_M, SEISMIC_TUNE_SUB_N,
-        project_rows_input(), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS), project_rows_weight(), m, n,
-        uint(SEISMIC_DIM_K), SEISMIC_TUNE_SPLIT, gl_WorkGroupID.z, gl_WorkGroupID.y, gl_WorkGroupID.x);
-#endif
-}
-
-void project_rows_finalize() {
-    projection_gemm_finalize(project_rows_output(), SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS),
-        uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_N), SEISMIC_TUNE_SPLIT, gl_GlobalInvocationID.x);
-}
+// The `dense` projection's launches (`lib/projection/operator.glsl`).
+void project_rows_stage() { projection_dense_stage(); }
+void project_rows_gemv1() { projection_single_gemv(1u); }
+void project_rows_gemv2() { projection_single_gemv(2u); }
+void project_rows_gemv4() { projection_single_gemv(4u); }
+void project_rows_gemv8() { projection_single_gemv(8u); }
+void project_rows_gemm() { projection_single_gemm(); }
+void project_rows_finalize() { projection_single_finalize(); }

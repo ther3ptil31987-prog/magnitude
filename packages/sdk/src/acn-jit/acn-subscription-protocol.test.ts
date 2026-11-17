@@ -10,10 +10,12 @@ describe("ACN subscription protocol", () => {
       .filter(acnSubscriptionProtocol.isStream)
       .sort()
     expect(subscriptions).toEqual([
-      "StreamActiveSessionStatuses",
       "StreamChanges",
-      "StreamDisplayView",
+      "StreamModelCandidateInspection",
+      "WatchApplicationOwner",
+      "WatchChat",
       "WatchFile",
+      "WatchHarnessConnections",
       "WatchProjectFiles",
     ])
     expect(acnSubscriptionProtocol.isStream("CheckFileExists")).toBe(false)

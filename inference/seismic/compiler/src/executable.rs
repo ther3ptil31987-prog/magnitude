@@ -27,6 +27,7 @@ use seismic_lang::expr::compiled::{
 use seismic_lang::expr::LoopBinderId;
 use seismic_lang::expr::SymbolValue;
 use std::fmt;
+use std::ptr::NonNull;
 
 /// Structured control over commands `C`, predicates `P`, ranges `R`.
 #[derive(Debug)]
@@ -1556,9 +1557,27 @@ fn compile_steps<B: seismic_native_target::TargetFamily>(
 
 /// Device services a backend provides to the generic runtime.
 pub trait DeviceService<T: seismic_native_target::TargetFamily>: Send + Sync + 'static {
+    /// Memory device work binds and the host reads.
     type Buffer: Clone + Send + Sync + 'static;
-    fn allocate(&self, bytes: u64, alignment: u64) -> Result<Self::Buffer, ExecutionError>;
-    fn write(&self, buffer: &Self::Buffer, offset: u64, bytes: &[u8])
+    /// A [`Self::Buffer`] the service allocated, which the host also writes.
+    /// Read-only memory a backend maps is a `Buffer` only, so it has no host
+    /// write path.
+    type Writable: std::borrow::Borrow<Self::Buffer> + Send + Sync + 'static;
+    /// Allocate `bytes` at `alignment` in memory of `kind`, one of the
+    /// backend's kinds (`seismic_topology::KindReport::id`), charged exactly
+    /// to `entry`, an entry of the kind's store: the native bytes the
+    /// allocation takes (its rounding, or a block range's bytes carved from
+    /// the block) are the entry's while the returned buffer lives, and freed
+    /// from it as the buffer drops. A refusal is
+    /// [`ExecutionError::AllocationCapacity`], nothing allocated.
+    fn allocate(
+        &self,
+        kind: u32,
+        bytes: u64,
+        alignment: u64,
+        entry: &std::sync::Arc<dyn seismic_memory::entry::Entry>,
+    ) -> Result<Self::Writable, ExecutionError>;
+    fn write(&self, buffer: &Self::Writable, offset: u64, bytes: &[u8])
         -> Result<(), ExecutionError>;
     fn read(
         &self,
@@ -1567,6 +1586,10 @@ pub trait DeviceService<T: seismic_native_target::TargetFamily>: Send + Sync + '
         into: &mut [u8],
     ) -> Result<(), ExecutionError>;
     fn buffer_len(&self, buffer: &Self::Buffer) -> u64;
+    /// The host address of `buffer`'s first byte where the host reads and
+    /// writes its memory in place, valid while the buffer lives; `None` for
+    /// memory only the device or a driver copy reaches.
+    fn host_address(&self, buffer: &Self::Writable) -> Option<NonNull<u8>>;
 }
 
 /// One invocation-bound physical allocation. `base_offset` is the caller's
@@ -2129,6 +2152,79 @@ fn available_instance_banks(
         .collect()
 }
 
+/// The record of one tensor publication on an execution path: its view's
+/// resolved shape checked against the declared one, and the publication kept
+/// under its path, which no other publication of the path holds.
+fn publish(
+    published: &mut std::collections::BTreeMap<Vec<u32>, ExecutedTensorPublication>,
+    publication: ExecutedTensorPublication,
+    declared: &[seismic_lang::expr::BigUint],
+) -> Result<(), ExecutionError> {
+    let path = &publication.path;
+    if published.contains_key(path) {
+        return Err(ExecutionError::ConstructionContradiction(format!(
+            "result {path:?} was published twice on one execution path"
+        )));
+    }
+    if publication.extents.len() != declared.len()
+        || declared
+            .iter()
+            .zip(&publication.extents)
+            .any(|(expected, actual)| expected != &(*actual).into())
+    {
+        return Err(ExecutionError::ConstructionContradiction(format!(
+            "published result {path:?} differs from its declared shape"
+        )));
+    }
+    published.insert(path.clone(), publication);
+    Ok(())
+}
+
+/// One tensor publication as a schedule's execution records it
+/// ([`ExecutableStep::PublishTensor`]'s host bookkeeping once its view is
+/// resolved): what a backend's analytical profile times as
+/// `core.tensor-publication`, which the model charges for each publication
+/// and argument binding. Each [`TensorPublicationProbe::publish`] records a
+/// rank-2 publication on a fresh execution path, as one step does.
+pub struct TensorPublicationProbe {
+    published: std::collections::BTreeMap<Vec<u32>, ExecutedTensorPublication>,
+    declared: Vec<seismic_lang::expr::BigUint>,
+}
+
+impl TensorPublicationProbe {
+    const EXTENTS: [u64; 2] = [64, 128];
+
+    pub fn new() -> Self {
+        Self {
+            published: std::collections::BTreeMap::new(),
+            declared: Self::EXTENTS.iter().map(|&axis| axis.into()).collect(),
+        }
+    }
+
+    /// Records one publication, then ends its execution path.
+    pub fn publish(&mut self) {
+        let publication = ExecutedTensorPublication {
+            path: vec![0],
+            allocation: ExecutableAllocationId(0),
+            representation: seismic_lang::registry::dense(seismic_lang::types::DType::F32),
+            byte_offset: 0,
+            bytes: Self::EXTENTS.iter().product::<u64>() * 4,
+            extents: Self::EXTENTS.to_vec(),
+            strides: vec![Self::EXTENTS[1], 1],
+        };
+        publish(&mut self.published, publication, &self.declared)
+            .expect("a fresh execution path admits its one publication");
+        std::hint::black_box(&self.published);
+        self.published.clear();
+    }
+}
+
+impl Default for TensorPublicationProbe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// A resource retry does not repeat source execution. The current Begin
 /// supersedes the old instance of this allocation; only its other unretained
 /// banks may be reclaimed, and only after the whole issued prefix is terminal.
@@ -2141,8 +2237,8 @@ fn acquire_with_completed_reclamation<B>(
     complete: impl FnOnce() -> Result<(), ExecutionError>,
 ) -> Result<(), ExecutionError> {
     match resources.acquire_instance(bank, bytes, alignment) {
-        Err(ExecutionError::AllocationCapacity { .. })
-            if available.iter().any(|other| *other != bank) =>
+        Err(error)
+            if error.capacity_refusal().is_some() && available.iter().any(|other| *other != bank) =>
         {
             complete()?;
             let retired = available
@@ -2264,11 +2360,6 @@ where
                 bytes,
                 declared_axes,
             } => {
-                if env.published.contains_key(path) {
-                    return Err(ExecutionError::ConstructionContradiction(format!(
-                        "result {path:?} was published twice on one execution path"
-                    )));
-                }
                 let allocation = match view.base {
                     CompiledViewBase::Allocation(id) => id,
                     CompiledViewBase::TensorValue(id) => {
@@ -2287,16 +2378,6 @@ where
                             .map_err(|error| eval_failure("declared result axis", error))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                if resolved.extents.len() != declared.len()
-                    || declared
-                        .iter()
-                        .zip(&resolved.extents)
-                        .any(|(expected, actual)| expected != &(*actual).into())
-                {
-                    return Err(ExecutionError::ConstructionContradiction(format!(
-                        "published result {path:?} differs from its declared shape"
-                    )));
-                }
                 let publication = ExecutedTensorPublication {
                     path: path.clone(),
                     allocation,
@@ -2306,7 +2387,7 @@ where
                     extents: resolved.extents,
                     strides: resolved.strides,
                 };
-                env.published.insert(path.clone(), publication);
+                publish(&mut env.published, publication, &declared)?;
             }
             ExecutableStep::EvaluateHost { value, to, failure } => {
                 use seismic_ir::schedule::HostValueDestination;
@@ -2646,7 +2727,14 @@ mod allocation_size_tests {
     struct NoDevice;
     impl DeviceService<FakeTarget> for NoDevice {
         type Buffer = ();
-        fn allocate(&self, _: u64, _: u64) -> Result<(), ExecutionError> {
+        type Writable = ();
+        fn allocate(
+            &self,
+            _: u32,
+            _: u64,
+            _: u64,
+            _: &Arc<dyn seismic_memory::entry::Entry>,
+        ) -> Result<(), ExecutionError> {
             unreachable!()
         }
         fn write(&self, _: &(), _: u64, _: &[u8]) -> Result<(), ExecutionError> {
@@ -2657,6 +2745,9 @@ mod allocation_size_tests {
         }
         fn buffer_len(&self, _: &()) -> u64 {
             u64::MAX
+        }
+        fn host_address(&self, _: &()) -> Option<NonNull<u8>> {
+            unreachable!()
         }
     }
     struct NoExecution;

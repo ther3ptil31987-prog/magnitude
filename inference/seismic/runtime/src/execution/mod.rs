@@ -273,7 +273,7 @@ impl<T: TargetFamily, E: NativeExecutor<T>> CompletedRun<T, E> {
     pub(crate) fn read_tensor(
         &self,
         tensor: &crate::api::tensor::TensorInner,
-    ) -> Result<Vec<u8>, ExecutionError> {
+    ) -> Result<Vec<u8>, crate::api::TensorError> {
         tensor.read_with(self.state.retained.access(tensor.allocation()))
     }
 
@@ -452,7 +452,7 @@ impl AdmittedOutput {
                 ),
             ))),
             Self::Scalar(AdmittedScalarOutput::Value { dtype, symbol }) => {
-                Ok(DecodedValue::Scalar(scalar_result(*dtype, *symbol, values)))
+                Ok(DecodedValue::scalar(scalar_result(*dtype, *symbol, values)))
             }
             Self::Scalar(AdmittedScalarOutput::Index { symbol }) => {
                 let Some(SymbolValue::Nat(value)) = values.get(*symbol) else {
@@ -460,7 +460,7 @@ impl AdmittedOutput {
                         "admitted index result slot has the wrong scalar sort".to_owned(),
                     )));
                 };
-                Ok(DecodedValue::Scalar(ArgumentValue::Index(value)))
+                Ok(DecodedValue::scalar(ArgumentValue::Index(value)))
             }
             Self::Scalar(AdmittedScalarOutput::Range { start, end }) => {
                 let (Some(SymbolValue::Nat(start)), Some(SymbolValue::Nat(end))) =
@@ -470,7 +470,7 @@ impl AdmittedOutput {
                         "admitted range result slots have the wrong scalar sort".to_owned(),
                     )));
                 };
-                Ok(DecodedValue::Scalar(ArgumentValue::Range { start, end }))
+                Ok(DecodedValue::scalar(ArgumentValue::Range { start, end }))
             }
         }
     }
@@ -487,6 +487,7 @@ fn scalar_result(
         (seismic_lang::types::DType::BF16, Some(SymbolValue::BF16(v))) => ArgumentValue::BF16(v),
         (seismic_lang::types::DType::I32, Some(SymbolValue::I32(v))) => ArgumentValue::I32(v),
         (seismic_lang::types::DType::U32, Some(SymbolValue::U32(v))) => ArgumentValue::U32(v),
+        (seismic_lang::types::DType::U64, Some(SymbolValue::U64(v))) => ArgumentValue::U64(v),
         (seismic_lang::types::DType::Bool, Some(SymbolValue::Bool(v))) => ArgumentValue::Bool(v),
         _ => panic!("closed scalar result slot has the wrong scalar sort"),
     }

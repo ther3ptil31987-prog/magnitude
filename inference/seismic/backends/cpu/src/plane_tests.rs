@@ -1,5 +1,5 @@
-//! Execute target storage-plane views through the production typed builder/JIT.
-use crate::{compile, open_host, workers::LaunchFrame, Cpu};
+//! Execute target storage-plane views through the production typed builder and toolchain.
+use crate::{compile, open::open_quota, workers::LaunchFrame, Cpu};
 use seismic_ir::construction::Construction;
 use seismic_ir::kernel::dynamic::PortableSliceAxis;
 use seismic_ir::storage::GlobalBufferKind;
@@ -9,7 +9,7 @@ use seismic_lang::types::DType;
 
 #[test]
 fn plane_storage_views_preserve_types_packet_offsets_and_partial_words() {
-    let opened = open_host().unwrap();
+    let opened = open_quota().unwrap();
     let target = &opened.device;
     for name in ["q4g32", "q4g64", "q4k", "q6k", "nvfp4_e2m1_block16"] {
         let representation = registry::representation(name).unwrap();
@@ -129,7 +129,7 @@ fn plane_storage_views_preserve_types_packet_offsets_and_partial_words() {
             builder.close();
             let kernel = &construction.kernels()[0];
             let emission = target.kernel_emission_layout(kernel);
-            let native = compile::compile_kernel(target, kernel, &emission).unwrap();
+            let native = compile::compile_kernel(&crate::toolchain::test_programs(target), target, kernel, &emission).unwrap();
             let mut words = vec![1u64; emission.words.total as usize];
             for (binding, extent) in emission.words.bindings.iter().zip([n, total]) {
                 words[binding.first as usize] = extent;
@@ -163,7 +163,7 @@ fn plane_storage_views_preserve_types_packet_offsets_and_partial_words() {
 #[test]
 fn rectangular_transpose_reshape_preserves_read_and_write_coordinates() {
     use seismic_ir::kernel::ops::{ConstantValue, ValueType};
-    let opened = open_host().unwrap();
+    let opened = open_quota().unwrap();
     let target = &opened.device;
     let mut arena = ExprArena::default();
     let mut construction = Construction::<Cpu>::new(
@@ -213,7 +213,7 @@ fn rectangular_transpose_reshape_preserves_read_and_write_coordinates() {
     builder.close();
     let kernel = &construction.kernels()[0];
     let emission = target.kernel_emission_layout(kernel);
-    let native = compile::compile_kernel(target, kernel, &emission).unwrap();
+    let native = compile::compile_kernel(&crate::toolchain::test_programs(target), target, kernel, &emission).unwrap();
     let mut words = vec![0u64; emission.words.total as usize];
     for (binding, fields) in emission
         .words

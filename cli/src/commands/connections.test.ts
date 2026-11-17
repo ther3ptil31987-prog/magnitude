@@ -1,23 +1,22 @@
 import { Command } from "@commander-js/extra-typings"
-import { HarnessIdSchema } from "@magnitudedev/client-common"
-import { ProviderModelIdSchema } from "@magnitudedev/sdk"
+import { HarnessIdSchema, ProviderModelIdSchema } from "@magnitudedev/sdk"
 import { describe, expect, it, vi } from "vitest"
 import { Option } from "effect"
 import { registerConnectionsCommand } from "./connections"
-import { addConnection, syncConnections, renderAddedConnection, renderConnections } from "./connections-runtime"
+import { connectConnection, syncConnections, renderAddedConnection, renderConnections } from "./connections-runtime"
 
-const startupProbe = vi.hoisted(() => vi.fn(() => { throw new Error("Unexpected service startup") }))
-vi.mock("../server/acn-connection", async () => {
+const startupProbe = vi.hoisted(() => vi.fn(() => { throw new Error("Unexpected harness configuration") }))
+vi.mock("../server/local-harness-connections", async () => {
   const { Effect } = await import("effect")
-  return { existingAcnConnection: Effect.sync(startupProbe) }
+  return { localHarnessConnections: Effect.sync(startupProbe), requireLocalService: Effect.sync(startupProbe) }
 })
 
 describe("connections command contract", () => {
   it.each([
-    [() => addConnection("magnitude", undefined, false), "Unsupported harness: magnitude"],
+    [() => connectConnection("magnitude", undefined, false), "Unsupported harness: magnitude"],
     [() => syncConnections("magnitude"), "Unsupported harness: magnitude"],
-    [() => addConnection("pi", "", false), "Invalid model ID: "],
-  ])("rejects invalid arguments before service startup", async (command, message) => {
+    [() => connectConnection("pi", "", false), "Invalid model ID: "],
+  ])("rejects invalid arguments before touching harness configuration", async (command, message) => {
     const exitCode = process.exitCode
     const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true)
     startupProbe.mockClear()
@@ -36,16 +35,16 @@ describe("connections command contract", () => {
     const program = new Command()
     registerConnectionsCommand(program)
     const connections = program.commands.find((command) => command.name() === "connections")
-    const add = connections?.commands.find((command) => command.name() === "add")
-    expect(add?.registeredArguments.map((argument) => argument.name())).toEqual(["harness"])
-    expect(add?.options.map(({ long }) => long)).toContain("--set-model")
-    expect(add?.options.map(({ long }) => long)).not.toContain("--set-current")
-    expect(add?.options.map(({ long }) => long)).toContain("--install-skill")
-    expect(add?.description()).toBe("Connect installed Magnitude models to a harness")
+    const connect = connections?.commands.find((command) => command.name() === "connect")
+    expect(connections?.commands.map((command) => command.name())).not.toContain("add")
+    expect(connect?.registeredArguments.map((argument) => argument.name())).toEqual(["harness"])
+    expect(connect?.options.map(({ long }) => long)).toContain("--set-model")
+    expect(connect?.options.map(({ long }) => long)).not.toContain("--set-current")
+    expect(connect?.options.map(({ long }) => long)).toContain("--install-skill")
   })
 
   it("distinguishes configuration integrity from installation", () => {
-    const common = { configurationFiles: [], plugin: Option.none(), managed: false }
+    const common = { configurationFiles: [], plugin: Option.none(), version: Option.none(), managed: false }
     const output = renderConnections([
       { ...common, id: HarnessIdSchema.make("codex"), name: "Codex", installed: true, inspection: { _tag: "Connected" } },
       { ...common, id: HarnessIdSchema.make("claude-code"), name: "Claude Code", installed: true, inspection: { _tag: "Disconnected", reason: "Settings changed" } },
@@ -67,7 +66,7 @@ describe("connections command contract", () => {
   ])("preserves configuration status when the executable is missing: %s", (inspection, status) => {
     const output = renderConnections([{
       id: HarnessIdSchema.make("claude-code"), name: "Claude Code", installed: false,
-      configurationFiles: [], plugin: Option.none(), managed: false, inspection,
+      configurationFiles: [], plugin: Option.none(), version: Option.none(), managed: false, inspection,
     }])
     expect(output).toContain("Not installed")
     expect(output).toContain(status)
@@ -89,7 +88,6 @@ describe("connections command contract", () => {
           activationInstructions: Option.some("Restart existing Pi sessions or run /reload to activate the extension."),
         }),
         skillInstalled: true,
-        startupInstalled: false,
       },
     })
 

@@ -5,6 +5,8 @@
 //! one step of the candidate path. The CPU test runs everywhere; the
 //! accelerator test covers every other device the host has.
 
+mod declared;
+
 use magnitude_kernels::{
     draft_convolve_input, draft_convolve_residual, draft_gated_rows, draft_path_step, draft_top_k,
 };
@@ -167,19 +169,21 @@ fn convolutions_restart_at_every_block(device: &Device) {
         &f32_bytes(&base_values),
     );
 
-    let implementation = draft_convolve_input::native_implementation(device)
+    let entry = draft_convolve_input::native_entry_with(draft_convolve_input::Elements { A: Element::bf16() });
+    let implementation = entry
+        .offered(device)
         .unwrap()
-        .expect("draft_convolve_input has a native implementation on every device");
-    let kernel = draft_convolve_input::native_for_device_with(
-        device,
-        draft_convolve_input::Elements { A: Element::bf16() },
-        &specialization(
-            &implementation.statics,
-            |fixed| implementation.default_specialization(fixed).unwrap(),
-            &extents,
-        ),
-    )
-    .unwrap();
+        .expect("draft_convolve_input has a native implementation at its elements");
+    let kernel = entry
+        .prepare(
+            device,
+            &specialization(
+                &implementation.statics,
+                |fixed| implementation.default_specialization(fixed).unwrap(),
+                &extents,
+            ),
+        )
+        .unwrap();
     let input = tensor(
         device,
         Element::bf16(),
@@ -219,8 +223,9 @@ fn convolutions_restart_at_every_block(device: &Device) {
     let implementation = draft_convolve_residual::native_implementation(device)
         .unwrap()
         .expect("draft_convolve_residual has a native implementation on every device");
-    let kernel = draft_convolve_residual::native_for_device(
+    let kernel = declared::prepared(
         device,
+        &draft_convolve_residual::native_entry(),
         &specialization(
             &implementation.statics,
             |fixed| implementation.default_specialization(fixed).unwrap(),
@@ -275,19 +280,21 @@ fn convolutions_restart_at_every_block(device: &Device) {
 
 fn gated_rows_are_silu_times_up(device: &Device) {
     let (rows, width) = (3usize, 300usize);
-    let implementation = draft_gated_rows::native_implementation(device)
+    let entry = draft_gated_rows::native_entry_with(draft_gated_rows::Elements { A: Element::bf16() });
+    let implementation = entry
+        .offered(device)
         .unwrap()
-        .expect("draft_gated_rows has a native implementation on every device");
-    let kernel = draft_gated_rows::native_for_device_with(
-        device,
-        draft_gated_rows::Elements { A: Element::bf16() },
-        &specialization(
-            &implementation.statics,
-            |fixed| implementation.default_specialization(fixed).unwrap(),
-            &[("M", rows as u64), ("F", width as u64)],
-        ),
-    )
-    .unwrap();
+        .expect("draft_gated_rows has a native implementation at its elements");
+    let kernel = entry
+        .prepare(
+            device,
+            &specialization(
+                &implementation.statics,
+                |fixed| implementation.default_specialization(fixed).unwrap(),
+                &[("M", rows as u64), ("F", width as u64)],
+            ),
+        )
+        .unwrap();
     let gate_values = values(rows * width, 6)
         .into_iter()
         .map(bf16_round)
@@ -347,8 +354,9 @@ fn top_k_orders_by_value_then_token(device: &Device, vocabulary: usize, count: u
     let implementation = draft_top_k::native_implementation(device)
         .unwrap()
         .expect("draft_top_k has a native implementation on every device");
-    let kernel = draft_top_k::native_for_device(
+    let kernel = declared::prepared(
         device,
+        &draft_top_k::native_entry(),
         &specialization(
             &implementation.statics,
             |fixed| implementation.default_specialization(fixed).unwrap(),
@@ -452,19 +460,21 @@ fn path_step_selects_the_best_joint_score(device: &Device) {
         );
         expected.extend([tokens[slot * count + best], 0]);
     }
-    let implementation = draft_path_step::native_implementation(device)
+    let entry = draft_path_step::native_entry_with(draft_path_step::Elements { A: Element::bf16() });
+    let implementation = entry
+        .offered(device)
         .unwrap()
-        .expect("draft_path_step has a native implementation on every device");
-    let kernel = draft_path_step::native_for_device_with(
-        device,
-        draft_path_step::Elements { A: Element::bf16() },
-        &specialization(
-            &implementation.statics,
-            |fixed| implementation.default_specialization(fixed).unwrap(),
-            &[("S", slots as u64), ("K", count as u64), ("R", rank as u64)],
-        ),
-    )
-    .unwrap();
+        .expect("draft_path_step has a native implementation at its elements");
+    let kernel = entry
+        .prepare(
+            device,
+            &specialization(
+                &implementation.statics,
+                |fixed| implementation.default_specialization(fixed).unwrap(),
+                &[("S", slots as u64), ("K", count as u64), ("R", rank as u64)],
+            ),
+        )
+        .unwrap();
     let mut selection = tensor(
         device,
         Element::i32(),
@@ -523,13 +533,13 @@ fn entries_match_on(device: &Device) {
 
 #[test]
 fn dflash2_entries_match_the_host_model_on_cpu() {
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     entries_match_on(&catalog.open_backend(BackendName::Cpu).unwrap());
 }
 
 #[test]
 fn dflash2_entries_match_the_host_model_on_accelerators() {
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     for backend in [BackendName::Metal, BackendName::Cuda, BackendName::Vulkan] {
         let Ok(device) = catalog.open_backend(backend) else {
             continue;
@@ -539,69 +549,8 @@ fn dflash2_entries_match_the_host_model_on_accelerators() {
 }
 
 #[test]
-#[ignore = "one-sample full-vocabulary readout timing on the measurement host"]
-fn time_top_k_full_vocabulary() {
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
-    for backend in [BackendName::Metal, BackendName::Cuda] {
-        let Ok(device) = catalog.open_backend(backend) else {
-            continue;
-        };
-        for vocabulary in [65_536usize, 248_320] {
-            for rows in [3usize, 7] {
-                let count = 16usize;
-                let logits = tensor(
-                    &device,
-                    Element::f32(),
-                    &[rows, vocabulary],
-                    &f32_bytes(&values(rows * vocabulary, 8)),
-                );
-                let mut candidates = tensor(
-                    &device,
-                    Element::i32(),
-                    &[rows * count, 2],
-                    &i32_bytes(&vec![0; rows * count * 2]),
-                );
-                let mut unary = tensor(
-                    &device,
-                    Element::f32(),
-                    &[rows, count],
-                    &f32_bytes(&vec![0.0; rows * count]),
-                );
-                let implementation = draft_top_k::native_implementation(&device)
-                    .unwrap()
-                    .unwrap();
-                let kernel = draft_top_k::native_for_device(
-                    &device,
-                    &implementation
-                        .default_specialization(&NativeSpecialization::new())
-                        .unwrap(),
-                )
-                .unwrap();
-                let measured = kernel
-                    .measure(
-                        vec![draft_top_k::Args {
-                            logits: &logits,
-                            candidates: &mut candidates,
-                            unary: &mut unary,
-                        }],
-                        &seismic::MeasureOptions {
-                            samples: 1,
-                            min_sample_seconds: 0.0,
-                        },
-                    )
-                    .unwrap();
-                eprintln!(
-                    "{backend:?} top_k V={vocabulary} M={rows} K={count} seconds={:.9}",
-                    measured.median
-                );
-            }
-        }
-    }
-}
-
-#[test]
 fn partitioned_top_k_matches_full_vocabulary_on_accelerators() {
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     for backend in [BackendName::Metal, BackendName::Cuda] {
         let Ok(device) = catalog.open_backend(backend) else {
             continue;

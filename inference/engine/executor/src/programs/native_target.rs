@@ -1,30 +1,44 @@
 //! Ordered target execution through sealed Seismic native graphs. A step
 //! queues one run per graph without waiting; the device queue orders them,
 //! and the returned submission owns the launch until completion is observed.
+//! A chain of steps interleaves their runs block by block, as a wavefront
+//! at a scratch-served layer: each step's back there, then its next block,
+//! so the next layer's requests are published while the layer's later
+//! backs wait.
 
 use super::{
+    Branded, Chain, DeviceSubmission, TargetProgram,
     graph::readout::{
-        certifies, shapes, write_selection, BoundTargetReadoutGraphs, ReadoutClass, ReadoutKind,
+        BoundTargetReadoutGraphs, ReadoutClass, ReadoutKind, certifies, shapes, write_selection,
     },
-    native_target_graph::{BoundTargetGraphs, EntryTokens},
-    DeviceSubmission, TargetProgram,
+    native_target_graph::{
+        BankRun, BoundTargetGraphs, CarryPorts, EntryTokens, GroupBuffers, LaunchControl, LaunchControlLayout,
+        TokenRow, complete, packed_selection_scores,
+    },
 };
-use crate::operators::block::{BlockControlPorts, BlockStatePorts};
+use crate::device_table::{SelectedRead, SubmittedRead};
+use crate::host_tables::HostTableError;
+use crate::stored_table::{NoticeStep, StepRows, StoredTable};
+use crate::operators::attention::pooled::ListPorts;
+use crate::operators::block::{BankPorts, HistoryPorts};
+use crate::operators::streams::ResidualCarry;
+use crate::experts::StepRoute;
+use crate::operators::routed::split::{RunStage, SplitPorts, SplitValues};
 use crate::{
-    completion::CompletionWaiter, native::AttestedState, ConditioningRef, ConditioningSlice,
-    DeviceError, GraphOutputTensor, InvariantError, NativeGraphOutputLease,
-    NativeGraphWorkspaceLease, SubmitError, TargetGraphOutputLease, TargetGraphWorkspaceLease,
-    TargetLaunchCore, TargetLaunchWorkspace, TargetTokens, ValidatedTargetLaunch,
+    ConditioningRef, ConditioningSlice, DeviceError, GraphOutputTensor, InvariantError,
+    NativeGraphOutputLease, NativeGraphWorkspaceLease, SubmitError, TargetGraphOutputLease,
+    TargetGraphWorkspaceLease, TargetLaunchCore, TargetLaunchWorkspace, TargetTokens,
+    ValidatedTargetLaunch, completion::CompletionWaiter, native::AttestedState,
 };
 use magnitude_batching::{Demand, TargetBatchUpload};
 use magnitude_family_contracts::Decoder;
-use magnitude_kernels::conditioning_overlay;
+use magnitude_kernels::{conditioning_overlay, feature_copy};
 use magnitude_state::LayerRef;
 use seismic::{
     Device, Element, NativeGraphCompletion, NativeGraphOutputs, NativeGraphPlan,
-    NativeGraphSequence, NativePort, Tensor,
+    NativeGraphSequence, NativePort, NativeQueue, Tensor,
 };
-use std::{cell::RefCell, collections::BTreeMap, rc::Rc, time::Instant};
+use std::{cell::RefCell, collections::BTreeMap, rc::Rc, sync::Arc, time::Instant};
 
 fn invalid(detail: impl Into<String>) -> SubmitError {
     SubmitError::Invariant(InvariantError {
@@ -47,11 +61,37 @@ fn token_rows(tokens: &[i32]) -> Vec<u8> {
         .collect()
 }
 
+/// A launch's encoded visible spans, `segments` a row, with each row's
+/// padded to `padded` spans by empty ones.
+fn padded_spans(visible: &[u8], segments: u64, padded: u64) -> Vec<u8> {
+    let (row, padded) = (segments as usize * 8, padded as usize * 8);
+    visible
+        .chunks_exact(row)
+        .flat_map(|spans| {
+            spans
+                .iter()
+                .copied()
+                .chain(std::iter::repeat_n(0, padded - row))
+        })
+        .collect()
+}
+
+
 fn i32_bytes(values: &[i32]) -> Vec<u8> {
     values
         .iter()
         .flat_map(|value| value.to_le_bytes())
         .collect()
+}
+
+/// Step `sequence`'s words (`routed_step`'s `sequence`): the u64 sequence
+/// as its pair, STEP_LOW and STEP_HIGH.
+fn step_bytes(step: u64) -> Vec<u8> {
+    use magnitude_kernels::constants::{STEP_HIGH, STEP_LOW, STEP_WORDS};
+    let mut words = [0u32; STEP_WORDS as usize];
+    words[STEP_LOW as usize] = step as u32;
+    words[STEP_HIGH as usize] = (step >> 32) as u32;
+    words.iter().flat_map(|word| word.to_le_bytes()).collect()
 }
 
 /// Observe every run, even after a failure, so none is still executing when
@@ -65,47 +105,193 @@ fn wait_all(completions: Vec<NativeGraphCompletion>) -> Result<(), SubmitError> 
 /// Submits a step's runs in sequences of doubling length (1, 2, 4, … runs):
 /// the device starts on the first run as soon as it is queued, and each
 /// sequence is queued while the device executes the previous ones, so a step
-/// of N runs has about log2(N) submission boundaries instead of N.
-struct StepSubmitter {
+/// of N runs has about log2(N) submission boundaries instead of N. Every
+/// run replays one of the graphs its family's slots hold
+/// (`seismic::NativeGraphFamily::launch`), so a sequence of any length and
+/// mix of places and classes records nothing once each shape has run. A
+/// scratch-served chain's submissions are its release's boundaries
+/// ([`RunningRelease`]).
+struct StepSubmitter<'p> {
     device: Device,
+    release: Option<RunningRelease<'p>>,
     sequence: NativeGraphSequence,
     queued: usize,
     limit: usize,
     completions: Vec<NativeGraphCompletion>,
+    /// The stored-table reads of the runs since the last submission, the
+    /// first `queued_reads` of them the queued runs', then of the submitted
+    /// runs.
+    pending_reads: Vec<StoredRead>,
+    queued_reads: usize,
+    reads: Vec<StoredRead>,
+    /// The landed reads of the runs since the last submission, the first
+    /// `queued_landed` of them the queued runs', then of the submitted
+    /// runs.
+    pending_landed: Vec<SelectedRead>,
+    queued_landed: usize,
+    landed: Vec<SubmittedRead>,
 }
 
-impl StepSubmitter {
-    fn new(device: &Device) -> Self {
+/// A scratch-served chain's release of its load's expert bank beside its
+/// running steps (`ExpertBank::release_running`), taken at each submission
+/// of its runs: the bank, the chain's first and last steps, what reads
+/// memory, the last block every pass of which is queued and the last
+/// submitted, and the block a cut's install awaits the submission of. A
+/// chain's encoding is throttled by the device, so its submissions come at
+/// the device's pace (a 16k prompt's chain of 31 chunks, 43 s on an M4 Pro,
+/// about every 29 ms): memory another program takes while it runs is
+/// answered within the passes the watcher decided ahead of them, not at
+/// the chain's end.
+struct RunningRelease<'p> {
+    bank: Arc<crate::experts::ExpertBank>,
+    chain: (u64, u64),
+    pressure: &'p dyn Fn() -> Option<crate::domain::RunningPressure>,
+    queued: Option<usize>,
+    submitted: Option<usize>,
+    awaits: Option<usize>,
+}
+
+/// A run's read of a stored table: the table and the step it queued there.
+#[derive(Clone)]
+pub struct StoredRead {
+    table: Arc<StoredTable>,
+    value: u64,
+}
+
+impl StoredRead {
+    /// A read of `table`'s step `value`.
+    pub fn new(table: Arc<StoredTable>, value: u64) -> Self {
+        Self { table, value }
+    }
+}
+
+impl<'p> StepSubmitter<'p> {
+    fn new(device: &Device, release: Option<RunningRelease<'p>>) -> Self {
         Self {
             device: device.clone(),
-            sequence: device.native_sequence(),
+            release,
+            sequence: device.native_sequence(NativeQueue::Compute),
             queued: 0,
             limit: 1,
             completions: Vec::new(),
+            pending_reads: Vec::new(),
+            queued_reads: 0,
+            reads: Vec::new(),
+            pending_landed: Vec::new(),
+            queued_landed: 0,
+            landed: Vec::new(),
         }
     }
 
+    /// The next run queued reads a stored table at its step `value`.
+    fn reads(&mut self, table: Arc<StoredTable>, value: u64) {
+        self.pending_reads.push(StoredRead { table, value });
+    }
+
+    /// The next run queued makes the landed read `read`.
+    fn lands(&mut self, read: SelectedRead) {
+        self.pending_landed.push(read);
+    }
+
+    /// After a failure, once the submitted runs completed: the stored-table
+    /// steps and the landed reads (dropped unsubmitted) of runs never
+    /// submitted read nothing.
+    fn abandon_unsubmitted(self) {
+        for read in self.pending_reads {
+            let _ = read.table.abandon(read.value);
+        }
+    }
+
+    /// Queue `ready`, `register` given its outputs before anything queued
+    /// is submitted: a run's parks are registered before the device can
+    /// reach them (`crate::experts::Parks`).
     fn queue(
         &mut self,
         ready: seismic::ReadyNativeGraphRun<'_>,
+        register: impl FnOnce(&NativeGraphOutputs),
     ) -> Result<NativeGraphOutputs, SubmitError> {
-        let outputs = ready.queue(&mut self.sequence).map_err(device)?;
+        self.queue_as(ready, false, register).map(|(outputs, _)| outputs)
+    }
+
+    /// [`Self::queue`], the run `sampled` for its span marks' device time
+    /// where so (`seismic::ReadyNativeGraphRun::queue_sampled`): its spans.
+    fn queue_as(
+        &mut self,
+        ready: seismic::ReadyNativeGraphRun<'_>,
+        sampled: bool,
+        register: impl FnOnce(&NativeGraphOutputs),
+    ) -> Result<(NativeGraphOutputs, Option<seismic::NativeSpans>), SubmitError> {
+        let (outputs, spans) = match sampled {
+            true => ready.queue_sampled(&mut self.sequence).map(|(outputs, spans)| (outputs, Some(spans))).map_err(device)?,
+            false => (ready.queue(&mut self.sequence).map_err(device)?, None),
+        };
+        register(&outputs);
+        (self.queued_reads, self.queued_landed) = (self.pending_reads.len(), self.pending_landed.len());
         self.queued += 1;
         if self.queued == self.limit {
             self.flush()?;
             self.limit *= 2;
         }
-        Ok(outputs)
+        Ok((outputs, spans))
     }
 
-    /// Submit what is queued.
+    /// Queue `ready`, a fill, `register` given its outputs before anything
+    /// it is queued with is submitted, once what is queued is submitted, so
+    /// no park of the fill holds work queued before it. Where fills run
+    /// beside compute it is submitted alone on the fill queue
+    /// (`seismic::NativeQueue::Fill`): the device orders it after the
+    /// submitted work it must follow by what it touches, and later work
+    /// after it likewise, so its moves and parks hold only what reads what
+    /// it writes. Where they share the compute queue it begins the next
+    /// compute sequence, as any run.
+    fn fill(
+        &mut self,
+        ready: seismic::ReadyNativeGraphRun<'_>,
+        register: impl FnOnce(&NativeGraphOutputs),
+    ) -> Result<(), SubmitError> {
+        self.flush()?;
+        if !self.device.backend().fills_beside_compute() {
+            return self.queue(ready, register).map(drop);
+        }
+        let mut sequence = self.device.native_sequence(NativeQueue::Fill);
+        let outputs = ready.queue(&mut sequence).map_err(device)?;
+        register(&outputs);
+        self.completions.push(sequence.submit().map_err(device)?);
+        Ok(())
+    }
+
+    /// Submit what is queued, with the reads its runs make; those of the
+    /// run about to be queued stay pending. A submission is a boundary of
+    /// the chain's release: every pass queued is submitted.
     fn flush(&mut self) -> Result<(), SubmitError> {
         self.queued = 0;
-        let sequence = std::mem::replace(&mut self.sequence, self.device.native_sequence());
+        let sequence = std::mem::replace(&mut self.sequence, self.device.native_sequence(NativeQueue::Compute));
         if !sequence.is_empty() {
             self.completions.push(sequence.submit().map_err(device)?);
+            self.reads.extend(self.pending_reads.drain(..self.queued_reads));
+            self.landed
+                .extend(self.pending_landed.drain(..self.queued_landed).map(SelectedRead::submitted));
+            if let Some(release) = &mut self.release {
+                release.submitted = release.queued;
+                release.awaits = release.bank.release_running(release.chain, release.submitted, release.pressure);
+            }
         }
+        (self.queued_reads, self.queued_landed) = (0, 0);
         Ok(())
+    }
+
+    /// Every pass of the chain's blocks through `through` is queued (none
+    /// where no block's is): submitted at once where a cut's install awaits
+    /// them, so it installs at this boundary.
+    fn passed(&mut self, through: Option<usize>) -> Result<(), SubmitError> {
+        let Some(release) = &mut self.release else {
+            return Ok(());
+        };
+        release.queued = through;
+        match release.awaits.zip(through) {
+            Some((block, through)) if through >= block => self.flush(),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -125,9 +311,13 @@ impl TargetTrace {
     }
 }
 
-/// A sealed single-range conditioning overlay for one row count. The source
-/// and the destination hidden rows are late bindings, so a plan serves every
-/// placement of that many rows.
+/// A sealed single-range conditioning overlay for one row count, or the
+/// boundary capture's copy of one row. The source and the destination
+/// hidden rows are late bindings, so a plan serves every placement of that
+/// many rows. A step makes its slot with earlier steps in flight, and an
+/// overlay's rows are a request's, which no load enumerates, so the plan is
+/// launched (`seismic::NativeGraph::seal_launched`): its slot holds no
+/// graph, and its one launch runs in its place in the step's submission.
 #[derive(Clone)]
 struct OverlayGraph {
     plan: NativeGraphPlan,
@@ -144,12 +334,21 @@ pub struct NativeTargetProgram {
     readout_graphs: Rc<BoundTargetReadoutGraphs>,
     /// Overlay plans by row count, sealed on first use.
     overlays: Rc<RefCell<BTreeMap<u64, OverlayGraph>>>,
+    boundary_copy: Rc<RefCell<Option<OverlayGraph>>>,
     waiter: CompletionWaiter,
     trace: TargetTrace,
 }
 
 /// The launch whose rows a step runs: its advances' state and conditioning.
 struct RowState<'a>(&'a TargetLaunchCore);
+
+/// A pooled source's planes and reads (`RowState::pooled`).
+struct PooledPlanes<'a> {
+    window: Option<(usize, [&'a Tensor; 2])>,
+    block_read: usize,
+    rows: &'a Tensor,
+    index_keys: Option<&'a Tensor>,
+}
 
 pub struct TargetReadoutGraphResult {
     pub features: GraphOutputTensor,
@@ -169,15 +368,264 @@ pub struct CommitSpan {
 
 /// A target step's readout and the commit span of its device work.
 pub struct TargetOutput {
+    pub boundary: Option<crate::FeatureRef>,
     pub readout: Option<TargetReadoutGraphResult>,
     pub commits: CommitSpan,
+    /// The step's landed reads of the table rows the device selected its
+    /// tokens for (`DeviceTable::read_selected`); none of a step of the
+    /// host's tokens or of a table held whole.
+    pub landed_reads: Vec<SubmittedRead>,
+    /// The step's reads of stored tables (`StoredTable`).
+    pub stored_reads: Vec<StoredRead>,
+    /// The step of a streamed load's expert bank, until it completes.
+    pub(crate) expert_step: Option<crate::experts::ExpertStep>,
+}
+
+/// A target step's output once the step completed (or will never be used,
+/// an orphan's): its reads and its expert bank's step completed
+/// ([`TargetOutput::complete`]).
+pub(crate) struct CompletedTargetOutput {
+    pub boundary: Option<crate::FeatureRef>,
+    pub readout: Option<TargetReadoutGraphResult>,
+    pub commits: CommitSpan,
+    /// Per batch slot, why the weights its rows named could not be read:
+    /// that slot's outputs are not to be used.
+    pub failures: Vec<Option<crate::WeightReadError>>,
+    /// How the step's expert bank's step ended.
+    pub(crate) experts: ExpertStepEnd,
+}
+
+/// How a step's expert bank's step ended.
+#[derive(Clone, Debug)]
+pub(crate) enum ExpertStepEnd {
+    /// It ran; the experts it could not read fail their slots
+    /// ([`CompletedTargetOutput::failures`]).
+    Ran,
+    /// A late beat of the load's pulse interrupted it: the step's outputs
+    /// are not to be used, and it is re-run from its accepted state.
+    Interrupted(String),
+}
+
+impl TargetOutput {
+    /// The step of `batch` completed, or will never be used (an orphan's):
+    /// its landed reads bring the rows they landed into slots of their own
+    /// (`SubmittedRead::complete`), its expert bank's step completes (its
+    /// misses `recorded` where the load records them), and its stored
+    /// tables forget its failures. Each slot fails where a stored table's
+    /// rows it named, or the experts its rows named, could not be read, and
+    /// every slot where a landed read could not land its rows (the step then
+    /// read other rows). A watcher that panicked serves no step again: the
+    /// load fails.
+    pub(crate) fn complete(
+        mut self,
+        batch: &magnitude_batching::ValidatedTargetBatch,
+        recorded: Option<crate::experts::Recording>,
+    ) -> Result<CompletedTargetOutput, crate::InvariantError> {
+        let landing = std::mem::take(&mut self.landed_reads)
+            .into_iter()
+            .map(SubmittedRead::complete)
+            .fold(None, |failure, outcome| {
+                failure.or(outcome.err().map(|detail| crate::WeightReadError { detail }))
+            });
+        let step = self.expert_step.take().map(|step| match recorded {
+            Some(recording) => step.recorded(recording),
+            None => step,
+        });
+        let (experts, unread) = match step.map(crate::experts::ExpertStep::complete) {
+            None | Some(Ok(())) => (ExpertStepEnd::Ran, None),
+            Some(Err(
+                crate::experts::StepFailure::Read { rows, reason } | crate::experts::StepFailure::Site { rows, reason },
+            )) => (ExpertStepEnd::Ran, Some((rows, crate::WeightReadError { detail: reason }))),
+            Some(Err(crate::experts::StepFailure::Interrupted(reason))) => (ExpertStepEnd::Interrupted(reason), None),
+            Some(Err(failure @ crate::experts::StepFailure::Watcher(_))) => {
+                return Err(crate::InvariantError { context: "expert bank", detail: failure.to_string() });
+            }
+        };
+        let failures = (0..batch.actual_slots())
+            .map(|slot| {
+                let rows = batch
+                    .slot(slot)
+                    .ok_or_else(|| crate::InvariantError {
+                        context: "target output",
+                        detail: "a completed target slot has no batch segment".into(),
+                    })?
+                    .span();
+                let table = self.stored_reads.iter().find_map(|read| {
+                    read.table
+                        .failure(read.value)
+                        .filter(|failure| failure.fails(slot))
+                        .map(|failure| crate::WeightReadError { detail: failure.error })
+                });
+                Ok(table
+                    .or_else(|| landing.clone())
+                    .or_else(|| unread.as_ref().and_then(|(failed, error)| failed.fails(rows).then(|| error.clone()))))
+            })
+            .collect::<Result<Vec<_>, crate::InvariantError>>()?;
+        for read in &self.stored_reads {
+            read.table.retire(read.value);
+        }
+        let Self { boundary, readout, commits, .. } = self;
+        Ok(CompletedTargetOutput { boundary, readout, commits, failures, experts })
+    }
 }
 
 /// Runs of one step queued on the device, with the outputs they will fill.
-struct QueuedStep {
+struct DeviceStep {
     readout: Option<TargetReadoutGraphResult>,
     commits: CommitSpan,
     completions: Vec<NativeGraphCompletion>,
+    landed_reads: Vec<SubmittedRead>,
+    stored_reads: Vec<StoredRead>,
+    expert_step: Option<crate::experts::ExpertStep>,
+}
+
+/// One launch of a chain once its readout is queued: its readout, its
+/// commit span, and where its command sequences end in the chain's
+/// (`StepSubmitter`). A launch's begin where the one before it ends.
+struct QueuedRuns {
+    readout: Option<TargetReadoutGraphResult>,
+    commits: CommitSpan,
+    sequences: usize,
+}
+
+/// The rows of the launch-row buffers a launch of a chain owns: the draft
+/// input rows its blocks write and its readout reads, the per-layer rows and
+/// the kept token rows its entry writes and its blocks read. A chain runs
+/// each block over every launch before the next block, so its `k`th launch
+/// takes region `k` (`PreparedTargetGraphs::region_start`) of its group's
+/// buffers (`BoundTargetGraphs::group`), never rows another launch of the
+/// chain writes or reads.
+#[derive(Clone)]
+struct ChainRegion {
+    /// The launch's place in its chain, whose words of the expert bank's
+    /// placed parts it binds (`BankPart::placed`).
+    place: usize,
+    /// The region's first row.
+    start: u64,
+    /// The buffers of the launch's group.
+    group: Rc<GroupBuffers>,
+}
+
+/// A chain's output slots: each launch's, which its entry writes, and the
+/// chain's spare (`TargetProgram::submit`). A graph of a run reads only its
+/// run's latest output, so between graphs each run holds one slot and one
+/// is free: the next graph writes it, and the slot its run held is the free
+/// one once that graph is queued (the device queue orders its rewrite after
+/// every read).
+struct OutputRotation<'l> {
+    slots: Vec<&'l mut TargetGraphOutputLease>,
+    free: usize,
+}
+
+impl<'l> OutputRotation<'l> {
+    /// The rotation of a chain's launches' `slots`, in chain order, and its
+    /// `spare`.
+    fn new(mut slots: Vec<&'l mut TargetGraphOutputLease>, spare: &'l mut TargetGraphOutputLease) -> Self {
+        let free = slots.len();
+        slots.push(spare);
+        Self { slots, free }
+    }
+
+    /// Activate the slot of the launch at `place` for its entry's `plan`.
+    fn entry(&mut self, place: usize, plan: &NativeGraphPlan) -> Result<(usize, NativeGraphOutputs), SubmitError> {
+        let outputs = self.slots[place].activate(plan).map_err(SubmitError::Invariant)?;
+        Ok((place, outputs))
+    }
+
+    /// Activate the free slot for `plan`.
+    fn activate(&mut self, plan: &NativeGraphPlan) -> Result<(usize, NativeGraphOutputs), SubmitError> {
+        let outputs = self.slots[self.free].activate(plan).map_err(SubmitError::Invariant)?;
+        Ok((self.free, outputs))
+    }
+
+    /// Free slot `at`, whose outputs every reader queued has read.
+    fn recycle(&mut self, (at, outputs): (usize, NativeGraphOutputs)) -> Result<(), SubmitError> {
+        self.slots[at].recycle(outputs).map_err(SubmitError::Invariant)?;
+        self.free = at;
+        Ok(())
+    }
+}
+
+impl ChainRegion {
+    /// Whether the launch is alone in its chain, in the floor's one region:
+    /// only then may it use the per-layer token-row slots, which lie in
+    /// every row of it.
+    fn alone(&self) -> bool {
+        self.group.places() == 1
+    }
+
+    /// The region's leading `rows` of `buffer`.
+    fn rows(&self, buffer: &Tensor, rows: u64) -> Result<Tensor, SubmitError> {
+        let end = self
+            .start
+            .checked_add(rows)
+            .filter(|&end| end <= buffer.extents()[0])
+            .ok_or_else(|| invalid("a chained launch's rows exceed its chain region"))?;
+        buffer.slice_leading(self.start, end).map_err(device)
+    }
+}
+
+/// What a step's run is threaded with from its launch: its batch, its view
+/// of the state of the launch's rows, the graph workspace its entry and
+/// blocks run in, and its readout's workspace and output.
+struct RunLaunch<'l> {
+    batch: TargetBatchUpload<'l>,
+    state: RowState<'l>,
+    graph_workspace: &'l mut TargetGraphWorkspaceLease,
+    readout: (&'l mut NativeGraphWorkspaceLease, &'l mut Option<NativeGraphOutputLease>),
+}
+
+/// The class of a block a run takes at its rows: its history segment class,
+/// the tiles it lists with their list's bytes, and whether it scores.
+struct BlockRun {
+    rows: u64,
+    segments: u64,
+    listed: Option<(u64, Vec<u8>)>,
+    scored: bool,
+}
+
+/// One step's queued work between its blocks: its launch, what the next
+/// block reads and the outputs still in use (`begin_run`, `run_block`,
+/// `finish_run`).
+struct TargetRun<'l> {
+    launch: RunLaunch<'l>,
+    /// The output slot of the chain's rotation the run's latest graph wrote
+    /// (`OutputRotation`), which holds `hidden`.
+    output: (usize, NativeGraphOutputs),
+    /// The block whose front the run queued last and its class, whose back
+    /// its merge set queues next (`run_sets`).
+    back: Option<(usize, BlockRun)>,
+    /// The scratch-served streamed block whose front the run queued and
+    /// whose fill is not yet queued (`run_sets`).
+    unfilled: Option<(usize, u64)>,
+    residual: Option<Tensor>,
+    /// The carry the next block reads (`ResidualCarry`).
+    hidden: ResidualCarry<Tensor>,
+    /// Which of its place's operand carries (`GroupBuffers::operands`) the
+    /// run's latest graph formed the next block's operand into, beside
+    /// `hidden`; none where it formed none.
+    carried: Option<usize>,
+    per_layer_rows: Option<Tensor>,
+    region: ChainRegion,
+    controls: GraphControls,
+    window: RowWindow,
+    segments: u64,
+    slots: u64,
+    /// The entry's selection notice, of a step reading selected tokens in a
+    /// model with a stored table.
+    notice: Option<Arc<NoticeStep>>,
+    /// The recurrent component the next recurrent block binds first.
+    recurrent_component: usize,
+    /// Blocks whose outputs the step reads; the last one's output feeds the
+    /// readout.
+    executed: usize,
+    first_commit: Instant,
+    /// The step of its load's expert bank it runs, of a streamed load.
+    bank: Option<BankRun>,
+    /// Whether any row demands features: a launch none of whose rows does
+    /// runs each tapped block's untapped graphs, as a load without the
+    /// drafter runs the block.
+    tapped: bool,
 }
 
 impl RowState<'_> {
@@ -186,6 +634,9 @@ impl RowState<'_> {
     }
     fn tokens(&self) -> &TargetTokens {
         self.0.tokens()
+    }
+    fn preceding(&self) -> &[Vec<u64>] {
+        self.0.preceding()
     }
     /// The state store's recurrent arenas, one per component. Every slot's
     /// advance belongs to the same store; the batch's bank columns select
@@ -197,7 +648,7 @@ impl RowState<'_> {
             .map(|advance| advance.bindings().recurrent)
             .ok_or_else(|| invalid("recurrent batch has no state advance"))
     }
-    /// `layer`'s history read (`StateStore::history_read`, the index of its
+    /// `layer`'s history read (`HistoryReads::read`, the index of its
     /// controls) and planes in the codec's plane-descriptor order, as the
     /// attention graph's state ports take them. A Shared layer binds its
     /// source layer's planes and its source domain's shared read.
@@ -205,7 +656,7 @@ impl RowState<'_> {
         let store = self.0.store();
         let missing = || invalid("attention layer has no history in its store");
         let source = store.history_source(layer).ok_or_else(missing)?;
-        let read = store.history_read(layer).ok_or_else(missing)?;
+        let read = store.history_reads().read(layer).ok_or_else(missing)?;
         let planes = self
             .0
             .advances()
@@ -221,6 +672,74 @@ impl RowState<'_> {
                 .collect(),
         ))
     }
+    /// Target block `block`'s indexer histories: its raw keys' and its
+    /// block keys' reads, each with its planes in descriptor order.
+    fn indexer(&self, block: u32) -> Result<[(usize, Vec<&Tensor>); 2], SubmitError> {
+        let store = self.0.store();
+        let (Some(window), blocks) = store
+            .produced_domains(LayerRef::IndexKeys { block, part: 0 })
+            .ok_or_else(|| invalid("a selected attention layer has no indexer history"))?
+        else {
+            return Err(invalid("a selected attention layer's indexer keeps no raw keys"));
+        };
+        let planes = self
+            .0
+            .advances()
+            .first()
+            .map(|advance| advance.bindings().history)
+            .ok_or_else(|| invalid("attention batch has no state advance"))?;
+        let layer = LayerRef::IndexKeys { block, part: 0 };
+        let of = |domain: magnitude_state::HistoryDomainId| {
+            (
+                domain.0,
+                planes
+                    .iter()
+                    .filter(|plane| plane.domain == domain && plane.layer == layer)
+                    .map(|plane| &plane.buffer)
+                    .collect(),
+            )
+        };
+        Ok([of(window), of(blocks)])
+    }
+    /// Target block `block`'s pooled source `part`
+    /// (`StateStore::produced_domains`): its Window read with its pending
+    /// rows and coordinates (none at rate 1), its Block read with its pooled
+    /// rows, and the index keys an own indexer keeps beside them.
+    fn pooled(&self, block: u32, part: u32) -> Result<PooledPlanes<'_>, SubmitError> {
+        let store = self.0.store();
+        let (window, blocks) = store
+            .produced_domains(LayerRef::Pooled { block, part })
+            .ok_or_else(|| invalid("an index-list source has no pooled history"))?;
+        let planes = self
+            .0
+            .advances()
+            .first()
+            .map(|advance| advance.bindings().history)
+            .ok_or_else(|| invalid("attention batch has no state advance"))?;
+        let of = |domain: magnitude_state::HistoryDomainId, layer: LayerRef| {
+            planes
+                .iter()
+                .filter(move |plane| plane.domain == domain && plane.layer == layer)
+                .map(|plane| &plane.buffer)
+                .collect::<Vec<_>>()
+        };
+        let pooled = LayerRef::Pooled { block, part };
+        let window = window
+            .map(|domain| match of(domain, pooled)[..] {
+                [rows, coordinates] => Ok((domain.0, [rows, coordinates])),
+                _ => Err(invalid("a pooled source's window planes are not two")),
+            })
+            .transpose()?;
+        let [rows] = of(blocks, pooled)[..] else {
+            return Err(invalid("a pooled source's Block planes are not one"));
+        };
+        let index_keys = match of(blocks, LayerRef::IndexKeys { block, part })[..] {
+            [] => None,
+            [keys] => Some(keys),
+            _ => return Err(invalid("a pooled source's index-key planes are not one")),
+        };
+        Ok(PooledPlanes { window, block_read: blocks.0, rows, index_keys })
+    }
     fn conditioning(&self, slot: usize) -> Option<&ConditioningRef> {
         self.0.conditioning().get(slot).and_then(Option::as_ref)
     }
@@ -234,8 +753,27 @@ impl RowState<'_> {
 }
 
 impl NativeTargetProgram {
+    /// What the graphs of the overlay plans sealed so far cost serving:
+    /// plans of no graph family (`seismic::NativeGraphPlan::graph_replays`).
+    pub(crate) fn overlay_graph_replays(&self) -> seismic::GraphReplays {
+        let overlays = self.overlays.borrow();
+        let copy = self.boundary_copy.borrow();
+        overlays
+            .values()
+            .chain(copy.iter())
+            .fold(seismic::GraphReplays::default(), |counts, overlay| counts.plus(overlay.plan.graph_replays()))
+    }
+
     pub(crate) fn constant_bytes(&self) -> Result<u64, &'static str> {
         self.graphs.constant_bytes()
+    }
+
+    pub(crate) fn group_bytes(&self, places: usize) -> Result<u64, String> {
+        self.graphs.group_bytes(places)
+    }
+
+    pub(crate) fn hold_group(&self, places: usize) -> Result<(), crate::resources::AllocationError> {
+        self.graphs.hold_group(places)
     }
 
     pub(crate) fn new(
@@ -254,19 +792,31 @@ impl NativeTargetProgram {
             graphs: Rc::new(graphs),
             readout_graphs: Rc::new(readout_graphs),
             overlays: Rc::new(RefCell::new(BTreeMap::new())),
+            boundary_copy: Rc::default(),
             waiter,
             trace: TargetTrace::from_environment(),
         })
     }
 
+    /// The readout over a run's final hidden rows, from batch row
+    /// `window.first` on (`RowWindow`), in its launch's region.
     fn graph_readout(
         &self,
-        batch: &TargetBatchUpload<'_>,
-        hidden: &Tensor,
-        workspace: &mut NativeGraphWorkspaceLease,
-        mut output: NativeGraphOutputLease,
+        run: &mut TargetRun<'_>,
         submitter: &mut StepSubmitter,
     ) -> Result<Option<TargetReadoutGraphResult>, SubmitError> {
+        let (workspace, output) = &mut run.launch.readout;
+        let mut output = output
+            .take()
+            .ok_or_else(|| invalid("readout output was not reserved before submit"))?;
+        let workspace = &mut **workspace;
+        let (batch, region, window, hidden, residual) = (
+            &run.launch.batch,
+            &run.region,
+            run.window,
+            &run.hidden.rows,
+            run.residual.as_ref(),
+        );
         let actual_outputs = batch.out_rows.len();
         if actual_outputs == 0 {
             return Ok(None);
@@ -285,6 +835,9 @@ impl NativeTargetProgram {
         let mut projected_output_rows = Vec::new();
         // Whether a selected row also reads its logits on the host.
         let mut selection_reads_logits = false;
+        // Whether a row demands features: only then does a tapped load's
+        // readout fuse its draft's taps (`BoundTargetReadoutGraphs::class`).
+        let mut features = false;
         for &output_index in batch.select_rows {
             projected_output_rows.push(
                 usize::try_from(output_index)
@@ -300,6 +853,7 @@ impl NativeTargetProgram {
                 .ok_or_else(|| invalid("readout demand is absent or invalid"))?;
             let selected = projected_output_rows[..actual_selected].contains(&output_index);
             selection_reads_logits |= selected && demand.contains(Demand::LOGITS);
+            features |= demand.contains(Demand::FEATURES);
             if demand.computes_logits() && !selected {
                 projected_output_rows.push(output_index);
             } else if selected && !demand.computes_logits() {
@@ -323,7 +877,10 @@ impl NativeTargetProgram {
         // samples or takes its largest admitted logit at a temperature at
         // most, none reads its logits, and nothing else projects.
         let certified = actual_projected == actual_selected
-            && projected_class as u64 <= self.readout_graphs.prepared.certified_rows()
+            && self
+                .readout_graphs
+                .prepared
+                .certifies(projected_class as u64)
             && !selection_reads_logits
             && batch.shaping[..actual_selected].iter().all(certifies);
         let kind = if actual_selected > 0 {
@@ -337,20 +894,23 @@ impl NativeTargetProgram {
             ReadoutKind::Features
         };
         let class = ReadoutClass {
-            rows: batch.class.rows() as u64,
+            rows: window.rows,
             outputs: output_class as u64,
             projected: projected_class as u64,
             selected: selected_class as u64,
             kind,
         };
-        let (graph, bound) = self.readout_graphs.class(class).map_err(invalid)?;
+        let (graph, bound) = self.readout_graphs.class(class, features).map_err(invalid)?;
         let mut active = workspace.slot_mut().activate(&graph.plan).map_err(device)?;
         let tap_rows = graph
             .taps
             .as_ref()
-            .map(|_| self.tap_rows(class.rows))
+            .map(|_| self.tap_rows(region, class.rows))
             .transpose()?;
         let mut bindings = bound.bindings();
+        if let Some(port) = &graph.residual {
+            bindings.set(port, residual.ok_or_else(|| invalid("residual conditioning was not exported"))?).map_err(device)?;
+        }
         if let Some(rows) = &graph.final_rows {
             bindings.set(&rows.hidden, hidden).map_err(device)?;
         }
@@ -358,7 +918,9 @@ impl NativeTargetProgram {
             bindings.set(&ports.taps, tap_rows).map_err(device)?;
         }
         let mut out_rows = vec![0_i32; output_class];
-        out_rows[..actual_outputs].copy_from_slice(batch.out_rows);
+        for (index, &row) in batch.out_rows.iter().enumerate() {
+            out_rows[index] = window.row(row)?;
+        }
         active
             .write_input(&graph.out_rows, &i32_bytes(&out_rows))
             .map_err(device)?;
@@ -366,10 +928,12 @@ impl NativeTargetProgram {
             // The head gathers the hidden rows of the projected outputs.
             let mut rows = vec![0_i32; projected_class];
             for (index, &output_index) in projected_output_rows.iter().enumerate() {
-                rows[index] = *batch
-                    .out_rows
-                    .get(output_index)
-                    .ok_or_else(|| invalid("projected output row exceeds output rows"))?;
+                rows[index] = window.row(
+                    *batch
+                        .out_rows
+                        .get(output_index)
+                        .ok_or_else(|| invalid("projected output row exceeds output rows"))?,
+                )?;
             }
             active
                 .write_input(port, &i32_bytes(&rows))
@@ -386,7 +950,7 @@ impl NativeTargetProgram {
                     .map_err(SubmitError::Invariant)?,
             )
             .map_err(device)?;
-        let outputs = submitter.queue(ready)?;
+        let outputs = submitter.queue(ready, |_| {})?;
         let owner = output.publish(outputs);
         let features = owner
             .tensor(&graph.features)
@@ -417,14 +981,52 @@ impl NativeTargetProgram {
         }))
     }
 
-    /// The leading `rows` draft input rows of a tapped target.
-    fn tap_rows(&self, rows: u64) -> Result<Tensor, SubmitError> {
-        self.graphs
-            .taps
-            .as_ref()
-            .ok_or_else(|| invalid("a tapped graph has no bound draft input rows"))?
-            .slice_leading(0, rows)
-            .map_err(device)
+    /// The leading `rows` draft input rows of a tapped target in `region`.
+    fn tap_rows(&self, region: &ChainRegion, rows: u64) -> Result<Tensor, SubmitError> {
+        region.rows(
+            region
+                .group
+                .taps
+                .as_ref()
+                .ok_or_else(|| invalid("a tapped graph has no bound draft input rows"))?,
+            rows,
+        )
+    }
+
+    fn boundary_copy(&self) -> Result<OverlayGraph, SubmitError> {
+        if let Some(graph) = self.boundary_copy.borrow().as_ref() {
+            return Ok(graph.clone());
+        }
+        let (element, width) = self.readout_graphs.prepared.residual_width.map_or((Element::dense(crate::planning::activation_dtype(self.geometry.activation_dtype)), self.geometry.hidden), |width| (Element::f32(), width));
+        let mut graph = self.device.native_graph();
+        let source = graph
+            .port(element, &[1, width])
+            .map_err(device)?;
+        let mut destination = graph
+            .port(element, &[1, width])
+            .map_err(device)?;
+        graph
+            .enqueue(
+                &self.state.feature_copy,
+                feature_copy::WorkflowArgs {
+                    input: source.tensor().into(),
+                    out: destination.tensor_mut().into(),
+                },
+            )
+            .map_err(device)?;
+        let plan = graph.seal_launched().map_err(device)?;
+        if plan.workspace_bytes() != 0 || plan.output_bytes() != 0 || plan.upload_bytes() != 0 {
+            return Err(invalid(
+                "boundary capture unexpectedly requires graph storage",
+            ));
+        }
+        let graph = OverlayGraph {
+            plan,
+            source,
+            destination,
+        };
+        *self.boundary_copy.borrow_mut() = Some(graph.clone());
+        Ok(graph)
     }
 
     fn overlay(&self, rows: u64) -> Result<OverlayGraph, SubmitError> {
@@ -452,7 +1054,7 @@ impl NativeTargetProgram {
                 },
             )
             .map_err(device)?;
-        let plan = graph.seal().map_err(device)?;
+        let plan = graph.seal_launched().map_err(device)?;
         if plan.workspace_bytes() != 0 || plan.output_bytes() != 0 || plan.upload_bytes() != 0 {
             return Err(invalid(
                 "conditioning overlay unexpectedly requires graph storage",
@@ -467,26 +1069,25 @@ impl NativeTargetProgram {
         Ok(overlay)
     }
 
-    /// Queue a per-layer model's per-layer entry over the step's embedded
-    /// and overlaid `hidden` rows, and return the per-layer rows its blocks
-    /// read. Each batch row gathers its token's table row, a media row the
-    /// entry's media row.
+    /// Queue a per-layer model's per-layer entry over a beginning run's
+    /// embedded and overlaid hidden rows, and return the per-layer rows its
+    /// blocks read, in the launch's region. Each batch row gathers its
+    /// token's table row, a row of `media_rows` the entry's media row.
     fn queue_per_layer_entry(
         &self,
-        batch: &TargetBatchUpload<'_>,
-        tokens: &TargetTokens,
-        rows: u64,
-        hidden: &Tensor,
+        run: &mut TargetRun<'_>,
         media_rows: &[std::ops::Range<usize>],
-        graph_workspace: &mut TargetGraphWorkspaceLease,
         submitter: &mut StepSubmitter,
     ) -> Result<Option<Tensor>, SubmitError> {
+        let (batch, region, rows, hidden) = (&run.launch.batch, &run.region, run.window.rows, &run.hidden.rows);
         let Some(entry) = self.graphs.per_layer_entry(rows) else {
             return Ok(None);
         };
         let (graph, bound, per_layer) = entry.map_err(invalid)?;
-        let TargetTokens::Host = tokens else {
-            return Err(invalid("a per-layer entry gathers table rows by host tokens"));
+        let TargetTokens::Host = run.launch.state.tokens() else {
+            return Err(invalid(
+                "a per-layer entry gathers table rows by host tokens",
+            ));
         };
         let media_row = self
             .geometry
@@ -509,29 +1110,142 @@ impl NativeTargetProgram {
                 }
             })
             .collect::<Vec<_>>();
-        let mut gathered = vec![0; table_rows.len() * per_layer.table.row_bytes()];
-        per_layer
-            .table
-            .gather(&table_rows, &mut gathered)
-            .map_err(|error| invalid(error.to_string()))?;
-        let inputs = per_layer.rows.slice_leading(0, rows).map_err(device)?;
-        let mut active = graph_workspace
+        let per_layer_rows = region
+            .group
+            .per_layer_rows
+            .as_ref()
+            .ok_or_else(|| invalid("a per-layer entry without its per-layer rows"))?;
+        let mut inputs = region.rows(per_layer_rows, rows)?;
+        // The token whose per-layer row this step writes into a token
+        // row's slot, and the slot.
+        let mut written = None;
+        // The token rows' slots are the floor's per-layer rows after the
+        // first, the last row the first slot, so only a launch alone in its
+        // chain reads or writes one. Its entry writes the leading rows: alone,
+        // its region is the floor's, from row 0, so its rows after the first
+        // overwrite the slots of the last `rows - 1` rows but the last.
+        if region.alone() {
+            let last = per_layer_rows.extents()[0] - 1;
+            per_layer
+                .token_rows
+                .overwrite((last + 1 - rows) as usize..last as usize);
+            if let ([token], true) = (batch.tokens, media_rows.is_empty()) {
+                let slot = |slot: usize| {
+                    let row = last - slot as u64;
+                    per_layer_rows.slice_leading(row, row + 1).map_err(device)
+                };
+                let token = u64::try_from(*token)
+                    .map_err(|_| invalid(format!("token {token} has no per-layer row")))?;
+                match per_layer.token_rows.find(token).map_err(invalid)? {
+                    TokenRow::Held(held) => return Ok(Some(slot(held)?)),
+                    TokenRow::Free(free) => {
+                        inputs = slot(free)?;
+                        written = Some((token, free));
+                    }
+                    TokenRow::None => {}
+                }
+            }
+        }
+        let mut active = run
+            .launch
+            .graph_workspace
             .slot_mut()
             .activate(&graph.plan)
             .map_err(device)?;
-        active
-            .write_input(&graph.ports.gathered, &gathered)
-            .map_err(device)?;
+        per_layer
+            .table
+            .gather(&table_rows, |gathered| {
+                active
+                    .write_input(&graph.ports.gathered, gathered)
+                    .map_err(device)
+            })
+            .map_err(|error: HostTableError| invalid(error.to_string()))??;
         let mut bindings = bound.bindings();
         bindings.set(&graph.ports.hidden, hidden).map_err(device)?;
-        bindings
-            .set(&graph.ports.rows, &inputs)
-            .map_err(device)?;
+        bindings.set(&graph.ports.rows, &inputs).map_err(device)?;
         let ready = active
             .attach(bindings, graph.plan.new_outputs().map_err(device)?)
             .map_err(device)?;
-        submitter.queue(ready)?;
+        submitter.queue(ready, |_| {})?;
+        if let Some((token, slot)) = written {
+            per_layer.token_rows.hold(token, slot);
+        }
         Ok(Some(inputs))
+    }
+
+    /// The rows block `index`'s stored table is read at in a step: its row
+    /// rule over each slot's tokens and the tokens its sequence holds before
+    /// them (`NGramHash::rows`), the rule the device evaluates
+    /// (`ngram_rows`). Of host tokens they are known now; of selected
+    /// tokens, the table's filler learns them from the step's notice.
+    fn stored_step_rows(
+        &self,
+        index: usize,
+        batch: &TargetBatchUpload<'_>,
+        state: &RowState<'_>,
+        notice: Option<&Arc<NoticeStep>>,
+    ) -> Result<StepRows, SubmitError> {
+        let hash = crate::operators::row_rules(&self.geometry)
+            .into_iter()
+            .find_map(|(block, hash)| (block == index).then(|| hash.clone()))
+            .ok_or_else(|| invalid("a stored table's block has no row rule"))?;
+        let preceding = state.preceding();
+        if preceding.len() != state.slots() {
+            return Err(invalid("the step's preceding tokens differ from its slots"));
+        }
+        match state.tokens() {
+            TargetTokens::Host => {
+                let mut rows = Vec::new();
+                for (slot, preceding) in preceding.iter().enumerate() {
+                    let [start, end] = batch.segments[slot];
+                    let tokens = usize::try_from(start)
+                        .ok()
+                        .zip(usize::try_from(end).ok())
+                        .and_then(|(start, end)| batch.tokens.get(start..end))
+                        .ok_or_else(|| invalid("a slot's segment lies outside the batch"))?
+                        .iter()
+                        .map(|token| u64::try_from(*token))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|_| invalid("a host token is negative"))?;
+                    rows.push(hash.rows(preceding, &tokens));
+                }
+                Ok(StepRows::Known(rows))
+            }
+            TargetTokens::Selected(_) => {
+                let notice = notice
+                    .cloned()
+                    .ok_or_else(|| invalid("selected tokens without their notice"))?;
+                let preceding = preceding.to_vec();
+                Ok(StepRows::Selected(Box::new(move || {
+                    // A slot's one row is its selection row; a failed
+                    // selection's slot names none, as its step is never
+                    // used.
+                    let selected = notice.read()?;
+                    Ok(preceding
+                        .iter()
+                        .zip(selected)
+                        .map(|(preceding, [token, status])| match (u64::try_from(token), status) {
+                            (Ok(token), 0) => hash.rows(preceding, &[token]),
+                            _ => Vec::new(),
+                        })
+                        .collect())
+                })))
+            }
+        }
+    }
+
+    /// The leading `rows` in `region` of the token rows a model whose
+    /// blocks read the step's token rows keeps
+    /// (`GroupBuffers::token_rows`).
+    fn kept_token_rows(&self, region: &ChainRegion, rows: u64) -> Result<Tensor, SubmitError> {
+        region.rows(
+            region
+                .group
+                .token_rows
+                .as_ref()
+                .ok_or_else(|| invalid("the model keeps no token rows"))?,
+            rows,
+        )
     }
 
     /// Conditioning rows that replace embedding rows, as (source, first
@@ -600,61 +1314,238 @@ impl NativeTargetProgram {
         Ok(sources)
     }
 
-    /// Queue every run of one step. On failure, runs already queued are
-    /// observed before the caller regains the storage they use.
-    fn queue_rows(
+    /// Queue every run of a chain (`TargetProgram::submit`), one step per
+    /// launch: each launch with its queued step. On failure, runs already
+    /// queued are observed before the caller regains the storage they use,
+    /// and the expert steps are refused: the launches go with the failure.
+    fn queue_chain(
         &self,
-        batch: &TargetBatchUpload<'_>,
-        state: &RowState<'_>,
-        readout: (&mut NativeGraphWorkspaceLease, NativeGraphOutputLease),
-        graph_workspace: &mut TargetGraphWorkspaceLease,
-        graph_outputs: &mut [TargetGraphOutputLease; 2],
-    ) -> Result<QueuedStep, SubmitError> {
-        let mut submitter = StepSubmitter::new(&self.device);
-        let queued = self
-            .queue_graphs(
-                batch,
-                state,
-                readout,
-                graph_workspace,
-                graph_outputs,
-                &mut submitter,
-            )
-            .and_then(|step| submitter.flush().map(|()| step));
+        chain: Chain<ValidatedTargetLaunch>,
+        spare: &mut TargetGraphOutputLease,
+        pressure: &dyn Fn() -> Option<crate::domain::RunningPressure>,
+    ) -> Result<Chain<(ValidatedTargetLaunch, DeviceStep)>, super::ChainRefusal> {
+        let refused = |error, chain| super::ChainRefusal { error, chain };
+        // A streamed load's steps, in chain order, one group: the watcher
+        // serves each from before its first run is queued until it
+        // completes.
+        let route = |launch: &ValidatedTargetLaunch| {
+            match crate::operators::routed::fused_graph::decodes(launch.batch().upload().class.rows() as u64) {
+                true => StepRoute::Decode,
+                false => StepRoute::Grouped,
+            }
+        };
+        // Per block, the steps of the merge set its group ends with
+        // (`Shared::begin`): the whole group but at a streamed layer of a
+        // group that is not resident (`ExpertBank::begin`).
+        let mut sets = vec![chain.len(); self.geometry.blocks.len()];
+        // Each launch with its expert step, of a streamed load: a decode
+        // launch's rows are at their positions (validated nonnegative); and
+        // how its chain is served: scratch-served where a group of grouped
+        // launches is not resident, its decode in the resident forms where
+        // it is.
+        let (steps, serving) = match &self.graphs.bank {
+            Some(bank) => {
+                let begun = bank.begin(chain, |launch| route(launch), |launch| launch.work());
+                let (steps, merges, serving) = begun.map_err(|(error, chain)| refused(invalid(error), chain))?;
+                let steps = steps.map(|(launch, step)| {
+                    let upload = launch.batch().upload();
+                    let step = match route(&launch) {
+                        StepRoute::Decode => {
+                            step.decoding(upload.coordinates[..upload.actual_rows].iter().map(|row| row[0] as u64))
+                        }
+                        StepRoute::Grouped => step,
+                    };
+                    (launch, Some((bank.clone(), step)))
+                });
+                // A streamed layer is a block's routed sublayer or a parallel
+                // sublayer's routed branch.
+                for (scope, size) in merges {
+                    use magnitude_family_contracts::WeightScope;
+                    let (WeightScope::TargetSublayer(at) | WeightScope::TargetBranch { sublayer: at, .. }) = scope else {
+                        let error = invalid(format!("an expert bank layer of {scope:?} outside the target's blocks"));
+                        return Err(refused(error, steps.map(|(launch, _)| launch)));
+                    };
+                    sets[at.block as usize] = size;
+                }
+                (steps, Some(serving))
+            }
+            None => (chain.map(|launch| (launch, None)), None),
+        };
+        // A scratch-served chain is a prompt group's, whose steps run long
+        // (a 16k prompt's 31 chunks one chain of 43 s): memory is read and
+        // the bank released between its submissions.
+        let release = match (&self.graphs.bank, serving) {
+            (Some(bank), Some(serving)) if serving.scratch() => {
+                let sequences = steps.iter().filter_map(|(_, banked)| banked.as_ref().map(|(_, step)| step.sequence()));
+                let (first, last) = sequences.fold((u64::MAX, 0), |(first, last), sequence| (first.min(sequence), last.max(sequence)));
+                Some(RunningRelease { bank: bank.clone(), chain: (first, last), pressure, queued: None, submitted: None, awaits: None })
+            }
+            _ => None,
+        };
+        let (mut submitter, queued) = steps.scoped(
+            StepSubmitter::new(&self.device, release),
+            |steps, submitter| self.queue_runs(steps, spare, &sets, serving, submitter),
+        );
         match queued {
-            Ok((readout, commits)) => Ok(QueuedStep {
-                readout,
-                commits,
-                completions: submitter.completions,
-            }),
-            Err(error) => {
+            Ok(runs) => {
+                // Each launch takes its command sequences, from where the
+                // launch before it ended.
+                let mut completions = submitter.completions.into_iter();
+                let mut taken = 0;
+                let mut steps = runs.map(|((launch, banked), runs)| {
+                    let step = DeviceStep {
+                        readout: runs.readout,
+                        commits: runs.commits,
+                        completions: completions.by_ref().take(runs.sequences - taken).collect(),
+                        stored_reads: Vec::new(),
+                        landed_reads: Vec::new(),
+                        expert_step: banked.map(|(_, step)| step),
+                    };
+                    taken = runs.sequences;
+                    (launch, step)
+                });
+                // Every launch's reads are queued before the first ends, and
+                // a chain of several launches is one request that commits as
+                // one: its last step, which completes once every read's gate
+                // opened, takes them all.
+                let (_, last) = steps.last_mut();
+                last.stored_reads = submitter.reads;
+                last.landed_reads = submitter.landed;
+                Ok(steps)
+            }
+            Err((error, steps)) => {
                 // The failure is reported; outcomes of runs submitted before
                 // it matter only for draining the device. Runs still queued
-                // are dropped unsubmitted.
-                let _ = wait_all(submitter.completions);
-                Err(error)
+                // are dropped unsubmitted, and their stored-table steps
+                // read nothing.
+                let _ = wait_all(std::mem::take(&mut submitter.completions));
+                submitter.abandon_unsubmitted();
+                // The device is past the chain's runs: each step is refused,
+                // none fed, as no run of the chain's is known to have written
+                // its records. A watcher that panicked fails the load.
+                let (chain, expert_steps) = steps.unzip();
+                let watcher = expert_steps.into_iter().flatten().map(|(_, step)| step.refuse()).filter_map(Result::err).reduce(|first, _| first);
+                let error = match watcher {
+                    Some(failure) => invalid(format!("{error}; {failure}")),
+                    None => error,
+                };
+                Err(super::ChainRefusal { error, chain })
             }
         }
     }
 
-    fn queue_graphs(
+    /// Queue a chain's runs: every launch's entry, then each block over
+    /// every launch in chain order, then every launch's readout, each
+    /// ending its own command sequences. Each launch is exactly the step it
+    /// would be alone, in its own region of the launch-row buffers
+    /// (`ChainRegion`); every run follows the runs it reads, as launch
+    /// `k + 1` reads launch `k`'s history rows and successor bank at the
+    /// block it runs.
+    fn queue_runs<'b>(
         &self,
-        batch: &TargetBatchUpload<'_>,
-        state: &RowState<'_>,
-        readout: (&mut NativeGraphWorkspaceLease, NativeGraphOutputLease),
-        graph_workspace: &mut TargetGraphWorkspaceLease,
-        graph_outputs: &mut [TargetGraphOutputLease; 2],
+        steps: Branded<'b, &'b mut (ValidatedTargetLaunch, Option<(Arc<crate::experts::ExpertBank>, crate::experts::ExpertStep)>)>,
+        spare: &mut TargetGraphOutputLease,
+        sets: &[usize],
+        serving: Option<crate::experts::ChainServing>,
         submitter: &mut StepSubmitter,
-    ) -> Result<(Option<TargetReadoutGraphResult>, CommitSpan), SubmitError> {
+    ) -> Result<Branded<'b, QueuedRuns>, SubmitError> {
+        let scratch = serving.is_some_and(crate::experts::ChainServing::scratch);
+        let resident = serving.is_some_and(|serving| serving.resident);
+        let group = self.graphs.group(steps.len()).map_err(invalid)?;
+        // Every step of the group holds its group's record.
+        let reads = steps
+            .iter()
+            .next()
+            .and_then(|(_, banked)| banked.as_ref())
+            .and_then(|(bank, step)| Some((bank.clone(), step.group_reads()?)));
+        let reads = reads.as_ref().map(|(bank, record)| (&**bank, *record));
+        let (launches, outputs) = steps
+            .map(|(launch, banked)| {
+                let bank = banked
+                    .as_ref()
+                    .map(|(bank, step)| BankRun { bank: bank.clone(), sequence: step.sequence(), sampled: step.samples(), resident });
+                let (core, graph_workspace, graph_output, workspace, output) = launch.submission_parts_mut();
+                ((core, graph_workspace, (workspace, output), bank), graph_output)
+            })
+            .unzip();
+        let (first, rest) = outputs.into_chain().split_first();
+        let mut rotation =
+            OutputRotation::new(std::iter::once(first).chain(rest).collect(), spare);
+        let mut place = 0;
+        let mut runs = launches.try_map(
+            |(core, graph_workspace, readout, bank)| {
+                // A later launch's entry runs before the chain's readouts,
+                // so it cannot read a selection the chain makes.
+                if place > 0 && matches!(core.tokens(), TargetTokens::Selected(_)) {
+                    return Err(invalid("a chained launch reads selected tokens"));
+                }
+                let region = ChainRegion {
+                    place,
+                    start: self.graphs.prepared.region_start(place),
+                    group: group.clone(),
+                };
+                place += 1;
+                let launch = RunLaunch {
+                    batch: core.batch().upload(),
+                    state: RowState(core),
+                    graph_workspace,
+                    readout,
+                };
+                self.begin_run(launch, region, bank, &mut rotation, submitter)
+            },
+        )?;
+        // A wavefront over merge sets: at each block, the backs of the block
+        // before by its merge sets, in chain order, each set's runs then
+        // taking the block; so a step's next front follows its own back and
+        // precedes the next set's backs, every front of a block precedes its
+        // first set's pass, and its later sets' passes overlap the next
+        // block's reads its earlier fronts requested.
+        for index in 0..=self.geometry.blocks.len() {
+            self.run_sets(&mut runs, index, sets, scratch, reads, &mut rotation, submitter)?;
+            // Every pass of the block before is queued: a pass runs at the
+            // set's next block (`run_sets`).
+            submitter.passed(index.checked_sub(1))?;
+        }
+        runs.try_map(|run| {
+            let (readout, commits) = self.finish_run(run, &mut rotation, submitter)?;
+            submitter.flush()?;
+            Ok(QueuedRuns {
+                readout,
+                commits,
+                sequences: submitter.completions.len(),
+            })
+        })
+    }
+
+    /// Queue a step's entry: its embedding, conditioning overlays and
+    /// per-layer inputs. The returned run then takes its blocks in order
+    /// (`run_block`) and its readout (`finish_run`).
+    fn begin_run<'l>(
+        &self,
+        launch: RunLaunch<'l>,
+        region: ChainRegion,
+        bank: Option<BankRun>,
+        rotation: &mut OutputRotation<'_>,
+        submitter: &mut StepSubmitter,
+    ) -> Result<TargetRun<'l>, SubmitError> {
+        let RunLaunch {
+            batch: upload,
+            state: rows_state,
+            graph_workspace,
+            readout,
+        } = launch;
+        let (batch, state) = (&upload, &rows_state);
         let rows =
             u64::try_from(batch.class.rows()).map_err(|_| invalid("row class exceeds u64"))?;
-        let mut pending: [Option<NativeGraphOutputs>; 2] = [None, None];
         let tokens = state.tokens();
         let source = match tokens {
             TargetTokens::Host => EntryTokens::Uploaded,
             TargetTokens::Selected(_) => EntryTokens::Selected,
         };
         let (entry, entry_bound) = self.graphs.entry(rows, source).map_err(invalid)?;
+        // A step reading selected tokens in a model with a stored table
+        // copies them for the host first (`EntryNotice`).
+        let mut notice = None;
         let entry_outputs = {
             let mut active = graph_workspace
                 .slot_mut()
@@ -662,22 +1553,59 @@ impl NativeTargetProgram {
                 .map_err(device)?;
             let mut bindings = entry_bound.bindings();
             match tokens {
-                TargetTokens::Host => active
-                    .write_input(&entry.tokens, &token_rows(batch.tokens))
-                    .map_err(device)?,
+                TargetTokens::Host => {
+                    let rows = self
+                        .graphs
+                        .embedding
+                        .indices(batch.tokens)
+                        .map_err(invalid)?;
+                    active
+                        .write_input(&entry.tokens, &token_rows(&rows))
+                        .map_err(device)?;
+                    // A model whose blocks read the step's token rows keeps
+                    // the host's tokens in the bound token rows.
+                    if let Some(kept) = &entry.kept_tokens {
+                        active
+                            .write_input(&kept.uploaded, &token_rows(batch.tokens))
+                            .map_err(device)?;
+                        bindings
+                            .set(
+                                &kept.rows,
+                                &self.kept_token_rows(&region, batch.tokens.len() as u64)?,
+                            )
+                            .map_err(device)?;
+                    }
+                }
                 TargetTokens::Selected(selected) => bindings
                     .set(&entry.tokens, selected.tensor())
                     .map_err(device)?,
             }
-            let ready = active
-                .attach(
-                    bindings,
-                    graph_outputs[0]
-                        .activate(&entry.plan)
-                        .map_err(SubmitError::Invariant)?,
-                )
-                .map_err(device)?;
-            submitter.queue(ready)?
+            // Selected tokens are copied for the host, which learns from
+            // them the stored tables' rows the step names.
+            if let Some(ports) = &entry.notice {
+                let step = self
+                    .graphs
+                    .notice
+                    .as_ref()
+                    .ok_or_else(|| invalid("an entry notice without a selection notice"))?
+                    .next(rows)
+                    .map_err(invalid)?;
+                bindings.set(&ports.tokens, &step.tokens).map_err(device)?;
+                bindings
+                    .set_timeline(ports.signal, &step.timeline, step.value)
+                    .map_err(device)?;
+                notice = Some(Arc::new(step));
+            }
+            // Selected tokens of a table with landing slots: a landed read.
+            if let Some(ports) = &entry.landed {
+                let read = ports
+                    .queue(&self.graphs.embedding, &mut bindings)
+                    .map_err(invalid)?;
+                submitter.lands(read);
+            }
+            let (at, outputs) = rotation.entry(region.place, &entry.plan)?;
+            let ready = active.attach(bindings, outputs).map_err(device)?;
+            (at, submitter.queue(ready, |_| {})?)
         };
         // The device embeds while the host prepares the remaining runs.
         let first_commit = Instant::now();
@@ -685,8 +1613,13 @@ impl NativeTargetProgram {
             .map_err(|_| invalid("segment class exceeds u64"))?;
         let slots = u64::try_from(batch.actual_slots)
             .map_err(|_| invalid("request slot class exceeds u64"))?;
-        let controls = GraphControls::new(batch)?;
-        let mut hidden = entry_outputs
+        let controls = GraphControls::new(
+            batch,
+            self.graphs.prepared.controls(),
+            graph_workspace.slot_mut(),
+        )?;
+        let hidden = entry_outputs
+            .1
             .exported(&entry.hidden)
             .ok_or_else(|| invalid("target embedding hidden was not exported"))?;
         let conditioning = self.conditioning_sources(state, batch)?;
@@ -708,19 +1641,8 @@ impl NativeTargetProgram {
             let ready = slot
                 .attach(bindings, overlay.plan.new_outputs().map_err(device)?)
                 .map_err(device)?;
-            submitter.queue(ready)?;
+            submitter.queue(ready, |_| {})?;
         }
-        let per_layer_rows = self.queue_per_layer_entry(
-            batch,
-            tokens,
-            rows,
-            &hidden,
-            &media_rows,
-            graph_workspace,
-            submitter,
-        )?;
-        pending[0] = Some(entry_outputs);
-        let mut recurrent_component = 0usize;
         if self.trace.batch {
             eprintln!(
                 "target batch actual_rows={} class_rows={} actual_slots={} outputs={} selections={}",
@@ -730,38 +1652,418 @@ impl NativeTargetProgram {
                 batch.out_rows.len(),
                 batch.select_rows.len()
             );
+            for (domain, history) in controls.histories.iter().enumerate() {
+                let spans = history
+                    .visible
+                    .chunks_exact(8)
+                    .map(|span| {
+                        let bound = |at: usize| {
+                            i32::from_le_bytes([span[at], span[at + 1], span[at + 2], span[at + 3]])
+                        };
+                        (bound(0), bound(4))
+                    })
+                    .collect::<Vec<_>>();
+                // Every row of a decode launch; a prefill launch's first
+                // and last.
+                let per_row = spans.chunks((segments as usize).max(1)).collect::<Vec<_>>();
+                let shown = match per_row.len() {
+                    0..=16 => per_row,
+                    rows => vec![per_row[0], per_row[rows - 1]],
+                };
+                eprintln!(
+                    "target batch history domain={domain} segments={segments} spans={shown:?}"
+                );
+            }
         }
-        for index in 0..self.geometry.blocks.len() {
-            let block_started = self.trace.blocks.then(Instant::now);
-            // A block with listing classes lists the history row tiles the
-            // launch's rows see in the smallest class that holds them; a
-            // launch that sees more than the largest (many requests with
-            // long histories) takes the class that lists none.
-            let listed_tiles = self
-                .graphs
-                .prepared
-                .listed_tiles(index, rows)
-                .iter()
-                .find_map(|&tiles| {
-                    let (read, _) = state.history(LayerRef::Target(index as u32)).ok()?;
-                    let visible = &controls.histories.get(read)?.visible;
+        let mut tapped = false;
+        for &bits in batch.demand.iter() {
+            let demand = Demand::from_bits(bits).ok_or_else(|| invalid("row demand is invalid"))?;
+            tapped |= demand.contains(Demand::FEATURES);
+        }
+        let mut run = TargetRun {
+            launch: RunLaunch {
+                batch: upload,
+                state: rows_state,
+                graph_workspace,
+                readout,
+            },
+            output: entry_outputs,
+            back: None,
+            unfilled: None,
+            residual: None,
+            hidden: ResidualCarry::rows(hidden),
+            carried: None,
+            per_layer_rows: None,
+            region,
+            controls,
+            window: RowWindow::whole(rows),
+            segments,
+            slots,
+            notice,
+            recurrent_component: 0,
+            executed: self.geometry.blocks.len(),
+            first_commit,
+            bank,
+            tapped,
+        };
+        run.per_layer_rows = self.queue_per_layer_entry(&mut run, &media_rows, submitter)?;
+        Ok(run)
+    }
+
+    /// Queue block `index` of a step's run: the whole block, or a split
+    /// block's front, whose back `run_sets` queues once the chain's later
+    /// runs queued their fronts there. Blocks are taken in
+    /// order; a run whose stateless tail reads no rows stops before it.
+    fn run_block(
+        &self,
+        run: &mut TargetRun<'_>,
+        index: usize,
+        rotation: &mut OutputRotation<'_>,
+        submitter: &mut StepSubmitter,
+    ) -> Result<(), SubmitError> {
+        if index >= run.executed {
+            return Ok(());
+        }
+        let (batch, state) = (&run.launch.batch, &run.launch.state);
+        let segments = run.segments;
+        if index == self.graphs.prepared.stateless_tail() {
+            // From here no block publishes state: run the rest over the
+            // rows the readout consumes, or not at all without any.
+            let rows = run.window.rows;
+            match RowWindow::consumed(batch.out_rows, rows)? {
+                None => {
+                    run.executed = index;
+                    return Ok(());
+                }
+                Some(tail) if tail.rows < rows => {
+                    // The streamed layers from here name their requests'
+                    // rows within the window.
+                    if let Some(BankRun { bank, sequence, .. }) = &run.bank {
+                        bank.window(*sequence, index, run.window.first + tail.first).map_err(invalid)?;
+                    }
+                    run.hidden = run.hidden.as_ref().try_map(|carried| tail.slice(carried))?;
+                    // An operand is carried at one row: none survives a
+                    // narrower window (no block of the tail reads one,
+                    // `block_carries`).
+                    run.carried = None;
+                    run.per_layer_rows = run
+                        .per_layer_rows
+                        .as_ref()
+                        .map(|inputs| tail.slice(inputs))
+                        .transpose()?;
+                    run.controls.window(rows, tail)?;
+                    run.window = tail;
+                }
+                Some(_) => {}
+            }
+        }
+        let controls = &run.controls;
+        let rows = run.window.rows;
+        // A block with listing classes lists the history row tiles the
+        // launch's rows see in the smallest class that holds them; a
+        // launch that sees more than the largest (many requests with long
+        // histories) takes the class that lists none.
+        let listed = match self.graphs.prepared.listed_tiles(index, rows) {
+            [] => None,
+            classes => {
+                let (read, _) = state.history(LayerRef::Target(index as u32))?;
+                let visible = &controls
+                    .histories
+                    .get(read)
+                    .ok_or_else(|| invalid("the batch lacks a listing block's history read"))?
+                    .visible;
+                classes.iter().find_map(|&tiles| {
                     crate::operators::attention::graph::history_tile_bytes(
                         visible,
-                        usize::try_from(tiles).ok()?,
+                        usize::try_from(tiles).expect("a tile count fits in usize"),
                     )
                     .map(|bytes| (tiles, bytes))
-                });
+                })
+            }
+        };
+        // A listing class may be sealed for more segments than the launch
+        // has: its rows' spans are then padded with empty ones.
+        let block_segments = match &listed {
+            Some(_) => self.graphs.prepared.listed_segments(index, segments),
+            None => segments,
+        };
+        let scored = match self.graphs.prepared.selection(index) {
+            None => false,
+            Some(selection) => {
+                let [_, (block_read, _)] = state.indexer(index as u32)?;
+                let blocks = controls
+                    .histories
+                    .get(block_read)
+                    .ok_or_else(|| invalid("the batch lacks an indexer's history read"))?;
+                packed_selection_scores(
+                    &blocks.visible,
+                    &blocks.destinations,
+                    segments as usize,
+                    selection.indexer.top,
+                )
+            }
+        };
+        let class = BlockRun {
+            rows,
+            segments: block_segments,
+            listed,
+            scored,
+        };
+        let stages = self.graphs.prepared.stages(index, rows);
+        // A run of a chain its bank began resident takes a whole decode
+        // block's resident form.
+        let resident = run.bank.as_ref().is_some_and(|bank| bank.resident);
+        let stage = self.graphs.prepared.run_stage(index, rows, stages[0], resident);
+        self.run_stage(run, index, &class, stage, rotation, submitter)?;
+        run.back = (stages.len() > 1).then_some((index, class));
+        Ok(())
+    }
+
+    /// Queue the backs the runs' fronts at the block before `index` left
+    /// (`run_block`), by merge set, each set's runs then taking block
+    /// `index` (none past the last). The group's runs end with a set of
+    /// `sets[block]` runs and begin with single ones. A set's backs follow
+    /// its pass (`run_pass`); its group's `reads` record takes the pass's
+    /// reads.
+    ///
+    /// In a `scratch`-served group at a streamed layer, the pass reads the
+    /// scratch tier its runs' fills (`run_fill`) wrote, which every
+    /// streamed layer shares, so a fill follows its run's front, the layer
+    /// before's last pass, and the passes of its own layer's merge sets
+    /// before its own (whose steps' records its seeding keeps: the
+    /// watcher's `Scratch` seeding), and precedes its set's pass. Where
+    /// fills run beside compute (`seismic::BackendName::fills_beside_compute`)
+    /// each is queued as soon as those allow, so it moves beside the backs
+    /// and fronts after it, which are submitted ahead of any later pass;
+    /// where they share the compute queue, right
+    /// before its set's pass, which leaves its request the most host time.
+    /// The device orders each by what it touches.
+    #[allow(clippy::too_many_arguments)]
+    fn run_sets(
+        &self,
+        runs: &mut Branded<'_, TargetRun<'_>>,
+        index: usize,
+        sets: &[usize],
+        scratch: bool,
+        reads: Option<(&crate::experts::ExpertBank, usize)>,
+        rotation: &mut OutputRotation<'_>,
+        submitter: &mut StepSubmitter,
+    ) -> Result<(), SubmitError> {
+        let count = runs.len();
+        let block = runs.iter_mut().find_map(|run| run.back.as_ref().map(|&(at, _)| at));
+        let merged = block.map_or(1, |at| sets[at]);
+        let filled = |at: usize| scratch && self.graphs.prepared.streams(at);
+        let early = self.device.backend().fills_beside_compute();
+        // The runs of block `index`'s first pass set, whose fills follow no
+        // pass of their own layer.
+        let first_set = self
+            .graphs
+            .passes()
+            .sets(count, sets.get(index).copied().unwrap_or(1))
+            .next()
+            .unwrap_or(0..0);
+        let first = |place: usize| index < self.geometry.blocks.len() && first_set.contains(&place);
+        // A pass covers at most the runs whose rows its graph holds
+        // (`group_pass_rows`): a longer merge set is several passes.
+        let block_windows = if block.is_some_and(filled) { self.graphs.prepared.windows() } else { 1 };
+        for set in self.graphs.passes().sets(count, merged) {
+            if let Some(at) = block {
+                for w in 0..block_windows {
+                    if filled(at) {
+                        // Where fills share the compute queue, the set's fills run
+                        // back to back, each but the last directly followed by a
+                        // sibling's (`ExpertBank::fill_followed`).
+                        let unfilled = |(place, run): &(usize, &mut TargetRun<'_>)| set.contains(place) && run.unfilled == Some((at, w));
+                        let fills = runs.iter_mut().enumerate().filter(unfilled).count();
+                        for (filled_idx, (_, run)) in runs.iter_mut().enumerate().filter(unfilled).enumerate() {
+                            self.run_fill(run, at, w, !early && filled_idx + 1 < fills, submitter)?;
+                        }
+                    }
+                    self.run_pass(runs, at, set.clone(), w, reads, submitter)?;
+                }
+            }
+            // No pass of the block before follows in this call: its last
+            // window's last has been queued.
+            let passed = early && (block.is_none() || set.end == count);
+            if passed {
+                for (_, run) in runs.iter_mut().enumerate().filter(|(place, run)| first(*place) && run.unfilled == Some((index, 0))) {
+                    self.run_fill(run, index, 0, false, submitter)?;
+                }
+            }
+            for (place, run) in runs.iter_mut().enumerate().filter(|(place, _)| set.contains(place)) {
+                if let Some((at, class)) = run.back.take() {
+                    self.run_stage(run, at, &class, RunStage::Combine, rotation, submitter)?;
+                }
+                if index < self.geometry.blocks.len() {
+                    self.run_block(run, index, rotation, submitter)?;
+                    if filled(index) && run.back.as_ref().is_some_and(|&(at, _)| at == index) {
+                        run.unfilled = Some((index, 0));
+                        if passed && first(place) {
+                            self.run_fill(run, index, 0, false, submitter)?;
+                        }
+                    }
+                }
+            }
+            // The device orders a submission by all it touches: fronts left
+            // queued would wait, with the next pass behind them, for the
+            // fill that pass reads, and their requests with them.
+            if early && index < self.geometry.blocks.len() && filled(index) {
+                submitter.flush()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Queue a scratch-served run's fill at block `index` (`OnceStage::Fill`,
+    /// `StepSubmitter::fill`): where fills run beside compute no park of it
+    /// holds compute, and where they share its queue a park holds only what
+    /// follows it. It runs in its run's workspace, the graphs' shared arena,
+    /// which it touches, and so orders against, only where its graph places
+    /// something there. `followed`: the next launch on its queue is a
+    /// sibling's fill, which waits on nothing queued after this one.
+    fn run_fill(&self, run: &mut TargetRun<'_>, index: usize, window: u64, followed: bool, submitter: &mut StepSubmitter) -> Result<(), SubmitError> {
+        run.unfilled = if window + 1 < self.graphs.prepared.windows() {
+            Some((index, window + 1))
+        } else {
+            None
+        };
+        let (graph, bound) = self.graphs.fill(index).map_err(invalid)?;
+        let mut bindings = bound.bindings();
+        if let Some(bank) = &run.bank {
+            bank.bind(graph, index, run.region.place, &mut bindings).map_err(invalid)?;
+            bank.bind_window(graph, index, window, &mut bindings).map_err(invalid)?;
+            bank.fill_followed(index, window, followed).map_err(invalid)?;
+        }
+        let mut active = run.launch.graph_workspace.slot_mut().activate(&graph.plan).map_err(device)?;
+        let ready = active
+            .attach(bindings, graph.plan.new_outputs().map_err(device)?)
+            .map_err(device)?;
+        let mut registered = Ok(());
+        submitter.fill(ready, |outputs| {
+            registered = run.bank.as_ref().map_or(Ok(()), |bank| bank.register_fill_parks(graph, index, window, outputs));
+        })?;
+        registered.map_err(invalid)
+    }
+
+    /// Queue block `index`'s pass over merge set `set` of the chain's runs,
+    /// once every front there is queued: one grouping and expert pass over
+    /// the crossed rows from the set's first run's that has a back there
+    /// through its last's (a stopped run's region between them is computed
+    /// and never read), into the merged buffers its runs' backs combine
+    /// from, and its reads into its group's `reads` record. It runs in that
+    /// last run's workspace.
+    fn run_pass(
+        &self,
+        runs: &mut Branded<'_, TargetRun<'_>>,
+        index: usize,
+        set: std::ops::Range<usize>,
+        window: u64,
+        reads: Option<(&crate::experts::ExpertBank, usize)>,
+        submitter: &mut StepSubmitter,
+    ) -> Result<(), SubmitError> {
+        let launches = runs.len();
+        let mut backs = runs
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(place, run)| {
+                let (_, class) = run.back.as_ref().filter(|(at, _)| set.contains(&place) && *at == index)?;
+                Some((run.region.start, class.rows, run))
+            });
+        let Some(head) = backs.next() else {
+            return Ok(());
+        };
+        let first = head.0;
+        let (start, last_rows, run) = backs.last().unwrap_or(head);
+        let rows = last_rows + start - first;
+        let (graph, bound, pass_rows) = self.graphs.pass(index, launches).map_err(invalid)?;
+        let into = &graph.ports.ports;
+        let group = run.region.group.clone();
+        let SplitValues { crossing, merged } = group.split(index).map_err(invalid)?;
+        // The pass's graph holds `pass_rows` crossed rows: the group's rows
+        // from the set's first, or its last ones where fewer follow it, the
+        // set's rows from `first` of them.
+        let chain_rows = crossing.routes.extents()[0];
+        let view = first.min(chain_rows - pass_rows);
+        let first = first - view;
+        let rows_of = |buffer: &seismic::Tensor| buffer.slice_leading(view, view + pass_rows).map_err(device);
+        let mut bindings = bound.bindings();
+        for (port, buffer) in into.crossing.iter().zip(crossing.pass().iter()) {
+            bindings.set(port, &rows_of(buffer)?).map_err(device)?;
+        }
+        if let Some(bank) = &run.bank {
+            bank.bind_window(graph, index, window, &mut bindings).map_err(invalid)?;
+        }
+        // A streamed layer's pass writes its set's reads into its group's
+        // record at the set's first place (`BankPart::GroupReads`).
+        if let Some((bank, record)) = reads {
+            let at = bank.group_reads_at(record, set.start);
+            for (port, words) in super::native_target_graph::placed_banks(bank, graph, index, at).map_err(invalid)? {
+                bindings.set(port, &words).map_err(device)?;
+            }
+        }
+        bindings
+            .set(&into.experts, &merged.experts.slice_leading(0, graph.ports.blocks).map_err(device)?)
+            .map_err(device)?;
+        bindings.set(&into.inverse, &rows_of(&merged.inverse)?).map_err(device)?;
+        for (port, entry) in [(&into.rows, rows), (&into.first, first)] {
+            bindings
+                .set(port, &merged.table.slice_leading(entry, entry + 1).map_err(device)?)
+                .map_err(device)?;
+        }
+        let mut active = run
+            .launch
+            .graph_workspace
+            .slot_mut()
+            .activate(&graph.plan)
+            .map_err(device)?;
+        let ready = active
+            .attach(bindings, graph.plan.new_outputs().map_err(device)?)
+            .map_err(device)?;
+        submitter.queue(ready, |_| {})?;
+        Ok(())
+    }
+
+    /// Queue the graph of `stage` of block `index` of a step's run, of
+    /// `class`, into the chain's free output slot, freeing the run's last.
+    fn run_stage(
+        &self,
+        run: &mut TargetRun<'_>,
+        index: usize,
+        class: &BlockRun,
+        stage: RunStage,
+        rotation: &mut OutputRotation<'_>,
+        submitter: &mut StepSubmitter,
+    ) -> Result<(), SubmitError> {
+        let RunLaunch {
+            batch,
+            state,
+            graph_workspace,
+            ..
+        } = &mut run.launch;
+        let (batch, state) = (&*batch, &*state);
+        let (segments, slots, bank) = (run.segments, run.slots, run.bank.as_ref());
+        let controls = &run.controls;
+        let BlockRun {
+            rows,
+            segments: block_segments,
+            listed: ref listed_tiles,
+            scored,
+        } = *class;
+        {
+            let block_started = self.trace.blocks.then(Instant::now);
             let (graph, bound) = self
                 .graphs
                 .block(
                     rows,
-                    segments,
+                    block_segments,
                     slots,
                     listed_tiles.as_ref().map_or(0, |(tiles, _)| *tiles),
+                    scored,
                     index,
+                    stage,
+                    run.tapped,
                 )
                 .map_err(invalid)?;
-            let parity = (index + 1) % 2;
             let mut active = graph_workspace
                 .slot_mut()
                 .activate(&graph.plan)
@@ -769,24 +2071,121 @@ impl NativeTargetProgram {
             let tap_rows = graph
                 .taps
                 .as_ref()
-                .map(|_| self.tap_rows(rows))
+                .map(|_| self.tap_rows(&run.region, rows))
                 .transpose()?;
             let mut bindings = bound.bindings();
-            bindings.set(&graph.hidden, &hidden).map_err(device)?;
-            match (&graph.per_layer, &per_layer_rows) {
+            let hidden = graph.hidden.as_ref().ok_or_else(|| invalid("a run's graph reads no rows"))?;
+            bindings.set(&hidden.rows, &run.hidden.rows).map_err(device)?;
+            match (&hidden.pre, &run.hidden.pre) {
+                (Some(port), Some(pre)) => bindings.set(port, pre).map_err(device)?,
+                (None, None) => {}
+                _ => return Err(invalid("a block graph's pre port disagrees with the carry it reads")),
+            }
+            // The operand the block before formed for this graph's
+            // projection, and the one this graph forms for the next
+            // block's: its place's two carries in turn.
+            let carried = match (&graph.operand_in, &graph.operand) {
+                (None, None) => None,
+                (operand_in, operand) => {
+                    let carries = run.region.group.operands(run.region.place).map_err(invalid)?;
+                    let mut bind = |ports: &CarryPorts, at: usize| {
+                        let [rows, quantized] = &carries[at];
+                        bindings.set(&ports.carry.rows, rows).map_err(device)?;
+                        bindings.set(&ports.carry.quantized, quantized).map_err(device)
+                    };
+                    let read = match (operand_in, run.carried) {
+                        (None, _) => None,
+                        (Some(ports), Some(at)) => {
+                            bind(ports, at)?;
+                            Some(at)
+                        }
+                        (Some(_), None) => {
+                            return Err(invalid("a block graph reads an operand the block before did not carry"));
+                        }
+                    };
+                    match operand {
+                        None => None,
+                        Some(ports) => {
+                            let at = read.map_or(0, |read| 1 - read);
+                            bind(ports, at)?;
+                            Some(at)
+                        }
+                    }
+                }
+            };
+            // A split block binds its chain place's words of the bank's
+            // placed parts and its rows of the crossing buffers; a back after
+            // the group's pass the chain's experts' rows and its rows'
+            // positions in them.
+            if let Some(bank) = bank {
+                bank.bind(graph, index, run.region.place, &mut bindings).map_err(invalid)?;
+            }
+            if let Some(ports) = &graph.ports {
+                let SplitValues { crossing, merged } = run.region.group.split(index).map_err(invalid)?;
+                match ports {
+                    SplitPorts::Front(ports) => {
+                        for (port, buffer) in ports.iter().zip(crossing.iter()) {
+                            bindings.set(port, &run.region.rows(buffer, rows)?).map_err(device)?;
+                        }
+                    }
+                    SplitPorts::Back(ports) => {
+                        for (port, buffer) in ports.crossing.iter().zip(crossing.back().iter()) {
+                            bindings.set(port, &run.region.rows(buffer, rows)?).map_err(device)?;
+                        }
+                        bindings.set(&ports.experts, &merged.experts).map_err(device)?;
+                        bindings
+                            .set(&ports.inverse, &run.region.rows(&merged.inverse, rows)?)
+                            .map_err(device)?;
+                    }
+                }
+            }
+            // A graph that sets the run's step words writes its sequence.
+            if let (Some(port), Some(bank)) = (&graph.sequence, bank) {
+                active.write_input(port, &step_bytes(bank.sequence)).map_err(device)?;
+            }
+            match (&graph.per_layer, &run.per_layer_rows) {
                 (None, _) => {}
                 (Some(port), Some(inputs)) => bindings.set(port, inputs).map_err(device)?,
                 (Some(_), None) => {
-                    return Err(invalid("a per-layer block graph has no per-layer rows"))
+                    return Err(invalid("a per-layer block graph has no per-layer rows"));
                 }
+            }
+            // An n-gram input reads the step's token rows: the host's, as
+            // the entry kept them, or the previous step's selection.
+            if let Some(ports) = &graph.ngram {
+                match state.tokens() {
+                    TargetTokens::Host => bindings
+                        .set(&ports.tokens, &self.kept_token_rows(&run.region, rows)?)
+                        .map_err(device)?,
+                    TargetTokens::Selected(selected) => bindings
+                        .set(&ports.tokens, selected.tensor())
+                        .map_err(device)?,
+                }
+                // Its table's rows: written by the host before the step's
+                // gate opens, from the step's tokens and the ones before.
+                let table = self
+                    .graphs
+                    .stored
+                    .get(&index)
+                    .ok_or_else(|| invalid("an n-gram block has no stored table"))?;
+                let rows = self.stored_step_rows(index, batch, state, run.notice.as_ref())?;
+                let step = table.queue(rows).map_err(invalid)?;
+                submitter.reads(table.clone(), step.value);
+                bindings
+                    .set_timeline(ports.table.gate, &step.gate, step.value)
+                    .map_err(device)?;
+                bindings
+                    .set_timeline(ports.table.read, &step.read, step.value)
+                    .map_err(device)?;
             }
             if let (Some(ports), Some(tap_rows)) = (&graph.taps, &tap_rows) {
                 let taps = self.graphs.prepared.block_taps(index);
                 bindings.set(&ports.taps, tap_rows).map_err(device)?;
+                let [entry, middle, output] = stage.taps();
                 for (port, tap) in [
-                    (&ports.entry, taps.entry),
-                    (&ports.middle, taps.middle),
-                    (&ports.output, taps.output),
+                    (&ports.entry, taps.entry.filter(|_| entry)),
+                    (&ports.middle, taps.middle.filter(|_| middle)),
+                    (&ports.output, taps.output.filter(|_| output)),
                 ] {
                     match (port, tap) {
                         (Some(port), Some(tap)) => active
@@ -797,113 +2196,206 @@ impl NativeTargetProgram {
                     }
                 }
             }
-            match (&graph.state, &graph.controls) {
-                (
-                    BlockStatePorts::Attention(ports),
-                    BlockControlPorts::Attention {
-                        coordinates,
-                        visible,
-                        fresh,
-                        destinations,
-                        history_tiles,
-                    },
-                ) => {
-                    let (read, history) = state.history(LayerRef::Target(index as u32))?;
-                    if history.len() != ports.len() {
-                        return Err(invalid(
-                            "the layer's history planes disagree with its attention entry",
-                        ));
-                    }
-                    for (port, plane) in ports.iter().zip(history) {
-                        bindings.set(port, plane).map_err(device)?;
-                    }
-                    let history_controls = controls
-                        .histories
-                        .get(read)
-                        .ok_or_else(|| invalid("the batch lacks the layer's history read"))?;
-                    active
-                        .write_input(coordinates, &controls.coordinates)
+            // A graph binds its block's history and bank, and their
+            // controls.
+            if let Some(HistoryPorts {
+                planes: ports,
+                indexer_planes,
+                coordinates,
+                visible,
+                fresh,
+                destinations,
+                history_tiles,
+                indexer,
+                picked,
+            }) = &graph.state.history
+            {
+                // An index-list source (`attention::pooled`) binds its
+                // pooled source's Block plane and the launch's picks table of
+                // that source's read; an indexing source also the read's
+                // index keys, its rows' complete units and lists (the read's
+                // spans, the pool table a producing indexer stores, or the
+                // pool table a restricted indexer lists); an own source also
+                // its Block destinations and, above rate 1, its Window planes
+                // and the window's spans and destinations.
+                if let Some(picked) = picked {
+                    // The block's own source: a graph its shape shares with
+                    // other blocks names none.
+                    let source = self
+                        .graphs
+                        .prepared
+                        .pooled_source(index)
+                        .expect("a block whose graph binds an index-list source keeps its own pooled source");
+                    let pooled = state.pooled(source.block, source.part)?;
+                    let block_read = pooled.block_read;
+                    bindings.set(&picked.plane, pooled.rows).map_err(device)?;
+                    bindings
+                        .set(&picked.picks, controls.bound(LaunchControl::Picks { read: block_read })?)
                         .map_err(device)?;
-                    active
-                        .write_input(visible, &history_controls.visible)
-                        .map_err(device)?;
-                    active
-                        .write_input(fresh, &history_controls.fresh)
-                        .map_err(device)?;
-                    active
-                        .write_input(destinations, &history_controls.destinations)
-                        .map_err(device)?;
-                    match (history_tiles, &listed_tiles) {
-                        (Some(tiles), Some((_, bytes))) => active
-                            .write_input(&tiles.port, bytes)
-                            .map_err(device)?,
-                        (None, None) => {}
-                        _ => {
-                            return Err(invalid(
-                                "the block's graph class and its history tile list disagree",
-                            ))
+                    if let Some(index) = &picked.index {
+                        let index_keys = pooled
+                            .index_keys
+                            .ok_or_else(|| invalid("an indexed pooled source has no index keys"))?;
+                        bindings.set(&index.index_keys, index_keys).map_err(device)?;
+                        let pool = LaunchControl::Pool { read: block_read };
+                        let mut tables = vec![(&index.complete, LaunchControl::Complete { read: block_read })];
+                        match &index.lists {
+                            ListPorts::Visible { spans, pool: stored } => {
+                                tables.push((spans, LaunchControl::Visible { read: block_read }));
+                                tables.extend(stored.iter().map(|stored| (stored, pool)));
+                            }
+                            ListPorts::Pool(listed) => tables.push((listed, pool)),
+                        }
+                        if let Some(own) = &index.own {
+                            tables.push((
+                                &own.block_destinations,
+                                LaunchControl::Destinations { read: block_read },
+                            ));
+                            match (&own.window, pooled.window) {
+                                (Some(window), Some((window_read, [window_rows, window_coordinates]))) => {
+                                    bindings.set(&window.rows, window_rows).map_err(device)?;
+                                    bindings
+                                        .set(&window.coordinates, window_coordinates)
+                                        .map_err(device)?;
+                                    tables.push((&window.visible, LaunchControl::Visible { read: window_read }));
+                                    tables.push((
+                                        &window.destinations,
+                                        LaunchControl::Destinations { read: window_read },
+                                    ));
+                                }
+                                (None, None) => {}
+                                _ => return Err(invalid("a pooled source's window disagrees with its graph's")),
+                            }
+                        }
+                        for (port, control) in tables {
+                            bindings.set(port, controls.bound(control)?).map_err(device)?;
                         }
                     }
                 }
-                (BlockStatePorts::Recurrent(ports), BlockControlPorts::Recurrent(recurrent)) => {
-                    let arenas = state.recurrent_arenas()?;
-                    for (offset, port) in ports.iter().enumerate() {
-                        bindings
-                            .set(
-                                port,
-                                arenas
-                                    .get(recurrent_component + offset)
-                                    .ok_or_else(|| invalid("recurrent bank arena is absent"))?,
-                            )
-                            .map_err(device)?;
+                // A selected read's keys: their planes, its rows' spans and
+                // destinations in their Window read and destinations in
+                // their Block read, and where its class scores, its
+                // indexer's spans, complete units and unit lists there.
+                match (indexer_planes, indexer) {
+                    (Some(planes), Some(tables)) => {
+                        let [(window_read, window), (block_read, blocks)] =
+                            state.indexer(index as u32)?;
+                        let [window_keys, window_coordinates] = window.as_slice() else {
+                            return Err(invalid("a selected read's pending-key planes are not two"));
+                        };
+                        let [block_keys] = blocks.as_slice() else {
+                            return Err(invalid("a selected read's unit-key planes are not one"));
+                        };
+                        for (port, plane) in [
+                            (&planes.window_keys, window_keys),
+                            (&planes.window_coordinates, window_coordinates),
+                            (&planes.block_keys, block_keys),
+                        ] {
+                            bindings.set(port, plane).map_err(device)?;
+                        }
+                        let read = |read| LaunchControl::Visible { read };
+                        let index_tables = tables.index.iter().flat_map(|index| {
+                            [
+                                (&index.block_visible, read(block_read)),
+                                (&index.complete, LaunchControl::Complete { read: block_read }),
+                                (&index.units, LaunchControl::Units { read: block_read }),
+                            ]
+                        });
+                        for (port, control) in [
+                            (&tables.window_visible, read(window_read)),
+                            (&tables.window_destinations, LaunchControl::Destinations { read: window_read }),
+                            (&tables.block_destinations, LaunchControl::Destinations { read: block_read }),
+                        ]
+                        .into_iter()
+                        .chain(index_tables)
+                        {
+                            bindings.set(port, controls.bound(control)?).map_err(device)?;
+                        }
                     }
-                    active
-                        .write_input(&recurrent.segments, &controls.segments)
-                        .map_err(device)?;
-                    active
-                        .write_input(&recurrent.stop, &controls.stop)
-                        .map_err(device)?;
-                    active
-                        .write_input(&recurrent.previous_bank, &controls.previous_bank)
-                        .map_err(device)?;
-                    active
-                        .write_input(&recurrent.previous_tape, &controls.previous_tape)
-                        .map_err(device)?;
-                    active
-                        .write_input(&recurrent.following_bank, &controls.following_bank)
+                    (None, None) => {}
+                    _ => return Err(invalid("a selected read's planes and tables disagree")),
+                }
+                let (read, history) = state.history(LayerRef::Target(index as u32))?;
+                if history.len() != ports.len() {
+                    return Err(invalid(
+                        "the layer's history planes disagree with its attention entry",
+                    ));
+                }
+                for (port, plane) in ports.iter().zip(history) {
+                    bindings.set(port, plane).map_err(device)?;
+                }
+                // A listing class sealed for more segments than the
+                // launch has reads its spans padded.
+                let spans = match block_segments == segments {
+                    true => LaunchControl::Visible { read },
+                    false => LaunchControl::Padded { read },
+                };
+                for (port, control) in [
+                    (coordinates, LaunchControl::Coordinates),
+                    (visible, spans),
+                    (fresh, LaunchControl::Fresh { read }),
+                    (destinations, LaunchControl::Destinations { read }),
+                ] {
+                    bindings.set(port, controls.bound(control)?).map_err(device)?;
+                }
+                match (history_tiles, &listed_tiles) {
+                    (Some(tiles), Some((_, bytes))) => {
+                        active.write_input(&tiles.port, bytes).map_err(device)?
+                    }
+                    (None, None) => {}
+                    _ => {
+                        return Err(invalid(
+                            "the block's graph class and its history tile list disagree",
+                        ));
+                    }
+                }
+            }
+            if let Some(BankPorts { components, controls: recurrent }) = &graph.state.bank {
+                let arenas = state.recurrent_arenas()?;
+                for (offset, port) in components.iter().enumerate() {
+                    bindings
+                        .set(
+                            port,
+                            arenas
+                                .get(run.recurrent_component + offset)
+                                .ok_or_else(|| invalid("recurrent bank arena is absent"))?,
+                        )
                         .map_err(device)?;
                 }
-                _ => return Err(invalid("sealed graph block state and controls disagree")),
+                for (port, control) in [
+                    (&recurrent.segments, LaunchControl::Segments),
+                    (&recurrent.stop, LaunchControl::Stop),
+                    (&recurrent.previous_bank, LaunchControl::PreviousBank),
+                    (&recurrent.previous_tape, LaunchControl::PreviousTape),
+                    (&recurrent.following_bank, LaunchControl::FollowingBank),
+                ] {
+                    bindings.set(port, controls.bound(control)?).map_err(device)?;
+                }
             }
-            let ready = active
-                .attach(
-                    bindings,
-                    graph_outputs[parity]
-                        .activate(&graph.plan)
-                        .map_err(SubmitError::Invariant)?,
-                )
-                .map_err(device)?;
-            let outputs = submitter.queue(ready)?;
-            if let BlockStatePorts::Recurrent(ports) = &graph.state {
-                recurrent_component += ports.len();
+            let (next, outputs) = rotation.activate(&graph.plan)?;
+            let ready = active.attach(bindings, outputs).map_err(device)?;
+            let mut registered = Ok(());
+            // A sampled step times each block whose routed layer streams.
+            let sampled = bank.is_some_and(|bank| bank.samples(graph));
+            let (outputs, spans) = submitter.queue_as(ready, sampled, |outputs| {
+                registered = bank.map_or(Ok(()), |bank| bank.register_parks(graph, index, outputs));
+            })?;
+            registered.map_err(invalid)?;
+            if let (Some(bank), Some(spans)) = (bank, spans) {
+                bank.block_sampled(graph, index, spans).map_err(invalid)?;
             }
-            hidden = outputs
-                .exported(&graph.output)
-                .ok_or_else(|| invalid("target block output was not exported"))?;
-            let previous = index % 2;
-            graph_outputs[previous]
-                .recycle(
-                    pending[previous]
-                        .take()
-                        .ok_or_else(|| invalid("prior target graph output is absent"))?,
-                )
-                .map_err(SubmitError::Invariant)?;
-            pending[parity] = Some(outputs);
+            if let Some(bank) = &graph.state.bank {
+                run.recurrent_component += bank.components.len();
+            }
+            run.residual = graph.residual.as_ref().map(|edge| outputs.exported(edge).ok_or_else(|| invalid("target residual was not exported"))).transpose()?;
+            run.hidden = graph
+                .output
+                .as_ref()
+                .try_map(|output| outputs.exported(output).ok_or_else(|| invalid("target block output was not exported")))?;
+            run.carried = carried;
+            rotation.recycle(std::mem::replace(&mut run.output, (next, outputs)))?;
             if let Some(started) = block_started {
-                let kind = match &graph.state {
-                    BlockStatePorts::Attention(_) => "attention",
-                    BlockStatePorts::Recurrent(_) => "recurrent",
-                };
+                let kind = graph.state.kind();
                 eprintln!(
                     "target block {index} {kind} rows {rows} lists {} history tiles {:.3}s",
                     listed_tiles.as_ref().map_or(0, |(tiles, _)| *tiles),
@@ -911,21 +2403,55 @@ impl NativeTargetProgram {
                 );
             }
         }
-        let (readout_workspace, readout_output) = readout;
-        let result =
-            self.graph_readout(batch, &hidden, readout_workspace, readout_output, submitter)?;
+        Ok(())
+    }
+
+    /// Queue a step's readout and boundary capture once every block is
+    /// queued, and return its readout and commit span.
+    fn finish_run(
+        &self,
+        mut run: TargetRun<'_>,
+        rotation: &mut OutputRotation<'_>,
+        submitter: &mut StepSubmitter,
+    ) -> Result<(Option<TargetReadoutGraphResult>, CommitSpan), SubmitError> {
+        let result = self.graph_readout(&mut run, submitter)?;
+        let TargetRun {
+            launch: RunLaunch { batch, state, .. },
+            output,
+            residual,
+            hidden,
+            first_commit,
+            ..
+        } = run;
+        if let Some(boundary) = state.0.boundary() {
+            let features = &result
+                .as_ref()
+                .ok_or_else(|| invalid("boundary capture has no features"))?
+                .features;
+            let row = batch.actual_rows - 1;
+            let source = features
+                .tensor()
+                .slice_leading(row as u64, row as u64 + 1)
+                .map_err(device)?;
+            let destination = boundary.allocation().tensor().map_err(device)?;
+            let copy = self.boundary_copy()?;
+            let mut bindings = copy.plan.bindings();
+            bindings.set(&copy.source, &source).map_err(device)?;
+            bindings
+                .set(&copy.destination, destination)
+                .map_err(device)?;
+            let mut slot = copy.plan.new_slot().map_err(device)?;
+            let ready = slot
+                .attach(bindings, copy.plan.new_outputs().map_err(device)?)
+                .map_err(device)?;
+            submitter.queue(ready, |_| {})?;
+        }
         let last_commit = Instant::now();
         // Every consumer of the final hidden rows is queued, so its output
-        // slot returns to the lease; the device queue orders any reuse.
+        // slot returns to the rotation; the device queue orders any reuse.
         drop(hidden);
-        let last = self.geometry.blocks.len() % 2;
-        graph_outputs[last]
-            .recycle(
-                pending[last]
-                    .take()
-                    .ok_or_else(|| invalid("final target graph output is absent"))?,
-            )
-            .map_err(SubmitError::Invariant)?;
+        drop(residual);
+        rotation.recycle(output)?;
         Ok((
             result,
             CommitSpan {
@@ -936,30 +2462,120 @@ impl NativeTargetProgram {
     }
 }
 
-struct GraphControls {
-    coordinates: Vec<u8>,
-    /// One control set per history domain, in domain order: an attention
-    /// block reads its own domain's.
-    histories: Vec<HistoryControls>,
-    segments: Vec<u8>,
-    /// Rows after which each slot publishes its recurrent state; later rows
-    /// are recorded on the successor bank's tape.
-    stop: Vec<u8>,
-    /// Each slot's read version: bank, and the tape rows that complete it.
-    previous_bank: Vec<u8>,
-    previous_tape: Vec<u8>,
-    following_bank: Vec<u8>,
+/// The batch rows a step's blocks run over: `rows` rows (a row class) from
+/// batch row `first`. Every block before the stateless tail runs the whole
+/// batch; the tail runs the smallest window that holds the rows the readout
+/// consumes. A row's computation in a block reads only its own hidden,
+/// per-layer and control rows and the history, so a window's rows compute
+/// what they would in the whole batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RowWindow {
+    first: u64,
+    rows: u64,
 }
 
-/// One history domain's attention controls.
+impl RowWindow {
+    fn whole(rows: u64) -> Self {
+        Self { first: 0, rows }
+    }
+
+    /// The window of the row class covering `out_rows` within a batch of
+    /// `rows` rows, placed at their first row unless that would pass the
+    /// batch's end. `None` when no row is consumed.
+    fn consumed(out_rows: &[i32], rows: u64) -> Result<Option<Self>, SubmitError> {
+        let row = |row: &i32| {
+            u64::try_from(*row)
+                .ok()
+                .filter(|row| *row < rows)
+                .ok_or_else(|| invalid("readout row lies outside the batch"))
+        };
+        let rows_read = out_rows.iter().map(row).collect::<Result<Vec<_>, _>>()?;
+        let (Some(&first), Some(&last)) = (rows_read.iter().min(), rows_read.iter().max()) else {
+            return Ok(None);
+        };
+        let class = magnitude_batching::row_class((last - first + 1) as usize)
+            .ok_or_else(|| invalid("consumed rows have no row class"))? as u64;
+        Ok(Some(Self {
+            first: first.min(rows - class),
+            rows: class,
+        }))
+    }
+
+    /// The window's rows of a tensor over the batch rows.
+    fn slice(self, rows: &Tensor) -> Result<Tensor, SubmitError> {
+        rows.slice_leading(self.first, self.first + self.rows)
+            .map_err(device)
+    }
+
+    /// Batch row `row` as a row of the window.
+    fn row(self, row: i32) -> Result<i32, SubmitError> {
+        u64::try_from(row)
+            .ok()
+            .and_then(|row| row.checked_sub(self.first))
+            .filter(|row| *row < self.rows)
+            .map(|row| row as i32)
+            .ok_or_else(|| invalid("readout row lies outside the step's row window"))
+    }
+
+    /// The window's rows of a per-row host table over `batch_rows` rows.
+    fn rows_of(self, table: &[u8], batch_rows: u64) -> Vec<u8> {
+        let stride = table.len() / batch_rows as usize;
+        table[self.first as usize * stride..(self.first + self.rows) as usize * stride].to_vec()
+    }
+}
+
+/// A launch's per-step controls: what the host reads of them to class its
+/// blocks, and their one upload, which every block graph of the launch
+/// binds (`ControlSource::Bound`).
+struct GraphControls {
+    /// One control set per history read, in read order: an attention block
+    /// reads its own read's.
+    histories: Vec<HistoryControls>,
+    /// Each control's view of the launch's upload, in upload order
+    /// (`LaunchControlLayout::controls`).
+    launch: Vec<(LaunchControl, Tensor)>,
+}
+
+/// What the host reads of one history read's controls: its rows' visible
+/// spans and destinations (`history_tile_bytes`, `selection_scores`).
 struct HistoryControls {
     visible: Vec<u8>,
-    fresh: Vec<u8>,
     destinations: Vec<u8>,
 }
 
 impl GraphControls {
-    fn new(batch: &TargetBatchUpload<'_>) -> Result<Self, SubmitError> {
+    /// Keep the per-row controls of `window`'s rows, of controls over
+    /// `batch_rows` rows. The per-slot recurrent controls stay whole: only
+    /// attention blocks run a window (`stateless_tail`).
+    fn window(&mut self, batch_rows: u64, window: RowWindow) -> Result<(), SubmitError> {
+        for history in &mut self.histories {
+            history.visible = window.rows_of(&history.visible, batch_rows);
+            history.destinations = window.rows_of(&history.destinations, batch_rows);
+        }
+        for (control, view) in &mut self.launch {
+            if control.per_row() {
+                *view = window.slice(view)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The launch's view of `control`.
+    fn bound(&self, control: LaunchControl) -> Result<&Tensor, SubmitError> {
+        self.launch
+            .iter()
+            .find(|(of, _)| *of == control)
+            .map(|(_, view)| view)
+            .ok_or_else(|| invalid(format!("the launch's upload has no {control:?}")))
+    }
+
+    /// The controls of `batch`, uploaded once into an idle region of the
+    /// launch's graph workspace `slot` as `layout` places them.
+    fn new(
+        batch: &TargetBatchUpload<'_>,
+        layout: &LaunchControlLayout,
+        slot: &mut seismic::NativeGraphFamilySlot,
+    ) -> Result<Self, SubmitError> {
         let rows = batch.class.rows();
         let segments = batch.class.segments();
         let slots = batch
@@ -976,90 +2592,168 @@ impl GraphControls {
                 history.visible.len() != rows
                     || history.fresh.len() != rows
                     || history.destinations.len() != rows
-                    || history.visible.iter().any(|ranges| ranges.len() != segments)
+                    || history
+                        .visible
+                        .iter()
+                        .any(|ranges| ranges.len() != segments)
             })
         {
             return Err(invalid(
                 "validated batch does not match exact graph row, segment, and slot classes",
             ));
         }
-        Ok(Self {
-            coordinates: batch
-                .coordinates
-                .iter()
-                .flatten()
-                .flat_map(|value| value.to_le_bytes())
-                .collect(),
-            histories: batch
+        let histories = batch
+            .histories
+            .iter()
+            .map(|history| HistoryControls {
+                visible: history
+                    .visible
+                    .iter()
+                    .flatten()
+                    .flatten()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect(),
+                destinations: i32_bytes(&history.destinations),
+            })
+            .collect::<Vec<_>>();
+        let pairs = |pairs: &[[i32; 2]]| i32_bytes(pairs.as_flattened());
+        let (rows, segments, slots) = (rows as u64, segments as u64, batch.actual_slots as u64);
+        let controls = layout.controls(rows, segments, slots);
+        let read = |read: usize| {
+            batch
                 .histories
-                .iter()
-                .map(|history| HistoryControls {
-                    visible: history
-                        .visible
-                        .iter()
-                        .flatten()
-                        .flatten()
-                        .flat_map(|value| value.to_le_bytes())
-                        .collect(),
-                    fresh: history
-                        .fresh
-                        .iter()
-                        .flatten()
-                        .flat_map(|value| value.to_le_bytes())
-                        .collect(),
-                    destinations: i32_bytes(&history.destinations),
+                .get(read)
+                .zip(histories.get(read))
+                .ok_or_else(|| invalid("the batch lacks a history read its layout places"))
+        };
+        let bytes = controls
+            .iter()
+            .map(|(control, extents)| {
+                Ok(match *control {
+                    LaunchControl::Coordinates => i32_bytes(batch.coordinates.as_flattened()),
+                    LaunchControl::Visible { read: at } => read(at)?.1.visible.clone(),
+                    LaunchControl::Padded { read: at } => {
+                        padded_spans(&read(at)?.1.visible, segments, extents[1])
+                    }
+                    LaunchControl::Fresh { read: at } => pairs(&read(at)?.0.fresh),
+                    LaunchControl::Destinations { read: at } => read(at)?.1.destinations.clone(),
+                    // The rows a row's visible spans list in a Block read are
+                    // its complete groups, and its unit list `[0, c)`.
+                    LaunchControl::Complete { read: at } => i32_bytes(&complete(&read(at)?.0.visible)),
+                    LaunchControl::Units { read: at } => i32_bytes(
+                        &complete(&read(at)?.0.visible)
+                            .into_iter()
+                            .flat_map(|complete| [0, complete])
+                            .collect::<Vec<_>>(),
+                    ),
+                    // The picks and the candidate pool the read's own layer
+                    // stores before any reader.
+                    LaunchControl::Picks { .. } | LaunchControl::Pool { .. } => {
+                        i32_bytes(&vec![-1; extents.iter().product::<u64>() as usize])
+                    }
+                    LaunchControl::Segments => pairs(&batch.segments[..=batch.actual_slots]),
+                    LaunchControl::Stop => i32_bytes(&batch.stop[..batch.actual_slots]),
+                    LaunchControl::PreviousBank => i32_bytes(&batch.bank[..batch.actual_slots]),
+                    LaunchControl::PreviousTape => {
+                        i32_bytes(&batch.previous_tape[..batch.actual_slots])
+                    }
+                    LaunchControl::FollowingBank => {
+                        i32_bytes(&batch.following_bank[..batch.actual_slots])
+                    }
                 })
-                .collect(),
-            segments: batch.segments[..=batch.actual_slots]
-                .iter()
-                .flatten()
-                .flat_map(|value| value.to_le_bytes())
-                .collect(),
-            stop: i32_bytes(&batch.stop[..batch.actual_slots]),
-            previous_bank: i32_bytes(&batch.bank[..batch.actual_slots]),
-            previous_tape: i32_bytes(&batch.previous_tape[..batch.actual_slots]),
-            following_bank: i32_bytes(&batch.following_bank[..batch.actual_slots]),
-        })
+            })
+            .collect::<Result<Vec<_>, SubmitError>>()?;
+        let tensors = controls
+            .iter()
+            .zip(&bytes)
+            .map(|((_, extents), bytes)| (Element::i32(), extents.as_slice(), bytes.as_slice()))
+            .collect::<Vec<_>>();
+        let uploaded = slot.upload(&tensors).map_err(device)?;
+        let launch = controls
+            .into_iter()
+            .map(|(control, _)| control)
+            .zip(uploaded)
+            .collect();
+        Ok(Self { histories, launch })
     }
 }
 
 impl TargetProgram for NativeTargetProgram {
     type Submission = DeviceSubmission<TargetLaunchCore, TargetLaunchWorkspace, TargetOutput>;
 
+    /// The device queue completes command sequences in order, so each
+    /// launch ends its own sequences after its readout and completes with
+    /// them.
     fn submit(
         &mut self,
-        mut launch: ValidatedTargetLaunch,
-    ) -> Result<Self::Submission, (SubmitError, ValidatedTargetLaunch)> {
-        let queued = {
-            let (core, graph_workspace, graph_outputs, readout_workspace, readout_output) =
-                launch.submission_parts_mut();
-            let batch = core.batch().upload();
-            self.queue_rows(
-                &batch,
-                &RowState(core),
-                (
-                    readout_workspace,
-                    readout_output
-                        .take()
-                        .expect("readout output was reserved before submit"),
-                ),
-                graph_workspace,
-                graph_outputs,
+        chain: Chain<ValidatedTargetLaunch>,
+        mut spare: TargetGraphOutputLease,
+        pressure: &dyn Fn() -> Option<crate::domain::RunningPressure>,
+    ) -> Result<Chain<Self::Submission>, super::ChainRefusal> {
+        Ok(self.queue_chain(chain, &mut spare, pressure)?.map(|(launch, queued)| {
+            let (core, workspace) = launch.into_submission_parts();
+            let boundary = core.boundary().cloned();
+            DeviceSubmission::new(
+                self.waiter.completion(queued.completions),
+                core,
+                workspace,
+                TargetOutput {
+                    boundary,
+                    readout: queued.readout,
+                    commits: queued.commits,
+                    landed_reads: queued.landed_reads,
+                    stored_reads: queued.stored_reads,
+                    expert_step: queued.expert_step,
+                },
             )
-        };
-        let queued = match queued {
-            Ok(queued) => queued,
-            Err(error) => return Err((error, launch)),
-        };
-        let (core, workspace) = launch.into_submission_parts();
-        Ok(DeviceSubmission::new(
-            self.waiter.completion(queued.completions),
-            core,
-            workspace,
-            TargetOutput {
-                readout: queued.readout,
-                commits: queued.commits,
-            },
-        ))
+        }))
+    }
+}
+
+#[cfg(test)]
+mod row_window_tests {
+    use super::RowWindow;
+
+    #[test]
+    fn an_unread_step_runs_no_tail() {
+        assert_eq!(RowWindow::consumed(&[], 512).unwrap(), None);
+    }
+
+    #[test]
+    fn the_window_is_the_row_class_covering_the_consumed_rows() {
+        // A prompt chunk's last row.
+        let last = RowWindow::consumed(&[511], 512).unwrap().unwrap();
+        assert_eq!(
+            last,
+            RowWindow {
+                first: 511,
+                rows: 1
+            }
+        );
+        assert_eq!(last.row(511).unwrap(), 0);
+        assert!(last.row(510).is_err());
+        // Rows spanning 11 rows take the 16-row class, kept inside the batch.
+        let spread = RowWindow::consumed(&[500, 510, 505], 512).unwrap().unwrap();
+        assert_eq!(
+            spread,
+            RowWindow {
+                first: 496,
+                rows: 16
+            }
+        );
+        assert_eq!(spread.row(510).unwrap(), 14);
+        // Rows across the batch keep the whole batch.
+        assert_eq!(
+            RowWindow::consumed(&[0, 511], 512).unwrap().unwrap(),
+            RowWindow::whole(512)
+        );
+        assert!(RowWindow::consumed(&[512], 512).is_err());
+    }
+
+    #[test]
+    fn a_window_takes_its_rows_of_a_host_table() {
+        let table = (0..8u8).flat_map(|row| [row, row]).collect::<Vec<_>>();
+        let window = RowWindow { first: 4, rows: 2 };
+        assert_eq!(window.rows_of(&table, 8), vec![4, 4, 5, 5]);
     }
 }

@@ -27,15 +27,16 @@ use magnitude_artifacts::{
 use magnitude_family_contracts::{
     checked_product, ActivationDType, ActivationFunction, Attention, AttentionGate, Block,
     Decoder, DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm, FamilyId, FeedForwardUp,
-    GateFunction, GateGranularity, HeadNorm, HistoryDomain, HistoryReads, ImportTransform,
-    InputNorm, InputSemantics, KeyValue, MediaRowAttention, ModelDefinition, Operator, OutputForm,
-    ResidualForm, RmsNorm, Rotary, Sublayer, UnweightedRms, ValueNorm,
+    GateFunction, GateGranularity, HeadNorm, HistoryRows, HistorySource, ImportTransform,
+    InputNorm, InputSemantics, MediaRowAttention, ProjectedRows, RowProducer, RowRounding,
+    TokenDomain, ModelDefinition, Operator, OutputForm,
+    OutputProjection, QueryKeys, QueryProjection, ResidualForm, RmsNorm, Rotary, Sublayer,
+    UnweightedRms, ValueNorm,
     ValueSource, WeightDescriptor,
 };
-use magnitude_family_common::{rotary, HeaderError, Metadata, Tensors};
-use std::{error, fmt};
+use magnitude_family_common::{rotary, Metadata, Tensors};
 
-const ARCHITECTURE: &str = "muse-glimmer";
+pub const ARCHITECTURE: &str = "muse-glimmer";
 
 /// Every `muse-glimmer.*` key the adapter interprets; any other is rejected.
 const KEYS: &[&str] = &[
@@ -66,26 +67,12 @@ const POST_NORM_EPSILON: f64 = 1e-8;
 /// the last layer of each period is full.
 const DEFAULT_WINDOW_PERIOD: u64 = 4;
 
-/// Failure to interpret a Muse Glimmer artifact.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Error(String);
-
-impl fmt::Display for Error {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl error::Error for Error {}
-
-impl From<HeaderError> for Error {
-    fn from(error: HeaderError) -> Self {
-        invalid(error.to_string())
-    }
-}
+/// Failure to interpret a Muse Glimmer artifact: the family error, which
+/// names every unsupported feature a header carries.
+pub use magnitude_family_contracts::FamilyError as Error;
 
 pub(crate) fn invalid(message: impl Into<String>) -> Error {
-    Error(message.into())
+    Error::invalid(message)
 }
 
 fn product(dimensions: &[u64]) -> Result<u64, Error> {
@@ -203,6 +190,7 @@ pub fn inspect_components(
             intermediate,
             up: FeedForwardUp::Gated {
                 activation: ActivationFunction::Silu,
+                limit: None,
                 gate: weight("ffn_gate.weight", &[intermediate, hidden])?,
                 up: weight("ffn_up.weight", &[intermediate, hidden])?,
             },
@@ -223,33 +211,36 @@ pub fn inspect_components(
             heads,
             kv_heads,
             width,
-            query: paired("attn_q.weight", &[query_rows, hidden])?,
+            query: QueryProjection::Full(paired("attn_q.weight", &[query_rows, hidden])?),
+            query_keys: QueryKeys::Direct,
             gate: AttentionGate::Separate {
                 weight: gate,
                 function: GateFunction::Sigmoid,
                 granularity: GateGranularity::Element,
             },
             query_norm: HeadNorm::Rms(rms(paired("attn_q_norm.weight", &[width])?)),
-            key_value: KeyValue::Owned {
-                key: paired("attn_k.weight", &[key_rows, hidden])?,
-                value: ValueSource::Projected(value),
-                key_norm: HeadNorm::Rms(rms(paired("attn_k_norm.weight", &[width])?)),
-                value_norm: ValueNorm::None,
-                domain: if windowed {
-                    HistoryDomain::Window { tokens: window }
-                } else {
-                    HistoryDomain::Token
+            history: vec![HistorySource::visible(HistoryRows::Own(RowProducer::Projected(
+                ProjectedRows {
+                    key: paired("attn_k.weight", &[key_rows, hidden])?,
+                    value: ValueSource::Projected(value),
+                    key_norm: HeadNorm::Rms(rms(paired("attn_k_norm.weight", &[width])?)),
+                    value_norm: ValueNorm::None,
+                    domain: if windowed {
+                        TokenDomain::Window { tokens: window }
+                    } else {
+                        TokenDomain::Token
+                    },
+                    rounding: RowRounding::None,
                 },
-            },
+            )))],
             rotary: if windowed {
                 rotary.clone()
             } else {
                 Rotary::None
-            },
-            scale: 1.0 / (width as f64).sqrt(),
-            reads: HistoryReads::Visible,
+            },            scale: 1.0 / (width as f64).sqrt(),
             media_rows: MediaRowAttention::Causal,
-            output,
+            sinks: None,
+            output: OutputProjection::Full(output),
         };
         blocks.push(Block {
             sublayers: vec![
@@ -285,7 +276,6 @@ pub fn inspect_components(
                 scale: EmbeddingScale::Unit,
                 norm: Some(UnweightedRms { epsilon }),
                 per_layer: None,
-                hash_routing: None,
             },
             blocks,
             exit: ExitForm {

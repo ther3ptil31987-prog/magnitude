@@ -1,10 +1,12 @@
 //! Family-neutral host image preprocessing. Model adapters supply the numeric
 //! processor contract; this module owns decoding and tensor construction.
 
-use crate::media::{DType, PreparedMedia, PreparedTensor, MAX_PREPARED_BYTES};
+use crate::media::{DType, MAX_PREPARED_BYTES, PreparedMedia, PreparedTensor};
 use image::{ImageDecoder, ImageReader};
 use sha2::{Digest, Sha256};
 use std::io::Cursor;
+
+mod slicing;
 
 /// Maximum images admitted by one prepared request. Resource planning uses
 /// the same bound for output leases retained across a request's lifetime.
@@ -15,15 +17,36 @@ const ASPECT_LIMIT: usize = 200;
 /// multiples of the cell side, `patch · merge` pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImageResize {
+    /// Aspect-preserving overview followed by row-major detail crops.
+    Slices {
+        resolution: usize,
+        max_slices: usize,
+    },
     /// Sides rounded half to even to cell multiples, then scaled into the
     /// pixel bounds (Qwen3-VL `smart_resize`).
-    PixelBounds { min_pixels: usize, max_pixels: usize },
+    PixelBounds {
+        min_pixels: usize,
+        max_pixels: usize,
+    },
     /// Aspect preserved: the largest cell-multiple sides with at most
     /// `max_patches` patches (Gemma 4 `get_aspect_ratio_preserving_size`).
     PatchBudget { max_patches: usize },
     /// The cell grid closest to the image's aspect with at most `max_cells`
     /// cells (Muse Glimmer `smart_resize`).
     CellBudget { max_cells: usize },
+    /// One tile of between `min_patches` and `max_patches` patches, the
+    /// aspect kept (Nemotron Omni `_compute_target_patches`).
+    PatchBounds {
+        min_patches: usize,
+        max_patches: usize,
+    },
+    /// The aspect-kept content scaled into a canvas of cell-multiple sides
+    /// within the pixel bounds, the rest of the canvas black before
+    /// normalization (GLM-5 `smart_resize`, whose canvas rounds sides up).
+    PaddedCanvas {
+        min_pixels: usize,
+        max_pixels: usize,
+    },
 }
 
 /// The separable, scale-aware (antialiasing) resampling filter.
@@ -57,12 +80,24 @@ impl ImageProcessorConfig {
         if factor == 0
             || self.frames == 0
             || match self.resize {
+                ImageResize::Slices {
+                    resolution,
+                    max_slices,
+                } => resolution < 4 * self.patch || max_slices == 0 || max_slices > 9,
                 ImageResize::PixelBounds {
+                    min_pixels,
+                    max_pixels,
+                }
+                | ImageResize::PaddedCanvas {
                     min_pixels,
                     max_pixels,
                 } => min_pixels == 0 || min_pixels > max_pixels,
                 ImageResize::PatchBudget { max_patches } => max_patches == 0,
                 ImageResize::CellBudget { max_cells } => max_cells == 0,
+                ImageResize::PatchBounds {
+                    min_patches,
+                    max_patches,
+                } => min_patches == 0 || min_patches > max_patches,
             }
             || self.mean.iter().any(|value| !value.is_finite())
             || self
@@ -78,12 +113,26 @@ impl ImageProcessorConfig {
     fn identity(&self) -> String {
         let mut digest = Sha256::new();
         let (resize, bounds): (&[u8], [usize; 2]) = match self.resize {
+            ImageResize::Slices {
+                resolution,
+                max_slices,
+            } => (b"slices:half-even:4-patch-align", [resolution, max_slices]),
             ImageResize::PixelBounds {
                 min_pixels,
                 max_pixels,
             } => (b"pixel-bounds:half-even", [min_pixels, max_pixels]),
             ImageResize::PatchBudget { max_patches } => (b"patch-budget", [max_patches, 0]),
-            ImageResize::CellBudget { max_cells } => (b"cell-budget:closest-aspect", [max_cells, 0]),
+            ImageResize::CellBudget { max_cells } => {
+                (b"cell-budget:closest-aspect", [max_cells, 0])
+            }
+            ImageResize::PatchBounds {
+                min_patches,
+                max_patches,
+            } => (b"patch-bounds:one-tile", [min_patches, max_patches]),
+            ImageResize::PaddedCanvas {
+                min_pixels,
+                max_pixels,
+            } => (b"padded-canvas:ceil-align:black", [min_pixels, max_pixels]),
         };
         let resampling: &[u8] = match self.resampling {
             Resampling::Bicubic => b"bicubic:a=-0.5:scale-aware-antialias:rgb8",
@@ -136,6 +185,13 @@ impl ImageProcessor {
 
     /// The `(height, width)` an image of the given size is resized to.
     pub fn resized_size(&self, height: usize, width: usize) -> Result<(usize, usize), String> {
+        Ok(self.target(height, width)?.canvas)
+    }
+
+    /// The canvas an image of the given size becomes, and the content size
+    /// its pixels are resampled to: the canvas itself unless the canvas is
+    /// padded.
+    fn target(&self, height: usize, width: usize) -> Result<Target, String> {
         if height == 0 || width == 0 {
             return Err("image dimensions must be nonzero".into());
         }
@@ -145,19 +201,49 @@ impl ImageProcessor {
             return Err("image aspect ratio exceeds processor limit".into());
         }
         let cell = self.config.patch * self.config.merge;
+        let whole = |canvas| Target {
+            canvas,
+            content: canvas,
+        };
         match self.config.resize {
+            ImageResize::Slices { resolution, .. } => Ok(whole(slicing::best_size(
+                height as f64,
+                width as f64,
+                resolution,
+                self.config.patch,
+                true,
+            ))),
             ImageResize::PixelBounds {
                 min_pixels,
                 max_pixels,
-            } => pixel_bounds_size(height, width, cell, min_pixels, max_pixels),
+            } => pixel_bounds_size(height, width, cell, min_pixels, max_pixels).map(whole),
             ImageResize::PatchBudget { max_patches } => patch_budget_size(
                 height,
                 width,
                 self.config.patch,
                 self.config.merge,
                 max_patches,
-            ),
-            ImageResize::CellBudget { max_cells } => cell_budget_size(height, width, cell, max_cells),
+            )
+            .map(whole),
+            ImageResize::CellBudget { max_cells } => {
+                cell_budget_size(height, width, cell, max_cells).map(whole)
+            }
+            ImageResize::PatchBounds {
+                min_patches,
+                max_patches,
+            } => patch_bounds_size(
+                height,
+                width,
+                self.config.patch,
+                self.config.merge,
+                min_patches,
+                max_patches,
+            )
+            .map(whole),
+            ImageResize::PaddedCanvas {
+                min_pixels,
+                max_pixels,
+            } => padded_canvas(height, width, cell, min_pixels, max_pixels),
         }
     }
 
@@ -173,6 +259,8 @@ impl ImageProcessor {
         let mut pixels = Vec::new();
         let mut grids = Vec::with_capacity(encoded_images.len() * 3 * 8);
         let mut rows = 0usize;
+        let mut slice_grids = Vec::new();
+        let sliced = matches!(self.config.resize, ImageResize::Slices { .. });
         for encoded in encoded_images {
             let reader = ImageReader::new(Cursor::new(encoded))
                 .with_guessed_format()
@@ -186,40 +274,76 @@ impl ImageProcessor {
             let mut image = image::DynamicImage::from_decoder(decoder)
                 .map_err(|error| format!("image decode failed: {error}"))?;
             image.apply_orientation(orientation);
-            let (height, width_pixels) =
-                self.resized_size(image.height() as usize, image.width() as usize)?;
-            u32::try_from(height).map_err(|_| "resized image height exceeds decoder domain")?;
-            u32::try_from(width_pixels)
-                .map_err(|_| "resized image width exceeds decoder domain")?;
             let source = image.to_rgb32f();
-            let grid_height = height / self.config.patch;
-            let grid_width = width_pixels / self.config.patch;
-            rows = rows
-                .checked_add(
-                    grid_height
-                        .checked_mul(grid_width)
-                        .ok_or("image grid overflows")?,
-                )
-                .ok_or("image row count overflows")?;
-            rows.checked_mul(width)
-                .and_then(|values| values.checked_mul(4))
-                .filter(|bytes| *bytes <= MAX_PREPARED_BYTES)
-                .ok_or("prepared image pixels exceed capacity")?;
-            let resized = resize(&source, width_pixels, height, self.config.resampling)?;
-            for value in [1i64, grid_height as i64, grid_width as i64] {
-                grids.extend_from_slice(&value.to_le_bytes());
+            let crops = match self.config.resize {
+                ImageResize::Slices {
+                    resolution,
+                    max_slices,
+                } => {
+                    let (grid, crops) = self.slices(&source, resolution, max_slices, rows)?;
+                    for extent in grid {
+                        slice_grids.extend_from_slice(&(extent as i64).to_le_bytes());
+                    }
+                    crops
+                }
+                _ => {
+                    let Target {
+                        canvas: (h, w),
+                        content: (content_h, content_w),
+                    } = self.target(image.height() as usize, image.width() as usize)?;
+                    self.prepared_rows(rows, h, w)?;
+                    let content = resize(&source, content_w, content_h, self.config.resampling)?;
+                    vec![pad(content, w, h)]
+                }
+            };
+            for crop in crops {
+                let grid_height = crop.height() as usize / self.config.patch;
+                let grid_width = crop.width() as usize / self.config.patch;
+                rows = self.prepared_rows(rows, crop.height() as usize, crop.width() as usize)?;
+                for value in [1i64, grid_height as i64, grid_width as i64] {
+                    grids.extend_from_slice(&value.to_le_bytes());
+                }
+                self.patchify(&crop, grid_height, grid_width, &mut pixels)?;
             }
-            self.patchify(&resized, grid_height, grid_width, &mut pixels)?;
         }
         let pixel_values =
             PreparedTensor::new("pixel_values".into(), DType::F32, vec![rows, width], pixels)?;
         let image_grid_thw = PreparedTensor::new(
             "image_grid_thw".into(),
             DType::I64,
-            vec![encoded_images.len(), 3],
+            vec![grids.len() / 24, 3],
             grids,
         )?;
-        PreparedMedia::new(self.identity.clone(), vec![pixel_values, image_grid_thw])
+        let mut tensors = vec![pixel_values, image_grid_thw];
+        if sliced {
+            tensors.push(PreparedTensor::new(
+                "image_slice_grid".into(),
+                DType::I64,
+                vec![encoded_images.len(), 2],
+                slice_grids,
+            )?);
+        }
+        PreparedMedia::new(self.identity.clone(), tensors)
+    }
+
+    /// Check aggregate patch storage before allocating resized pixels or crops.
+    fn prepared_rows(&self, prior: usize, height: usize, width: usize) -> Result<usize, String> {
+        u32::try_from(height).map_err(|_| "resized image height exceeds decoder domain")?;
+        u32::try_from(width).map_err(|_| "resized image width exceeds decoder domain")?;
+        let patch_width = 3usize
+            .checked_mul(self.config.frames)
+            .and_then(|n| n.checked_mul(self.config.patch))
+            .and_then(|n| n.checked_mul(self.config.patch))
+            .ok_or("image patch width overflows")?;
+        let rows = (height / self.config.patch)
+            .checked_mul(width / self.config.patch)
+            .and_then(|n| prior.checked_add(n))
+            .ok_or("image row count overflows")?;
+        rows.checked_mul(patch_width)
+            .and_then(|n| n.checked_mul(4))
+            .filter(|n| *n <= MAX_PREPARED_BYTES)
+            .ok_or("prepared image pixels exceed capacity")?;
+        Ok(rows)
     }
 
     fn patchify(
@@ -261,6 +385,72 @@ impl ImageProcessor {
         }
         Ok(())
     }
+}
+
+/// A resized image's canvas and the content size inside it (the content's
+/// top-left corner is the canvas's).
+#[derive(Clone, Copy, Debug)]
+struct Target {
+    canvas: (usize, usize),
+    content: (usize, usize),
+}
+
+/// `content` on a black canvas of `width` by `height`, at the top left.
+fn pad(content: image::Rgb32FImage, width: usize, height: usize) -> image::Rgb32FImage {
+    if content.width() as usize == width && content.height() as usize == height {
+        return content;
+    }
+    let mut canvas = image::Rgb32FImage::new(width as u32, height as u32);
+    image::imageops::replace(&mut canvas, &content, 0, 0);
+    canvas
+}
+
+/// GLM-5's `smart_resize` and `resize` for one frame of an image (the
+/// released processor's two-frame budgets are these pixel bounds): the sides
+/// rounded up to cell multiples; scaled up to the minimum or, past the
+/// maximum, fitted by bisection on the content height; the content scaled by
+/// the canvas's tighter ratio, never up once the image holds the minimum.
+fn padded_canvas(
+    height: usize,
+    width: usize,
+    cell: usize,
+    min_pixels: usize,
+    max_pixels: usize,
+) -> Result<Target, String> {
+    let align = |value: usize| value.div_ceil(cell) * cell;
+    if max_pixels < cell * cell {
+        return Err("the pixel bound holds no cell".into());
+    }
+    let (mut canvas_height, mut canvas_width) = (align(height), align(width));
+    if canvas_height * canvas_width < min_pixels {
+        let scale = (min_pixels as f64 / (height as f64 * width as f64)).sqrt();
+        canvas_height = align(((height as f64 * scale).ceil() as usize).max(1));
+        canvas_width = align(((width as f64 * scale).ceil() as usize).max(1));
+    }
+    if canvas_height * canvas_width > max_pixels {
+        let (mut low, mut high) = (1usize, height);
+        (canvas_height, canvas_width) = (cell, cell);
+        while low <= high {
+            let content_height = (low + high) / 2;
+            let content_width = ((width * content_height) / height).max(1);
+            let candidate = (align(content_height), align(content_width));
+            if candidate.0 * candidate.1 <= max_pixels {
+                (canvas_height, canvas_width) = candidate;
+                low = content_height + 1;
+            } else {
+                high = content_height - 1;
+            }
+        }
+    }
+    let mut scale = (canvas_height as f64 / height as f64).min(canvas_width as f64 / width as f64);
+    if height * width >= min_pixels {
+        scale = scale.min(1.0);
+    }
+    let content = |side: usize, canvas: usize| ((side as f64 * scale).floor() as usize).clamp(1, canvas);
+    Ok(Target {
+        canvas: (canvas_height, canvas_width),
+        content: (content(height, canvas_height), content(width, canvas_width)),
+    })
 }
 
 /// Qwen3-VL `smart_resize`: sides rounded half to even to multiples of
@@ -386,6 +576,69 @@ fn cell_budget_size(
             .ok_or_else(|| String::from("resized image extent overflows"))
     };
     Ok((side(best.0)?, side(best.1)?))
+}
+
+/// Nemotron Omni `_compute_target_patches` (image path), in f64 as the
+/// released processor computes it: each side's patch count rounded up (by
+/// Python's half-to-even `round(n + 0.5)`), scaled down into `max_patches`
+/// (the processor's per-image token budget), scaled up to `min_patches` when
+/// the budget exceeds it, then each side moved to a multiple of `merge`: up
+/// when the tile stays within the budget, down otherwise.
+fn patch_bounds_size(
+    height: usize,
+    width: usize,
+    patch: usize,
+    merge: usize,
+    min_patches: usize,
+    max_patches: usize,
+) -> Result<(usize, usize), String> {
+    let closest = |side: usize| (side as f64 / patch as f64 + 0.5).round_ties_even();
+    let (closest_height, closest_width) = (closest(height), closest(width));
+    let factor = (max_patches as f64 / (closest_height * closest_width))
+        .sqrt()
+        .min(1.0);
+    let mut rows = (factor * closest_height).floor() as usize;
+    let mut columns = (factor * closest_width).floor() as usize;
+    let patches = rows
+        .checked_mul(columns)
+        .ok_or("resized image extent overflows")?;
+    if max_patches > min_patches && patches < min_patches {
+        if patches == 0 {
+            return Err("image resizes to no patch".into());
+        }
+        let up = (min_patches as f64 / patches as f64).sqrt();
+        rows = (up * rows as f64).ceil() as usize;
+        columns = (up * columns as f64).ceil() as usize;
+    }
+    let fits = |rows: usize, columns: usize| {
+        rows.checked_mul(columns)
+            .is_some_and(|patches| patches <= max_patches)
+    };
+    let remainder = rows % merge;
+    if remainder != 0 {
+        rows = if fits(rows + merge - remainder, columns) {
+            rows + merge - remainder
+        } else {
+            merge.max(rows - remainder)
+        };
+    }
+    let remainder = columns % merge;
+    if remainder != 0 {
+        columns = if fits(rows, columns + merge - remainder) {
+            columns + merge - remainder
+        } else {
+            merge.max(columns - remainder)
+        };
+    }
+    if rows == 0 || columns == 0 || !fits(rows, columns) {
+        return Err("resized image is outside the patch bounds".into());
+    }
+    let side = |patches: usize| {
+        patches
+            .checked_mul(patch)
+            .ok_or_else(|| String::from("resized image extent overflows"))
+    };
+    Ok((side(rows)?, side(columns)?))
 }
 
 /// CPython's `hash((a, b))` of two small non-negative integers

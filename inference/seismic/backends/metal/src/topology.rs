@@ -1,0 +1,52 @@
+//! The Metal backend's description of its devices in the topology's terms
+//! (`seismic_topology::MetalReport`).
+
+use crate::DeviceHandle;
+use seismic_lang::registry::BackendName;
+use seismic_native_target::ArtifactStore;
+use seismic_topology::{Diagnostic, HostReads, KindMemory, KindReport, MetalReport, Reach};
+
+/// The id of the backend's one kind ([`kind`]).
+pub const SHARED_KIND: u32 = 0;
+
+/// The backend's one kind: shared storage mode, which every contract is
+/// allocated in, in host RAM on a device whose memory is the host's.
+pub fn kind() -> KindReport {
+    KindReport {
+        id: SHARED_KIND,
+        name: "shared storage".into(),
+        reach: Reach::Mapped { reads: HostReads::Cached },
+        memory: KindMemory::HostRam,
+    }
+}
+
+/// Every Metal device's report, with its handle, which status samples
+/// read; that there is none, as `diagnostics`. A device's capability probes
+/// answer its language and tensor-operation support, read from `store` and
+/// compiled only where it lacks them (`profile::probe_answers`).
+pub fn describe(
+    diagnostics: &mut Vec<Diagnostic>,
+    store: &dyn ArtifactStore,
+) -> Vec<(MetalReport, DeviceHandle)> {
+    let handles = DeviceHandle::discover();
+    if handles.is_empty() {
+        diagnostics.push(Diagnostic::no_device(BackendName::Metal));
+    }
+    handles
+        .into_iter()
+        .map(|handle| {
+            let answers = crate::profile::probe_answers(&handle, store);
+            let report = MetalReport {
+                registry_id: handle.registry_id(),
+                name: handle.name(),
+                unified: handle.has_unified_memory(),
+                tensor_operations: answers.forms_tensor_operations(&handle),
+                admission: answers.language().map(|_| ()).map_err(|error| error.to_string()),
+                working_set: handle.recommended_working_set_bytes(),
+                max_allocation: handle.max_allocation_bytes(),
+                kind: kind(),
+            };
+            (report, handle)
+        })
+        .collect()
+}

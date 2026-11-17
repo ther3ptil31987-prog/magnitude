@@ -4,7 +4,13 @@
 #define ATTENTION_I uint(0)
 #define ATTENTION_U uint(0)
 #define ATTENTION_FRESH (SEISMIC_DIM_F != 0)
+#define ATTENTION_QUERY_NORM false
 #define ATTENTION_NORM (SEISMIC_DIM_N != 0)
+#define ATTENTION_STORED_KEY (SEISMIC_DIM_VK != 0)
+#define ATTENTION_KEY_ROUNDING                                                                                 \
+    (SEISMIC_DIM_KR != 0 ? rounding_of(SEISMIC_PARAM_KEY_BLOCK, SEISMIC_PARAM_KEY_ELEMENT, SEISMIC_PARAM_KEY_SCALE, \
+                               SEISMIC_PARAM_KEY_AMAX_FLOOR)                                                    \
+                         : rounding_none())
 #define ATTENTION_VALUE_NORM (SEISMIC_DIM_NV != 0)
 #define ATTENTION_SOFTPLUS false
 #define ATTENTION_QUERY_BUFFER 0ul
@@ -16,25 +22,20 @@
 #include "lib/attention/history.glsl"
 
 void attention_append_dense() {
-    const uint64_t item = uint64_t(gl_WorkGroupID.x) * 8ul + uint64_t(SEISMIC_SUBGROUP);
-    const uint64_t row = item / uint64_t(ATTENTION_KV);
-    const uint kv_head = uint(item % uint64_t(ATTENTION_KV));
+    // Item (row, kv_head) of each of a group's 8 subgroups.
+    uint64_t row, head;
+    seismic_split_group(gl_WorkGroupID.x, 8u, SEISMIC_SUBGROUP, ATTENTION_KV, row, head);
+    const uint kv_head = uint(head);
     const uint lane = SEISMIC_LANE;
     if (!ATTENTION_FRESH || row >= SEISMIC_DIM_M) return;
     const int destination = element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_DESTINATIONS) + row * 4ul);
     if (destination < 0) return;
-    const attention_history h = attention_dense_history(SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_KEY),
-        SEISMIC_PTR(SEISMIC_BUFFER_HISTORY_VALUE));
-    const uint64_t source = (row * uint64_t(ATTENTION_KV) + uint64_t(kv_head)) * uint64_t(ATTENTION_W);
-    const float epsilon = element_word_f32(SEISMIC_PARAM_EPSILON);
+    const attention_history h = attention_dense_history(SEISMIC_OUT_HISTORY_KEY, SEISMIC_OUT_HISTORY_VALUE);
     float x[ATTENTION_E];
-    attention_prepare(SEISMIC_PTR(SEISMIC_BUFFER_KEY) + source * uint64_t(ELEMENT_BYTES(ELEMENT_ACT)),
-        SEISMIC_PTR(SEISMIC_BUFFER_KEY_NORM), SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES) + row * 16ul,
-        SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_COMPONENTS), SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_FREQUENCIES),
-        ATTENTION_AMPLITUDE_BUFFER, epsilon, lane, x);
-    [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i) x[i] = element_round(ELEMENT_ACT, x[i]);
-    history_append(h, true, destination, kv_head, lane, x);
-    attention_value(SEISMIC_PTR(SEISMIC_BUFFER_VALUE) + source * uint64_t(ELEMENT_BYTES(ELEMENT_ACT)),
-        ATTENTION_VALUE_NORM_BUFFER, epsilon, lane, x);
-    history_append(h, false, destination, kv_head, lane, x);
+    history_fresh_row(true, row, kv_head, lane, x);
+    history_hold(h, true, destination, kv_head, lane, false, x);
+    if (ATTENTION_STORED_KEY)
+        return;
+    history_fresh_row(false, row, kv_head, lane, x);
+    history_hold(h, false, destination, kv_head, lane, false, x);
 }

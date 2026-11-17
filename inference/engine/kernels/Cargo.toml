@@ -7,11 +7,28 @@ license.workspace = true
 [dependencies]
 seismic.workspace = true
 
+[features]
+# Development-only: the machine's line probes (`line/`), which
+# `magnitude-engine`'s `machine-line` feature enables for `magnitude-harness`
+# and `magnitude-assess`; never by a served engine.
+machine-line = ["seismic/machine-line"]
+
 [build-dependencies]
 seismic-build.workspace = true
+# The GGUF formats the registry imports (`gguf_format_tests`).
+magnitude-ggml.workspace = true
+seismic-lang.workspace = true
 
 [dev-dependencies]
+magnitude-ggml.workspace = true
 seismic-lang.workspace = true
+# The head-to-head's pool of a chosen size (`examples/kernel_h2h.rs`).
+seismic-cpu.workspace = true
+# The CPU's INT8 activation quantization, the rule every backend's follows
+# (`tests/int8_rule`).
+seismic-native-cpu.workspace = true
+# The shared test-device selector.
+seismic-native-tests.workspace = true
 seismic-std.workspace = true
-# Offline formation coverage of this crate's kernels (`tests/formation.rs`).
+# Offline formation of focused requests (`tests/priming_formation.rs`).
 seismic = { workspace = true, features = ["coverage"] }

@@ -5,29 +5,46 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+seismic-topology.workspace = true
+seismic-discovery.workspace = true
+seismic-measure.workspace = true
 seismic-ir.workspace = true
 seismic-lang.workspace = true
 seismic-compiler.workspace = true
 seismic-native-target.workspace = true
 seismic-metal.workspace = true
 seismic-cpu.workspace = true
+seismic-memory.workspace = true
+seismic-threads.workspace = true
 seismic-native-cpu.workspace = true
 seismic-cuda.workspace = true
 # Offline formation coverage forms Vulkan sources on every host.
 seismic-vulkan = { workspace = true, optional = true }
 opentelemetry = "0.33.0"
 serde.workspace = true
+postcard.workspace = true
 sha2 = "=0.11.0"
+# The artifact store's failures (writes, and stored artifacts damaged or
+# declined), as events the embedder's subscriber carries to its telemetry.
+tracing.workspace = true
 
 [features]
 # The offline formation coverage suite (`native::coverage`).
 coverage = ["dep:seismic-vulkan"]
+# Development-only: the machine's line probes' support (`magnitude-engine`'s
+# `machine-line` feature); never by a served engine.
+machine-line = []
 
 [dev-dependencies]
+# Fixture native sources (`seismic_lang::native_source::check_fixture`).
+seismic-lang = { workspace = true, features = ["fixtures"] }
 seismic-std.workspace = true
+seismic-topology = { workspace = true, features = ["fixtures"] }
 # The Vulkan prefix's formation tests run on every host.
 seismic-vulkan.workspace = true
 serde_json = "1"
+# The catalog's placement arenas, gzipped (`native::graph` tests).
+flate2.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -39,8 +56,11 @@ seismic-vulkan.workspace = true
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
-  "Win32_System_JobObjects",
-  "Win32_System_ProcessStatus",
-  "Win32_System_SystemInformation",
-  "Win32_System_Threading",
+  "Win32_System_Memory",
 ] }
+
+# Serves the probe processes it starts, as every executable that runs the
+# measurement job does.
+[[test]]
+name = "probes"
+harness = false

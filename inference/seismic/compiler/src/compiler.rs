@@ -21,11 +21,13 @@
 //! use seismic_compiler::solve::RawAssignment;
 //! ```
 
+pub mod blocks;
 pub mod candidate_domain;
 pub mod errors;
 pub mod evaluation;
 pub mod executable;
 pub mod feedback;
+pub mod graph_cost;
 pub mod implementation;
 pub mod numerics;
 pub mod planning;

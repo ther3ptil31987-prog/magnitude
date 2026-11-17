@@ -1,0 +1,173 @@
+# Metal implementations of the expert-streaming entries (routed.seismic's
+# streaming section, which holds their contract): a waiting launch spins in
+# its threadgroup on its slot until the host answers it
+# (`SEISMIC_PARKS_IN_KERNELS` 1, `streaming/park.hpp`), over the protocol
+# every backend shares (`kernels/streaming/`, the Metal shim
+# `metal/lib/streaming/control.h`). The protocol entries' unmeasured
+# geometry is every backend's (SERIAL_THREADS, LIST_THREADS,
+# REQUEST_THREADS, streaming_words.seismic).
+
+# Metal: `routed_route_shared`'s launch and parameters (so its bits). A block
+# with layers ahead (AHEAD 2) adds, while the next layer may lack an expert (its POLICY_RESOLVED
+# clear), the router GEMV threadgroups of the next layer and of the one after it
+# (`lib/routed/route.h`), dispatched before the
+# shared expert's, each lead's last to arrive ranking its rows (`rank_row`) and
+# publishing the hints into the lead's ring row (`streaming/hint.hpp`); the groups count their
+# arrivals apart and none waits for another. One of four launches is encoded
+# a run, by this layer's POLICY_WHOLE and the next layer's POLICY_RESOLVED words, each compiled with
+# only its own work:
+#   routed_route_streamed (_alone without the hints): the selecting
+#     threadgroup resolves and assigns and, when a choice is absent,
+#     publishes the request under system-scope fences
+#     (`lib/streaming/control.h`).
+#   routed_route_whole (_alone without the hints): `routed_route_shared`
+#     whose selecting lanes resolve their hits and write the routing record
+#     from their registers.
+native routed_route_streamed for metal from "metal/routed_route_streamed.metal":
+    static (H, PT, NM, E, K, S, ES, TM)
+    where H % 32 == 0 and E <= 1024 and K <= 32
+    project dense segmented (router, shared_router, (shared_gate, shared_up)) rows rms publishes (result 0) ordered (router, shared_router)
+    scratch logits bytes (M * (E + 1) * 4)
+    scratch arrivals bytes (4) sync
+
+native routed_hint_route for metal from "metal/routed_hint_route.metal":
+    static (H, PT, NM, K, AHEAD, EN)
+    where H % 32 == 0 and EN <= 1024 and K <= 32
+    project dense segmented (next_router, after_router) rows rms ordered (next_router, after_router)
+    unless (next_policy[POLICY_RESOLVED])
+    scratch logits bytes (2 * M * EN * 4)
+    scratch arrivals bytes (4) sync
+
+native routed_select_streamed for metal from "metal/routed_select_streamed.metal":
+    static (H, E, K, ES, TM)
+    where H % 32 == 0 and E <= 1024 and K <= E and K <= 32
+    project dense single (router) rows rms ordered (router)
+    scratch logits bytes (M * E * 4)
+    scratch arrivals bytes (4) sync
+
+native routed_hint_select for metal from "metal/routed_hint_select.metal":
+    static (H, K, AHEAD, EN)
+    where H % 32 == 0 and EN <= 1024 and K <= EN and K <= 32
+    project dense segmented (next_router, after_router) rows rms ordered (next_router, after_router)
+    unless (next_policy[POLICY_RESOLVED])
+    scratch logits bytes (2 * M * EN * 4)
+    scratch arrivals bytes (4) sync
+
+# Metal: one threadgroup; its threads widen the rows into the slot through
+# system-coherent stores, then, after every thread's stores
+# (`streaming_publish_barrier`), thread 0 writes the entries, the count and
+# the step (`streaming/site.hpp`).
+native routed_site_request for metal from "metal/routed_site_request.metal":
+    static (H, K)
+    launch routed_site_request:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# Metal: `routed_down`'s launch over its projection (`lib/routed/down.h`),
+# each channel's thread then publishing its choices' projections.
+native routed_down_project for metal from "metal/routed_down_project.metal":
+    static (H, K, F)
+    records (expert_down, tier_down)
+    project routed summed (expert_down)
+
+# Metal: a thread a channel of a row (`lib/routed/down_sum.h`); every
+# threadgroup's thread 0 waits for the CPU's answer when a choice is the
+# CPU's.
+native routed_down_sited for metal from "metal/routed_down_sited.metal":
+    static (H, K)
+    launch routed_down_sited:
+        threadgroups (ceil_div(H, 256), M, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# Metal: `routed_output`'s launch over its projections
+# (`lib/routed/output.h`), each channel's thread then publishing them.
+native routed_output_project for metal from "metal/routed_output_project.metal":
+    static (H, K, F, S)
+    records (expert_down, tier_down)
+    project routed summed (expert_down) shared (shared_down)
+
+# Metal: a thread a channel of a row (`lib/routed/output_sum.h`), waiting
+# as `routed_down_sited`'s.
+native routed_output_sited for metal from "metal/routed_output_sited.metal":
+    static (H, SN, IN, K)
+    launch routed_output_sited:
+        threadgroups (ceil_div(H, 256), M, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# Metal: the landing launch (`streaming/land.hpp` over the window library,
+# `lib/streaming/window.h`, `metal/lib/streaming/land.h`): where the bank
+# places (V > 0), LAND_GROUPS threadgroups claiming (entry, item) work in
+# landing order, each item one window of a row tile of one routed tensor
+# (or a dense record's row), thread 0 awaiting the entry it claimed, one
+# threadgroup at a time polling the host's count (`streaming_land_poll`);
+# threadgroup 0 then writes each absent choice's sources
+# (`streaming/tier_wait.hpp`). Where the tier places, one threadgroup only
+# sources. Every threadgroup that sees no request returns at its first
+# look.
+native routed_land for metal from "metal/routed_land.metal":
+    static (K)
+    records (staging_gate, staging_up, staging_down, gate, up, down)
+    scratch counters bytes (4 * (LAND_ITEMS + L)) sync
+    launch routed_land:
+        threadgroups (1 + min(V, 1) * (LAND_GROUPS - 1), 1, 1)
+        unless (policy[POLICY_RESOLVED])
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (WINDOW_BYTES)
+
+native routed_step for metal from "metal/routed_step.metal":
+    launch routed_step:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (SERIAL_THREADS, 1, 1)
+
+# Metal: one threadgroup counts every choice in threadgroup memory.
+native routed_scratch_request for metal from "metal/routed_scratch_request.metal":
+    static (K, E)
+    launch routed_scratch_request:
+        threadgroups (1, 1, 1)
+        unless (resident)
+        threads_per_threadgroup (REQUEST_THREADS, 1, 1)
+
+# Metal: a round's landing launch on its park grid (`routed_scratch_grids`:
+# LAND_GROUPS threadgroups while it, or unfollowed the round before, has
+# records; round 0's always), each threadgroup's thread 0 storing the
+# round's arrival, then claiming as `routed_land`'s.
+native routed_round for metal from "metal/routed_round.metal":
+    records (conveyor_gate, conveyor_up, conveyor_down, gate, up, down)
+    scratch counters bytes (4 * (LAND_ITEMS + L)) sync
+    launch routed_round:
+        threadgroups (LAND_GROUPS, 1, 1)
+        grid (grid)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (WINDOW_BYTES)
+
+native routed_scratch_grids for metal from "metal/routed_scratch_grids.metal":
+    launch routed_scratch_grids:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (SERIAL_THREADS, 1, 1)
+
+native routed_list_grid for metal from "metal/routed_list_grid.metal":
+    launch routed_list_grid:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (LIST_THREADS, 1, 1)
+
+native routed_pass_map for metal from "metal/routed_pass_map.metal":
+    launch routed_pass_map:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (LIST_THREADS, 1, 1)
+
+# Metal: on its list's grid, each threadgroup copying its own LIST_PART-byte
+# parts of the listed records in turn.
+native routed_copy for metal from "metal/routed_copy.metal":
+    records (source, destination)
+    launch routed_copy:
+        threadgroups (LIST_GROUPS, LIST_ROWS, 1)
+        grid (grid)
+        threads_per_threadgroup (LIST_THREADS, 1, 1)
+
+# Metal: one threadgroup reads the list's count, then commits each listed
+# record after a system-scope fence (`streaming/seed.hpp`).
+native routed_seed_commit for metal from "metal/routed_seed_commit.metal":
+    static (X)
+    launch routed_seed_commit:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (LIST_THREADS, 1, 1)

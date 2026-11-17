@@ -6,28 +6,35 @@ use std::sync::Arc;
 
 use futures_util::future::BoxFuture;
 use futures_util::{StreamExt, stream};
+use magnitude_artifacts::catalog_headers::{
+    CatalogComponent, ComponentRole as HeaderRole, lock_digest,
+};
+use magnitude_service_contracts::ComponentRole;
 use magnitude_service_contracts::models::{
-    CatalogBaseId, CatalogDiagnostic, CatalogSupport, CatalogVariantId, ModelFailure, ModelFileRole, ModelPackage, ModelPackageSource,
-    ModelParameterization, ModelReleaseDate, ModelServingConfiguration, PackageValidation,
-    ParsedModelId,
+    CatalogBaseId, CatalogDiagnostic, CatalogQuant, CatalogSupport, CatalogVariantId, LabId,
+    ModelDeveloper, ModelFailure, ModelFamily, ModelFamilyStatus, ModelFileRole, ModelId,
+    ModelPackage, ModelPackageSource, ModelParameterization,
+    ModelReleaseDate, ModelServingConfiguration, PackageValidation, ParsedModelId,
     RecommendableModel, RecommendableModelCatalog, RecommendableModelCatalogProvider,
     ResolvedServableModelBundle, ServableModelBundle, ServingProfile, SpeculativeDraftSource,
     SpeculativeMethod,
 };
 use magnitude_service_contracts::{
-    ContentId, HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot, Integrity,
-    InventoryEntryId, InventoryError, InventoryModel, InventoryProperties, ModelAvailability,
-    ModelComponent, ModelLocation, ModelPreviewComponentRole, ModelPreviewComponentSource,
-    ModelPreviewSource, ModelSource, ResolvedComponent, ResolvedModel,
+    ContentId, HuggingFaceRepositoryFile, HuggingFaceRepositoryRequest,
+    HuggingFaceRepositorySnapshot, Integrity, InventoryEntryId, InventoryError, InventoryModel,
+    InventoryProperties, ModelAvailability, ModelComponent, ModelLocation,
+    ModelPreviewComponentRole, ModelPreviewComponentSource, ModelPreviewSource, ModelSource,
+    ResolvedComponent, ResolvedModel,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::cache::ModelBlobKind;
+use crate::developers::ModelDevelopers;
 use crate::inventory::ManagedModelStore;
 use crate::package_service::{
     ServableModelBundleKey, servable_model_bundle_key_for_bundle, validated_package_from_resolved,
 };
 use crate::preview::PreparedPreview;
+use crate::weight_lineage::WeightSample;
 use crate::refresh_hugging_face_repository;
 
 #[path = "../../../catalog/planner_bundle.rs"]
@@ -43,7 +50,112 @@ const MAX_PLANNER_BUNDLE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CatalogSource {
     artificial_analysis_frontier: ArtificialAnalysisFrontier,
+    labs: Vec<CatalogLab>,
+    families: Vec<CatalogFamily>,
     models: Vec<CatalogModel>,
+}
+
+/// A family of models Magnitude runs: its display name, its lab and the GGUF architectures its
+/// models declare. Each architecture the engine serves as a target belongs to exactly one family.
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CatalogFamily {
+    name: String,
+    lab: String,
+    architectures: Vec<String>,
+    status: CatalogFamilyStatus,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum CatalogFamilyStatus {
+    Supported,
+    ComingSoon,
+}
+
+/// A lab that develops catalog models: its display name, its country (ISO 3166-1 alpha-2) and the
+/// Hugging Face organizations it publishes under, which attribute models outside the catalog.
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CatalogLab {
+    id: String,
+    name: String,
+    country: String,
+    hugging_face_organizations: Vec<String>,
+}
+
+impl CatalogLab {
+    fn developer(&self) -> ModelDeveloper {
+        ModelDeveloper {
+            lab: LabId(self.id.clone()),
+            name: self.name.clone(),
+            country: self.country.clone(),
+        }
+    }
+}
+
+impl CatalogSource {
+    /// The developer of a catalog model, whose lab `catalog_source` requires the table to hold.
+    fn developer(&self, model: &CatalogModel) -> ModelDeveloper {
+        self.lab_developer(&model.lab)
+    }
+
+    fn lab_developer(&self, lab: &str) -> ModelDeveloper {
+        self.labs
+            .iter()
+            .find(|candidate| candidate.id == lab)
+            .expect("catalog_source requires every lab a model or family names in the lab table")
+            .developer()
+    }
+
+    fn families(&self) -> Vec<ModelFamily> {
+        self.families
+            .iter()
+            .map(|family| ModelFamily {
+                name: family.name.clone(),
+                developer: self.lab_developer(&family.lab),
+                architectures: family.architectures.clone(),
+                status: match family.status {
+                    CatalogFamilyStatus::Supported => ModelFamilyStatus::Supported,
+                    CatalogFamilyStatus::ComingSoon => ModelFamilyStatus::ComingSoon,
+                },
+            })
+            .collect()
+    }
+
+    fn developers(&self) -> ModelDevelopers {
+        ModelDevelopers::new(
+            self.labs
+                .iter()
+                .map(|lab| (lab.developer(), lab.hugging_face_organizations.clone())),
+            self.models
+                .iter()
+                .filter_map(|model| {
+                    Some((CatalogBaseId::new(model.id.clone()).ok()?, LabId(model.lab.clone())))
+                })
+                .collect(),
+        )
+    }
+}
+
+/// The developers of the compiled catalog, whose source its tests validate.
+pub fn model_developers() -> &'static ModelDevelopers {
+    static DEVELOPERS: std::sync::LazyLock<ModelDevelopers> = std::sync::LazyLock::new(|| {
+        catalog_source()
+            .expect("the compiled catalog source is valid")
+            .developers()
+    });
+    &DEVELOPERS
+}
+
+/// The model families of the compiled catalog, whose source its tests validate.
+pub fn model_families() -> &'static [ModelFamily] {
+    static FAMILIES: std::sync::LazyLock<Vec<ModelFamily>> = std::sync::LazyLock::new(|| {
+        catalog_source()
+            .expect("the compiled catalog source is valid")
+            .families()
+    });
+    &FAMILIES
 }
 
 /// The top Artificial Analysis Intelligence Index result. Catalog intelligence is each model's
@@ -106,18 +218,111 @@ enum ArtificialAnalysisProvenance {
 struct CatalogModel {
     id: String,
     display_name: String,
+    lab: String,
     description: String,
     release_date: ModelReleaseDate,
     parameterization: ModelParameterization,
+    sources: Vec<CatalogModelSource>,
+    #[serde(default)]
+    speculative_decoding: Option<CatalogSpeculativeDecoding>,
+    /// Required of every model that is not disabled (`valid_model_score`).
+    #[serde(default)]
+    artificial_analysis: Option<ArtificialAnalysisScore>,
+    support: DeclaredSupport,
+}
+
+/// What the release promises for a catalog model, as the catalog declares it beside the model's
+/// score; the service's `CatalogSupport` carries the two together.
+#[derive(Clone, Deserialize)]
+#[serde(tag = "level", rename_all = "camelCase", deny_unknown_fields)]
+enum DeclaredSupport {
+    Supported,
+    Disabled {
+        reason: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    Deprecated {
+        since: String,
+        replacement: ModelId,
+        reason: String,
+    },
+}
+
+impl DeclaredSupport {
+    fn is_deprecated(&self) -> bool {
+        matches!(self, Self::Deprecated { .. })
+    }
+
+    fn is_available(&self) -> bool {
+        matches!(self, Self::Supported)
+    }
+}
+
+impl CatalogModel {
+    /// The model's support with its intelligence score, which `catalog_source` requires of every
+    /// model that is not disabled (`valid_model_score`).
+    fn rated_support(&self, frontier: &ArtificialAnalysisFrontier) -> CatalogSupport {
+        let intelligence = self
+            .artificial_analysis
+            .as_ref()
+            .map(|artificial_analysis| frontier.intelligence(artificial_analysis));
+        let rated =
+            || intelligence.expect("catalog_source scores every model that is not disabled");
+        match &self.support {
+            DeclaredSupport::Supported => CatalogSupport::Supported {
+                intelligence: rated(),
+            },
+            DeclaredSupport::Disabled { reason } => CatalogSupport::Disabled {
+                reason: reason.clone(),
+                intelligence,
+            },
+            DeclaredSupport::Deprecated {
+                since,
+                replacement,
+                reason,
+            } => CatalogSupport::Deprecated {
+                since: since.clone(),
+                replacement: replacement.clone(),
+                reason: reason.clone(),
+                intelligence: rated(),
+            },
+        }
+    }
+
+    /// Every variant, with the source that publishes it.
+    fn variants(&self) -> impl Iterator<Item = (&CatalogModelSource, &CatalogVariant)> {
+        self.sources
+            .iter()
+            .flat_map(|source| source.variants.iter().map(move |variant| (source, variant)))
+    }
+
+    /// Every repository a variant of the model resolves from: its sources' and a separately
+    /// packaged draft's.
+    fn repositories(&self) -> impl Iterator<Item = &str> {
+        self.sources
+            .iter()
+            .map(|source| source.repository.as_str())
+            .chain(self.draft_repository())
+    }
+
+    fn draft_repository(&self) -> Option<&str> {
+        self.speculative_decoding
+            .as_ref()
+            .and_then(|speculative| speculative.draft.file())
+            .map(|(repository, _)| repository)
+    }
+}
+
+/// One repository's publication of a model: the variants it hosts, the projector they share and
+/// the license it grants.
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CatalogModelSource {
     repository: String,
     variants: Vec<CatalogVariant>,
     #[serde(default)]
     projector: Option<CatalogProjectorSource>,
-    #[serde(default)]
-    speculative_decoding: Option<CatalogSpeculativeDecoding>,
     license: String,
-    artificial_analysis: ArtificialAnalysisScore,
-    support: CatalogSupport,
 }
 
 #[derive(Clone, Deserialize)]
@@ -125,8 +330,9 @@ struct CatalogModel {
 struct CatalogVariant {
     variant_id: String,
     format: String,
+    #[serde(default)]
+    path: Option<PathBuf>,
     variant_label: String,
-    fidelity_rank: u32,
     quantization_aware: bool,
 }
 
@@ -147,11 +353,7 @@ struct CatalogSpeculativeDecoding {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum CatalogSpeculativeDraftSource {
     Embedded,
-    File {
-        #[serde(default)]
-        repository: Option<String>,
-        path: PathBuf,
-    },
+    File { repository: String, path: PathBuf },
 }
 
 #[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -164,6 +366,8 @@ enum CatalogSpeculativeMethod {
     DFlash2,
     #[serde(rename = "dspark")]
     DSpark,
+    #[serde(rename = "lilicorr")]
+    LiLiCorr,
 }
 
 impl From<CatalogSpeculativeMethod> for SpeculativeMethod {
@@ -173,18 +377,16 @@ impl From<CatalogSpeculativeMethod> for SpeculativeMethod {
             CatalogSpeculativeMethod::DFlash => Self::DFlash,
             CatalogSpeculativeMethod::DFlash2 => Self::DFlash2,
             CatalogSpeculativeMethod::DSpark => Self::DSpark,
+            CatalogSpeculativeMethod::LiLiCorr => Self::LiLiCorr,
         }
     }
 }
 
 impl CatalogSpeculativeDraftSource {
-    fn file<'a>(&'a self, target_repository: &'a str) -> Option<(&'a str, &'a Path)> {
+    fn file(&self) -> Option<(&str, &Path)> {
         match self {
             Self::Embedded => None,
-            Self::File { repository, path } => Some((
-                repository.as_deref().unwrap_or(target_repository),
-                path.as_path(),
-            )),
+            Self::File { repository, path } => Some((repository, path)),
         }
     }
 }
@@ -213,6 +415,31 @@ struct ReleasePlannerPackage {
     properties: InventoryProperties,
     primary_gguf: PathBuf,
     components: Vec<ReleasePlannerComponent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    weight_sample: Option<ReleasePlannerWeightSample>,
+}
+
+/// A target's weight sample (see [`WeightSample`]), stored in the bundle as an input of its own,
+/// so the variants of one model, whose sampled weights are the same bytes, share it.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReleasePlannerWeightSample {
+    digest: String,
+    size_bytes: u64,
+}
+
+impl ReleasePlannerPackage {
+    /// Every bundle input the package names, with its declared size.
+    fn inputs(&self) -> impl Iterator<Item = (&str, u64)> {
+        self.components
+            .iter()
+            .map(|component| (component.header_digest.as_str(), component.header_size_bytes))
+            .chain(
+                self.weight_sample
+                    .iter()
+                    .map(|sample| (sample.digest.as_str(), sample.size_bytes)),
+            )
+    }
 }
 
 impl ReleasePlannerInput {
@@ -221,15 +448,8 @@ impl ReleasePlannerInput {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ModelCatalogLockEntry {
-    pub target: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub speculative_draft: Option<String>,
-}
-
-pub type ModelCatalogLock = BTreeMap<String, ModelCatalogLockEntry>;
+/// The immutable commit of every repository the catalog resolves from, by repository.
+pub type ModelCatalogLock = BTreeMap<String, String>;
 
 /// One package component's assessment material: its exact GGUF header (every byte through the
 /// aligned tensor-data offset), which is what the engine's header-only planning and chat
@@ -250,6 +470,7 @@ pub struct GeneratedReleaseCatalog {
 
 #[derive(Clone)]
 pub struct ReleaseCatalog {
+    weight_samples: Arc<BTreeMap<ServableModelBundleKey, WeightSample>>,
     catalog: RecommendableModelCatalog,
     planner_inputs: Arc<BTreeMap<ServableModelBundleKey, ReleasePlannerInput>>,
     planner_bundle: Arc<PlannerBundle<'static>>,
@@ -268,47 +489,70 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
             "invalid Artificial Analysis frontier declaration".to_owned(),
         ));
     }
+    if !valid_labs(&source.labs) {
+        return Err(InventoryError::Integrity(
+            "invalid or duplicate catalog lab declaration".to_owned(),
+        ));
+    }
+    if !valid_families(&source.families, &source.labs) {
+        return Err(InventoryError::Integrity(
+            "invalid or duplicate catalog family declaration".to_owned(),
+        ));
+    }
     let mut ids = BTreeSet::new();
     let mut presentations = BTreeSet::new();
     for model in &source.models {
+        let variant_count = model.variants().count();
         let variant_ids = model
-            .variants
-            .iter()
-            .map(|variant| variant.variant_id.as_str())
-            .collect::<BTreeSet<_>>();
-        let formats = model
-            .variants
-            .iter()
-            .map(|variant| variant.format.as_str())
+            .variants()
+            .map(|(_, variant)| variant.variant_id.as_str())
             .collect::<BTreeSet<_>>();
         let variant_labels = model
-            .variants
+            .variants()
+            .map(|(_, variant)| variant.variant_label.as_str())
+            .collect::<BTreeSet<_>>();
+        let repositories = model
+            .sources
             .iter()
-            .map(|variant| variant.variant_label.as_str())
+            .map(|source| source.repository.as_str())
             .collect::<BTreeSet<_>>();
         if !valid_identity_component(&model.id)
             || model.display_name.is_empty()
             || model.description.is_empty()
             || !valid_parameterization(&model.parameterization)
-            || model.repository.is_empty()
-            || model.variants.is_empty()
-            || variant_ids.len() != model.variants.len()
-            || formats.len() != model.variants.len()
-            || variant_labels.len() != model.variants.len()
-            || model.variants.iter().any(|variant| {
+            || model.sources.is_empty()
+            || repositories.len() != model.sources.len()
+            || model.sources.iter().any(|source| {
+                // A format selects its variant's primary GGUF among its repository's files.
+                let formats = source
+                    .variants
+                    .iter()
+                    .map(|variant| variant.format.as_str())
+                    .collect::<BTreeSet<_>>();
+                source.repository.is_empty()
+                    || source.variants.is_empty()
+                    || formats.len() != source.variants.len()
+                    || source
+                        .projector
+                        .as_ref()
+                        .is_some_and(|projector| projector.path.as_os_str().is_empty())
+                    || source.license.is_empty()
+            })
+            || variant_ids.len() != variant_count
+            || variant_labels.len() != variant_count
+            || model.variants().any(|(_, variant)| {
                 !valid_variant_id(&variant.variant_id)
                     || variant.format.is_empty()
                     || variant.format.trim() != variant.format.as_str()
+                    || variant
+                        .path
+                        .as_ref()
+                        .is_some_and(|path| path.as_os_str().is_empty())
                     || variant.variant_label.is_empty()
                     || variant.variant_label.trim() != variant.variant_label.as_str()
                     || variant.variant_label.contains('(')
                     || variant.variant_label.contains(')')
-                    || variant.fidelity_rank == 0
             })
-            || model
-                .projector
-                .as_ref()
-                .is_some_and(|projector| projector.path.as_os_str().is_empty())
             || model
                 .speculative_decoding
                 .as_ref()
@@ -318,24 +562,21 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
                         (
                             CatalogSpeculativeMethod::DFlash
                                 | CatalogSpeculativeMethod::DFlash2
-                                | CatalogSpeculativeMethod::DSpark,
+                                | CatalogSpeculativeMethod::DSpark
+                                | CatalogSpeculativeMethod::LiLiCorr,
                             CatalogSpeculativeDraftSource::Embedded
                         )
                     ) || match &speculative.draft {
                         CatalogSpeculativeDraftSource::Embedded => false,
                         CatalogSpeculativeDraftSource::File { repository, path } => {
-                            repository.as_ref().is_some_and(String::is_empty)
-                                || path.as_os_str().is_empty()
+                            repository.is_empty() || path.as_os_str().is_empty()
                         }
                     }
                 })
-            || model.license.is_empty()
-            || !valid_artificial_analysis(
-                &model.artificial_analysis,
-                &source.artificial_analysis_frontier,
-            )
+            || !valid_model_score(model, &source.artificial_analysis_frontier)
+            || !source.labs.iter().any(|lab| lab.id == model.lab)
             || !ids.insert(model.id.as_str())
-            || model.variants.iter().any(|variant| {
+            || model.variants().any(|(_, variant)| {
                 !presentations.insert((model.display_name.as_str(), variant.variant_label.as_str()))
             })
         {
@@ -358,13 +599,51 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
     Ok(source)
 }
 
+/// Every lab has an identity-component ID, a name, an ISO 3166-1 alpha-2 country and at least one
+/// Hugging Face organization; no two labs share an ID or an organization (ignoring case).
+fn valid_labs(labs: &[CatalogLab]) -> bool {
+    let mut ids = BTreeSet::new();
+    let mut organizations = BTreeSet::new();
+    !labs.is_empty()
+        && labs.iter().all(|lab| {
+            valid_identity_component(&lab.id)
+                && ids.insert(lab.id.as_str())
+                && valid_non_empty(&lab.name)
+                && lab.country.len() == 2
+                && lab.country.bytes().all(|byte| byte.is_ascii_uppercase())
+                && !lab.hugging_face_organizations.is_empty()
+                && lab.hugging_face_organizations.iter().all(|organization| {
+                    valid_identity_component(organization)
+                        && !organization.contains('/')
+                        && organizations.insert(organization.to_lowercase())
+                })
+        })
+}
+
+/// Every family has a unique name, a lab in the lab table and at least one architecture, and no
+/// architecture belongs to two families.
+fn valid_families(families: &[CatalogFamily], labs: &[CatalogLab]) -> bool {
+    let mut names = BTreeSet::new();
+    let mut architectures = BTreeSet::new();
+    !families.is_empty()
+        && families.iter().all(|family| {
+            valid_non_empty(&family.name)
+                && names.insert(family.name.as_str())
+                && labs.iter().any(|lab| lab.id == family.lab)
+                && !family.architectures.is_empty()
+                && family.architectures.iter().all(|architecture| {
+                    valid_non_empty(architecture) && architectures.insert(architecture.as_str())
+                })
+        })
+}
+
 /// A deprecation names its date and reason, and its replacement is an exact supported catalog
 /// configuration of another model.
 fn valid_catalog_support(model: &CatalogModel, source: &CatalogSource) -> bool {
     match &model.support {
-        CatalogSupport::Supported => true,
-        CatalogSupport::Disabled { reason } => valid_non_empty(reason),
-        CatalogSupport::Deprecated {
+        DeclaredSupport::Supported => true,
+        DeclaredSupport::Disabled { reason } => valid_non_empty(reason),
+        DeclaredSupport::Deprecated {
             since,
             replacement,
             reason,
@@ -384,12 +663,20 @@ fn valid_catalog_support(model: &CatalogModel, source: &CatalogSource) -> bool {
                             candidate.id == base_id.as_str()
                                 && candidate.support.is_available()
                                 && candidate
-                                    .variants
-                                    .iter()
-                                    .any(|variant| variant.variant_id == variant_id.as_str())
+                                    .variants()
+                                    .any(|(_, variant)| variant.variant_id == variant_id.as_str())
                         })
                 }
         }
+    }
+}
+
+/// Every model that is not disabled has a score; a disabled one may have none, and a score it has is
+/// valid.
+fn valid_model_score(model: &CatalogModel, frontier: &ArtificialAnalysisFrontier) -> bool {
+    match &model.artificial_analysis {
+        Some(artificial_analysis) => valid_artificial_analysis(artificial_analysis, frontier),
+        None => matches!(model.support, DeclaredSupport::Disabled { .. }),
     }
 }
 
@@ -450,7 +737,7 @@ fn valid_https_url(value: &str) -> bool {
         && !value.chars().any(char::is_whitespace)
 }
 
-fn is_projector_path(path: &Path) -> bool {
+pub(crate) fn is_projector_path(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
@@ -462,9 +749,10 @@ fn is_projector_path(path: &Path) -> bool {
 
 fn resolve_projector_path(
     declaration: &CatalogModel,
+    source: &CatalogModelSource,
     snapshot: &HuggingFaceRepositorySnapshot,
 ) -> Result<Option<PathBuf>, InventoryError> {
-    let projector = if let Some(projector) = &declaration.projector {
+    let projector = if let Some(projector) = &source.projector {
         if !is_projector_path(&projector.path)
             || !snapshot
                 .gguf_files
@@ -497,14 +785,20 @@ fn resolve_projector_path(
             }
         }
     };
+    // An embedded MTP head embeds every prompt token, so it cannot enter the
+    // projector's media rows. A separately packaged assistant reads the
+    // target's history, media rows included, and keeps none of its own.
     if projector.is_some()
         && declaration
             .speculative_decoding
             .as_ref()
-            .is_some_and(|speculative| speculative.method == CatalogSpeculativeMethod::Mtp)
+            .is_some_and(|speculative| {
+                speculative.method == CatalogSpeculativeMethod::Mtp
+                    && matches!(speculative.draft, CatalogSpeculativeDraftSource::Embedded)
+            })
     {
         return Err(InventoryError::Integrity(format!(
-            "{} combines a projector with MTP, which cannot process projector embedding batches",
+            "{} combines a projector with embedded MTP, which cannot enter projector media rows",
             declaration.id
         )));
     }
@@ -534,25 +828,36 @@ pub(crate) fn valid_variant_id(value: &str) -> bool {
     )
 }
 
+/// The compiled catalog lock's identity (`magnitude_artifacts::catalog_headers::lock_digest`).
+pub fn catalog_lock_digest() -> String {
+    lock_digest(CATALOG_LOCK.as_bytes())
+}
+
+/// The SHA-256 of the curated catalog source (`catalog/models.json`) this build holds, in hex.
+pub fn catalog_source_digest() -> String {
+    lock_digest(CATALOG_SOURCE.as_bytes())
+}
+
 pub fn model_catalog_lock() -> Result<ModelCatalogLock, InventoryError> {
     model_catalog_lock_from(CATALOG_LOCK.as_bytes(), &catalog_source()?)
 }
 
 /// Which catalog entries a lock update resolves to their repositories' current commits. Every
-/// other entry keeps its locked revisions.
+/// other repository keeps its locked revision.
 pub enum CatalogLockAdvance {
     All,
     Models(BTreeSet<String>),
 }
 
-/// Advance the selected catalog entries to their repositories' current commits. A deprecated
-/// model is never advanced: its locked revisions are what keep existing installs identifiable.
+/// Advance the selected catalog entries' repositories to their current commits. A repository a
+/// deprecated model resolves from is never advanced: its locked revision is what keeps existing
+/// installs identifiable.
 pub async fn advance_model_catalog_lock(
     models: Arc<ManagedModelStore>,
     advance: CatalogLockAdvance,
 ) -> Result<ModelCatalogLock, InventoryError> {
     let source = catalog_source()?;
-    // The compiled lock need not cover models declared since it was written, so only its
+    // The compiled lock need not cover repositories declared since it was written, so only its
     // syntax is checked here; the advanced lock is validated in full below.
     let current: ModelCatalogLock = serde_json::from_str(CATALOG_LOCK).map_err(|error| {
         InventoryError::Integrity(format!("invalid model catalog lock: {error}"))
@@ -570,74 +875,56 @@ pub async fn advance_model_catalog_lock(
             "{id} is not an advanceable catalog model; deprecated models keep their locked revisions"
         )));
     }
-    let resolved = stream::iter(source.models.clone())
-        .map(|declaration| {
+    let kept = source
+        .models
+        .iter()
+        .filter(|model| model.support.is_deprecated())
+        .flat_map(CatalogModel::repositories)
+        .collect::<BTreeSet<_>>();
+    let advanced = source
+        .models
+        .iter()
+        .filter(|model| match &advance {
+            CatalogLockAdvance::All => true,
+            CatalogLockAdvance::Models(ids) => ids.contains(&model.id),
+        })
+        .flat_map(CatalogModel::repositories)
+        .filter(|repository| !kept.contains(repository))
+        .collect::<BTreeSet<_>>();
+    let repositories = source
+        .models
+        .iter()
+        .flat_map(CatalogModel::repositories)
+        .collect::<BTreeSet<_>>();
+    let resolved = stream::iter(repositories)
+        .map(|repository| {
             let models = Arc::clone(&models);
-            let advanced = !declaration.support.is_deprecated()
-                && match &advance {
-                    CatalogLockAdvance::All => true,
-                    CatalogLockAdvance::Models(ids) => ids.contains(&declaration.id),
-                };
-            let locked = current.get(&declaration.id).cloned();
+            let advanced = advanced.contains(repository);
+            let locked = current.get(repository).cloned();
             async move {
-                let entry_id = declaration.id;
                 if !advanced {
-                    return locked.map(|entry| (entry_id.clone(), entry)).ok_or_else(|| {
-                        InventoryError::Integrity(format!(
-                            "catalog entry {entry_id} has no locked revision to keep"
-                        ))
-                    });
+                    return locked
+                        .map(|commit| (repository.to_owned(), commit))
+                        .ok_or_else(|| {
+                            InventoryError::Integrity(format!(
+                                "catalog repository {repository} has no locked revision to keep"
+                            ))
+                        });
                 }
-                let target_repository = declaration.repository;
-                let target = refresh_hugging_face_repository(
+                let snapshot = refresh_hugging_face_repository(
                     &models,
                     HuggingFaceRepositoryRequest {
-                        repository: target_repository.clone(),
+                        repository: repository.to_owned(),
                         revision: "main".to_owned(),
                     },
                 )
                 .await
                 .map_err(|error| {
                     InventoryError::Upstream(format!(
-                        "failed to resolve catalog entry {entry_id}: {error}"
+                        "failed to resolve catalog repository {repository}: {error}"
                     ))
                 })?;
-                let speculative_draft = match declaration
-                    .speculative_decoding
-                    .and_then(|speculative| match speculative.draft {
-                        CatalogSpeculativeDraftSource::Embedded => None,
-                        CatalogSpeculativeDraftSource::File { repository, .. } => {
-                            Some(repository.unwrap_or_else(|| target_repository.clone()))
-                        }
-                    }) {
-                    Some(repository) if repository == target_repository => {
-                        Some(target.commit.clone())
-                    }
-                    Some(repository) => Some(
-                        refresh_hugging_face_repository(
-                            &models,
-                            HuggingFaceRepositoryRequest {
-                                repository,
-                                revision: "main".to_owned(),
-                            },
-                        )
-                        .await
-                        .map_err(|error| {
-                            InventoryError::Upstream(format!(
-                                "failed to resolve catalog entry {entry_id} speculative draft: {error}"
-                            ))
-                        })?
-                        .commit,
-                    ),
-                    None => None,
-                };
-                Ok::<_, InventoryError>((
-                    entry_id,
-                    ModelCatalogLockEntry {
-                        target: target.commit,
-                        speculative_draft,
-                    },
-                ))
+                Ok::<_, InventoryError>((repository.to_owned(), snapshot.commit))
             }
         })
         .buffer_unordered(12)
@@ -666,35 +953,16 @@ fn validate_model_catalog_lock(
     let expected = source
         .models
         .iter()
-        .map(|model| model.id.clone())
+        .flat_map(CatalogModel::repositories)
         .collect::<BTreeSet<_>>();
-    if lock.keys().cloned().collect::<BTreeSet<_>>() != expected {
+    if !lock.keys().map(String::as_str).eq(expected) {
         return Err(InventoryError::Integrity(
-            "model catalog lock does not exactly cover models.json".to_owned(),
+            "model catalog lock does not exactly cover the repositories of models.json".to_owned(),
         ));
     }
-    if source.models.iter().any(|model| {
-        let Some(entry) = lock.get(&model.id) else {
-            return true;
-        };
-        !valid_commit(&entry.target)
-            || entry.speculative_draft.is_some()
-                != model
-                    .speculative_decoding
-                    .as_ref()
-                    .is_some_and(|speculative| {
-                        matches!(
-                            speculative.draft,
-                            CatalogSpeculativeDraftSource::File { .. }
-                        )
-                    })
-            || entry
-                .speculative_draft
-                .as_ref()
-                .is_some_and(|commit| !valid_commit(commit))
-    }) {
+    if lock.values().any(|commit| !valid_commit(commit)) {
         return Err(InventoryError::Integrity(
-            "model catalog lock contains invalid or mismatched package revisions".to_owned(),
+            "model catalog lock contains invalid package revisions".to_owned(),
         ));
     }
     Ok(())
@@ -724,18 +992,12 @@ pub fn load_release_catalog(planner_bundle_path: &Path) -> Result<ReleaseCatalog
     validate_planner_inputs(&catalog, &manifest.planner_inputs)?;
     let mut expected_inputs = BTreeMap::new();
     for input in manifest.planner_inputs.values() {
-        for component in input
-            .packages()
-            .flat_map(|package| package.components.iter())
-        {
-            if let Some(previous_size) = expected_inputs.insert(
-                component.header_digest.as_str(),
-                component.header_size_bytes,
-            ) && previous_size != component.header_size_bytes
+        for (digest, size) in input.packages().flat_map(ReleasePlannerPackage::inputs) {
+            if let Some(previous_size) = expected_inputs.insert(digest, size)
+                && previous_size != size
             {
                 return Err(InventoryError::Integrity(format!(
-                    "planner input {} has inconsistent declared sizes",
-                    component.header_digest
+                    "planner input {digest} has inconsistent declared sizes"
                 )));
             }
         }
@@ -757,10 +1019,23 @@ pub fn load_release_catalog(planner_bundle_path: &Path) -> Result<ReleaseCatalog
             )));
         }
     }
+    let mut weight_samples = BTreeMap::new();
+    for (bundle_key, input) in &manifest.planner_inputs {
+        if let Some(sample) = &input.target.weight_sample {
+            let bytes = planner_bundle
+                .input(&sample.digest)
+                .map_err(InventoryError::Integrity)?;
+            let sample = WeightSample::decode(&bytes).map_err(|error| {
+                InventoryError::Integrity(format!("invalid weight sample {}: {error}", sample.digest))
+            })?;
+            weight_samples.insert(bundle_key.clone(), sample);
+        }
+    }
     Ok(ReleaseCatalog {
         catalog,
         planner_inputs: Arc::new(manifest.planner_inputs),
         planner_bundle: Arc::new(planner_bundle),
+        weight_samples: Arc::new(weight_samples),
     })
 }
 
@@ -811,11 +1086,18 @@ fn validate_runtime_catalog(catalog: &RecommendableModelCatalog) -> Result<(), I
         || model_ids.len() != catalog.models.len()
         || target_package_ids.len() != catalog.models.len()
         || catalog.models.iter().any(|model| {
-            let (target, method) = match &model.configuration.bundle {
-                ServableModelBundle::Standalone { package } => (package, None),
-                ServableModelBundle::SpeculativeDecoding { target, method, .. } => {
-                    (target, Some(method))
-                }
+            // An embedded MTP head cannot enter the projector's media rows.
+            let (target, embedded_mtp) = match &model.configuration.bundle {
+                ServableModelBundle::Standalone { package } => (package, false),
+                ServableModelBundle::SpeculativeDecoding {
+                    target,
+                    method,
+                    draft_source,
+                } => (
+                    target,
+                    *method == SpeculativeMethod::Mtp
+                        && matches!(draft_source, SpeculativeDraftSource::Embedded),
+                ),
             };
             let projector_count = target
                 .files
@@ -826,7 +1108,7 @@ fn validate_runtime_catalog(catalog: &RecommendableModelCatalog) -> Result<(), I
                 || target.properties.maximum_context_length
                     != Some(model.configuration.profile.context_length)
                 || projector_count > 1
-                || (projector_count == 1 && method == Some(&SpeculativeMethod::Mtp))
+                || (projector_count == 1 && embedded_mtp)
                 || servable_bundle_packages(&model.configuration.bundle).any(|package| {
                     !matches!(
                         &package.source,
@@ -987,6 +1269,109 @@ impl ReleaseCatalog {
         &self.catalog
     }
 
+    /// The header digest of every bundled package file, by the file's Hub SHA-256.
+    #[must_use]
+    pub fn file_header_digests(&self) -> BTreeMap<String, String> {
+        self.planner_inputs
+            .values()
+            .flat_map(|input| input.packages())
+            .flat_map(|package| {
+                package.components.iter().filter_map(|component| {
+                    package
+                        .package
+                        .files
+                        .iter()
+                        .find(|file| file.path == component.component.path)
+                        .map(|file| (file.sha256.clone(), component.header_digest.clone()))
+                })
+            })
+            .collect()
+    }
+
+    /// Write every catalog component's exact header, extended sparsely to its file's size, under
+    /// `root` at `<repository>/<revision>/<path>`, and return them
+    /// (`magnitude_artifacts::catalog_headers`): each variant's target, draft and projector.
+    pub fn export_headers(&self, root: &Path) -> Result<Vec<CatalogComponent>, InventoryError> {
+        let mut components = Vec::new();
+        let mut written = BTreeSet::new();
+        for input in self.planner_inputs.values() {
+            let model = ModelId::catalog(&input.model_id, &input.variant_id);
+            let target = (
+                HeaderRole::Target,
+                &input.target,
+                input.target.primary_gguf.clone(),
+                &[ComponentRole::Weights, ComponentRole::Shard] as &[ComponentRole],
+            );
+            let projector = input
+                .target
+                .components
+                .iter()
+                .find(|component| component.component.role == ComponentRole::Projector)
+                .map(|projector| {
+                    (
+                        HeaderRole::Projector,
+                        &input.target,
+                        projector.component.path.clone(),
+                        &[ComponentRole::Projector] as &[ComponentRole],
+                    )
+                });
+            let draft = input.draft.as_ref().map(|draft| {
+                (
+                    HeaderRole::Draft,
+                    draft,
+                    draft.primary_gguf.clone(),
+                    &[
+                        ComponentRole::Weights,
+                        ComponentRole::Shard,
+                        ComponentRole::Draft,
+                        ComponentRole::Mtp,
+                    ] as &[ComponentRole],
+                )
+            });
+            for (role, package, path, roles) in
+                std::iter::once(target).chain(projector).chain(draft)
+            {
+                let ModelPackageSource::HuggingFace {
+                    repository,
+                    revision,
+                } = &package.package.source
+                else {
+                    return Err(InventoryError::Integrity(
+                        "release catalog package must have an immutable Hugging Face source"
+                            .to_owned(),
+                    ));
+                };
+                let component = CatalogComponent {
+                    model: model.as_str().to_owned(),
+                    role,
+                    repository: repository.clone(),
+                    revision: revision.clone(),
+                    path,
+                };
+                for file in package
+                    .components
+                    .iter()
+                    .filter(|file| roles.contains(&file.component.role))
+                {
+                    let path = root
+                        .join(repository)
+                        .join(revision)
+                        .join(&file.component.path);
+                    if written.insert(path.clone()) {
+                        let header = self
+                            .planner_bundle
+                            .input(&file.header_digest)
+                            .map_err(InventoryError::Integrity)?;
+                        write_component_header(file, &header, &path)?;
+                    }
+                }
+                components.push(component);
+            }
+        }
+        components.sort_by(|left, right| (&left.model, left.role).cmp(&(&right.model, right.role)));
+        Ok(components)
+    }
+
     pub fn resolve_bundle(
         &self,
         bundle_key: &ServableModelBundleKey,
@@ -1016,6 +1401,78 @@ impl ReleaseCatalog {
             },
         )?))
     }
+}
+
+impl ReleaseCatalog {
+    /// A release catalog of `catalog`'s declarations without release assessment material: every
+    /// bundle resolves from installed files or its pinned source instead. For tests and tools
+    /// that carry no planner bundle.
+    pub fn without_material(catalog: RecommendableModelCatalog) -> Result<Self, InventoryError> {
+        let manifest = serde_json::to_vec(&ReleasePlannerManifest {
+            planner_inputs: BTreeMap::new(),
+        })
+        .map_err(|error| InventoryError::Internal(error.to_string()))?;
+        let bytes = planner_bundle::encode(&manifest, &BTreeMap::new(), |_, _| {})
+            .map_err(InventoryError::Integrity)?;
+        let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+        Ok(Self {
+            catalog,
+            planner_inputs: Arc::new(BTreeMap::new()),
+            planner_bundle: Arc::new(PlannerBundle::parse(bytes).map_err(InventoryError::Integrity)?),
+            weight_samples: Arc::new(BTreeMap::new()),
+        })
+    }
+
+    /// This catalog with `samples` as its targets' weight samples, by bundle, as a release bundle
+    /// carries them. For tests and tools that carry no planner bundle.
+    #[must_use]
+    pub fn with_target_weight_samples(
+        mut self,
+        samples: BTreeMap<ServableModelBundleKey, WeightSample>,
+    ) -> Self {
+        self.weight_samples = Arc::new(samples);
+        self
+    }
+
+    /// The weight sample of a catalog bundle's target, when the release bundle carries one.
+    #[must_use]
+    pub fn target_weight_sample(&self, bundle_key: &ServableModelBundleKey) -> Option<&WeightSample> {
+        self.weight_samples.get(bundle_key)
+    }
+}
+
+/// One component's exact header at `path`, extended sparsely to the component's logical size so
+/// no tensor payload occupies disk.
+fn write_component_header(
+    component: &ReleasePlannerComponent,
+    header: &[u8],
+    path: &Path,
+) -> Result<(), InventoryError> {
+    if u64::try_from(header.len()).ok() != Some(component.header_size_bytes) {
+        return Err(InventoryError::Integrity(format!(
+            "planner input for {} has the wrong length",
+            component.component.path.display()
+        )));
+    }
+    write_header_file(header, component.component.size_bytes, path)
+}
+
+/// A GGUF file's exact `header` at `path`, extended sparsely to the file's `size` so no tensor
+/// payload occupies disk: it opens as the file it was read from.
+pub(crate) fn write_header_file(header: &[u8], size: u64, path: &Path) -> Result<(), InventoryError> {
+    let io = |error: std::io::Error| InventoryError::Io(error.to_string());
+    let parent = path
+        .parent()
+        .ok_or_else(|| InventoryError::Integrity("a header file has no parent".to_owned()))?;
+    fs::create_dir_all(parent).map_err(io)?;
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .map_err(io)?;
+    file.write_all(header)
+        .and_then(|()| magnitude_service_utils::sparse_file::set_sparse_len(&file, size))
+        .map_err(io)
 }
 
 /// Materialize the bundle's assessment material: each component's exact header, extended
@@ -1087,31 +1544,11 @@ fn materialize_planner_package(
     let package_identity = package.id.0.clone();
     let workspace = tempfile::tempdir().map_err(|error| InventoryError::Io(error.to_string()))?;
     for component in &artifact.components {
-        let header = header_for(component)?;
-        if u64::try_from(header.len()).ok() != Some(component.header_size_bytes) {
-            return Err(InventoryError::Integrity(format!(
-                "planner input for {} has the wrong length",
-                component.component.path.display()
-            )));
-        }
-        let path = workspace.path().join(&component.component.path);
-        let parent = path.parent().ok_or_else(|| {
-            InventoryError::Integrity("planner component has no parent".to_owned())
-        })?;
-        fs::create_dir_all(parent).map_err(|error| InventoryError::Io(error.to_string()))?;
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&path)
-            .map_err(|error| InventoryError::Io(error.to_string()))?;
-        file.write_all(&header)
-            .and_then(|()| {
-                magnitude_service_utils::sparse_file::set_sparse_len(
-                    &file,
-                    component.component.size_bytes,
-                )
-            })
-            .map_err(|error| InventoryError::Io(error.to_string()))?;
+        write_component_header(
+            component,
+            &header_for(component)?,
+            &workspace.path().join(&component.component.path),
+        )?;
     }
     let components = artifact
         .components
@@ -1178,9 +1615,8 @@ fn validate_resolved_catalog(
         .iter()
         .flat_map(|model| {
             model
-                .variants
-                .iter()
-                .map(|variant| (model.id.as_str(), variant.variant_id.as_str()))
+                .variants()
+                .map(|(_, variant)| (model.id.as_str(), variant.variant_id.as_str()))
         })
         .collect::<BTreeSet<_>>();
     if actual.len() != catalog.models.len()
@@ -1203,9 +1639,26 @@ fn validate_resolved_catalog(
                     model.model_id, model.variant_id
                 ))
             })?;
-        let expected_lock = lock.get(model.model_id.as_str()).ok_or_else(|| {
-            InventoryError::Integrity(format!("model catalog lock is missing {}", model.model_id))
-        })?;
+        let declared_source = declaration
+            .sources
+            .iter()
+            .find(|source| {
+                source
+                    .variants
+                    .iter()
+                    .any(|variant| variant.variant_id == model.variant_id.as_str())
+            })
+            .ok_or_else(|| {
+                InventoryError::Integrity(format!(
+                    "release catalog model {} variant {} has no source declaration",
+                    model.model_id, model.variant_id
+                ))
+            })?;
+        let locked = |repository: &str| {
+            lock.get(repository).ok_or_else(|| {
+                InventoryError::Integrity(format!("model catalog lock is missing {repository}"))
+            })
+        };
         let (target, draft_source, method) = match &model.configuration.bundle {
             ServableModelBundle::Standalone { package } => (package, None, None),
             ServableModelBundle::SpeculativeDecoding {
@@ -1223,37 +1676,26 @@ fn validate_resolved_catalog(
                 }),
                 Some(SpeculativeDraftSource::Embedded),
                 Some(method),
-            ) => expected_lock.speculative_draft.is_none() && method == &(*expected_method).into(),
+            ) => method == &(*expected_method).into(),
             (
                 Some(CatalogSpeculativeDecoding {
                     method: expected_method,
-                    draft: CatalogSpeculativeDraftSource::File { .. },
+                    draft:
+                        CatalogSpeculativeDraftSource::File {
+                            repository: expected_repository,
+                            path: expected_path,
+                        },
                 }),
                 Some(SpeculativeDraftSource::Separate { draft }),
                 Some(method),
             ) => {
-                let Some(expected_draft_commit) = expected_lock.speculative_draft.as_deref() else {
-                    return Err(InventoryError::Integrity(format!(
-                        "model catalog lock is missing {} speculative draft",
-                        model.model_id
-                    )));
-                };
-                let Some((expected_repository, expected_path)) = declaration
-                    .speculative_decoding
-                    .as_ref()
-                    .and_then(|speculative| speculative.draft.file(&declaration.repository))
-                else {
-                    return Err(InventoryError::Integrity(
-                        "file draft declaration lost its source".to_owned(),
-                    ));
-                };
                 method == &(*expected_method).into()
                     && package_source_matches(
                         &draft.source,
                         expected_repository,
-                        expected_draft_commit,
+                        locked(expected_repository)?,
                     )
-                    && draft.files.iter().any(|file| file.path == expected_path)
+                    && draft.files.iter().any(|file| file.path == *expected_path)
             }
             _ => false,
         };
@@ -1262,18 +1704,20 @@ fn validate_resolved_catalog(
             .iter()
             .filter(|file| file.role == ModelFileRole::Projector)
             .collect::<Vec<_>>();
-        let projector_matches = match &declaration.projector {
+        // As `resolve_projector_path` selects: the declared projector, or
+        // without a declaration the repository's sole mmproj, if any.
+        let projector_matches = match &declared_source.projector {
             Some(projector) => {
                 projector_files.len() == 1 && projector_files[0].path == projector.path
             }
-            None => projector_files.is_empty(),
+            None => projector_files.len() <= 1,
         };
         if target.properties.maximum_context_length
             != Some(model.configuration.profile.context_length)
             || !package_source_matches(
                 &target.source,
-                &declaration.repository,
-                &expected_lock.target,
+                &declared_source.repository,
+                locked(&declared_source.repository)?,
             )
             || !projector_matches
             || !speculative_matches
@@ -1302,8 +1746,9 @@ fn package_source_matches(
 }
 
 fn recommendable_model(
+    catalog: &CatalogSource,
     declaration: &CatalogModel,
-    frontier: &ArtificialAnalysisFrontier,
+    source: &CatalogModelSource,
     variant: &CatalogVariant,
     target: ModelPackage,
     draft: Option<ModelPackage>,
@@ -1375,11 +1820,14 @@ fn recommendable_model(
         variant_label: variant.variant_label.clone(),
         description: declaration.description.clone(),
         release_date: declaration.release_date.clone(),
-        license: declaration.license.clone(),
+        license: source.license.clone(),
         parameterization: declaration.parameterization.clone(),
-        intelligence: frontier.intelligence(&declaration.artificial_analysis),
-        support: declaration.support.clone(),
-        fidelity_rank: variant.fidelity_rank,
+        developer: catalog.developer(declaration),
+        support: declaration.rated_support(&catalog.artificial_analysis_frontier),
+        quant: CatalogQuant {
+            repository: source.repository.clone(),
+            name: variant.format.clone(),
+        },
         quantization_aware: variant.quantization_aware,
     })
 }
@@ -1399,7 +1847,7 @@ fn catalog_from_planner_inputs(
     }
     let mut models = Vec::new();
     for declaration in &source.models {
-        for variant in &declaration.variants {
+        for (declared_source, variant) in declaration.variants() {
             let identity = (
                 CatalogBaseId::new(declaration.id.clone())
                     .map_err(|error| InventoryError::Integrity(error.to_string()))?,
@@ -1413,8 +1861,9 @@ fn catalog_from_planner_inputs(
                 ))
             })?;
             let model = recommendable_model(
+                source,
                 declaration,
-                &source.artificial_analysis_frontier,
+                declared_source,
                 variant,
                 input.target.package.clone(),
                 input.draft.as_ref().map(|draft| draft.package.clone()),
@@ -1452,8 +1901,9 @@ impl ResolvingRecommendableCatalog {
 
     async fn resolve_model(
         &self,
+        catalog: &CatalogSource,
         declaration: &CatalogModel,
-        frontier: &ArtificialAnalysisFrontier,
+        source: &CatalogModelSource,
         variant: &CatalogVariant,
         snapshots: &BTreeMap<String, HuggingFaceRepositorySnapshot>,
     ) -> Result<
@@ -1464,35 +1914,17 @@ impl ResolvingRecommendableCatalog {
         ),
         InventoryError,
     > {
-        let snapshot = snapshots.get(&declaration.repository).ok_or_else(|| {
+        let snapshot = snapshots.get(&source.repository).ok_or_else(|| {
             InventoryError::Integrity(format!(
                 "target repository {} was not resolved",
-                declaration.repository
+                source.repository
             ))
         })?;
-        let selector = variant.format.to_ascii_lowercase();
-        let mut matches = snapshot
-            .gguf_files
-            .iter()
-            .filter(|file| {
-                let path = file.path.to_string_lossy().to_ascii_lowercase();
-                let basename = path.rsplit('/').next().unwrap_or(path.as_str());
-                path.contains(&selector)
-                    && !is_projector_path(&file.path)
-                    && !basename.contains("imatrix")
-                    && (!is_later_shard(basename) || is_first_shard(basename))
-            })
-            .collect::<Vec<_>>();
-        if matches.len() != 1 {
-            return Err(InventoryError::Integrity(format!(
-                "{} format {} resolved to {} primary files",
-                declaration.repository,
-                variant.format,
-                matches.len()
-            )));
-        }
-        let primary = matches.remove(0);
-        let projector = resolve_projector_path(declaration, snapshot)?;
+        let primary = match &variant.path {
+            Some(path) => declared_primary_gguf(snapshot, path)?,
+            None => select_primary_gguf(snapshot, &variant.format)?,
+        };
+        let projector = resolve_projector_path(declaration, source, snapshot)?;
         let additional_components = projector
             .map(|path| ModelPreviewComponentSource {
                 path,
@@ -1512,11 +1944,27 @@ impl ResolvingRecommendableCatalog {
                 snapshot,
             )
             .await?;
-        let (target, mut headers) = self.release_planner_package(target_prepared, &primary.path)?;
+        let (mut target, mut headers) =
+            self.release_planner_package(target_prepared, &primary.path)?;
+        if let Some(sample) = self
+            .models
+            .hub_weight_sample(snapshot, &primary.path)
+            .await?
+        {
+            let bytes = sample.encode();
+            let digest = planner_bundle::sha256(&bytes);
+            target.weight_sample = Some(ReleasePlannerWeightSample {
+                digest: digest.clone(),
+                size_bytes: u64::try_from(bytes.len()).map_err(|_| {
+                    InventoryError::Integrity("weight sample is too large".to_owned())
+                })?,
+            });
+            merge_content_map(&mut headers, BTreeMap::from([(digest, bytes)]))?;
+        }
         let draft = match declaration
             .speculative_decoding
             .as_ref()
-            .and_then(|speculative| speculative.draft.file(&declaration.repository))
+            .and_then(|speculative| speculative.draft.file())
         {
             Some((draft_repository, draft_path)) => {
                 let snapshot = snapshots.get(draft_repository).ok_or_else(|| {
@@ -1555,8 +2003,9 @@ impl ResolvingRecommendableCatalog {
             None => None,
         };
         let model = recommendable_model(
+            catalog,
             declaration,
-            frontier,
+            source,
             variant,
             target.package.clone(),
             draft.as_ref().map(|draft| draft.package.clone()),
@@ -1583,7 +2032,7 @@ impl ResolvingRecommendableCatalog {
             .map(|header| {
                 self.models
                     .cache
-                    .read_blob(ModelBlobKind::GgufHeader, &header.digest)
+                    .read_header(&header.digest)
                     .map(|bytes| (header.digest.clone(), bytes))
                     .ok_or_else(|| {
                         InventoryError::Integrity(format!(
@@ -1639,9 +2088,63 @@ impl ResolvingRecommendableCatalog {
             properties: prepared.model.model.properties.clone(),
             primary_gguf: primary.to_path_buf(),
             components,
+            weight_sample: None,
         };
         Ok((planner, headers))
     }
+}
+
+/// The variant's primary GGUF: the one non-projector, non-imatrix file (or first shard) whose
+/// repository path contains the variant's upstream format selector.
+fn select_primary_gguf<'a>(
+    snapshot: &'a HuggingFaceRepositorySnapshot,
+    format: &str,
+) -> Result<&'a HuggingFaceRepositoryFile, InventoryError> {
+    let selector = format.to_ascii_lowercase();
+    let matches = snapshot
+        .gguf_files
+        .iter()
+        .filter(|file| {
+            let path = file.path.to_string_lossy().to_ascii_lowercase();
+            let basename = path.rsplit('/').next().unwrap_or(path.as_str());
+            path.contains(&selector)
+                && !is_projector_path(&file.path)
+                && !basename.contains("imatrix")
+                && (!is_later_shard(basename) || is_first_shard(basename))
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [primary] => Ok(primary),
+        _ => Err(InventoryError::Integrity(format!(
+            "{} format {} resolved to {} primary files",
+            snapshot.repository,
+            format,
+            matches.len()
+        ))),
+    }
+}
+
+/// A declared primary GGUF: an exact repository file that is unsharded or a first shard.
+fn declared_primary_gguf<'a>(
+    snapshot: &'a HuggingFaceRepositorySnapshot,
+    path: &Path,
+) -> Result<&'a HuggingFaceRepositoryFile, InventoryError> {
+    let basename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    snapshot
+        .gguf_files
+        .iter()
+        .find(|file| file.path == path)
+        .filter(|_| !is_projector_path(path) && !is_later_shard(basename))
+        .ok_or_else(|| {
+            InventoryError::Integrity(format!(
+                "{} declared primary {} is not a repository GGUF or first shard",
+                snapshot.repository,
+                path.display()
+            ))
+        })
 }
 
 fn merge_content_map(
@@ -1680,22 +2183,94 @@ fn is_later_shard(name: &str) -> bool {
         })
 }
 
-fn insert_locked_repository(
-    repositories: &mut BTreeMap<String, String>,
-    repository: &str,
-    revision: &str,
-) -> Result<(), InventoryError> {
-    if let Some(existing) = repositories.insert(repository.to_owned(), revision.to_owned())
-        && existing != revision
-    {
-        return Err(InventoryError::Integrity(format!(
-            "catalog repository {repository} is locked to conflicting revisions"
+/// One catalog variant addressed by its catalog `ModelId`, with the locked repository revisions
+/// its target and separately packaged draft resolve from.
+struct LockedCatalogVariant {
+    declaration: CatalogModel,
+    source: CatalogModelSource,
+    variant: CatalogVariant,
+    repositories: BTreeMap<String, String>,
+}
+
+fn locked_catalog_variant(
+    source: &CatalogSource,
+    lock: &ModelCatalogLock,
+    id: &ModelId,
+) -> Result<LockedCatalogVariant, InventoryError> {
+    let ParsedModelId::Catalog {
+        base_id,
+        variant_id,
+    } = id.parsed()
+    else {
+        return Err(InventoryError::InvalidRequest(format!(
+            "{id} is not a catalog model ID"
         )));
-    }
-    Ok(())
+    };
+    let declaration = source
+        .models
+        .iter()
+        .find(|model| model.id == base_id.as_str())
+        .ok_or_else(|| InventoryError::NotFound(format!("catalog model {base_id}")))?;
+    let (source, variant) = declaration
+        .variants()
+        .find(|(_, variant)| variant.variant_id == variant_id.as_str())
+        .ok_or_else(|| {
+            InventoryError::NotFound(format!("catalog model {base_id} variant {variant_id}"))
+        })?;
+    let repositories = std::iter::once(source.repository.as_str())
+        .chain(declaration.draft_repository())
+        .map(|repository| {
+            lock.get(repository)
+                .map(|commit| (repository.to_owned(), commit.clone()))
+                .ok_or_else(|| {
+                    InventoryError::Integrity(format!(
+                        "model catalog lock is missing {repository}"
+                    ))
+                })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(LockedCatalogVariant {
+        declaration: declaration.clone(),
+        source: source.clone(),
+        variant: variant.clone(),
+        repositories,
+    })
 }
 
 impl ResolvingRecommendableCatalog {
+    /// Resolve one catalog variant at its locked revisions into its exact servable bundle:
+    /// the target package (with its projector), and the separately packaged draft if declared.
+    pub async fn resolve_catalog_model(
+        &self,
+        id: &ModelId,
+    ) -> Result<RecommendableModel, InventoryError> {
+        let source = catalog_source()?;
+        let lock = model_catalog_lock()?;
+        let selected = locked_catalog_variant(&source, &lock, id)?;
+        let mut snapshots = BTreeMap::new();
+        for (repository, revision) in selected.repositories {
+            let snapshot = refresh_hugging_face_repository(
+                &self.models,
+                HuggingFaceRepositoryRequest {
+                    repository: repository.clone(),
+                    revision,
+                },
+            )
+            .await?;
+            snapshots.insert(repository, snapshot);
+        }
+        let (model, _, _) = self
+            .resolve_model(
+                &source,
+                &selected.declaration,
+                &selected.source,
+                &selected.variant,
+                &snapshots,
+            )
+            .await?;
+        Ok(model)
+    }
+
     pub fn resolve_release_catalog<F>(
         &self,
         progress: F,
@@ -1736,36 +2311,8 @@ impl ResolvingRecommendableCatalog {
     where
         F: Fn(&str, usize, usize) + Send + Sync + 'static,
     {
-        let mut repositories = BTreeMap::new();
-        for declaration in &source.models {
-            let entry = lock.get(&declaration.id).ok_or_else(|| {
-                InventoryError::Integrity(format!(
-                    "model catalog lock is missing {}",
-                    declaration.id
-                ))
-            })?;
-            insert_locked_repository(&mut repositories, &declaration.repository, &entry.target)?;
-            if let Some(speculative) = &declaration.speculative_decoding {
-                if let Some((repository, _)) = speculative.draft.file(&declaration.repository) {
-                    insert_locked_repository(
-                        &mut repositories,
-                        repository,
-                        entry.speculative_draft.as_deref().ok_or_else(|| {
-                            InventoryError::Integrity(format!(
-                                "model catalog lock is missing {} speculative draft",
-                                declaration.id
-                            ))
-                        })?,
-                    )?;
-                } else if entry.speculative_draft.is_some() {
-                    return Err(InventoryError::Integrity(format!(
-                        "model catalog lock unexpectedly includes {} embedded speculative draft",
-                        declaration.id
-                    )));
-                }
-            }
-        }
-        let repositories = repositories.into_iter().collect::<Vec<_>>();
+        // The lock covers exactly the catalog's repositories (`validate_model_catalog_lock`).
+        let repositories = lock.into_iter().collect::<Vec<_>>();
         let repository_total = repositories.len();
         let mut repository_completed = 0;
         let snapshots = stream::iter(repositories)
@@ -1805,30 +2352,24 @@ impl ResolvingRecommendableCatalog {
         }
         let resolved_snapshots = &resolved_snapshots;
         let snapshot_failures = &snapshot_failures;
-        let frontier = &source.artificial_analysis_frontier;
+        let catalog = &source;
         let model_total = source.models.len();
         let mut model_completed = 0;
         let resolved =
             stream::iter(source.models.iter().cloned().enumerate())
                 .map(|(declaration_index, declaration)| async move {
-                    let mut variants = Vec::with_capacity(declaration.variants.len());
-                    for (variant_index, variant) in declaration.variants.iter().enumerate() {
-                        let missing_repository = std::iter::once(declaration.repository.as_str())
-                            .chain(declaration.speculative_decoding.iter().filter_map(
-                                |speculative| {
-                                    speculative
-                                        .draft
-                                        .file(&declaration.repository)
-                                        .map(|(repository, _)| repository)
-                                },
-                            ))
+                    let mut variants = Vec::new();
+                    for (variant_index, (source, variant)) in declaration.variants().enumerate() {
+                        let missing_repository = std::iter::once(source.repository.as_str())
+                            .chain(declaration.draft_repository())
                             .find(|repository| !resolved_snapshots.contains_key(*repository));
                         let result =
                             match missing_repository {
                                 None => {
                                     self.resolve_model(
+                                        catalog,
                                         &declaration,
-                                        frontier,
+                                        source,
                                         variant,
                                         resolved_snapshots,
                                     )
@@ -1951,6 +2492,35 @@ mod tests {
     }
 
     #[test]
+    fn every_registered_target_architecture_belongs_to_exactly_one_family() {
+        // Llama is registered only as a drafter architecture, which no family serves as a target.
+        const DRAFTER_ONLY: &[&str] = &["llama"];
+        let source = catalog_source().expect("catalog source should be valid");
+        let registered = magnitude_family_registry::FAMILIES
+            .iter()
+            .flat_map(|family| family.architectures().iter().copied())
+            .collect::<BTreeSet<_>>();
+        for architecture in registered.iter().filter(|architecture| !DRAFTER_ONLY.contains(architecture)) {
+            let families = source
+                .families
+                .iter()
+                .filter(|family| family.architectures.iter().any(|declared| declared == architecture))
+                .count();
+            assert_eq!(families, 1, "{architecture} belongs to {families} catalog families");
+        }
+        for family in &source.families {
+            for architecture in &family.architectures {
+                assert!(
+                    registered.contains(architecture.as_str())
+                        && !DRAFTER_ONLY.contains(&architecture.as_str()),
+                    "{} declares {architecture}, which is not a registered target architecture",
+                    family.name
+                );
+            }
+        }
+    }
+
+    #[test]
     fn authored_catalog_declares_valid_parameterization_for_every_model() {
         let source = catalog_source().expect("catalog source should be valid");
         assert!(
@@ -1965,11 +2535,13 @@ mod tests {
     fn projector_resolution_is_automatic_only_when_unambiguous() {
         let source = catalog_source().expect("catalog source should be valid");
         let mut declaration = source.models[0].clone();
-        declaration.projector = None;
         declaration.speculative_decoding = None;
+        let mut model_source = declaration.sources[0].clone();
+        model_source.projector = None;
         assert_eq!(
             resolve_projector_path(
                 &declaration,
+                &model_source,
                 &repository_snapshot(&["model.gguf", "mmproj-model-F16.gguf"]),
             )
             .unwrap(),
@@ -1977,6 +2549,7 @@ mod tests {
         );
         let error = resolve_projector_path(
             &declaration,
+            &model_source,
             &repository_snapshot(&[
                 "model.gguf",
                 "mmproj-model-BF16.gguf",
@@ -1988,29 +2561,47 @@ mod tests {
     }
 
     #[test]
-    fn projector_resolution_rejects_invalid_paths_and_mtp() {
+    fn projector_resolution_rejects_invalid_paths_and_embedded_mtp() {
         let source = catalog_source().expect("catalog source should be valid");
         let mut declaration = source.models[0].clone();
+        let mut model_source = declaration.sources[0].clone();
         let snapshot = repository_snapshot(&["model.gguf", "mmproj-BF16.gguf"]);
-        declaration.projector = Some(CatalogProjectorSource {
+        model_source.projector = Some(CatalogProjectorSource {
             path: PathBuf::from("mmproj-missing.gguf"),
         });
-        let error = resolve_projector_path(&declaration, &snapshot).unwrap_err();
+        let error = resolve_projector_path(&declaration, &model_source, &snapshot).unwrap_err();
         assert!(
             error
                 .to_string()
                 .contains("is not a repository mmproj GGUF")
         );
 
-        declaration.projector = Some(CatalogProjectorSource {
+        model_source.projector = Some(CatalogProjectorSource {
             path: PathBuf::from("mmproj-BF16.gguf"),
         });
         declaration.speculative_decoding = Some(CatalogSpeculativeDecoding {
             method: CatalogSpeculativeMethod::Mtp,
             draft: CatalogSpeculativeDraftSource::Embedded,
         });
-        let error = resolve_projector_path(&declaration, &snapshot).unwrap_err();
-        assert!(error.to_string().contains("combines a projector with MTP"));
+        let error = resolve_projector_path(&declaration, &model_source, &snapshot).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("combines a projector with embedded MTP")
+        );
+
+        // A separately packaged assistant reads the target's history.
+        declaration.speculative_decoding = Some(CatalogSpeculativeDecoding {
+            method: CatalogSpeculativeMethod::Mtp,
+            draft: CatalogSpeculativeDraftSource::File {
+                repository: "publisher/model-MTP".to_owned(),
+                path: PathBuf::from("mtp-gemma-4-12B-it.gguf"),
+            },
+        });
+        assert_eq!(
+            resolve_projector_path(&declaration, &model_source, &snapshot).unwrap(),
+            Some(PathBuf::from("mmproj-BF16.gguf"))
+        );
     }
 
     #[test]
@@ -2024,7 +2615,7 @@ mod tests {
             .clone();
         assert!(valid_catalog_support(&model, &source));
         let deprecated = |since: &str, replacement: &str, reason: &str| {
-            CatalogSupport::Deprecated {
+            DeclaredSupport::Deprecated {
                 since: since.to_owned(),
                 replacement: replacement.parse().expect("model ID"),
                 reason: reason.to_owned(),
@@ -2042,7 +2633,7 @@ mod tests {
                 false,
             ),
             (
-                CatalogSupport::Disabled {
+                DeclaredSupport::Disabled {
                     reason: String::new(),
                 },
                 false,
@@ -2062,7 +2653,8 @@ mod tests {
                 .models
                 .iter()
                 .filter(|model| model.support.is_deprecated())
-                .all(|model| lock.contains_key(&model.id))
+                .flat_map(CatalogModel::repositories)
+                .all(|repository| lock.contains_key(repository))
         );
     }
 
@@ -2074,7 +2666,7 @@ mod tests {
             .iter_mut()
             .find(|model| model.id == "qwen3.5-4b")
             .expect("replacement model");
-        replacement.support = CatalogSupport::Deprecated {
+        replacement.support = DeclaredSupport::Deprecated {
             since: "2026-09-27".to_owned(),
             replacement: "qwen3.5-4b:gguf:q4".parse().expect("model ID"),
             reason: "superseded".to_owned(),
@@ -2085,6 +2677,25 @@ mod tests {
             .find(|model| model.id == "bonsai-8b-q1")
             .expect("deprecated model");
         assert!(!valid_catalog_support(deprecated, &source));
+    }
+
+    #[test]
+    fn labs_have_distinct_ids_and_organizations_and_a_country_code() {
+        let source = catalog_source().expect("catalog source should be valid");
+        assert!(valid_labs(&source.labs));
+        assert!(source
+            .models
+            .iter()
+            .all(|model| source.labs.iter().any(|lab| lab.id == model.lab)));
+        let mut shared = source.labs.clone();
+        shared[1].hugging_face_organizations.push("QWEN".to_owned());
+        assert!(!valid_labs(&shared));
+        let mut duplicate = source.labs.clone();
+        duplicate[1].id = duplicate[0].id.clone();
+        assert!(!valid_labs(&duplicate));
+        let mut country = source.labs.clone();
+        country[0].country = "China".to_owned();
+        assert!(!valid_labs(&country));
     }
 
     #[test]
@@ -2116,9 +2727,12 @@ mod tests {
         let frontier = &source.artificial_analysis_frontier;
         assert!(valid_artificial_analysis_frontier(frontier));
         for model in &source.models {
-            assert!(valid_artificial_analysis(&model.artificial_analysis, frontier));
+            assert!(valid_model_score(model, frontier));
         }
-        let model = source.models[0].artificial_analysis.clone();
+        let model = source.models[0]
+            .artificial_analysis
+            .clone()
+            .expect("the first catalog model is scored");
         let above = ArtificialAnalysisScore {
             score: frontier.score + 0.1,
             ..model.clone()
@@ -2135,6 +2749,31 @@ mod tests {
                 ..frontier.clone()
             }));
         }
+    }
+
+    #[test]
+    fn only_a_disabled_model_may_have_no_score() {
+        let source = catalog_source().expect("catalog source should be valid");
+        let frontier = &source.artificial_analysis_frontier;
+        let mut model = source
+            .models
+            .iter()
+            .find(|model| model.support.is_available())
+            .expect("the catalog has a supported model")
+            .clone();
+        assert!(valid_model_score(&model, frontier));
+        model.artificial_analysis = None;
+        assert!(!valid_model_score(&model, frontier));
+        model.support = DeclaredSupport::Deprecated {
+            since: "2026-01-01".to_owned(),
+            replacement: "qwen3.5-4b:gguf:q4".parse().expect("model ID"),
+            reason: "superseded".to_owned(),
+        };
+        assert!(!valid_model_score(&model, frontier));
+        model.support = DeclaredSupport::Disabled {
+            reason: "not implemented yet".to_owned(),
+        };
+        assert!(valid_model_score(&model, frontier));
     }
 
     #[test]
@@ -2191,5 +2830,142 @@ mod tests {
             repository,
             commit,
         ));
+    }
+
+    fn select(id: &str) -> Result<LockedCatalogVariant, InventoryError> {
+        let source = catalog_source().expect("catalog source should be valid");
+        let lock = model_catalog_lock().expect("catalog lock should be valid");
+        locked_catalog_variant(&source, &lock, &id.parse().expect("valid model ID"))
+    }
+
+    #[test]
+    fn catalog_variant_selection_locks_target_and_separate_draft_repositories() {
+        let selected = select("qwen3.5-4b:gguf:q4").unwrap();
+        let lock = model_catalog_lock().unwrap();
+        assert_eq!(selected.declaration.id, "qwen3.5-4b");
+        assert_eq!(selected.variant.variant_id, "gguf:q4");
+        assert_eq!(selected.variant.format, "UD-Q4_K_XL");
+        let draft = "magnitudedev/Qwen3.5-4B-DFlash-GGUF";
+        assert_eq!(selected.declaration.draft_repository(), Some(draft));
+        assert_eq!(
+            selected.repositories,
+            BTreeMap::from([
+                (
+                    "unsloth/Qwen3.5-4B-MTP-GGUF".to_owned(),
+                    lock["unsloth/Qwen3.5-4B-MTP-GGUF"].clone()
+                ),
+                (draft.to_owned(), lock[draft].clone()),
+            ])
+        );
+    }
+
+    #[test]
+    fn catalog_variant_selection_locks_its_own_sources_repository() {
+        let lock = model_catalog_lock().unwrap();
+        let shared_draft = "unsloth/Qwen3.8-Flash-Next-GGUF";
+        for (id, repository, license) in [
+            ("qwen3.8-flash-next:gguf:q4", shared_draft, "qwen-community-1.0"),
+            (
+                "qwen3.8-flash-next:gguf:q2",
+                "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+                "apache-2.0",
+            ),
+        ] {
+            let selected = select(id).unwrap();
+            assert_eq!(selected.source.repository, repository, "{id}");
+            assert_eq!(selected.source.license, license, "{id}");
+            assert_eq!(
+                selected.repositories,
+                [repository, shared_draft]
+                    .into_iter()
+                    .map(|repository| (repository.to_owned(), lock[repository].clone()))
+                    .collect::<BTreeMap<_, _>>(),
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_variant_selection_needs_no_draft_repository_for_embedded_or_absent_drafts() {
+        let source = catalog_source().unwrap();
+        let lock = model_catalog_lock().unwrap();
+        for declaration in source
+            .models
+            .iter()
+            .filter(|declaration| declaration.draft_repository().is_none())
+        {
+            for (model_source, variant) in declaration.variants() {
+                let id = format!("{}:{}", declaration.id, variant.variant_id);
+                assert_eq!(
+                    select(&id).unwrap().repositories,
+                    BTreeMap::from([(
+                        model_source.repository.clone(),
+                        lock[&model_source.repository].clone()
+                    )]),
+                    "{id}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_variant_selection_rejects_unknown_and_non_catalog_ids() {
+        assert!(matches!(
+            select("no-such-model:gguf:q4"),
+            Err(InventoryError::NotFound(_))
+        ));
+        assert!(matches!(
+            select("qwen3.5-4b:gguf:q3"),
+            Err(InventoryError::NotFound(_))
+        ));
+        assert!(matches!(
+            select("hf:unsloth/Qwen3.5-4B-MTP-GGUF/Qwen3.5-4B-UD-Q4_K_XL.gguf"),
+            Err(InventoryError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn primary_gguf_is_the_single_format_match_excluding_projectors_imatrix_and_later_shards() {
+        let snapshot = repository_snapshot(&[
+            "Model-UD-Q4_K_XL.gguf",
+            "Model-UD-Q5_K_XL.gguf",
+            "mmproj-UD-Q4_K_XL.gguf",
+            "imatrix-UD-Q4_K_XL.gguf",
+            "Q8/Model-UD-Q8_K_XL-00001-of-00002.gguf",
+            "Q8/Model-UD-Q8_K_XL-00002-of-00002.gguf",
+        ]);
+        assert_eq!(
+            select_primary_gguf(&snapshot, "UD-Q4_K_XL").unwrap().path,
+            Path::new("Model-UD-Q4_K_XL.gguf")
+        );
+        assert_eq!(
+            select_primary_gguf(&snapshot, "ud-q8_k_xl").unwrap().path,
+            Path::new("Q8/Model-UD-Q8_K_XL-00001-of-00002.gguf")
+        );
+        assert!(select_primary_gguf(&snapshot, "Q6_K").is_err());
+        assert!(select_primary_gguf(&snapshot, "UD-Q").is_err());
+    }
+
+    #[test]
+    fn declared_primary_gguf_is_an_exact_repository_file_or_first_shard() {
+        let snapshot = repository_snapshot(&[
+            "Q8_0/Model-Q8_0-00001-of-00002.gguf",
+            "Q8_0/Model-Q8_0-00002-of-00002.gguf",
+            "MTP/mtp-Model-Q8_0.gguf",
+            "mmproj-BF16.gguf",
+        ]);
+        assert!(select_primary_gguf(&snapshot, "Q8_0").is_err());
+        assert_eq!(
+            declared_primary_gguf(&snapshot, Path::new("Q8_0/Model-Q8_0-00001-of-00002.gguf"))
+                .unwrap()
+                .path,
+            Path::new("Q8_0/Model-Q8_0-00001-of-00002.gguf")
+        );
+        assert!(
+            declared_primary_gguf(&snapshot, Path::new("Q8_0/Model-Q8_0-00002-of-00002.gguf"))
+                .is_err()
+        );
+        assert!(declared_primary_gguf(&snapshot, Path::new("mmproj-BF16.gguf")).is_err());
+        assert!(declared_primary_gguf(&snapshot, Path::new("Q8_0/Missing.gguf")).is_err());
     }
 }

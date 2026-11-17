@@ -4,7 +4,7 @@ import { lstat, unlink, chmod } from "node:fs/promises"
 import { Deferred, Effect, Option, Schema, Stream } from "effect"
 import { receiveJsonLines, sendJsonLine } from "@magnitudedev/utils/json-line-channel"
 import { ApplicationIntent, ApplicationRequest, ApplicationSnapshot, ApplicationLoginRequest, ApplicationLoginReply, LoginStartupFailed, type LoginStartupAction, type LoginStartupState } from "@magnitudedev/sdk/desktop-host"
-import { ApplicationUpdateRequest, ApplicationUpdateReply, type ApplicationUpdateAction, type ApplicationUpdateControlFailed, type DesktopUpdateState } from "@magnitudedev/sdk/desktop-host"
+import { ApplicationUpdateRequest, ApplicationUpdateReply, type ApplicationUpdateAction, type ApplicationUpdateControlFailed, type ApplicationUpdateState } from "@magnitudedev/sdk/desktop-host"
 export { ApplicationIntent, ApplicationRequest, ApplicationSnapshot } from "@magnitudedev/sdk/desktop-host"
 
 export class ApplicationControlFailed extends Schema.TaggedError<ApplicationControlFailed>()("ApplicationControlFailed", { message: Schema.String }) {}
@@ -28,10 +28,11 @@ export interface ApplicationControlOptions {
   readonly snapshot: Effect.Effect<ApplicationSnapshot>
   readonly dispatch: (intent: ApplicationIntent) => Effect.Effect<void>
   readonly login: (action: LoginStartupAction) => Effect.Effect<LoginStartupState, LoginStartupFailed>
-  readonly update: (action: ApplicationUpdateAction) => Effect.Effect<{ readonly state: DesktopUpdateState; readonly afterReply: Effect.Effect<void> }, ApplicationUpdateControlFailed>
+  readonly update: (action: ApplicationUpdateAction) => Effect.Effect<{ readonly state: ApplicationUpdateState; readonly afterReply: Effect.Effect<void> }, ApplicationUpdateControlFailed>
 }
 
-export const serveApplicationControl = (path: string, options: ApplicationControlOptions) => Effect.gen(function* () {
+/** The server profile admits every local account to its control socket, as loopback HTTP already does. */
+export const serveApplicationControl = (path: string, options: ApplicationControlOptions, sharedControl = false) => Effect.gen(function* () {
   if (process.platform === "win32") return yield* new ApplicationControlFailed({ message: "Windows application control requires the named-pipe ACL adapter" })
   yield* validateUnixControlPath(path)
   yield* Effect.tryPromise({ try: async () => {
@@ -63,7 +64,7 @@ export const serveApplicationControl = (path: string, options: ApplicationContro
       await new Promise<void>(resolve => server.close(() => resolve()))
       await unlink(path).catch(error => { if (error.code !== "ENOENT") throw error })
     }),
-  ).pipe(Effect.tap(() => Effect.tryPromise({ try: () => chmod(path, 0o600), catch: failure })), Effect.tap(() => Deferred.succeed(listening, undefined))))
+  ).pipe(Effect.tap(() => Effect.tryPromise({ try: () => chmod(path, sharedControl ? 0o666 : 0o600), catch: failure })), Effect.tap(() => Deferred.succeed(listening, undefined))))
   const worker = yield* serveApplicationRequests(connections.pipe(Stream.tapError(error => Deferred.fail(listening, error))), options)
   yield* Deferred.await(listening)
   return worker
@@ -97,16 +98,22 @@ const exchange = <Q, QI, A, AI>(path: string, requestSchema: Schema.Schema<Q, QI
     Effect.async<Socket, ApplicationControlFailed | ApplicationControlUnavailable>(resume => {
       const client = new Socket()
       client.on("error", error => resume(Effect.fail("code" in error && (error.code === "ENOENT" || error.code === "ECONNREFUSED")
-        ? new ApplicationControlUnavailable({ message: "Magnitude desktop is not running" }) : failure(error))))
+        ? new ApplicationControlUnavailable({ message: "Magnitude desktop is not running" })
+        : failure(error))))
       client.once("connect", () => resume(Effect.succeed(client)))
       client.connect(path)
       return Effect.sync(() => client.destroy())
     }),
     client => Effect.sync(() => client.destroy()),
   )
+  // An owner that exits during the exchange resets the connection instead of ending it: like a
+  // clean close, it went away without replying. Malformed replies remain failures.
+  let reset = false
+  socket.on("error", error => { if ("code" in error && (error.code === "ECONNRESET" || error.code === "EPIPE")) reset = true })
+  const departed = <E>(error: E) => reset ? new ApplicationControlClosed() : error
   // Start reading before sending so immediate replies are retained by the stream.
-  const response = yield* receiveJsonLines(socket, replySchema).pipe(Stream.take(1), Stream.runHead, Effect.forkScoped)
-  yield* sendJsonLine(socket, requestSchema, request)
+  const response = yield* receiveJsonLines(socket, replySchema).pipe(Stream.take(1), Stream.runHead, Effect.mapError(departed), Effect.forkScoped)
+  yield* sendJsonLine(socket, requestSchema, request).pipe(Effect.mapError(departed))
   const value = yield* response.await.pipe(Effect.flatten)
   return yield* Option.match(value, { onNone: () => Effect.fail(new ApplicationControlClosed()), onSome: Effect.succeed })
 })).pipe(Effect.catchTag("JsonLineChannelFailed", error => Effect.fail(new ApplicationControlFailed({ message: error.message }))), Effect.timeoutFail({ duration: timeout, onTimeout: () => new ApplicationControlFailed({ message: "Application control request timed out" }) }))

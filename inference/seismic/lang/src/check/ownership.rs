@@ -309,12 +309,15 @@ impl Checker<'_> {
                 (ValueType::Tensor(_), ir::Ownership::Owned) => {
                     ValueOwnership::Tensor(TensorOwnership::Owned { moved: false })
                 }
-                (ValueType::Tensor(_), ir::Ownership::Shared | ir::Ownership::Exclusive) => {
-                    ValueOwnership::Tensor(TensorOwnership::Borrowed {
-                        owner: place.clone(),
-                        exclusive: *access == ir::Ownership::Exclusive,
-                    })
-                }
+                // A host port's local is never in scope: it is borrowed and
+                // never used.
+                (
+                    ValueType::Tensor(_),
+                    ir::Ownership::Shared | ir::Ownership::Exclusive | ir::Ownership::Host { .. },
+                ) => ValueOwnership::Tensor(TensorOwnership::Borrowed {
+                    owner: place.clone(),
+                    exclusive: *access == ir::Ownership::Exclusive,
+                }),
                 (ValueType::Tensor(_), _) => panic!("tensor parameter lost ownership"),
                 _ => ValueOwnership::Scalar,
             }
@@ -441,7 +444,7 @@ pub(crate) fn project(value: &ir::Expr, index: usize) -> ir::Expr {
     {
         return operands[index].clone();
     }
-    ir::Expr::new(
+    let mut projected = ir::Expr::new(
         ir::ExprKind::Primitive {
             id: PrimitiveId::TupleGet(index as u32),
             operands: vec![value.clone()],
@@ -451,7 +454,11 @@ pub(crate) fn project(value: &ir::Expr, index: usize) -> ir::Expr {
         parts.as_slice()[index].clone(),
         None,
         value.span,
-    )
+    );
+    if let ir::SourceValue::Tuple(parts) = &value.value {
+        projected.value = parts[index].clone();
+    }
+    projected
 }
 pub(crate) fn argument_leaves(
     access: &ir::Ownership,

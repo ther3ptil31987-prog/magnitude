@@ -2,14 +2,12 @@
 
 use crate::Cpu;
 use cranelift_codegen::ir::{
-    self,
+    self, AbiParam, BlockArg, InstBuilder, MemFlags, Value,
     condcodes::{FloatCC, IntCC},
-    types, AbiParam, BlockArg, InstBuilder, MemFlags, Value,
+    types,
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use cranelift_jit::JITModule;
-use cranelift_module::Module;
 use seismic_ir::kernel::ops::{
     BarrierScope, BinaryOp, BitOp, Block, ClosedDensePlace, ClosedExternalGlobalPlace,
     ClosedOpView, ClosedPackedGlobalPlace, ClosedPackedPlace, ClosedPlace, ClosedPlaceKind,
@@ -22,25 +20,24 @@ use seismic_ir::physical_target::{
 };
 use seismic_ir::storage::LaunchLocalKind;
 use seismic_lang::intrinsics::MathOp;
-use seismic_lang::registry::{PlaneEncoding, PlaneInfo, PlaneRepackRecipe, RepackExpr};
+use seismic_lang::registry::{PlaneEncoding, PlaneInfo, PlaneRepackRecipe, RepackExpr, RepackTable};
 use seismic_lang::types::DType;
 use seismic_native_target::NativeCompilationError;
 use std::collections::{BTreeSet, HashMap};
 
-pub(crate) struct Import {
-    pub name: &'static str,
-    pub signature: ir::Signature,
-    pub reference: ir::FuncRef,
-}
-
+/// One kernel's function and the read-only data it addresses: data object
+/// `i` is the symbol [`crate::toolchain::data_symbol`]`(i)`. Every function
+/// it calls is a host symbol it names ([`crate::numeric::host_symbols`]),
+/// so the function holds no address of this process.
 pub(crate) struct EmittedKernel {
     pub function: ir::Function,
-    pub imports: Vec<Import>,
+    pub data: Vec<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum HostImport {
     ApproxExp,
+    ApproxExp2,
     ApproxLog,
     ApproxSin,
     ApproxCos,
@@ -87,6 +84,7 @@ impl HostImport {
     fn name(self) -> &'static str {
         match self {
             Self::ApproxExp => "seismic_approx_exp_f32",
+            Self::ApproxExp2 => "seismic_approx_exp2_f32",
             Self::ApproxLog => "seismic_approx_log_f32",
             Self::ApproxSin => "seismic_approx_sin_f32",
             Self::ApproxCos => "seismic_approx_cos_f32",
@@ -127,7 +125,11 @@ impl HostImport {
     fn signature(self, call_conv: CallConv) -> ir::Signature {
         let mut signature = ir::Signature::new(call_conv);
         match self {
-            Self::ApproxExp | Self::ApproxLog | Self::ApproxSin | Self::ApproxCos => {
+            Self::ApproxExp
+            | Self::ApproxExp2
+            | Self::ApproxLog
+            | Self::ApproxSin
+            | Self::ApproxCos => {
                 signature.params.push(AbiParam::new(types::F32));
                 signature.returns.push(AbiParam::new(types::F32));
             }
@@ -179,6 +181,7 @@ fn round_import(dtype: DType) -> HostImport {
         DType::I32 => RoundImport::I32,
         DType::U32 => RoundImport::U32,
         DType::Bool => RoundImport::Bool,
+        DType::U64 => unreachable!("only narrow floating values are rounded by import"),
     })
 }
 
@@ -200,18 +203,18 @@ fn atomic_import(dtype: DType, op: seismic_lang::intrinsics::AtomicOp) -> HostIm
         (DType::U32, AtomicOp::Add) => AtomicImport::AddU32,
         (DType::U32, AtomicOp::Max) => AtomicImport::MaxU32,
         (DType::U32, AtomicOp::Min) => AtomicImport::MinU32,
-        (DType::Bool, _) => panic!("typed CPU kernel admitted an atomic boolean"),
+        (DType::Bool | DType::U64, _) => {
+            panic!("typed CPU kernel admitted an atomic {dtype}")
+        }
     })
 }
 
 pub(crate) fn emit(
-    module: &mut JITModule,
     kernel: &Kernel<Cpu>,
     layout: &KernelEmissionLayout,
     call_conv: CallConv,
 ) -> Result<EmittedKernel, NativeCompilationError> {
-    let mut signature = module.make_signature();
-    signature.call_conv = call_conv;
+    let mut signature = ir::Signature::new(call_conv);
     signature.params.extend([
         AbiParam::new(types::I64), // frame
         AbiParam::new(types::I64), // barrier
@@ -222,7 +225,7 @@ pub(crate) fn emit(
         AbiParam::new(types::I64), // register scratch
     ]);
     let mut function = ir::Function::with_name_signature(
-        ir::UserFuncName::testcase("seismic_cpu_kernel"),
+        ir::UserFuncName::testcase(crate::toolchain::KERNEL_SYMBOL),
         signature,
     );
     let mut context = FunctionBuilderContext::new();
@@ -257,6 +260,7 @@ pub(crate) fn emit(
         kernel,
         layout,
         imports,
+        tables: Vec::new(),
         values: HashMap::new(),
         buffers,
         words,
@@ -273,20 +277,19 @@ pub(crate) fn emit(
         panic!("root kernel block yielded values");
     }
     emitter.builder.ins().return_(&[]);
-    let import_records = emitter
-        .imports
+    let data = emitter
+        .tables
         .iter()
-        .map(|(kind, reference)| Import {
-            name: kind.name(),
-            signature: kind.signature(call_conv),
-            reference: *reference,
+        .map(|(table, _)| {
+            table
+                .values()
+                .iter()
+                .flat_map(|value| value.to_ne_bytes())
+                .collect()
         })
-        .collect::<Vec<_>>();
+        .collect();
     drop(emitter);
-    Ok(EmittedKernel {
-        function,
-        imports: import_records,
-    })
+    Ok(EmittedKernel { function, data })
 }
 
 fn collect_imports(kernel: &Kernel<Cpu>) -> BTreeSet<HostImport> {
@@ -322,6 +325,9 @@ fn collect_block_imports(kernel: &Kernel<Cpu>, block: BlockId, imports: &mut BTr
                 MathOp::Exp => {
                     imports.insert(HostImport::ApproxExp);
                 }
+                MathOp::Exp2 => {
+                    imports.insert(HostImport::ApproxExp2);
+                }
                 MathOp::Log => {
                     imports.insert(HostImport::ApproxLog);
                 }
@@ -337,7 +343,7 @@ fn collect_block_imports(kernel: &Kernel<Cpu>, block: BlockId, imports: &mut BTr
                 MathOp::Min => {
                     imports.insert(HostImport::Fmin);
                 }
-                MathOp::Fma | MathOp::Rsqrt | MathOp::Sqrt | MathOp::Abs => {}
+                MathOp::Fma | MathOp::Rint | MathOp::Rsqrt | MathOp::Sqrt | MathOp::Abs => {}
             },
             Op::Binary {
                 op: BinaryOp::Min, ..
@@ -377,6 +383,9 @@ struct Emitter<'a, 'b> {
     kernel: &'b Kernel<Cpu>,
     layout: &'b KernelEmissionLayout,
     imports: HashMap<HostImport, ir::FuncRef>,
+    /// The lookup tables the function addresses, each by the data symbol
+    /// of its position.
+    tables: Vec<(RepackTable, ir::GlobalValue)>,
     values: HashMap<ErasedValue, Value>,
     buffers: Value,
     words: Value,
@@ -410,6 +419,8 @@ impl Emitter<'_, '_> {
                             UnaryOp::Neg => self.builder.ins().fneg(a),
                             UnaryOp::Abs => self.builder.ins().fabs(a),
                         },
+                        // An unsigned word is its own magnitude.
+                        ValueType::Scalar(DType::U32 | DType::U64) if op == UnaryOp::Abs => a,
                         _ => match op {
                             UnaryOp::Neg => self.builder.ins().ineg(a),
                             UnaryOp::Abs => {
@@ -658,6 +669,27 @@ impl Emitter<'_, '_> {
                     );
                     self.define(out.value, value);
                 }
+                ClosedOpView::ReadPlaneLane {
+                    out,
+                    plane_info,
+                    indices,
+                    ..
+                } => {
+                    // The packing axis's coordinate (a plane group divides
+                    // the packet group).
+                    let logical = self.value(
+                        indices
+                            .last()
+                            .expect("a packed place has a packing axis")
+                            .value(),
+                    );
+                    let lane = self
+                        .builder
+                        .ins()
+                        .urem_imm(logical, i64::from(plane_info.group));
+                    let lane = self.builder.ins().ireduce(types::I32, lane);
+                    self.define(out.value, lane);
+                }
                 ClosedOpView::ReadPlane {
                     out,
                     place,
@@ -851,6 +883,7 @@ impl Emitter<'_, '_> {
             }
             ConstantValue::I32(value) => self.builder.ins().iconst(types::I32, i64::from(value)),
             ConstantValue::U32(value) => self.builder.ins().iconst(types::I32, i64::from(value)),
+            ConstantValue::U64(value) => self.builder.ins().iconst(types::I64, value as i64),
             ConstantValue::Bool(value) => self.builder.ins().iconst(types::I32, i64::from(value)),
             ConstantValue::Index(value) => self.builder.ins().iconst(types::I64, value as i64),
         }
@@ -1057,10 +1090,12 @@ impl Emitter<'_, '_> {
     fn math(&mut self, op: MathOp, a: Value) -> Value {
         match op {
             MathOp::Exp => self.call_float1(HostImport::ApproxExp, a),
+            MathOp::Exp2 => self.call_float1(HostImport::ApproxExp2, a),
             MathOp::Log => self.call_float1(HostImport::ApproxLog, a),
             MathOp::Sin => self.call_float1(HostImport::ApproxSin, a),
             MathOp::Cos => self.call_float1(HostImport::ApproxCos, a),
             MathOp::Sqrt => self.builder.ins().sqrt(a),
+            MathOp::Rint => self.builder.ins().nearest(a),
             MathOp::Rsqrt => {
                 let one = self.builder.ins().f32const(1.0);
                 let root = self.builder.ins().sqrt(a);
@@ -1141,7 +1176,7 @@ impl Emitter<'_, '_> {
         } else if from_bool {
             if to_float {
                 self.builder.ins().fcvt_from_uint(types::F32, value)
-            } else if to == ValueType::Index {
+            } else if native_type(to).bits() > 32 {
                 self.builder.ins().uextend(types::I64, value)
             } else {
                 value
@@ -1149,10 +1184,14 @@ impl Emitter<'_, '_> {
         } else if from_float && to_float {
             value
         } else if from_float {
-            let word = if to == ValueType::Scalar(DType::I32) {
-                self.builder.ins().fcvt_to_sint_sat(types::I32, value)
-            } else {
-                self.builder.ins().fcvt_to_uint_sat(types::I32, value)
+            let word = match to {
+                ValueType::Scalar(DType::I32) => {
+                    self.builder.ins().fcvt_to_sint_sat(types::I32, value)
+                }
+                ValueType::Scalar(DType::U64) => {
+                    self.builder.ins().fcvt_to_uint_sat(types::I64, value)
+                }
+                _ => self.builder.ins().fcvt_to_uint_sat(types::I32, value),
             };
             if to == ValueType::Index {
                 self.builder.ins().uextend(types::I64, word)
@@ -1164,23 +1203,28 @@ impl Emitter<'_, '_> {
                 ValueType::Scalar(DType::I32) => {
                     self.builder.ins().fcvt_from_sint(types::F32, value)
                 }
-                ValueType::Scalar(DType::U32) | ValueType::Index => {
+                ValueType::Scalar(DType::U32 | DType::U64) | ValueType::Index => {
                     self.builder.ins().fcvt_from_uint(types::F32, value)
                 }
                 _ => panic!("typed scalar cast contains a non-scalar source"),
             }
         } else {
-            // Source integer conversions preserve the low 32 bits;
-            // an internal natural destination zero-extends that word.
-            let word = if from == ValueType::Index {
+            // Integer conversions keep the low word of a wider source. Into a
+            // wider destination (Index and U64 are 64-bit) a U64 takes an
+            // I32's value modulo 2^64 (sign extension); every other word
+            // zero-extends.
+            let (from_bits, to_bits) = (native_type(from).bits(), native_type(to).bits());
+            if from_bits > to_bits {
                 self.builder.ins().ireduce(types::I32, value)
+            } else if from_bits < to_bits {
+                match (from, to) {
+                    (ValueType::Scalar(DType::I32), ValueType::Scalar(DType::U64)) => {
+                        self.builder.ins().sextend(types::I64, value)
+                    }
+                    _ => self.builder.ins().uextend(types::I64, value),
+                }
             } else {
                 value
-            };
-            if to == ValueType::Index {
-                self.builder.ins().uextend(types::I64, word)
-            } else {
-                word
             }
         };
         self.round_value(result, to)
@@ -1502,9 +1546,12 @@ impl Emitter<'_, '_> {
                 let address = self.builder.ins().iadd(base, offset);
                 self.load_element(address, *dtype)
             }
-            PlaneEncoding::Packed { bits, .. } => {
-                let bit = self.builder.ins().imul_imm(entry, i64::from(*bits));
-                let width = self.builder.ins().iconst(types::I32, i64::from(*bits));
+            PlaneEncoding::Packed { .. }
+            | PlaneEncoding::Grid(_)
+            | PlaneEncoding::SignedLocal { .. } => {
+                let bits = plane.entry_bits;
+                let bit = self.builder.ins().imul_imm(entry, i64::from(bits));
+                let width = self.builder.ins().iconst(types::I32, i64::from(bits));
                 self.call(HostImport::PackedBits, &[base, bit, width])
             }
             PlaneEncoding::FloatCode { format } => {
@@ -1527,7 +1574,9 @@ impl Emitter<'_, '_> {
                     .bitcast(types::F32, MemFlags::new(), shifted)
             }
             DType::I32 => self.builder.ins().fcvt_from_sint(types::F32, value),
-            DType::U32 | DType::Bool => self.builder.ins().fcvt_from_uint(types::F32, value),
+            DType::U32 | DType::U64 | DType::Bool => {
+                self.builder.ins().fcvt_from_uint(types::F32, value)
+            }
         }
     }
 
@@ -1583,6 +1632,7 @@ impl Emitter<'_, '_> {
         packet: Value,
     ) {
         let source_layout = &source.geometry.layout;
+        assert!(source_layout.planes.is_none(), "{}", seismic_lang::registry::PLANAR_SOURCE_IS_CONVERSION_ONLY);
         let destination_layout = &destination.geometry.layout;
         let source_base = self.buffer(source.buffer_ordinal as usize);
         let source_offset = self
@@ -1609,7 +1659,12 @@ impl Emitter<'_, '_> {
                 PlaneRepackRecipe::BitRoutes(routes) => {
                     for (destination_byte, byte_routes) in routes.chunks_exact(8).enumerate() {
                         let mut byte = self.builder.ins().iconst(types::I32, 0);
-                        for (destination_bit, source_bit) in byte_routes.iter().copied().enumerate()
+                        for (destination_bit, source_bit) in byte_routes
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(destination_bit, source_bit)| {
+                                source_bit.map(|source_bit| (destination_bit, source_bit))
+                            })
                         {
                             let bit = self.source_bits(source_packet, source_bit, 1);
                             let bit = self.builder.ins().ishl_imm(bit, destination_bit as i64);
@@ -1694,42 +1749,23 @@ impl Emitter<'_, '_> {
     fn repack_expression(&mut self, source_packet: Value, expression: &RepackExpr) -> Value {
         match expression {
             RepackExpr::SourceBits { bit, width } => self.source_bits(source_packet, *bit, *width),
-            RepackExpr::ShiftLeft { value, bits } => {
-                let value = self.repack_expression(source_packet, value);
-                self.builder.ins().ishl_imm(value, i64::from(*bits))
-            }
-            RepackExpr::BitOr(left, right) => {
-                let left = self.repack_expression(source_packet, left);
-                let right = self.repack_expression(source_packet, right);
-                self.builder.ins().bor(left, right)
-            }
-            RepackExpr::OffsetI32 { value, offset } => {
-                let value = self.repack_expression(source_packet, value);
-                self.builder.ins().iadd_imm(value, i64::from(*offset))
-            }
             RepackExpr::F16ToF32(value) => {
                 let value = self.repack_expression(source_packet, value);
                 self.call(HostImport::F16Load, &[value])
             }
-            RepackExpr::I32ToF32(value) => {
+            RepackExpr::ScaleF32 { value, exponent } => {
                 let value = self.repack_expression(source_packet, value);
-                self.builder.ins().fcvt_from_sint(types::F32, value)
-            }
-            RepackExpr::MultiplyF32(left, right) => {
-                let left = self.repack_expression(source_packet, left);
-                let right = self.repack_expression(source_packet, right);
-                self.builder.ins().fmul(left, right)
+                let factor = self.builder.ins().f32const(2f32.powi(i32::from(*exponent)));
+                self.builder.ins().fmul(value, factor)
             }
             RepackExpr::Lookup { index, table } => {
-                // Registered tables are process-lifetime statics and the JIT
-                // runs in this process, so the table is addressed directly.
+                // The table is a data object of the program, addressed by
+                // its symbol: the function holds no address of this process.
                 let index = self.repack_expression(source_packet, index);
                 let index = self.builder.ins().uextend(types::I64, index);
                 let offset = self.builder.ins().imul_imm(index, 4);
-                let base = self
-                    .builder
-                    .ins()
-                    .iconst(types::I64, table.as_ptr() as i64);
+                let table = self.table(*table);
+                let base = self.builder.ins().symbol_value(types::I64, table);
                 let address = self.builder.ins().iadd(base, offset);
                 self.builder
                     .ins()
@@ -1749,6 +1785,10 @@ impl Emitter<'_, '_> {
                     .ins()
                     .load(types::I32, MemFlags::trusted(), address, 0)
             }
+            DType::U64 => self
+                .builder
+                .ins()
+                .load(types::I64, MemFlags::trusted(), address, 0),
             DType::Bool => {
                 let value = self
                     .builder
@@ -1768,7 +1808,7 @@ impl Emitter<'_, '_> {
 
     fn store_element(&mut self, address: Value, dtype: DType, value: Value) {
         let stored = match dtype {
-            DType::F32 | DType::I32 | DType::U32 => value,
+            DType::F32 | DType::I32 | DType::U32 | DType::U64 => value,
             DType::Bool => self.builder.ins().ireduce(types::I8, value),
             DType::F16 | DType::BF16 => self.builder.ins().ireduce(types::I16, value),
         };
@@ -1786,6 +1826,7 @@ impl Emitter<'_, '_> {
                     .bitcast(types::F32, MemFlags::new(), bits)
             }
             DType::I32 | DType::U32 | DType::Bool => self.builder.ins().ireduce(types::I32, word),
+            DType::U64 => word,
             DType::F16 | DType::BF16 => {
                 let bits = self.builder.ins().ireduce(types::I32, word);
                 self.builder.ins().band_imm(bits, 0xffff)
@@ -1794,6 +1835,9 @@ impl Emitter<'_, '_> {
     }
 
     fn encode_word(&mut self, value: Value, dtype: DType) -> Value {
+        if dtype == DType::U64 {
+            return value;
+        }
         let raw = match dtype {
             DType::F32 => self
                 .builder
@@ -1801,6 +1845,7 @@ impl Emitter<'_, '_> {
                 .bitcast(types::I32, MemFlags::new(), value),
             DType::I32 | DType::U32 | DType::Bool => value,
             DType::F16 | DType::BF16 => self.builder.ins().band_imm(value, 0xffff),
+            DType::U64 => unreachable!("a U64 word is its own encoding"),
         };
         self.builder.ins().uextend(types::I64, raw)
     }
@@ -1931,6 +1976,21 @@ impl Emitter<'_, '_> {
         }
     }
 
+    /// The data symbol of `table`, declared at its first use.
+    fn table(&mut self, table: RepackTable) -> ir::GlobalValue {
+        if let Some((_, symbol)) = self.tables.iter().find(|(held, _)| *held == table) {
+            return *symbol;
+        }
+        let symbol = self.builder.create_global_value(ir::GlobalValueData::Symbol {
+            name: ir::ExternalName::testcase(crate::toolchain::data_symbol(self.tables.len())),
+            offset: ir::immediates::Imm64::new(0),
+            colocated: false,
+            tls: false,
+        });
+        self.tables.push((table, symbol));
+        symbol
+    }
+
     fn call(&mut self, import: HostImport, args: &[Value]) -> Value {
         let reference = self.imports[&import];
         let call = self.builder.ins().call(reference, args);
@@ -1989,6 +2049,8 @@ fn native_type(ty: ValueType) -> ir::Type {
 fn native_scalar_type(dtype: DType) -> ir::Type {
     if dtype == DType::F32 {
         types::F32
+    } else if dtype == DType::U64 {
+        types::I64
     } else {
         types::I32
     }

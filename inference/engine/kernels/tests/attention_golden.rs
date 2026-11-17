@@ -18,11 +18,14 @@
 // ```
 #![allow(dead_code)]
 
+mod common;
+mod declared;
+
 use magnitude_kernels::{
     attention_decode, attention_decode_k8v4, attention_prefill, attention_prefill_k8v4,
 };
 use seismic::{
-    BackendName, Device, DeviceCatalog, Element, NativeSpecialization, SlabRegion, SlabTensor,
+    BackendName, Device, Element, NativeSpecialization, SlabRegion, SlabTensor,
     Tensor,
 };
 use seismic_lang::registry::{f16_bits, f16_to_f32};
@@ -189,21 +192,19 @@ fn history(
     let kv = case.geometry.kv;
     let rows = case.history_rows;
     let planes = planes(case, affine);
-    let mut slabs = SlabTensor::new(
+    let slabs = crate::common::slab_tensor(
         device,
         slab_rows as u64,
         rows as u64,
-        planes
+        &planes
             .iter()
             .map(|plane| SlabRegion {
                 element: plane.element,
                 row_shape: vec![kv as u64, plane.width as u64],
             })
-            .collect(),
-    )
-    .unwrap();
+            .collect::<Vec<_>>());
     for index in 0..rows.div_ceil(slab_rows) {
-        slabs.add_slab().unwrap();
+        slabs.add_slab(seismic::SlabFill::Zeroed).unwrap();
         let start = index * slab_rows;
         let count = slab_rows.min(rows - start);
         for (region, plane) in planes.iter().enumerate() {
@@ -318,10 +319,8 @@ fn cases(kind: Kind, geometry: Geometry) -> Vec<Named> {
 /// variations, each admissible at both geometries.
 fn configurations(backend: BackendName, kind: Kind) -> Vec<Vec<(&'static str, u64)>> {
     match (backend, kind.decode()) {
-        (BackendName::Cpu, true) => {
-            vec![vec![("PARTS", 8)], vec![("PARTS", 1)], vec![("PARTS", 16)]]
-        }
-        (BackendName::Cpu, false) => vec![vec![]],
+        // The CPU's decode partitions are the pool's (`device.units`).
+        (BackendName::Cpu, _) => vec![vec![]],
         (BackendName::Metal, true) => vec![
             vec![("SPAN", 32), ("PARTS", 16), ("SIMDS", 4)],
             vec![("SPAN", 64), ("PARTS", 8), ("SIMDS", 8)],
@@ -343,10 +342,13 @@ fn configurations(backend: BackendName, kind: Kind) -> Vec<Vec<(&'static str, u6
             vec![("SPAN", 64), ("PARTS", 8), ("SIMDS", 8), ("SLICES", 2)],
             vec![("SPAN", 128), ("PARTS", 32), ("SIMDS", 4), ("SLICES", 1)],
         ],
+        // The matrix form, whose walks the goldens record (the vector form
+        // is checked against the host model in `attention.rs`); the other
+        // parameters at their declared defaults.
         (BackendName::Vulkan, false) => vec![
-            vec![("ROWS", 64), ("SPLIT_GROUPS", 256)],
-            vec![("ROWS", 64), ("SPLIT_GROUPS", 1)],
-            vec![("ROWS", 128), ("SPLIT_GROUPS", 512)],
+            vec![("MATRIX", 1), ("ROWS", 64), ("SPLIT_GROUPS", 256)],
+            vec![("MATRIX", 1), ("ROWS", 64), ("SPLIT_GROUPS", 1)],
+            vec![("MATRIX", 1), ("ROWS", 128), ("SPLIT_GROUPS", 512)],
         ],
         (other, _) => panic!("no attention configurations for {other:?}"),
     }
@@ -403,6 +405,8 @@ struct Family {
     query_norm: Tensor,
     key_norm: Tensor,
     value_norm: Tensor,
+    /// No sinks (`[0, heads]`, the dense entries' `SK = 0`).
+    sinks: Tensor,
     amplitudes: Tensor,
 }
 
@@ -422,6 +426,7 @@ impl Family {
             query_norm: inputs.query_norm.reshape(&[1, w]).unwrap(),
             key_norm: inputs.key_norm.reshape(&[1, w]).unwrap(),
             value_norm: empty(Element::f32(), &[0, w]),
+            sinks: empty(Element::f32(), &[0, heads]),
             amplitudes: f32_tensor(device, &[p], &vec![1.0; p]),
         }
     }
@@ -430,7 +435,18 @@ impl Family {
     /// declarations fix).
     fn statics(device: &Device, geometry: Geometry) -> NativeSpecialization {
         let w = geometry.w() as u64;
-        let form = [("I", w), ("U", 0), ("F", 1), ("N", 1), ("NV", 0)];
+        let form = [
+            ("I", w),
+            ("U", 0),
+            ("F", 1),
+            ("NQ", 1),
+            ("N", 1),
+            ("NV", 0),
+            ("RA", 0),
+            ("RT", 0),
+            ("RO", 0),
+            ("VK", 0),
+        ];
         let base = if device.backend() == BackendName::Cpu {
             NativeSpecialization::new()
                 .with_static("P", geometry.p as u64)
@@ -457,15 +473,39 @@ fn run_family(
     let case = &named.case;
     let slab_rows = named.slab_rows as u32;
     let elements = Element::bf16();
+    // The prefills in their Visible form: no WorkList bitmap (B = 0, a static
+    // of the GPU natives).
+    let prefill = matches!(kind, Kind::Prefill | Kind::PrefillK8V4);
+    let specialization = &if !prefill || is_cpu(device) {
+        specialization.clone()
+    } else {
+        specialization.clone().with_static("B", 0)
+    };
+    let rows = inputs.destinations.extents()[0];
+    let selection = Tensor::from_host(device, Element::u32(), &[rows, 0], &[]).unwrap();
+    let every_key = block_slots(device, 1);
     {
+        // Half-split leading rotary pairs, no output rotary (the dense
+        // entries' with no key rounding).
+        let layout = half_split_layout(device);
+        let dense_form = dense_layout(device);
+        let (selected_rows, selected) =
+            no_picks(device, rows as usize, case.geometry.kv, case.geometry.w());
         macro_rules! dense {
-            ($module:ident) => {{
-                let kernel = $module::native_for_device_with(
+            ($module:ident $(, $extra:ident: $value:expr)*) => {{
+                let entry = $module::native_entry_with($module::Elements { A: elements });
+                let prepare = |error: &dyn std::fmt::Display| {
+                    format!("prepare {}: {error}", stringify!($module))
+                };
+                let configured = declared::declared_at(
                     device,
-                    $module::Elements { A: elements },
-                    specialization,
+                    &entry,
+                    &dense_statics(specialization.clone().with_static("SK", 0)),
                 )
-                .map_err(|error| format!("prepare {}: {error}", stringify!($module)))?;
+                .map_err(|error| prepare(&error))?;
+                let kernel = entry
+                    .prepare(device, &configured)
+                    .map_err(|error| prepare(&error))?;
                 let [history_key, history_value] = &mut *history else {
                     panic!("dense history has two planes")
                 };
@@ -478,6 +518,7 @@ fn run_family(
                         query_norm: &family.query_norm,
                         key_norm: &family.key_norm,
                         value_norm: &family.value_norm,
+                        sinks: &family.sinks,
                         rotary_components: &inputs.components,
                         rotary_frequencies: &inputs.frequencies,
                         rotary_amplitudes: &family.amplitudes,
@@ -485,25 +526,41 @@ fn run_family(
                         visible: &inputs.visible,
                         fresh: &inputs.fresh,
                         destinations: &inputs.destinations,
+                        $($extra: $value,)*
+                        selected_rows: &selected_rows,
+                        selected: &selected,
                         history_key,
                         history_value,
+                        form: &dense_form,
                         epsilon: case.epsilon,
                         scale: case.scale,
                         gate_function: 0,
                         slab_rows,
+                        selected_slab_rows: 1,
+                        key_block: 0,
+                        key_element: 0,
+                        key_scale: 0,
+                        key_amax_floor: 0.0,
                     })
                     .unwrap()
                     .value
             }};
         }
         macro_rules! affine {
-            ($module:ident $(, $extra:ident: $value:expr)?) => {{
-                let kernel = $module::native_for_device_with(
+            ($module:ident $(, $extra:ident: $value:expr)*) => {{
+                let entry = $module::native_entry_with($module::Elements { A: elements });
+                let prepare = |error: &dyn std::fmt::Display| {
+                    format!("prepare {}: {error}", stringify!($module))
+                };
+                let configured = declared::declared_at(
                     device,
-                    $module::Elements { A: elements },
-                    specialization,
+                    &entry,
+                    &specialization.clone().with_static("SK", 0),
                 )
-                .map_err(|error| format!("prepare {}: {error}", stringify!($module)))?;
+                .map_err(|error| prepare(&error))?;
+                let kernel = entry
+                    .prepare(device, &configured)
+                    .map_err(|error| prepare(&error))?;
                 let [key_codes, key_coefficients, value_codes, value_coefficients] = &mut *history
                 else {
                     panic!("affine history has four planes")
@@ -517,6 +574,7 @@ fn run_family(
                         query_norm: &family.query_norm,
                         key_norm: &family.key_norm,
                         value_norm: &family.value_norm,
+                        sinks: &family.sinks,
                         rotary_components: &inputs.components,
                         rotary_frequencies: &inputs.frequencies,
                         rotary_amplitudes: &family.amplitudes,
@@ -524,11 +582,12 @@ fn run_family(
                         visible: &inputs.visible,
                         fresh: &inputs.fresh,
                         destinations: &inputs.destinations,
-                        $($extra: $value,)?
+                        $($extra: $value,)*
                         history_key_codes: key_codes,
                         history_key_coefficients: key_coefficients,
                         history_value_codes: value_codes,
                         history_value_coefficients: value_coefficients,
+                        form: &layout,
                         epsilon: case.epsilon,
                         scale: case.scale,
                         gate_function: 0,
@@ -540,10 +599,11 @@ fn run_family(
         }
         let result = match kind {
             Kind::Decode => dense!(attention_decode),
-            Kind::Prefill => dense!(attention_prefill),
+            Kind::Prefill => dense!(attention_prefill, selection: &selection, block_slots: &every_key),
             Kind::DecodeK8V4 => affine!(attention_decode_k8v4),
             Kind::PrefillK8V4 => {
-                affine!(attention_prefill_k8v4, history_tiles: &inputs.history_tiles)
+                affine!(attention_prefill_k8v4, selection: &selection, block_slots: &every_key,
+                    history_tiles: &inputs.history_tiles)
             }
         };
         Ok(outputs(&result, history))
@@ -573,7 +633,7 @@ fn open(backend: &str) -> Device {
         "cpu" => BackendName::Cpu,
         other => panic!("ATTENTION_GOLDEN_BACKEND={other}: expected metal, cuda, vulkan or cpu"),
     };
-    DeviceCatalog::discover()
+    seismic::Devices::discover(&[])
         .unwrap()
         .open_backend(backend)
         .unwrap()
@@ -637,6 +697,7 @@ fn attention_golden() {
                                     .with_param("MATRIX", 0)
                                     .with_param("STAGES", 2)
                                     .with_param("COLUMNS", 1)
+                                    .with_param("QREG", 0)
                             }
                             BackendName::Vulkan => {
                                 specialization = specialization.with_param("MATRIX", 0);
@@ -656,10 +717,11 @@ fn attention_golden() {
                         specialization = specialization
                             .with_param("HEADS", (geometry.g.next_power_of_two() as u64).min(16))
                             .with_param("DIRECT", 0);
-                        if kind == Kind::PrefillK8V4 {
-                            specialization =
-                                specialization.with_static("L", 1).with_param("COISSUE", 0);
-                        }
+                        specialization = if kind == Kind::PrefillK8V4 {
+                            specialization.with_static("L", 1).with_param("COISSUE", 0)
+                        } else {
+                            specialization.with_param("KEYS", 8)
+                        };
                     }
                     // CUDA's prefill also splits key tiles; the goldens are
                     // one partition's walk.

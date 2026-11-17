@@ -7,7 +7,7 @@ use super::ir::{
 };
 use super::{elem_rounds, Checker, LocalKind};
 use crate::checked::DiagnosticRule;
-use crate::expr::{IntExpr, SymbolId};
+use crate::expr::SymbolId;
 use crate::initialization::{Condition, RegionOps};
 use crate::span::Span;
 use crate::syntax::ast::{self, AssignOp, BinaryOp, ExprKind as A, UnaryOp};
@@ -45,33 +45,31 @@ impl RegionOps for Conditions<'_> {
         self.arena
     }
     fn fresh_variable(&mut self) -> SymbolId {
-        self.arena.proof_variable(crate::expr::SymbolSort::Int)
+        self.arena.checker_variable(crate::expr::SymbolSort::Int)
     }
 }
 
 impl<'a> Checker<'a> {
-    /// A new version of a mutable quantity or word local, carrying its
-    /// declared type's bounds (L32 (a)). The path that reaches a version
-    /// (an assignment, an `if` arm, a loop visit) decides its value at run
-    /// time, so a bound its facts do not prove is checked where it is used.
-    /// A version made by binding or assigning a value with a symbol equals
-    /// that symbol (L31, I-90), so the value's facts hold for the local.
-    fn fresh_integer_version(&mut self, local: LocalId, assigned: Option<IntExpr>) -> SymbolId {
+    fn fresh_source_version(&mut self, local: LocalId, assigned: Option<&super::ir::SourceValue>) -> super::ir::SourceValue {
         let ty = self.locals[local.index()].ty.clone();
-        let symbol = self.fresh_data_symbol();
-        self.facts.assume_type(&mut self.arena, symbol, &ty);
-        let value = self.arena.int_symbol(symbol);
-        if let Some(assigned) = assigned {
-            let difference = self.arena.int_sub(value, assigned);
-            self.assume_zero(difference);
-        }
-        self.scalar_symbols.insert(local, value);
-        symbol
+        let value = self.source_value(&ty, assigned, true);
+        self.source_values.insert(local, value.clone());
+        value
     }
 
-    fn integer_value_type(ty: &ValueType) -> bool {
-        matches!(ty, ValueType::Integer | ValueType::Index { .. })
-            || ty.scalar_dtype().is_some_and(DType::is_int)
+    fn source_value_type(ty: &ValueType) -> bool {
+        match ty {
+            ValueType::Tuple(parts) => parts.as_slice().iter().any(Self::source_value_type),
+            ValueType::Integer | ValueType::Index { .. } | ValueType::Scalar(_) | ValueType::Range { .. } => true,
+            _ => false,
+        }
+    }
+
+    fn source_snapshot(&self) -> std::collections::HashMap<LocalId, super::ir::SourceValue> {
+        self.source_values.clone()
+    }
+    fn restore_source_snapshot(&mut self, values: &std::collections::HashMap<LocalId, super::ir::SourceValue>) {
+        self.source_values = values.clone();
     }
 
     pub fn push_scope(&mut self) {
@@ -240,7 +238,29 @@ impl<'a> Checker<'a> {
         for place in moves {
             self.consume_place(&place);
         }
-        Some(CheckedStmt::Let { pattern, value })
+        fn collect(
+            pattern: &Pattern,
+            locals: &[super::ir::Local],
+            result: &mut Vec<(LocalId, super::ir::SourceValue)>,
+        ) {
+            match pattern {
+                Pattern::Local(local) => {
+                    if !locals[local.index()].value.leaf_bindings().is_empty() {
+                        result.push((*local, locals[local.index()].value.clone()));
+                    }
+                }
+                Pattern::Tuple(items) => {
+                    items.iter().for_each(|item| collect(item, locals, result))
+                }
+            }
+        }
+        let mut value_bindings = Vec::new();
+        collect(&pattern, &self.locals, &mut value_bindings);
+        Some(CheckedStmt::Let {
+            pattern,
+            value,
+            value_bindings,
+        })
     }
 
     fn destructure(
@@ -315,56 +335,10 @@ impl<'a> Checker<'a> {
                 }
                 install(&mut ownership, state, &|root| self.writable_place(root));
                 self.locals[id.index()].ownership = ownership;
-                if state && Self::integer_value_type(ty) {
-                    let symbol = self.fresh_integer_version(id, value.sym);
-                    self.locals[id.index()].symbol = Some(symbol);
-                } else if !state && ty.scalar_dtype().is_some_and(DType::is_int) {
-                    // I-90: a word local is one symbol, its runtime value.
-                    let symbol = self.fresh_data_symbol();
-                    self.facts.assume_type(&mut self.arena, symbol, ty);
-                    if let Some(exact) = value.sym {
-                        let local = self.arena.int_symbol(symbol);
-                        let difference = self.arena.int_sub(local, exact);
-                        self.assume_zero(difference);
-                    }
-                    self.symbols.insert(id, symbol);
-                    self.locals[id.index()].symbol = Some(symbol);
-                } else if !state && Self::integer_value_type(ty) {
-                    match value.sym {
-                        Some(sym) => {
-                            self.scalar_symbols.insert(id, sym);
-                        }
-                        None => {
-                            // A scalar argmax over an axis is an index into that axis.
-                            if let CheckedExprKind::Primitive {
-                                id:
-                                    crate::intrinsics::PrimitiveId::Reduce {
-                                        op: crate::intrinsics::ReduceOp::Argmax,
-                                        axis,
-                                        ..
-                                    },
-                                operands,
-                                ..
-                            } = &value.kind
-                            {
-                                if let Some(extent) = operands
-                                    .first()
-                                    .and_then(|o| o.ty.shaped())
-                                    .and_then(|s| s.axes.get(*axis as usize))
-                                    .copied()
-                                {
-                                    let symbol = self.fresh_data_symbol();
-                                    let zero = self.arena.int(0);
-                                    let one = self.arena.int(1);
-                                    let upper = self.arena.int_sub(extent, one);
-                                    self.facts.set_range(symbol, zero, upper);
-                                    self.symbols.insert(id, symbol);
-                                    self.locals[id.index()].symbol = Some(symbol);
-                                }
-                            }
-                        }
-                    }
-                }
+                self.locals[id.index()].value = if state && Self::source_value_type(ty) {
+                    self.fresh_source_version(id, Some(&value.value))
+                } else { value.value.clone() };
+                self.source_values.insert(id, self.locals[id.index()].value.clone());
                 Some(Pattern::Local(id))
             }
             ast::Pattern::Tuple(items) => {
@@ -448,7 +422,7 @@ impl<'a> Checker<'a> {
         match (target, &value.ty) {
             (ValueType::Index { bound }, ValueType::Index { bound: actual }) => {
                 let slack = self.arena.int_sub(*bound, *actual);
-                if super::prove::nonneg(&self.arena, &self.facts, slack) {
+                if super::prove::derive_nonnegative(&mut self.arena, &self.facts, slack).is_established() {
                     Some(value)
                 } else {
                     let span = value.span;
@@ -593,11 +567,11 @@ impl<'a> Checker<'a> {
                     let root = self.write_place(place, target.span)?;
                     authorities.extend(self.exclusive_write_authority(root, place));
                 }
-                let value_symbols = targets
+                let value_bindings = targets
                     .iter()
                     .filter_map(|(place, ty)| match place {
-                        CheckedPlace::Local(root) if Self::integer_value_type(ty) => {
-                            Some((root.local, self.fresh_integer_version(root.local, None)))
+                        CheckedPlace::Local(root) if Self::source_value_type(ty) => {
+                            Some((root.local, self.fresh_source_version(root.local, None)))
                         }
                         _ => None,
                     })
@@ -610,7 +584,7 @@ impl<'a> Checker<'a> {
                 Some(CheckedStmt::Assign {
                     place,
                     value,
-                    value_symbols,
+                    value_bindings,
                     authorities,
                 })
             }
@@ -643,14 +617,14 @@ impl<'a> Checker<'a> {
                     return None;
                 }
                 let authorities = self.exclusive_write_authority(root, &place);
-                let value_symbols = Self::integer_value_type(&ty)
-                    .then(|| (root, self.fresh_integer_version(root, value.sym)))
+                let value_bindings = Self::source_value_type(&ty)
+                    .then(|| (root, self.fresh_source_version(root, Some(&value.value))))
                     .into_iter()
                     .collect();
                 Some(CheckedStmt::Assign {
                     place,
                     value,
-                    value_symbols,
+                    value_bindings,
                     authorities,
                 })
             }
@@ -680,14 +654,19 @@ impl<'a> Checker<'a> {
                     );
                     return None;
                 }
-                // Packed representations are readable and decodable but never writable.
-                if let Some(shaped) = self.locals[binding.index()].ty.shaped() {
-                    if matches!(shaped.elem, Elem::Repr(_)) {
-                        self.error(
-                            DiagnosticRule::Type,
-                            target.span,
-                            "packed representations are readable and decodable but not writable",
-                        );
+                // The selection, then the value, the representation's store
+                // rule takes (`registry::store_rule`).
+                let shaped = self.locals[binding.index()].ty.shaped().cloned();
+                let record = shaped
+                    .as_ref()
+                    .is_some_and(|shaped| super::ir::whole_records(&indices, shaped.rank()));
+                let packed = match shaped.as_ref().map(|shaped| &shaped.elem) {
+                    Some(Elem::Repr(representation)) => Some(*representation),
+                    _ => None,
+                };
+                if let Some(representation) = packed {
+                    if let Err(refusal) = crate::registry::store_rule(representation).admits(record) {
+                        self.error(DiagnosticRule::Type, target.span, refusal);
                         return None;
                     }
                 }
@@ -714,6 +693,22 @@ impl<'a> Checker<'a> {
                 } else {
                     self.compound_value(target, op, value, Some(&selected))?
                 };
+                // A value of an element parameter is decided where lowering
+                // binds it (`entry_build`).
+                let stored = match &value.ty {
+                    ValueType::Tensor(stored) => match &stored.elem {
+                        Elem::Param(_) => None,
+                        Elem::Repr(stored) => Some(Some(*stored)),
+                        Elem::Dtype(_) => Some(None),
+                    },
+                    _ => Some(None),
+                };
+                if let (Some(representation), Some(stored)) = (packed, stored) {
+                    if let Err(refusal) = crate::registry::store_rule(representation).admits_value(stored) {
+                        self.error(DiagnosticRule::Type, value.span, refusal);
+                        return None;
+                    }
+                }
                 let value = match (&selected, &value.ty) {
                     (ValueType::Scalar(dtype), ValueType::Scalar(actual))
                         if !(*actual == *dtype || (actual.is_float() && dtype.is_float())) =>
@@ -762,7 +757,7 @@ impl<'a> Checker<'a> {
                         "this selection has type",
                     )?,
                 };
-                self.write(root, binding, target.span)?;
+                self.write(root, binding, record, target.span)?;
                 let checked_place = CheckedPlace::Element {
                     root: super::ownership::LocalPlace::root(root),
                     indices,
@@ -771,7 +766,7 @@ impl<'a> Checker<'a> {
                 Some(CheckedStmt::Assign {
                     place: checked_place,
                     value,
-                    value_symbols: Vec::new(),
+                    value_bindings: Vec::new(),
                     authorities,
                 })
             }
@@ -802,7 +797,7 @@ impl<'a> Checker<'a> {
                     );
                     return None;
                 }
-                self.write(root.local, root.local, span)
+                self.write(root.local, root.local, false, span)
             }
             CheckedPlace::Element { root, .. } => {
                 if !self.writable_place(root) {
@@ -813,7 +808,7 @@ impl<'a> Checker<'a> {
                     );
                     return None;
                 }
-                self.write(root.local, root.local, span)
+                self.write(root.local, root.local, false, span)
             }
             CheckedPlace::Tuple(places) => {
                 let mut last = None;
@@ -828,14 +823,13 @@ impl<'a> Checker<'a> {
     fn state_place(&mut self, name: &ast::Ident) -> Option<CheckedPlace> {
         let Some(id) = self.lookup(&name.name) else {
             if !self.poisoned.contains(&name.name) {
-                self.error(
-                    DiagnosticRule::Resolution,
-                    name.span,
+                let message = self.host_port(&name.name).unwrap_or_else(|| {
                     format!(
                         "`{}` is not declared; introduce state with `let mut`",
                         name.name
-                    ),
-                );
+                    )
+                });
+                self.error(DiagnosticRule::Resolution, name.span, message);
             }
             return None;
         };
@@ -901,7 +895,7 @@ impl<'a> Checker<'a> {
     }
 
     fn uniform_value(&self, value: &CheckedExpr) -> bool {
-        value.sym.is_some_and(|sym| {
+        value.integer().is_some_and(|sym| {
             super::prove::symbols(&self.arena, sym)
                 .into_iter()
                 .all(|symbol| self.uniform_symbol(symbol))
@@ -972,25 +966,15 @@ impl<'a> Checker<'a> {
         }
         let divergent = !self.uniform_condition(&cond);
         let facts_before = self.facts.clone();
-        let symbols_before = self.scalar_symbols.clone();
+        let values_before = self.source_snapshot();
         // Captures cover only the locals in scope at the `if` (G-A1-new-1).
-        let capture_symbols = (0..self.locals.len())
-            .filter_map(|ordinal| {
-                let id = LocalId::new(ordinal as u32);
-                if !self.in_scope(id) || !Self::integer_value_type(&self.locals[ordinal].ty) {
-                    return None;
-                }
-                let symbol = self.symbols.get(&id).copied().or_else(|| {
-                    symbols_before.get(&id).and_then(|value| {
-                        match self.arena.view((*value).into()) {
-                            crate::expr::NodeView::Symbol(symbol) => Some(symbol),
-                            _ => None,
-                        }
-                    })
-                })?;
-                Some((id, symbol))
-            })
-            .collect::<Vec<_>>();
+        let capture_bindings = (0..self.locals.len()).filter_map(|ordinal| {
+            let id = LocalId::new(ordinal as u32);
+            if !self.in_scope(id) { return None; }
+            let value = self.source_values.get(&id)?;
+            if value.leaf_bindings().is_empty() { return None; }
+            Some((id, value.clone()))
+        }).collect::<Vec<_>>();
         let moved_before = self.moved_snapshot();
         if divergent {
             *self.divergence.last_mut().expect("a divergence frame") += 1;
@@ -999,7 +983,8 @@ impl<'a> Checker<'a> {
         self.assume(&cond, false);
         let then_body = self.scoped_block(then);
         let facts_then = std::mem::replace(&mut self.facts, facts_before.clone());
-        let symbols_then = std::mem::replace(&mut self.scalar_symbols, symbols_before.clone());
+        let values_then = self.source_snapshot();
+        self.restore_source_snapshot(&values_before);
         let moved_then = self.moved_snapshot();
         self.restore_moves(&moved_before);
 
@@ -1017,27 +1002,21 @@ impl<'a> Checker<'a> {
         }
         let facts_else = std::mem::replace(&mut self.facts, facts_before);
         let moved_else = self.moved_snapshot();
-        let symbols_else = std::mem::replace(&mut self.scalar_symbols, symbols_before.clone());
-        let mut join_symbols = Vec::new();
-        for (id, before) in symbols_before {
-            if !self.locals[id.index()].mutable
-                || !Self::integer_value_type(&self.locals[id.index()].ty)
-            {
-                continue;
-            }
-            let then_value = symbols_then.get(&id).copied().unwrap_or(before);
-            let else_value = symbols_else.get(&id).copied().unwrap_or(before);
+        let values_else = self.source_snapshot();
+        self.restore_source_snapshot(&values_before);
+        let mut join_bindings = Vec::new();
+        for (id, before) in &values_before {
+            let id = *id;
+            if !self.locals[id.index()].mutable || !Self::source_value_type(&self.locals[id.index()].ty) { continue; }
+            let then_value = values_then.get(&id).unwrap_or(before);
+            let else_value = values_else.get(&id).unwrap_or(before);
             if then_value != before || else_value != before {
-                let joined = self.fresh_integer_version(id, None);
-                // L32 (b): the bounds common to both arms.
-                let scope = self.scope_symbols();
-                self.facts.join_bounds(
-                    &mut self.arena,
-                    joined,
-                    [(&facts_then, then_value), (&facts_else, else_value)],
-                    &|symbol| scope.contains(&symbol),
-                );
-                join_symbols.push((id, joined));
+                let joined = self.fresh_source_version(id, None);
+                if let (Some(binding), Some(a), Some(b)) = (joined.binding(), then_value.integer(), else_value.integer()) {
+                    let scope = self.scope_symbols();
+                    self.facts.join_bounds(&mut self.arena, binding, [(&facts_then, a), (&facts_else, b)], &|symbol| scope.contains(&symbol));
+                }
+                join_bindings.push((id, joined));
             }
         }
         // A value is available after an `if` only when it is available on every
@@ -1048,8 +1027,8 @@ impl<'a> Checker<'a> {
             condition: cond,
             then_body,
             else_body,
-            capture_symbols,
-            join_symbols,
+            capture_bindings,
+            join_bindings,
         })
     }
 
@@ -1067,9 +1046,10 @@ impl<'a> Checker<'a> {
             if !self.in_scope(id) {
                 continue;
             }
-            symbols.extend(self.symbols.get(&id).copied());
-            if let Some(value) = self.scalar_symbols.get(&id) {
-                symbols.extend(super::prove::symbols(&self.arena, *value));
+            let Some(source) = self.source_values.get(&id) else { continue; };
+            symbols.extend(source.leaf_bindings().into_iter().map(|(_, symbol)| symbol));
+            if let Some(value) = source.integer() {
+                symbols.extend(super::prove::symbols(&self.arena, value));
             }
         }
         symbols
@@ -1090,7 +1070,7 @@ impl<'a> Checker<'a> {
                 id: crate::intrinsics::PrimitiveId::Binary(op),
                 operands,
                 ..
-            } if operands.len() == 2 => match (op, operands[0].sym, operands[1].sym) {
+            } if operands.len() == 2 => match (op, operands[0].integer(), operands[1].integer()) {
                 (BinaryOp::And, _, _) => Condition::And(
                     Box::new(self.condition(&operands[0])),
                     Box::new(self.condition(&operands[1])),
@@ -1123,6 +1103,7 @@ impl<'a> Checker<'a> {
             arena: &mut self.arena,
         }
         .assume(&mut path, &mut self.facts, condition, !negate);
+        self.facts.refine_booleans(&mut self.arena);
     }
 
     fn for_stmt(
@@ -1172,10 +1153,10 @@ impl<'a> Checker<'a> {
                 ..
             } if operands.len() == 2 => {
                 let lo = operands[0]
-                    .sym
+                    .integer()
                     .expect("a checked range endpoint has its symbol");
                 let hi = operands[1]
-                    .sym
+                    .integer()
                     .expect("a checked range endpoint has its symbol");
                 (operands[0].clone(), operands[1].clone(), lo, hi, hi)
             }
@@ -1215,19 +1196,19 @@ impl<'a> Checker<'a> {
         let data_bounds = self.data_dependent(lo) || self.data_dependent(hi);
         let floor = self.locals.len();
         let moved_before = self.moved_snapshot();
-        let symbols_before = self.scalar_symbols.clone();
+        let values_before = self.source_snapshot();
         let facts_before = self.facts.clone();
-        let mut value_symbols = Vec::new();
+        let mut value_versions = Vec::new();
         // The header carries exactly the mutable integer locals in scope
         // (G-A1-new-1).
         for ordinal in 0..floor {
             let id = LocalId::new(ordinal as u32);
             if self.in_scope(id)
                 && self.locals[ordinal].mutable
-                && Self::integer_value_type(&self.locals[ordinal].ty)
+                && Self::source_value_type(&self.locals[ordinal].ty)
             {
-                let header = self.fresh_integer_version(id, None);
-                value_symbols.push((id, header, header));
+                let header = self.fresh_source_version(id, None);
+                value_versions.push((id, header.clone(), header));
             }
         }
         self.push_scope();
@@ -1247,8 +1228,9 @@ impl<'a> Checker<'a> {
         if data_bounds {
             self.data_symbols.insert(symbol);
         }
-        self.symbols.insert(binder, symbol);
-        self.locals[binder.index()].symbol = Some(symbol);
+        let value = super::ir::SourceValue::Scalar(super::ir::SourceScalar::Quantity { meaning: self.arena.int_symbol(symbol), binding: Some(symbol) });
+        self.locals[binder.index()].value = value.clone();
+        self.source_values.insert(binder, value);
         if parallel {
             self.logical_parallel.push((floor, binder));
             self.divergence.push(0);
@@ -1268,9 +1250,9 @@ impl<'a> Checker<'a> {
         self.finish_loop_ownership(moved_before, floor, cardinality, iter.span);
         // Facts learned in the body do not survive a loop that may not run.
         self.facts = facts_before;
-        self.scalar_symbols = symbols_before;
-        for (id, _, exit) in &mut value_symbols {
-            *exit = self.fresh_integer_version(*id, None);
+        self.restore_source_snapshot(&values_before);
+        for (id, _, exit) in &mut value_versions {
+            *exit = self.fresh_source_version(*id, None);
         }
         let kind = if parallel {
             LoopKind::Independent
@@ -1283,7 +1265,7 @@ impl<'a> Checker<'a> {
             start,
             end,
             body: body_block,
-            value_symbols,
+            value_versions,
             initialization: crate::initialization::LoopInitialization::empty(
                 crate::initialization::ParameterPath::root(self.sig.params.len() + binder.index()),
             ),

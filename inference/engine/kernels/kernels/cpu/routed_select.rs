@@ -1,15 +1,17 @@
 // routed_select on CPU (contract and portable body in routed.seismic).
 // `routed_select_normalize` publishes each row's RMS normalization with
 // `norm` (rounded to A) as the `normalized` result, and with `router_norm` as
-// F32 into scratch, one work item per row. `routed_select_logits` gives each
-// work item ROWS router rows, which it projects against every router input
-// row into the `logits` scratch [M, E]. `routed_select_select` selects one
-// row per work item: scores, biased top-K, normalization, scales.
+// F32 into scratch, one work item per row. `routed_select_logits` splits the
+// router rows evenly over its grid (the pool's participants, at most E), each
+// work item projecting its rows against every router input row into the
+// `logits` scratch [M, E]. `routed_select_select` selects one row per work
+// item: scores, biased top-K, normalization, scales.
 
 use lib::core::{activation, reduce};
 use lib::projection::projection;
-use lib::routed::select;
+use lib::routed::{ranked, routed, select};
 
+#[inline(always)]
 fn routed_select_normalize<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
     let h = cx.dim_h() as usize;
@@ -36,9 +38,10 @@ fn routed_select_normalize<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, grou
     activation::store::<E::A>(published, unsafe { cx.result_0().row_mut([row, 0]) });
 }
 
+#[inline(always)]
 fn routed_select_logits<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let (m, h, e) = (cx.dim_m() as usize, cx.dim_h() as usize, cx.dim_e() as usize);
-    let rows = projection::item_rows(group[0], cx.param_rows(), e);
+    let rows = projection::part_rows(group[0], cx.groups()[0], e);
     let router = cx.arg_router();
     // SAFETY: the normalize launch wrote every row before this launch.
     let router_rows = unsafe { cx.scratch_router_rows().slice::<f32>(0, m * h) };
@@ -49,25 +52,29 @@ fn routed_select_logits<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: 
     }
 }
 
+#[inline(always)]
 fn routed_select_select<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
     let e = cx.dim_e() as usize;
     let (scores, order) = shared.split_at_mut(4 * e);
     let scores = seismic::cpu::tensor::floats(scores, e);
-    let order = select::indices(order, e);
+    let order = ranked::indices(order, e);
     // SAFETY: the logits launch wrote every row before this launch.
     scores.copy_from_slice(unsafe { cx.scratch_logits().slice::<f32>(4 * row * e, e) });
     select::scores(cx.arg_score(), scores);
     // SAFETY: each work item writes its own row of the routes and weights.
-    let (routes, weights) = unsafe { (cx.arg_routes().row_mut([row, 0]), cx.arg_weights().row_mut([row, 0])) };
+    let (routes, mut weights) = unsafe { (cx.arg_routes().row_mut([row, 0]), cx.arg_weights().row_mut([row, 0])) };
     let bias = cx.arg_bias();
-    select::top_k(scores, |expert| bias.get([expert]), order, routes, weights);
-    let denominator = weights.iter().sum::<f32>();
-    let (normalization, epsilon, scale) =
-        (cx.arg_normalization(), cx.arg_normalization_epsilon(), cx.arg_scale());
-    let expert_scale = cx.arg_expert_scale();
-    for (weight, expert) in weights.iter_mut().zip(routes.iter()) {
-        *weight = select::normalized(normalization, *weight, denominator, epsilon) * scale
-            * expert_scale.get([*expert as usize]);
-    }
+    weights.compute(|weights| {
+        select::top_k(scores, |expert| bias.get([expert]), order, routes, weights);
+        let denominator = weights.iter().sum::<f32>();
+        let (normalization, epsilon, scale) =
+            (cx.arg_normalization(), cx.arg_normalization_epsilon(), cx.arg_scale());
+        let expert_scale = cx.arg_expert_scale();
+        for (weight, expert) in weights.iter_mut().zip(routes.iter()) {
+            *weight = select::normalized(normalization, *weight, denominator, epsilon)
+                * scale
+                * routed::scale_factor(cx.dim_es(), |e| expert_scale.get([e]), *expert);
+        }
+    });
 }

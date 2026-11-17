@@ -18,52 +18,67 @@
   <a href="https://github.com/magnitudedev/magnitude/stargazers"><img src="https://img.shields.io/github/stars/magnitudedev/magnitude" alt="GitHub Repo stars"></a>
 </p>
 
-Magnitude is an open source inference engine for agents that optimizes itself for your exact hardware. It compiles and tunes its kernels on your device, so open models run up to 2x faster than llama.cpp. One click connects the agent you already use (Pi, OpenCode, Hermes, Codex, and more). Works on Apple Silicon, NVIDIA, AMD, or nothing but a CPU.
-
-**[Download Magnitude for macOS, Windows, or Linux](https://magnitude.dev/download)**
+Magnitude is an open source inference engine that tunes its kernels on your hardware to find the fastest way to run each model. It's over 2x faster than Ollama and works on Apple Silicon, NVIDIA, AMD, Intel, or just a CPU. One click connects it to the agent you already use (Pi, OpenCode, Hermes, Codex, and more).
 
 ⭐ Help us reach more developers and grow the Magnitude community. Star this repo!
 
-https://github.com/user-attachments/assets/983328c8-93e8-4360-bfef-11e93ff76035
-
 ## Get started
 
-1. [Download Magnitude](https://magnitude.dev/download), install it, and open the app.
-2. Choose a recommended model in **Discover** and download it.
-3. Connect your agent in **Connections** and start using it.
+Magnitude comes with a desktop app and a CLI. Install from your terminal:
 
-The desktop app includes the `magnitude` CLI. No separate installation is needed.
+macOS / Linux:
+
+```sh
+curl -fsSL https://magnitude.dev/install.sh | sh
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://magnitude.dev/install.ps1 | iex
+```
+
+Or download the installer:
+
+- **macOS:** [Apple silicon](https://magnitude.dev/api/installer?os=darwin&arch=arm64&package=dmg) · [Intel](https://magnitude.dev/api/installer?os=darwin&arch=x64&package=dmg)
+- **Windows:** [x64](https://magnitude.dev/api/installer?os=windows&arch=x64&package=windows-exe)
+- **Linux x64:** [.deb](https://magnitude.dev/api/installer?os=linux&arch=x64&package=deb) · [.rpm](https://magnitude.dev/api/installer?os=linux&arch=x64&package=rpm) · [.pkg.tar.zst](https://magnitude.dev/api/installer?os=linux&arch=x64&package=pacman)
+- **Linux ARM64:** [.deb](https://magnitude.dev/api/installer?os=linux&arch=arm64&package=deb) · [.rpm](https://magnitude.dev/api/installer?os=linux&arch=arm64&package=rpm)
+
+To run Magnitude as a service other computers can use, see [Remote server](https://docs.magnitude.dev/remote-server). To run it in a container, see [Docker](https://docs.magnitude.dev/installation/docker).
 
 ## Why Magnitude?
 
-- **Up to 2x faster than llama.cpp:** 92% faster decode on Metal, 19% on CUDA
-- **Tuned on your device:** kernels are tuned on your hardware before a model runs
-- **Built for the best models:** hand-optimized kernels for popular open-weight families
-- **Memory that flexes:** 27% less memory per agent, freed when agents stop
+- **2x faster than Ollama:** on average across popular local models, on Mac and NVIDIA
+- **Tuned on your hardware:** kernels are tuned for each model when you download it
+- **Best drafter built in:** each model ships with the fastest speculative decoding drafter
+- **Memory that flexes:** quantized KV halves memory per agent, freed when agents stop
 - **Fast concurrent sessions:** sessions share prefix caches to prevent slowdown
 - **Works with your agent:** one click to connect Pi, OpenCode, Hermes, Codex, and more
 - **Free, private, open source:** no token costs, nothing leaves your machine, Apache 2.0
 
-## Up to 2x faster than llama.cpp
+## Over 2x faster than Ollama
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/benchmarks/llama-cpp-dark.svg">
-  <img alt="Magnitude vs llama.cpp: 9% faster prefill and 92% faster decode on Metal, 23% faster prefill and 19% faster decode on CUDA" src="assets/benchmarks/llama-cpp-light.svg" width="800">
+  <source media="(prefers-color-scheme: dark)" srcset="assets/benchmarks/ollama-dark.svg">
+  <img alt="Magnitude vs Ollama, average of 11 popular local models: 1.32x faster prefill and 2.19x faster decode on Mac, 1.34x faster prefill and 2.17x faster decode on NVIDIA" src="assets/benchmarks/ollama-light.svg" width="800">
 </picture>
+
+[View full benchmarks →](https://magnitude.dev/benchmarks)
 
 ## FAQ
 
 ### What is Magnitude?
 
-An open source inference engine that optimizes itself for your hardware. It ships as a desktop app that runs open models and connects them to the agent you already use.
+An open source inference engine that optimizes each model for your exact hardware. It ships as a desktop app that runs open models and connects them to the agent you already use.
 
 ### How is it faster than llama.cpp, Ollama, or LM Studio?
 
-They ship kernels precompiled for broad classes of hardware. Magnitude compiles and tunes its kernels on your actual device before a model runs, so they fit your exact chip. [See the benchmarks against llama.cpp.](#up-to-2x-faster-than-llamacpp)
+They ship one-size-fits-all kernels, because tuning each model for each chip by hand would take forever. Magnitude tunes them automatically. When you download a model, it spends up to a minute on your actual chip trying different ways to split up the math (how many GPU threads team up, how big a chunk each one takes, how far ahead to load data) and keeps the fastest combination that doesn't change the model's output. [See the full benchmarks against Ollama.](https://magnitude.dev/benchmarks)
 
 ### What hardware do I need?
 
-Any Apple Silicon, NVIDIA, or AMD GPU, or nothing but a CPU. There is no fixed minimum. Smaller machines run smaller models, and more memory lets you run larger ones.
+Any Apple Silicon, NVIDIA, AMD, or Intel GPU, or nothing but a CPU. There is no fixed minimum. Smaller machines run smaller models, and more memory lets you run larger ones.
 
 ### What operating systems does it support?
 

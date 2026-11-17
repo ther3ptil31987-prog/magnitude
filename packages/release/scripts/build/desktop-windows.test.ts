@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest"
 import { Cause, ConfigProvider, Effect, Exit, Schema } from "effect"
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as NodeContext from "@effect/platform-node/NodeContext"
+import { readFileSync } from "node:fs"
 import { join } from "node:path"
 import { WindowsInstallerInput, WindowsPayloadPath, buildWindowsDesktopInstaller, renderWindowsInstaller, renderWindowsInstallationInventory } from "./desktop-windows"
 const template = "@PAYLOAD_FILES@\n@REMOVE_FILES@\n@REMOVE_DIRECTORIES@"
@@ -49,6 +50,48 @@ describe("Windows installer file contract", () => {
   })
 })
 
+describe("Windows installer link handler", () => {
+  const script = Effect.runSync(renderWindowsInstaller(readFileSync(join(import.meta.dirname, "../../resources/windows/desktop.nsi"), "utf8"), input))
+  const install = script.slice(script.indexOf('Section "Magnitude"'), script.indexOf("SectionEnd"))
+  const uninstall = script.slice(script.indexOf('Section "Uninstall"'))
+  it("registers magnitude:// for the current user on every installation and update", () => {
+    expect(script).toContain('!define PROTOCOLKEY "Software\\Classes\\magnitude"')
+    const registration = install.slice(install.indexOf("installed:"))
+    expect(registration).toContain('WriteRegStr HKCU "${PROTOCOLKEY}" "URL Protocol" ""')
+    expect(registration).toContain(`WriteRegStr HKCU "\${PROTOCOLKEY}\\shell\\open\\command" "" '"$INSTDIR\\Magnitude.exe" "%1"'`)
+  })
+  it("removes the handler on uninstall only while it names this installation", () => {
+    expect(uninstall).toContain(`\${If} $9 == '"$INSTDIR\\Magnitude.exe" "%1"'\n    DeleteRegKey HKCU "\${PROTOCOLKEY}"`)
+    expect(install).not.toContain("DeleteRegKey")
+  })
+})
+
+describe("Windows installer stage", () => {
+  const script = Effect.runSync(renderWindowsInstaller(readFileSync(join(import.meta.dirname, "../../resources/windows/desktop.nsi"), "utf8"), input))
+  const install = script.slice(script.indexOf('Section "Magnitude"'), script.indexOf("SectionEnd"))
+  it("removes the stage after a fresh install moves the payload out", () => {
+    const fresh = install.slice(install.indexOf('Rename "$Stage" "$INSTDIR"'))
+    expect(fresh.slice(0, fresh.indexOf("ClearErrors"))).toContain("Call CleanupStage")
+  })
+  it("removes the stage after a committed update, and keeps it while previous files remain for a retry", () => {
+    const finish = install.slice(install.indexOf("FinishReplacement"), install.indexOf("Goto installed"))
+    expect(finish).toMatch(/\$\{If\} \$0 != 0[^]*StrCpy \$Stage ""\s*\$\{Else\}\s*Call CleanupStage\s*\$\{EndIf\}/)
+  })
+  it("keeps the stage through an update over an installed version until the previous files are retired", () => {
+    const update = install.slice(install.indexOf('${If} $PreviousVersion != ""'), install.indexOf('Rename "$Stage" "$INSTDIR"'))
+    const begin = update.indexOf("::BeginReplacement(")
+    const finish = update.indexOf("::FinishReplacement(")
+    expect(begin).toBeGreaterThan(-1)
+    expect(finish).toBeGreaterThan(begin)
+    expect(update.indexOf("Call CleanupStage")).toBeGreaterThan(finish)
+    expect(update.match(/Call CleanupStage/g)).toHaveLength(1)
+  })
+  it("restores the previous installation before an update failure clears the stage", () => {
+    const failure = install.slice(install.indexOf("replacementRegistrationFailed:"), install.indexOf("registrationFailed:", install.indexOf("replacementRegistrationFailed:") + 1))
+    expect(failure.indexOf("::RollbackReplacement(")).toBeGreaterThan(-1)
+    expect(failure.indexOf("Call CleanupStage")).toBeGreaterThan(failure.indexOf("::RollbackReplacement("))
+  })
+})
 
 describe("Windows installer source boundary", () => {
   it.each(["redirected payload", "x64 helper"] as const)("rejects %s before compiler execution", async scenario => {

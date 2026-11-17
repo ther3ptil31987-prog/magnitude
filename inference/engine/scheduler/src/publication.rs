@@ -6,7 +6,7 @@
 //! admission-command capacity.
 
 use magnitude_generation::{DetailedUsage, FinishReason, OutputToken};
-use magnitude_executor::{DeviceError, InvariantError, ResourceKind};
+use magnitude_executor::{DeviceError, InvariantError, ResourceKind, WeightReadError};
 use std::{
     collections::VecDeque,
     sync::{
@@ -44,8 +44,15 @@ pub enum RequestError {
     Input(String),
     State(magnitude_state::Error),
     Capacity(ServiceCapacityError),
+    /// The request's state needs `required` bytes of memory where nothing
+    /// else the load holds can be freed for it: alone, it exceeds what the
+    /// loaded model can ever give it, `available`.
+    ContextExceedsMemory { required: u64, available: u64 },
     Device(DeviceError),
     Invariant(InvariantError),
+    /// The request's weights (table rows or experts) could not be read from
+    /// the model's artifact; other requests continue.
+    WeightRead(WeightReadError),
     WorkerClosed,
     ModelUnloaded { cause: ModelUnloadCause },
 }
@@ -60,8 +67,13 @@ impl std::fmt::Display for RequestError {
                 "{:?} capacity exhausted: {} required, {} available",
                 capacity.resource, capacity.required, capacity.available
             ),
+            Self::ContextExceedsMemory { required, available } => write!(
+                formatter,
+                "the request's context needs {required} bytes of memory, past the {available} the loaded model can give it"
+            ),
             Self::Device(error) => error.fmt(formatter),
             Self::Invariant(error) => error.fmt(formatter),
+            Self::WeightRead(error) => error.fmt(formatter),
             Self::WorkerClosed => formatter.write_str("the execution worker closed"),
             Self::ModelUnloaded {
                 cause: ModelUnloadCause::MemoryPressure,
@@ -74,6 +86,8 @@ impl std::error::Error for RequestError {}
 
 /// Elapsed native work measured per request from submission through completion.
 /// A request in a packed batch receives that batch's wall duration.
+/// Deferred work retains its originating prompt/generation phase; work solely
+/// for post-terminal prefix retention is excluded from these throughput fields.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PhysicalTimings {
     pub prompt_ns: u64,
@@ -129,6 +143,8 @@ struct State {
     receiver_open: bool,
     sender_open: bool,
     receiver_waker: Option<Waker>,
+    /// The request became resident: it began, before anything it publishes.
+    began: bool,
 }
 
 struct Shared {
@@ -167,6 +183,7 @@ impl PublicationQueue {
                 receiver_open: true,
                 sender_open: true,
                 receiver_waker: None,
+                began: false,
             }),
             wake_worker: Box::new(wake_worker),
         });
@@ -234,6 +251,22 @@ impl Drop for PublicationPermit {
 }
 
 impl PublicationSender {
+    /// The request became resident: it began, and the receiver is woken to
+    /// read it ([`PublicationReceiver::began`]). Each later residency, after
+    /// a preemption, changes nothing.
+    pub fn began(&self) {
+        let receiver_waker = {
+            let mut state = self.shared.state.lock().unwrap();
+            match std::mem::replace(&mut state.began, true) {
+                true => None,
+                false => state.receiver_waker.take(),
+            }
+        };
+        if let Some(waker) = receiver_waker {
+            waker.wake();
+        }
+    }
+
     pub fn reserve_outputs(&self, count: usize) -> Result<Vec<PublicationPermit>, PublishError> {
         if count == 0 {
             return Ok(Vec::new());
@@ -413,6 +446,14 @@ pub struct PublicationReceiver {
 }
 
 impl PublicationReceiver {
+    /// Whether the request has begun ([`PublicationSender::began`]): set
+    /// before anything it publishes, so a publication read while this is
+    /// false came of a request that never became resident. A receiver
+    /// [`Self::poll_next`] left pending is woken when it begins.
+    pub fn began(&self) -> bool {
+        self.shared.state.lock().unwrap().began
+    }
+
     pub fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Publication>> {
         if self.terminal_seen {
             return Poll::Ready(None);
@@ -548,6 +589,34 @@ mod tests {
         ));
         assert_eq!(next(&mut receiver), None);
         assert!(wakes.lock().unwrap().is_empty());
+    }
+
+    /// A receiver pending on a request that has not begun is woken when it
+    /// begins, and reads it begun; one whose request fails before it began
+    /// reads the failure with the request never begun.
+    #[test]
+    fn a_request_reads_begun_once_resident_and_not_when_refused_before() {
+        struct Woken(std::sync::atomic::AtomicBool);
+        impl std::task::Wake for Woken {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let (sender, mut receiver) = PublicationQueue::bounded(1, |_| {}).unwrap();
+        let woken = Arc::new(Woken(Default::default()));
+        let waker = Waker::from(Arc::clone(&woken));
+        assert!(receiver.poll_next(&mut Context::from_waker(&waker)).is_pending());
+        assert!(!receiver.began());
+        sender.began();
+        assert!(woken.0.load(Ordering::Relaxed), "beginning wakes the receiver");
+        assert!(receiver.began());
+        sender.began();
+        assert!(receiver.began(), "a later residency changes nothing");
+
+        let (sender, mut receiver) = PublicationQueue::bounded(1, |_| {}).unwrap();
+        sender.fail(RequestError::WorkerClosed);
+        assert_eq!(next(&mut receiver), Some(Publication::Failed(RequestError::WorkerClosed)));
+        assert!(!receiver.began(), "refused before it began");
     }
 
     #[test]

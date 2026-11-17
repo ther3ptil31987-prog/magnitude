@@ -1,88 +1,55 @@
-// attention_decode on CPU (contract and portable body in attention.seismic).
-// `prepare`: one work item per row prepares its queries and, for a layer with
-// fresh rows, its keys and values (activation values, as F32) into scratch
-// and appends its key and value at its destination. `attend`: one work item
-// per (kv head, partition, row); a row's keys (spans in order, then its fresh
+// attention_decode on CPU (contract and portable body in attention.seismic),
+// one launch: one work item per (kv head, partition, row). The item prepares
+// its row's G queries of the kv head and, for a layer with fresh rows, the kv
+// head's key and value of every row it reads (and its own, whose part 0
+// appends at its destination); a row's keys (spans in order, then its fresh
 // span) split into consecutive partitions of max(PARTITION_KEYS, ceil(keys /
-// PARTS)) keys, each absorbed for the kv head's G query heads into a partial
-// state. `merge`: one work item per row merges each query head's partitions
-// in order and applies its output gates.
+// parts)) keys, parts the grid's second extent (sized by the pool), each
+// absorbed for the kv head's G query heads into a partial state. The last of a (kv head, row)'s items to arrive (`lib/core/arrive`)
+// merges each of its G query heads' partitions in order and applies its
+// output gates, and emits those heads toward the row's operand
+// (`projection::emit`, whose row's last arrival stages the stored row and
+// forms its Q8 blocks and NVFP4 operand rows) for the output projection
+// (`attention_output`), in the forms its graph pairs
+// (`emits_result_0_rows()`, `emits_result_0_quantized()`,
+// `nvfp4_result_0_rows()`).
 
-use lib::attention::attention::{self, Form, Online, BLOCK};
-use lib::core::activation;
+use lib::attention::attention::{self, Form, Layout, Online, BLOCK};
+use lib::core::{arrive, spans};
+use lib::projection::projection;
 use seismic::cpu::slab::SlabTensor;
 
+#[inline(always)]
 fn form<E: Elements>(cx: &Context<'_, E>) -> Form {
-    Form::new(cx.dim_kv(), cx.dim_g(), cx.dim_p(), cx.dim_s(), cx.dim_i(), cx.dim_u(), cx.dim_f(), cx.dim_n(), cx.dim_nv())
+    Form::new(
+        cx.dim_kv(),
+        cx.dim_g(),
+        cx.dim_p(),
+        cx.dim_s(),
+        cx.dim_i(),
+        cx.dim_u(),
+        cx.dim_f(),
+        cx.dim_nq(),
+        cx.dim_n(),
+        cx.dim_nv(),
+        Layout::new(cx.dim_ra(), cx.dim_rt()),
+        cx.dim_ro(),
+        cx.dim_vk(),
+    )
+    .with_key_rounding(cx.dim_kr(), cx.arg_key_block(), cx.arg_key_element(), cx.arg_key_scale(), cx.arg_key_amax_floor())
 }
 
-fn attention_decode_prepare<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
-    let row = group[0] as usize;
-    let form = form(cx);
-    let (w, q, kv) = (form.heads.w, form.heads.queries(), form.heads.kv);
-    let angles = seismic::cpu::tensor::floats(shared, 2 * form.heads.p);
-    let (cosines, sines) = angles.split_at_mut(form.heads.p);
-    attention::scaled_angles(
-        cx.arg_coordinates().row([row, 0]),
-        cx.arg_rotary_components().row([0]),
-        cx.arg_rotary_frequencies().row([0]),
-        cx.arg_rotary_amplitudes().row([0]),
-        cosines,
-        sines,
-    );
-    // SAFETY: each work item writes its own row of the scratch.
-    let queries = unsafe { cx.scratch_queries().slice_mut::<f32>(4 * row * q * w, q * w) };
-    let keys = unsafe { cx.scratch_keys().slice_mut::<f32>(4 * row * kv * w, kv * w) };
-    let values = unsafe { cx.scratch_values().slice_mut::<f32>(4 * row * kv * w, kv * w) };
-    let (query_norm, key_norm, value_norm) = (cx.arg_query_norm(), cx.arg_key_norm(), cx.arg_value_norm());
-    let norms = (
-        form.norm.then(|| query_norm.row([0, 0])),
-        form.norm.then(|| key_norm.row([0, 0])),
-        form.value_norm.then(|| value_norm.row([0, 0])),
-    );
-    let (query, key, value) = (cx.arg_query(), cx.arg_key(), cx.arg_value());
-    let (key, value) = if form.fresh { (key.row([0, row, 0]), value.row([0, row, 0])) } else { (&[][..], &[][..]) };
-    attention::prepare_form_row::<E::A>(
-        form,
-        |head| query.row([row, head, 0]),
-        key,
-        value,
-        norms,
-        cosines,
-        sines,
-        cx.arg_epsilon(),
-        queries,
-        keys,
-        values,
-    );
-    let destination = cx.arg_destinations().get([row]);
-    if form.fresh && destination >= 0 {
-        let slab_rows = cx.arg_slab_rows() as usize;
-        let (history_key, history_value) = (
-            SlabTensor::from_bound(cx.arg_history_key(), slab_rows),
-            SlabTensor::from_bound(cx.arg_history_value(), slab_rows),
-        );
-        for head in 0..kv {
-            // SAFETY: destinations are distinct, freshly reserved history rows
-            // no row of the call reads.
-            let (key_row, value_row) = unsafe {
-                (history_key.row_mut([destination as usize, head, 0]), history_value.row_mut([destination as usize, head, 0]))
-            };
-            activation::store::<E::A>(&keys[head * w..][..w], key_row);
-            activation::store::<E::A>(&values[head * w..][..w], value_row);
-        }
-    }
-}
-
-fn attention_decode_attend<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
+#[inline(always)]
+fn attention_decode_attend<L: Isa, E: Elements>(l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let (kv_head, part, row) = (group[0] as usize, group[1] as usize, group[2] as usize);
     let form = form(cx);
     let (g, w, kv) = (form.heads.g, form.heads.w, form.heads.kv);
-    let (m, r, parts) = (cx.dim_m() as usize, cx.dim_r() as usize, cx.param_parts() as usize);
+    let (m, r, parts) = (cx.dim_m() as usize, cx.dim_r() as usize, cx.groups()[1] as usize);
     let (visible, fresh) = (cx.arg_visible(), cx.arg_fresh());
     let spans = (0..r)
-        .map(move |span| (visible.get([row, span, 0]), visible.get([row, span, 1])))
-        .filter(|(lo, hi)| hi > lo);
+        .map(move |span| spans::span(visible.get([row, span, 0]), visible.get([row, span, 1])))
+        .filter(|rows| !rows.is_empty())
+        .map(|rows| (rows.start, rows.end));
     // A layer without fresh rows sees none (the portable `for layer in 0..F`).
     let fresh = if form.fresh { (fresh.get([row, 0]), fresh.get([row, 1])) } else { (0, 0) };
     let range = attention::partition(attention::total(spans.clone(), fresh), parts, part);
@@ -93,69 +60,178 @@ fn attention_decode_attend<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, grou
     let (maximum, denominator) = statistics.split_at_mut(g);
     let mut state = Online { maximum, denominator, accumulator };
     state.reset();
-    let work = seismic::cpu::tensor::floats(shared, g * BLOCK + w);
-    let (scores, key_row) = work.split_at_mut(g * BLOCK);
-    // SAFETY: the prepare launch wrote every row before this launch.
-    let (queries, keys, values) = unsafe {
-        (
-            cx.scratch_queries().slice::<f32>(4 * (row * kv + kv_head) * g * w, g * w),
-            cx.scratch_keys().slice::<f32>(0, m * kv * w),
-            cx.scratch_values().slice::<f32>(0, m * kv * w),
-        )
-    };
-    let slab_rows = cx.arg_slab_rows() as usize;
-    let (history_key, history_value) = (
-        SlabTensor::from_bound(cx.arg_history_key(), slab_rows),
-        SlabTensor::from_bound(cx.arg_history_value(), slab_rows),
+    let (p, ro) = (form.heads.p, usize::from(form.output_rotary));
+    let shared = seismic::cpu::tensor::floats(
+        shared,
+        g * BLOCK + attention::work(w, false) + 2 * p + g * w + 2 * m * w + w + 2 * p * ro,
     );
-    attention::attend_rows(
+    let (scores, shared) = shared.split_at_mut(g * BLOCK);
+    let (work, shared) = shared.split_at_mut(attention::work(w, false));
+    let (angles, shared) = shared.split_at_mut(2 * p);
+    let (queries, shared) = shared.split_at_mut(g * w);
+    let (keys, shared) = shared.split_at_mut(m * w);
+    let (values, merged) = shared.split_at_mut(m * w);
+    let (query_norm, key_norm, value_norm) = (cx.arg_query_norm(), cx.arg_key_norm(), cx.arg_value_norm());
+    let norms = (
+        form.query_norm.then(|| query_norm.row([0, 0])),
+        form.key_norm.then(|| key_norm.row([0, 0])),
+        form.value_norm.then(|| value_norm.row([0, 0])),
+    );
+    let (query, key_rows, value_rows) = (cx.arg_query(), cx.arg_key(), cx.arg_value());
+    let destination = cx.arg_destinations().get([row]);
+    let append = form.fresh && destination >= 0 && part == 0;
+    attention::prepare_group::<E::A>(
+        form,
+        kv_head,
+        row,
+        append,
+        spans::span(fresh.0, fresh.1),
+        |r, cosines, sines| {
+            attention::scaled_angles(
+                cx.arg_coordinates().row([r, 0]),
+                cx.arg_rotary_components().row([0]),
+                cx.arg_rotary_frequencies().row([0]),
+                cx.arg_rotary_amplitudes().row([0]),
+                cosines,
+                sines,
+            )
+        },
+        |head| query.row([row, head, 0]),
+        |r| key_rows.row([0, r, 0]),
+        |r| if form.own_values() { value_rows.row([0, r, 0]) } else { &[][..] },
+        norms,
+        cx.arg_epsilon(),
+        angles.split_at_mut(p),
+        queries,
+        keys,
+        values,
+    );
+    let slab_rows = cx.arg_slab_rows() as usize;
+    let history_key = SlabTensor::from_bound(cx.arg_history_key(), slab_rows);
+    let history_value = SlabTensor::from_bound(cx.arg_history_value(), slab_rows);
+    if append {
+        // SAFETY: destinations are distinct, freshly reserved history rows
+        // no row of the call reads.
+        unsafe {
+            attention::store_dense_head::<E::A>(
+                form,
+                &keys[row * w..][..w],
+                &values[row * w..][..w],
+                &history_key,
+                &history_value,
+                destination as usize,
+                kv_head,
+            );
+        }
+    }
+    // Stored-key values are read from the key plane.
+    let history_value = if form.stored_key { &history_key } else { &history_value };
+    let history = (attention::history_rows(&history_key, kv_head), attention::history_rows(history_value, kv_head));
+    let batch = (attention::batch_rows(keys, 1, 0, w), attention::batch_rows(values, 1, 0, w));
+    attention::attend(
+        l,
         &mut state,
         queries,
         cx.arg_scale(),
         scores,
-        key_row,
+        work,
         spans,
         fresh,
         range,
-        |token, out| activation::widen::<E::A>(history_key.row([token, kv_head, 0]), out),
-        |token, out| activation::widen::<E::A>(history_value.row([token, kv_head, 0]), out),
-        |token, out| out.copy_from_slice(&keys[(token * kv + kv_head) * w..][..w]),
-        |token, out| out.copy_from_slice(&values[(token * kv + kv_head) * w..][..w]),
+        |_| true,
+        (&history.0, &history.1),
+        (&batch.0, &batch.1),
     );
+    // The index-list source's picks join the row's last partition.
+    let picks = cx.dim_ks() as usize;
+    if picks > 0 && part + 1 == parts {
+        let selected = SlabTensor::from_bound(cx.arg_selected(), cx.arg_selected_slab_rows() as usize);
+        attention::attend_picks::<_, E::A>(
+            l,
+            &mut state,
+            queries,
+            cx.arg_scale(),
+            scores,
+            work,
+            cx.arg_selected_rows().row([row, 0]),
+            |pick| selected.row([pick, kv_head, 0]),
+        );
+    }
+    // SAFETY: one counter a (row, kv head) of the launch's `arrivals` scratch,
+    // each of the group's partition items arriving once, after its partial state.
+    let last = unsafe { arrive::last(cx.scratch_arrivals().pointer::<u32>(4 * (row * kv + kv_head)), parts as u32) };
+    if last {
+        merge(cx, form, kv_head, row, merged);
+    }
 }
 
-fn attention_decode_merge<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
-    let row = group[0] as usize;
-    let form = form(cx);
+/// The merge of one (kv head, row)'s partitions, run by the last item of the
+/// group to finish: `work` holds the output row and the output rotary's angles.
+#[inline(always)]
+fn merge<E: Elements>(cx: &Context<'_, E>, form: Form, kv_head: usize, row: usize, work: &mut [f32]) {
     let (g, w, kv) = (form.heads.g, form.heads.w, form.heads.kv);
-    let (m, parts) = (cx.dim_m() as usize, cx.param_parts() as usize);
-    // SAFETY: the attend launch wrote every partial state before this launch.
+    let (m, parts) = (cx.dim_m() as usize, cx.groups()[1] as usize);
+    // SAFETY: every item of the group stored its partial state before it arrived.
     let (partials, statistics) = unsafe {
         (
             cx.scratch_partials().slice::<f32>(0, m * kv * parts * g * w),
             cx.scratch_statistics().slice::<f32>(0, m * kv * parts * 2 * g),
         )
     };
-    let output = seismic::cpu::tensor::floats(shared, w);
+    let (output, angles) = work.split_at_mut(w);
+    let turned = attention::output_angles(
+        form,
+        cx.arg_coordinates().row([row, 0]),
+        cx.arg_rotary_components().row([0]),
+        cx.arg_rotary_frequencies().row([0]),
+        cx.arg_rotary_amplitudes().row([0]),
+        angles,
+    );
     let (query, gate, result) = (cx.arg_query(), cx.arg_gate(), cx.result_0());
     let softplus = cx.arg_gate_function() != 0;
-    for head in 0..form.heads.queries() {
-        let (kv_head, local) = (head / g, head % g);
+    for local in 0..g {
+        let head = kv_head * g + local;
         let item = |part: usize| (row * kv + kv_head) * parts + part;
-        let denominator = attention::merge(
+        let maximum = |part: usize| statistics[item(part) * 2 * g + local];
+        let mut denominator = attention::merge(
             parts,
-            |part| statistics[item(part) * 2 * g + local],
+            maximum,
             |part| statistics[item(part) * 2 * g + g + local],
             |part| &partials[(item(part) * g + local) * w..][..w],
             output,
         );
+        if cx.dim_sk() == 1 {
+            let overall = (0..parts).map(maximum).fold(f32::NEG_INFINITY, f32::max);
+            denominator += attention::sink_weight(cx.arg_sinks().get([0, head]), overall);
+        }
         // SAFETY: each work item writes its own row of the result.
-        let out = unsafe { result.row_mut([row, head, 0]) };
+        let mut out = unsafe { result.row_mut([row, head, 0]) };
         let gates = if form.interleaved > 0 {
             query.span([row, head, w], form.interleaved)
         } else {
             gate.row([row, head, 0])
         };
-        attention::gate_row::<E::A>(output, denominator, gates, softplus, out);
+        attention::gate_row::<E::A>(output, denominator, gates, softplus, &mut out);
+        if let Some((cosines, sines)) = turned {
+            attention::output_rotary::<E::A>(&mut out, form.layout, cosines, sines);
+        }
+    }
+    // The kv head's G heads of the row, stored, toward the row's operand.
+    if cx.emits_result_0_rows() {
+        let width = kv * g * w;
+        // SAFETY: the emitted operand's buffers; this merge stored the kv
+        // head's heads of the row, which arrive once.
+        unsafe {
+            projection::emit(
+                cx.scratch_result_0_rows(),
+                cx.emits_result_0_quantized().then(|| cx.scratch_result_0_quantized()),
+                cx.nvfp4_result_0_rows(),
+                cx.scratch_result_0_arrivals(),
+                width,
+                row,
+                g * w,
+                |out| projection::stage_heads::<E::A>(&result, row, out),
+            )
+        };
     }
 }

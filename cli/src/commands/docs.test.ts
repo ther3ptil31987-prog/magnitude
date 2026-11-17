@@ -40,7 +40,7 @@ describe("Magnitude documentation", () => {
     if (result._tag === "Failure") return
     expect(result.output).toContain("# Speculative decoding methods")
     expect(result.output).toContain(
-      "None (usually slowest) -> MTP -> DFlash -> DSpark (usually fastest)",
+      "None (usually slowest) -> MTP -> DFlash -> DSpark -> LiLiCorr (usually fastest)",
     )
     expect(result.output).toContain("Magnitude then activates the method automatically")
     expect(result.output).toContain("typical ordering, not a guarantee")
@@ -53,10 +53,9 @@ describe("Magnitude documentation", () => {
     if (result._tag === "Failure") return
     expect(result.output).toContain("# Model recommendations")
     expect(result.output).toContain("Artificial Analysis Intelligence Index")
-    expect(result.output).toContain("normal requests to lean toward speed or intelligence")
-    expect(result.output).toContain("`fastest` and `smartest` are extremes")
-    expect(result.output).toContain("`smartest` prioritizes intelligence and gives speed only")
-    expect(result.output).toContain("shorter and longer contexts")
+    expect(result.output).toContain("estimated to decode at 20 tokens per second or more")
+    expect(result.output).toContain("`--country US` recommends only")
+    expect(result.output).toContain("each assessed context")
     expect(result.output).toContain("useful reference points")
     expect(result.output).toContain("magnitude docs speculative-methods")
     expect(result.output).toContain("GPT-5.6 Sol")
@@ -65,6 +64,18 @@ describe("Magnitude documentation", () => {
     expect(result.output).not.toContain("25K")
     expect(result.output).not.toContain("50K")
     expect(result.output).not.toContain("75K")
+  })
+
+  it("documents custom models, drafters, and model locations", () => {
+    const result = resolveDocumentationCommand("custom-models")
+
+    expect(result._tag).toBe("Success")
+    if (result._tag === "Failure") return
+    for (const command of ["models search", "models show", "models pull", "models rm", "models drafter", "models hide", "models folders"]) {
+      expect(result.output).toContain(command)
+    }
+    const cli = resolveDocumentationCommand("cli")
+    expect(cli._tag === "Success" && cli.output).toContain("accepts `--json`")
   })
 
   it("rejects unknown topic IDs and lists the available IDs", () => {

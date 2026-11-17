@@ -3,7 +3,9 @@
 //!
 //! A process that installs a [`TuningSurvey`] replaces the search of every
 //! tuned entry instance (or of the named entries) by a survey: every
-//! admissible configuration is formed, measured with
+//! admissible configuration that runs work of its own at the surveyed
+//! points (one moving only parameters no launch it runs there reads runs
+//! its default's work) is formed, measured with
 //! [`TuningSurvey::samples`] samples per point, and validated, and the whole
 //! Seismic `TuningResult` (every raw sample of every configuration) is
 //! written to one JSON file per entry instance: the true cost of every
@@ -13,13 +15,14 @@
 //! these files (tuning spec §E2) and reports, per entry instance, the choice
 //! quality at the evaluations the survey's load would have allowed its
 //! search, the configurations needed, and the per-point gap of one
-//! configuration for all points (example `tuning_replay`).
+//! configuration for all points (`replay.md` beside a harness survey's
+//! records).
 //!
 //! On a shared host the whole surveying process must run under the host's
 //! GPU lock: its model load, the tuning of entries it does not survey and
 //! its bench cells use the device as much as the survey does.
 //!
-//! Only `forward_bench` enables the feature (`--tuning-survey DIR`). The
+//! Only `magnitude-harness` enables the feature (`--tuning-survey DIR`). The
 //! survey is process-global so that no production API carries it.
 
 use super::TuningKey;
@@ -37,8 +40,8 @@ pub struct TuningSurvey {
     /// Entries to survey; every tuned entry when empty. The others are
     /// searched as usual.
     pub entries: Vec<String>,
-    /// Widened parameter domains by entry (each list keeps the declared
-    /// default first), to test the search on larger spaces.
+    /// Widened parameter domains by entry (each list keeps every declared
+    /// value), to test the search on larger spaces.
     pub domains: BTreeMap<String, BTreeMap<String, Vec<u64>>>,
 }
 
@@ -47,6 +50,11 @@ static SURVEY: Mutex<Option<TuningSurvey>> = Mutex::new(None);
 /// Install the survey for every later program preparation in this process.
 pub fn install(survey: TuningSurvey) {
     *SURVEY.lock().expect("tuning survey lock poisoned") = Some(survey);
+}
+
+/// Whether a survey is installed in this process.
+pub(crate) fn installed() -> bool {
+    SURVEY.lock().expect("tuning survey lock poisoned").is_some()
 }
 
 /// The installed survey, when it names `entry`.
@@ -77,8 +85,9 @@ pub(super) fn record(
     let survey = guard
         .as_ref()
         .expect("a survey result implies an installed survey");
-    let (entry, bindings, statics) = key;
-    let instance = crate::kernel_cache::TuningCacheKey::of(&format!("{bindings}{statics:?}"));
+    let (entry, bindings, fixed) = key;
+    let statics = &fixed.statics;
+    let instance = crate::kernel_cache::TuningCacheKey::of(&format!("{bindings}{fixed:?}"));
     let path = survey
         .directory
         .join(format!("{entry}-{}.json", &instance.as_str()[..12]));
@@ -86,6 +95,7 @@ pub(super) fn record(
         "entry": entry,
         "bindings": bindings,
         "statics": statics,
+        "fixed": fixed.params,
         "allowance_seconds": allowance.as_secs_f64(),
         "result": result,
     });
@@ -102,6 +112,11 @@ pub(super) fn record(
 /// Replays per entry instance.
 pub const REPLAY_RUNS: usize = 1000;
 
+/// The replay report's line for an entry instance no point of the load
+/// demands: every configuration scores zero, so a search has nothing to
+/// choose between.
+pub const NO_DEMAND: &str = "No point has demand at this load: every configuration scores alike.";
+
 /// Replay the production search against every survey file in `directory`
 /// ([`REPLAY_RUNS`] runs each, §E2) and report, as Markdown: per entry
 /// instance, the chosen configuration's true cost relative to the true best
@@ -113,7 +128,7 @@ pub const REPLAY_RUNS: usize = 1000;
 /// and per point, the time of the overall best configuration against the
 /// best at that point alone (what a per-size launch could recover).
 pub fn replay_report(directory: &std::path::Path) -> Result<String, String> {
-    use seismic::replay::{replay, Objective, Recording};
+    use seismic::replay::{Objective, Recording, replay};
     use std::fmt::Write;
     let mut files = std::fs::read_dir(directory)
         .map_err(|error| format!("reading {}: {error}", directory.display()))?
@@ -143,6 +158,17 @@ pub fn replay_report(directory: &std::path::Path) -> Result<String, String> {
         let allowance = field("allowance_seconds")?
             .as_f64()
             .ok_or_else(|| format!("{}: `allowance_seconds` is not a time", path.display()))?;
+        if result.points.iter().all(|point| point.weight == 0.0) {
+            writeln!(
+                report,
+                "### {} [{}] {}\n\n{NO_DEMAND}\n",
+                result.entry,
+                field("bindings")?.as_str().unwrap_or_default(),
+                field("statics")?,
+            )
+            .expect("writing to a string");
+            continue;
+        }
         let time = &result.time;
         let per_configuration =
             (time.forming_seconds + time.measuring_seconds + time.validating_seconds)
@@ -151,12 +177,9 @@ pub fn replay_report(directory: &std::path::Path) -> Result<String, String> {
             ((allowance / per_configuration.max(f64::MIN_POSITIVE)).floor() as usize).max(1);
         let recording =
             Recording::new(&result).map_err(|error| format!("{}: {error}", path.display()))?;
-        let space = recording.space().len();
+        let space = recording.len();
         // The settings the recorded entry's search runs with.
-        let settings = super::search_settings(
-            seismic::BackendName::parse(&result.backend)
-                .ok_or_else(|| format!("{}: unknown backend", path.display()))?,
-        );
+        let settings = super::SEARCH_SETTINGS;
         writeln!(
             report,
             "### {} [{}] {}\n\n{} admissible, {} measured, allowance {allowance:.2} s ({budget} evaluations); true best {:?}\n",
@@ -165,7 +188,7 @@ pub fn replay_report(directory: &std::path::Path) -> Result<String, String> {
             field("statics")?,
             space,
             recording.measured(),
-            recording.space().values(recording.best()),
+            recording.values(recording.best()),
         )
         .expect("writing to a string");
         writeln!(

@@ -6,17 +6,21 @@
 use crate::error::{ArtifactError, LoadError, ResolveError, UnsupportedModel};
 use crate::host::HostArtifacts;
 use crate::options::{ExecutionManifest, InputModalities, ModelPolicy, PackageOptions, ReadyInfo};
-use magnitude_artifacts::PackageIdentity;
-use std::fmt;
+use crate::execution::LoadAttempt;
+use crate::preview::{now, priced};
 use crate::worker::{
-    connect_worker, protocol::LoadProgress, run_worker, transport::channel_pair, EngineClient,
-    WorkerConnection,
+    connect_worker, load_prepared, measure::InProcessJobs, prepare, protocol::LoadProgress, run_worker,
+    start_worker_process, transport::channel_pair, EngineClient, Preparation, WorkerConnection,
 };
+use magnitude_executor::UnpreparedUnits;
+use magnitude_artifacts::PackageIdentity;
 use magnitude_executor::{
-    platform::{DeviceRequest, MemoryReserves},
+    image_cell_limit, max_image_cells,
+    platform::{DeviceRequest, ReleaseRate},
     ExecutionPath,
 };
 use magnitude_scheduler::ServiceLimits;
+use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -37,11 +41,12 @@ pub struct EngineConfiguration {
     pub device: DeviceRequest,
     /// The directory the host keeps formed kernels and tuning results in
     /// (`--cache-dir`; ACN names `<dataDir>/cache/kernels`). `None` caches
-    /// nothing: every load forms and tunes every entry.
+    /// nothing: no tuning record reaches a load, which forms every entry
+    /// at its canonical default.
     pub kernel_cache: Option<PathBuf>,
-    /// The host's threshold policy (`MemoryReserves::standard()` for the
+    /// The machine's page-release rate (`ReleaseRate::of_machine(None)` for the
     /// service and CLI). The engine never defaults it.
-    pub reserves: MemoryReserves,
+    pub release: ReleaseRate,
 }
 
 /// The two authorities produced by host resolution: host artifacts (chat
@@ -64,9 +69,7 @@ impl EngineConfiguration {
         )?;
         let definition = host.definition();
         definition.validate().map_err(|error| {
-            ResolveError::Unsupported(UnsupportedModel::Representation {
-                reason: error.to_string(),
-            })
+            ResolveError::Unsupported(UnsupportedModel::unreadable(error.to_string()))
         })?;
         let invalid = |reason: String| ResolveError::InvalidConfiguration { reason };
         let model = self
@@ -81,7 +84,8 @@ impl EngineConfiguration {
             self.path,
             self.device,
             self.kernel_cache,
-            self.reserves,
+            Some(host.package().store().to_path_buf()),
+            self.release,
         )
         .map_err(invalid)?;
         Ok(ResolvedEngineConfiguration { host, manifest })
@@ -110,6 +114,9 @@ pub enum ReadinessMismatch {
         host: InputModalities,
         worker: InputModalities,
     },
+    /// The host cannot bound its image resize to the cells the worker's
+    /// device encodes per image.
+    ImageCells { reason: String },
 }
 
 impl fmt::Display for ReadinessMismatch {
@@ -127,6 +134,10 @@ impl fmt::Display for ReadinessMismatch {
                 formatter,
                 "the worker accepts {worker:?} but the host resolved {host:?}"
             ),
+            Self::ImageCells { reason } => write!(
+                formatter,
+                "the host cannot bound its images to the cells the worker's device encodes: {reason}"
+            ),
         }
     }
 }
@@ -136,7 +147,8 @@ impl std::error::Error for ReadinessMismatch {}
 impl ReadyEngine {
     /// Bind host artifacts to a connected worker. The worker must have
     /// loaded exactly the package the host resolved and read the same chat
-    /// templates and input modalities from it.
+    /// templates and input modalities from it. The engine's host resizes
+    /// images to the cells the worker's device encodes.
     pub fn new(
         host: Arc<HostArtifacts>,
         connection: WorkerConnection,
@@ -161,6 +173,14 @@ impl ReadyEngine {
                 worker: ready.modalities,
             });
         }
+        let host = image_cell_limit(
+            host.definition(),
+            ready.service.launch_rows(),
+            max_image_cells(ready.backend),
+        )
+        .map_err(|error| error.to_string())
+        .and_then(|cells| host.within_image_cells(cells))
+        .map_err(|reason| ReadinessMismatch::ImageCells { reason })?;
         Ok(Self {
             host,
             client: connection.client,
@@ -185,25 +205,150 @@ impl ReadyEngine {
     }
 }
 
+/// Have the standing figures a load of `manifest` plans on measured in this
+/// process before it loads or prepares (`preview::priced`): no job runs
+/// beside a host that loads in its own process, so while they are pending
+/// its own jobs measure them ([`InProcessJobs`]), and the plan is taken
+/// again. Jobs whose time gives no next one before they measure anything
+/// of what is pending ([`crate::worker::measure::JobTime`]) fail the load
+/// with why. A preview that fails otherwise is the load's to report, as it
+/// plans the same. Returns how often its jobs measured; never without a
+/// kernel cache, which holds the figures. A load in its own process
+/// settles them once an attempt finds them pending ([`load_in_process`]),
+/// so a priced machine's load plans nothing more.
+pub fn settle_prices(manifest: &ExecutionManifest) -> Result<u64, LoadError> {
+    let internal = |reason: String| LoadError::Internal { reason };
+    let paths = vec![manifest.store().to_path_buf()];
+    let catalog = seismic::Devices::discover(&paths).map_err(|error| internal(error.to_string()))?;
+    let Some(mut jobs) = InProcessJobs::of_load(&catalog, paths, manifest).map_err(internal)? else {
+        return Ok(0);
+    };
+    let mut ran = 0;
+    let mut measured = || {
+        ran += 1;
+        jobs.run()
+            .map(drop)
+            .map_err(|stopped| internal(format!("the plan's prices are pending, and {stopped}")))
+    };
+    now(priced(
+        || std::future::ready(manifest.preview(&catalog)),
+        || std::future::ready(manifest.request_prices(&catalog).map_err(internal)),
+        || std::future::ready(measured()),
+    ))?;
+    Ok(ran)
+}
+
+/// The model's Prepare, as a host that loads in its own process runs it
+/// for no load ([`prepare`]): its prices settled first ([`settle_prices`]),
+/// as its search plans the load.
+pub fn prepare_in_process(
+    manifest: &ExecutionManifest,
+    worker: std::process::Command,
+    progress: impl FnMut(LoadProgress),
+) -> Result<Preparation, LoadError> {
+    settle_prices(manifest)?;
+    prepare(manifest, || start_worker_process(worker), progress)
+}
+
+/// [`load_prepared`] for a host that loads in its own process: `load` is its
+/// load, and `worker` starts the host's executable in its worker role
+/// ([`crate::worker::serve_worker`] over its standard streams) for the
+/// model's Prepare when the load finds tuning units without a stored record.
+/// A Prepare that does not finish is reported on the diagnostic stream; the
+/// load then serves canonical defaults for the units without a record. The
+/// stream also carries `kernel preparation began` when the Prepare's process
+/// is started and `kernel preparation ended in S s` once it is gone.
+pub fn load_in_process<L>(
+    manifest: &ExecutionManifest,
+    load: impl FnMut(UnpreparedUnits) -> Result<LoadAttempt<L>, LoadError>,
+    worker: std::process::Command,
+    prepare_progress: impl FnMut(LoadProgress),
+) -> Result<L, LoadError> {
+    // The diagnostic stream says when the Prepare's process began and that it
+    // is gone, so a log's reader can tell preparation from the load itself.
+    let preparing = std::cell::Cell::new(None);
+    let mut load = load;
+    let (loaded, preparation) = load_prepared(
+        manifest,
+        |unprepared| {
+            if let Some(began) = preparing.take() {
+                let began: std::time::Instant = began;
+                tracing::info!(
+                    "kernel preparation ended in {:.3} s",
+                    began.elapsed().as_secs_f64()
+                );
+            }
+            // An attempt whose prices are pending has them measured here and
+            // is made again; one still pending once nothing was left to
+            // measure plans otherwise than its preview, and fails as it is.
+            loop {
+                match load(unprepared) {
+                    Err(error @ LoadError::PricesPending { .. }) => match settle_prices(manifest)? {
+                        0 => return Err(error),
+                        _ => continue,
+                    },
+                    attempt => return attempt,
+                }
+            }
+        },
+        || {
+            tracing::info!("kernel preparation began");
+            preparing.set(Some(std::time::Instant::now()));
+            start_worker_process(worker)
+        },
+        prepare_progress,
+    )?;
+    if let Preparation::Incomplete(error) = preparation {
+        tracing::warn!(
+            "kernel preparation did not finish ({error}); the load serves \
+             canonical defaults for the units without a stored tuning record"
+        );
+    }
+    Ok(loaded)
+}
+
 /// Load the model on a worker thread of this process over the in-process
-/// transport: the same worker and protocol a worker process runs.
+/// transport: the same worker and protocol a worker process runs. Like every
+/// load it searches nothing: `worker` starts this executable in its worker
+/// role for the model's Prepare when records are missing
+/// ([`load_in_process`]).
 pub fn start_in_process(
     resolved: ResolvedEngineConfiguration,
+    worker: std::process::Command,
     progress: impl FnMut(LoadProgress),
 ) -> Result<ReadyEngine, LoadError> {
     let ResolvedEngineConfiguration { host, manifest } = resolved;
-    let (host_end, worker_end) = channel_pair();
-    std::thread::Builder::new()
-        .name("magnitude-worker".into())
-        .spawn(move || {
-            let exit = run_worker(manifest, worker_end);
-            eprintln!("magnitude-engine: in-process worker exited: {exit:?}");
-        })
-        .map_err(|error| LoadError::Internal {
-            reason: error.to_string(),
-        })?;
-    let connection = connect_worker(host_end, None, progress)?;
-    ReadyEngine::new(Arc::new(host), connection).map_err(|mismatch| LoadError::Internal {
-        reason: mismatch.to_string(),
+    let host = Arc::new(host);
+    // The load's attempts and the Prepare report to one observer, in turn.
+    let progress = std::cell::RefCell::new(progress);
+    let attempt = |unprepared| -> Result<LoadAttempt<ReadyEngine>, LoadError> {
+        let (host_end, worker_end) = channel_pair();
+        let worker_manifest = manifest.clone();
+        let worker = std::thread::Builder::new()
+            .name("magnitude-worker".into())
+            .spawn(move || {
+                let exit = run_worker(worker_manifest, unprepared, worker_end);
+                tracing::info!("in-process worker exited: {exit:?}");
+            })
+            .map_err(|error| LoadError::Internal {
+                reason: error.to_string(),
+            })?;
+        match connect_worker(host_end, None, |update| (progress.borrow_mut())(update))? {
+            LoadAttempt::Loaded(connection) => ReadyEngine::new(Arc::clone(&host), connection)
+                .map(LoadAttempt::Loaded)
+                .map_err(|mismatch| LoadError::Internal {
+                    reason: mismatch.to_string(),
+                }),
+            LoadAttempt::Unprepared => {
+                // Everything the attempt opened is gone with its thread.
+                worker.join().map_err(|_| LoadError::Internal {
+                    reason: "the in-process worker panicked".into(),
+                })?;
+                Ok(LoadAttempt::Unprepared)
+            }
+        }
+    };
+    load_in_process(&manifest, attempt, worker, |update| {
+        (progress.borrow_mut())(update)
     })
 }

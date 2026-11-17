@@ -1,0 +1,848 @@
+//! The exclusions on the device between residency and the jobs that search or measure kernels
+//! on it (device topology spec §2.15). Loads share the device for their lifetime. A job (the
+//! measurement job, or a catalog installation's optimization) runs only with the device to
+//! itself: a search beside a resident model would take the memory that model's verdict promised
+//! its requests, and would time kernels against its serving. A job never queues ahead of a load
+//! as a waiting writer would: it tries to take the device and waits for a release to try again,
+//! so a job deferred by a resident model runs once the device is free. A share wanted while a job
+//! holds the device preempts the job: its owner kills it at once, so a load waits only for that
+//! kill's process to be shown gone.
+//!
+//! The measurement job alone may also run beside a resident model while that model is idle (no
+//! request holds it), in the model's idle time: residency publishes the idle model
+//! ([`DeviceLock::resident_idle`]), whose worker the job asks for room first
+//! ([`ResidentRoom`]). Such a job holds the device as a job does against every other share and
+//! job, and is preempted as one is, and also by any change of the idle model: a request leasing
+//! it, or its release. The model's idleness and the job's start are one decision, so no job
+//! starts once a request holds the model, and a request is served only once the job it
+//! preempted is gone ([`DeviceLock::admit_request`]): no point is timed beside a request.
+//!
+//! A measurement starts beside the idle model only once the model has been idle for a quiet
+//! period ([`Quiet`]): longer than its idle periods between requests mostly last, and doubled for
+//! each measurement in a row that a request preempted. A job started in every short idle gap
+//! would be killed by the next request each time, and keep the machine busy for nothing.
+
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use futures_util::future::BoxFuture;
+use magnitude_engine::error::RequestError;
+use magnitude_engine::worker::protocol::RoomAnswer;
+use magnitude_service_contracts::models::ModelInstanceId;
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, watch};
+use tokio::time::Instant;
+
+/// What a measurement beside an idle resident model asks of that model's worker.
+pub trait ResidentRoom: Send + Sync {
+    /// Make `bytes` of device memory free beside the model, shrinking what it holds toward its
+    /// floor: answered once made, with why it cannot be, or released by [`Self::release`] first;
+    /// failing once the model is gone. The model grows nothing until [`Self::release`].
+    fn claim(&self, bytes: u64) -> BoxFuture<'static, Result<RoomAnswer, RequestError>>;
+    /// The measurement holding the room runs as `process`: its footprint is credited against the
+    /// room, so its growth is never read as another program's, until [`Self::release`], which
+    /// comes only once it is shown gone, so a reused pid is never credited. A model that credits
+    /// nothing ignores it.
+    fn attach(&self, process: seismic::ProcessId) {
+        let _ = process;
+    }
+    /// The measurement ended: the model may grow into the room again.
+    fn release(&self);
+    /// The measurement stored new records: the model prices its experts again from them.
+    fn reprice(&self);
+}
+
+/// The resident model while no request holds it: the load it is, and what a measurement beside
+/// it asks of its worker.
+#[derive(Clone)]
+pub struct IdleResident {
+    pub instance: ModelInstanceId,
+    pub room: Arc<dyn ResidentRoom>,
+}
+
+/// The device exclusion, shared by residency and the jobs. `released` counts the holds that
+/// ended, shares and jobs alike, so a job waiting for the device tries again after each.
+#[derive(Clone)]
+pub struct DeviceLock {
+    lock: Arc<RwLock<()>>,
+    released: Arc<watch::Sender<u64>>,
+    /// How many shares have waited on a job: each one preempts the job holding the device then.
+    wanted: Arc<watch::Sender<u64>>,
+    /// Counts the point requests stored by loads that hold no share ([`Self::requested`]).
+    requested: Arc<watch::Sender<u64>>,
+    /// The shares held, the idle resident model, and whether a measurement runs beside it.
+    sharing: Arc<watch::Sender<Sharing>>,
+    /// When a measurement may start beside the idle resident model.
+    quiet: Arc<Mutex<Quiet>>,
+}
+
+/// The idle periods a quiet period is judged by: the last this many that a request ended.
+const GAPS: usize = 32;
+/// The shortest quiet period.
+const QUIET_FLOOR: Duration = Duration::from_secs(5);
+/// The longest quiet period, however many measurements in a row were preempted.
+const QUIET_CEILING: Duration = Duration::from_secs(10 * 60);
+
+/// What decides how long the resident model is idle before a measurement starts beside it:
+/// `clamp(2 × p90(gaps), 5 s, 10 min) × 2^preemptions`, at most 10 min. Only the measurement job
+/// runs beside a resident model, so only its jobs are judged by it.
+#[derive(Default)]
+struct Quiet {
+    /// The last [`GAPS`] idle periods a request's lease ended, oldest first.
+    gaps: VecDeque<Duration>,
+    /// The measurement jobs in a row that were preempted.
+    preemptions: u32,
+}
+
+impl Quiet {
+    /// How long the resident model is idle before a measurement starts beside it.
+    fn period(&self) -> Duration {
+        let mut gaps = Vec::from(self.gaps.clone());
+        gaps.sort_unstable();
+        // The nearest rank's: the gap at least 90% of the others are no longer than.
+        let p90 = match gaps.len() {
+            0 => Duration::ZERO,
+            count => gaps[(count * 9).div_ceil(10) - 1],
+        };
+        (p90 * 2)
+            .clamp(QUIET_FLOOR, QUIET_CEILING)
+            .saturating_mul(2u32.saturating_pow(self.preemptions))
+            .min(QUIET_CEILING)
+    }
+
+    /// A request's lease ended the resident model's idle period of `gap`.
+    fn leased(&mut self, gap: Duration) {
+        if self.gaps.len() == GAPS {
+            self.gaps.pop_front();
+        }
+        self.gaps.push_back(gap);
+    }
+
+    /// A measurement job's hold ended: one that ran to its end unkilled ([`DeviceJob::finished`])
+    /// ends the preemptions in a row; one preempted adds to them; one that ended otherwise (its
+    /// room unmade, its time expired) leaves them.
+    fn ended_job(&mut self, finished: bool, preempted: bool) {
+        match (finished, preempted) {
+            (true, _) => self.preemptions = 0,
+            (false, true) => self.preemptions = self.preemptions.saturating_add(1),
+            (false, false) => {}
+        }
+    }
+}
+
+/// The shares held, the resident model while no request holds it, and the job holding the
+/// device, to itself or beside that model: while one does, no share is taken.
+#[derive(Clone, Default)]
+struct Sharing {
+    shares: usize,
+    idle: Option<IdleResident>,
+    /// Counts the idle model's changes: each preempts a measurement beside it.
+    idleness: u64,
+    /// Since when the resident model is idle: its idle period's start, which republishing it
+    /// idle keeps.
+    idle_since: Option<Instant>,
+    /// A job holds the device.
+    job: bool,
+}
+
+impl Default for DeviceLock {
+    fn default() -> Self {
+        Self {
+            lock: Arc::default(),
+            released: Arc::new(watch::Sender::new(0)),
+            wanted: Arc::new(watch::Sender::new(0)),
+            requested: Arc::new(watch::Sender::new(0)),
+            sharing: Arc::new(watch::Sender::new(Sharing::default())),
+            quiet: Arc::default(),
+        }
+    }
+}
+
+/// Residency's hold on the device: a load's, held by every worker it starts until that worker
+/// is proven retired.
+pub struct DeviceShare {
+    /// Held until the share ends; `None` only inside `drop`.
+    guard: Option<OwnedRwLockReadGuard<()>>,
+    released: Arc<watch::Sender<u64>>,
+    sharing: Arc<watch::Sender<Sharing>>,
+}
+
+impl Drop for DeviceShare {
+    /// Release the share, then wake a waiting job: its next try sees the device released.
+    fn drop(&mut self) {
+        self.sharing.send_modify(|sharing| sharing.shares -= 1);
+        drop(self.guard.take());
+        self.released
+            .send_modify(|released| *released = released.wrapping_add(1));
+    }
+}
+
+/// A job's hold on the device: nothing of residency runs on it, but an idle resident model
+/// beside the measurement job.
+pub struct DeviceJob {
+    hold: JobHold,
+    sharing: Arc<watch::Sender<Sharing>>,
+    released: Arc<watch::Sender<u64>>,
+    preemption: Preemption,
+    /// The quiet periods of a measurement job beside the idle resident model, which its end
+    /// moves ([`Quiet::ended_job`]); none for a job with the device to itself.
+    quiet: Option<Arc<Mutex<Quiet>>>,
+    /// The job ran to its end without being killed ([`Self::finished`]).
+    finished: bool,
+}
+
+enum JobHold {
+    /// The device to itself; `None` only inside `drop`.
+    Exclusive(Option<OwnedRwLockWriteGuard<()>>),
+    /// Beside the idle resident model's share.
+    Beside { resident: Arc<dyn ResidentRoom> },
+}
+
+impl Drop for DeviceJob {
+    /// Release the device, then wake another waiting job, and a request waiting on the job. Beside
+    /// an idle resident model, the room its worker made is the model's again
+    /// ([`ResidentRoom::release`]) before a request waiting on the job is admitted.
+    fn drop(&mut self) {
+        if let Some(quiet) = &self.quiet {
+            quiet.lock().expect("quiet lock").ended_job(self.finished, self.preemption.fired.load(Ordering::Acquire));
+        }
+        match &mut self.hold {
+            JobHold::Exclusive(guard) => {
+                self.sharing.send_modify(|sharing| sharing.job = false);
+                drop(guard.take());
+            }
+            JobHold::Beside { resident } => {
+                resident.release();
+                self.sharing.send_modify(|sharing| sharing.job = false);
+            }
+        }
+        self.released
+            .send_modify(|released| *released = released.wrapping_add(1));
+    }
+}
+
+impl DeviceJob {
+    /// Return once a share is wanted while the job holds the device, or, beside an idle resident
+    /// model, once that model is no longer idle: the job is preempted.
+    pub async fn preempted(&mut self) {
+        self.preemption.preempted().await;
+    }
+
+    /// The job ran to its end without being killed: a measurement's preemptions in a row end
+    /// with its hold ([`Quiet::ended_job`]).
+    pub fn finished(&mut self) {
+        self.finished = true;
+    }
+
+    /// The job's preemption apart from its hold, for a hold its worker keeps until retired.
+    pub fn preemption(&self) -> Preemption {
+        self.preemption.clone()
+    }
+
+    /// The job's process runs as `process`: beside an idle resident model, the room that model
+    /// made is credited by its footprint until the hold, and with it the room, is released
+    /// ([`ResidentRoom::attach`]).
+    pub fn credit(&self, process: seismic::ProcessId) {
+        if let Some(resident) = self.beside() {
+            resident.attach(process);
+        }
+    }
+
+    /// The idle resident model the job runs beside; none when it has the device to itself.
+    pub fn beside(&self) -> Option<&Arc<dyn ResidentRoom>> {
+        match &self.hold {
+            JobHold::Exclusive(_) => None,
+            JobHold::Beside { resident } => Some(resident),
+        }
+    }
+}
+
+/// When the shares wanted since a job took the device preempt it, and, beside an idle resident
+/// model, any change of the idle model since.
+#[derive(Clone)]
+pub struct Preemption {
+    wanted: watch::Receiver<u64>,
+    /// Beside an idle model: the device's sharing, and its idleness last seen, first when the
+    /// job took the device.
+    idle: Option<(watch::Receiver<Sharing>, u64)>,
+    /// Whether the job was preempted: [`Self::preempted`] returned, from any of its clones.
+    fired: Arc<AtomicBool>,
+}
+
+impl Preemption {
+    /// Return once a share is wanted, or the idle model the job runs beside changed, since the
+    /// job took the device or since this last returned: each preemption is seen once, as a
+    /// change of a watch is.
+    pub async fn preempted(&mut self) {
+        match &mut self.idle {
+            None => changed(&mut self.wanted).await,
+            Some((sharing, idleness)) => {
+                let seen = *idleness;
+                tokio::select! {
+                    () = changed(&mut self.wanted) => {}
+                    // The sender lives as long as the lock the hold is of.
+                    changed = sharing.wait_for(|sharing| sharing.idleness != seen) => {
+                        if let Ok(sharing) = changed {
+                            *idleness = sharing.idleness;
+                        }
+                    }
+                }
+            }
+        }
+        self.fired.store(true, Ordering::Release);
+    }
+
+    fn new(wanted: watch::Receiver<u64>, idle: Option<(watch::Receiver<Sharing>, u64)>) -> Self {
+        Self { wanted, idle, fired: Arc::default() }
+    }
+}
+
+/// Return once `receiver` changes. Its sender lives as long as the lock the hold is of, so a
+/// change is the only end.
+async fn changed<T>(receiver: &mut watch::Receiver<T>) {
+    if receiver.changed().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// The device's changes a measurement owner waits for: a hold ended, a resident model became
+/// idle that has not been (a load ended, and its model is resident), or a load holding no share
+/// stored point requests ([`DeviceLock::requested`]). A request's lease and its end are none: the
+/// load they lease is the same. What changed in between is never missed: each is seen at the
+/// next wait.
+pub struct DeviceChanges {
+    released: watch::Receiver<u64>,
+    requested: watch::Receiver<u64>,
+    sharing: watch::Receiver<Sharing>,
+    /// The load last seen idle.
+    idle: Option<ModelInstanceId>,
+}
+
+impl DeviceChanges {
+    /// Return at the next change since the last; never once the lock is gone.
+    pub async fn changed(&mut self) {
+        loop {
+            tokio::select! {
+                () = changed(&mut self.released) => return,
+                () = changed(&mut self.requested) => return,
+                () = changed(&mut self.sharing) => {
+                    let idle = self.sharing.borrow().idle.as_ref().map(|idle| idle.instance.clone());
+                    if idle.is_some() && idle != self.idle {
+                        self.idle = idle;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The holds' ends, shares and jobs alike, that a waiter holding nothing of the device waits
+/// for: a job ending has stored what it measured. What ended in between is never missed.
+pub struct Releases(watch::Receiver<u64>);
+
+impl Releases {
+    /// Return at the next hold's end since the last; never once the lock is gone.
+    pub async fn released(&mut self) {
+        changed(&mut self.0).await;
+    }
+}
+
+/// What an inference worker holds of the device until it is proven retired: its load's share,
+/// or its optimization's job.
+pub enum DeviceHold {
+    Share(Arc<DeviceShare>),
+    Job(DeviceJob),
+}
+
+impl DeviceLock {
+    /// Share the device, without waiting: `None` while a job holds it.
+    pub fn try_share(&self) -> Option<DeviceShare> {
+        let guard = Arc::clone(&self.lock).try_read_owned().ok()?;
+        self.share_of(guard)
+    }
+
+    /// Share the device, preempting a job that holds it: the job's owner kills it and releases
+    /// the device once its process is shown gone, so this waits for that.
+    pub async fn share(&self) -> DeviceShare {
+        if let Some(share) = self.try_share() {
+            return share;
+        }
+        self.wanted.send_modify(|wanted| *wanted += 1);
+        self.share_after_measurement().await
+    }
+
+    /// Share the device once no measurement job holds it, without preempting one: for work that
+    /// would rather wait for a job, bounded by its hang deadline, than end it.
+    pub async fn share_after_measurement(&self) -> DeviceShare {
+        let mut sharing = self.sharing.subscribe();
+        loop {
+            let guard = Arc::clone(&self.lock).read_owned().await;
+            if let Some(share) = self.share_of(guard) {
+                return share;
+            }
+            // The sender lives as long as this lock.
+            let _ = sharing.wait_for(|sharing| !sharing.job).await;
+        }
+    }
+
+    /// A share of `guard`, unless a measurement runs beside the idle resident model (`guard`
+    /// excludes a job with the device to itself): decided with the count of shares, which that
+    /// measurement's start reads.
+    fn share_of(&self, guard: OwnedRwLockReadGuard<()>) -> Option<DeviceShare> {
+        let mut shared = false;
+        self.sharing.send_if_modified(|sharing| {
+            shared = !sharing.job;
+            if shared {
+                sharing.shares += 1;
+            }
+            shared
+        });
+        shared.then(|| DeviceShare {
+            guard: Some(guard),
+            released: Arc::clone(&self.released),
+            sharing: Arc::clone(&self.sharing),
+        })
+    }
+
+    /// The resident model is idle (no request holds it), and a measurement may run beside it, or
+    /// it no longer is (`None`): every change preempts a measurement beside it, and from a
+    /// `None` on none starts. Residency's alone to publish; a lease ends the idleness by
+    /// [`Self::resident_leased`] instead.
+    pub fn resident_idle(&self, resident: Option<IdleResident>) {
+        self.publish_idle(resident);
+    }
+
+    /// The idle resident model was leased for a request, which ends its idleness as
+    /// [`Self::resident_idle`]`(None)` does; the idle period it ended is one the quiet period is
+    /// judged by. Residency's alone to publish, before it hands out the lease.
+    pub fn resident_leased(&self) {
+        if let Some(gap) = self.publish_idle(None) {
+            self.quiet.lock().expect("quiet lock").leased(gap);
+        }
+    }
+
+    /// Publish the resident model's idleness: the idle period this ends, if any.
+    fn publish_idle(&self, resident: Option<IdleResident>) -> Option<Duration> {
+        let now = Instant::now();
+        let mut ended = None;
+        self.sharing.send_modify(|sharing| {
+            match (&resident, sharing.idle_since) {
+                (Some(_), None) => sharing.idle_since = Some(now),
+                (None, Some(since)) => {
+                    ended = Some(now - since);
+                    sharing.idle_since = None;
+                }
+                (Some(_), Some(_)) | (None, None) => {}
+            }
+            sharing.idle = resident;
+            sharing.idleness = sharing.idleness.wrapping_add(1);
+        });
+        ended
+    }
+
+    /// Return once no measurement runs beside the resident model: a request holding a lease on
+    /// it, which ended its idleness and so preempted such a measurement, is served only then,
+    /// once the measurement's process is shown gone, which its owner waits for.
+    pub async fn admit_request(&self) {
+        // The sender lives as long as this lock.
+        let _ = self.sharing.subscribe().wait_for(|sharing| !sharing.job).await;
+    }
+
+    /// The device's changes from now on ([`DeviceChanges`]).
+    pub fn changes(&self) -> DeviceChanges {
+        let sharing = self.sharing.subscribe();
+        let idle = sharing.borrow().idle.as_ref().map(|idle| idle.instance.clone());
+        DeviceChanges {
+            released: self.released.subscribe(),
+            requested: self.requested.subscribe(),
+            sharing,
+            idle,
+        }
+    }
+
+    /// A load that holds no share stored point requests: the measurement owner reads what is
+    /// stored again ([`DeviceChanges`]), as it does after a hold that stored them ends.
+    pub fn requested(&self) {
+        self.requested.send_modify(|requested| *requested = requested.wrapping_add(1));
+    }
+
+    /// The holds' ends from now on ([`Releases`]).
+    pub fn releases(&self) -> Releases {
+        Releases(self.released.subscribe())
+    }
+
+    /// Take the device for a job, without waiting: `None` while residency shares it or another
+    /// job holds it. Only shares wanted from here on preempt the job.
+    pub fn try_job(&self) -> Option<DeviceJob> {
+        let preemption = Preemption::new(self.wanted.subscribe(), None);
+        let guard = Arc::clone(&self.lock).try_write_owned().ok()?;
+        // A measurement beside a resident model whose share has ended holds the device until it
+        // ends; no share starts while the write guard is held, so none starts beside it.
+        let mut taken = false;
+        self.sharing.send_if_modified(|sharing| {
+            taken = !sharing.job;
+            if taken {
+                sharing.job = true;
+            }
+            taken
+        });
+        taken.then(|| DeviceJob {
+            hold: JobHold::Exclusive(Some(guard)),
+            sharing: Arc::clone(&self.sharing),
+            released: Arc::clone(&self.released),
+            preemption,
+            quiet: None,
+            finished: false,
+        })
+    }
+
+    /// Take the device for the measurement job beside the idle resident model, without waiting,
+    /// once the model has been idle for its quiet period ([`Quiet`]); until then, `Err` of when
+    /// it will have been. `Err(None)` unless that model is idle, its share is the one held, and
+    /// nothing else runs beside it, all read in one decision with the model's idleness.
+    fn try_beside(&self) -> Result<DeviceJob, Option<Instant>> {
+        let wanted = self.wanted.subscribe();
+        let period = self.quiet.lock().expect("quiet lock").period();
+        let now = Instant::now();
+        let mut taken = Err(None);
+        self.sharing.send_if_modified(|sharing| {
+            if let (Some(idle), 1, false, Some(since)) = (&sharing.idle, sharing.shares, sharing.job, sharing.idle_since) {
+                taken = match since + period {
+                    quiet if quiet <= now => {
+                        sharing.job = true;
+                        Ok((Arc::clone(&idle.room), sharing.idleness))
+                    }
+                    quiet => Err(Some(quiet)),
+                };
+            }
+            taken.is_ok()
+        });
+        let (resident, idleness) = taken?;
+        Ok(DeviceJob {
+            hold: JobHold::Beside { resident },
+            sharing: Arc::clone(&self.sharing),
+            released: Arc::clone(&self.released),
+            preemption: Preemption::new(wanted, Some((self.sharing.subscribe(), idleness))),
+            quiet: Some(Arc::clone(&self.quiet)),
+            finished: false,
+        })
+    }
+
+    /// Take the device for the measurement job once nothing holds it, or once the only share
+    /// held is an idle resident model's, beside which it runs ([`DeviceJob::beside`]) once the
+    /// model has been idle for its quiet period, trying again after each release, each change of
+    /// the device's sharing, and the quiet period's end. The end of a job beside the model,
+    /// preempted or not, moves the quiet periods after it; one with the device to itself leaves
+    /// them.
+    pub async fn measurement(&self) -> DeviceJob {
+        let mut released = self.released.subscribe();
+        let mut sharing = self.sharing.subscribe();
+        loop {
+            let taken = match self.try_job() {
+                Some(job) => Ok(job),
+                None => self.try_beside(),
+            };
+            let quiet = match taken {
+                Ok(job) => return job,
+                Err(quiet) => quiet,
+            };
+            tokio::select! {
+                () = changed(&mut released) => {}
+                () = changed(&mut sharing) => {}
+                () = async {
+                    match quiet {
+                        Some(quiet) => tokio::time::sleep_until(quiet).await,
+                        None => std::future::pending().await,
+                    }
+                } => {}
+            }
+        }
+    }
+
+    /// Take the device for a job once nothing holds it, trying again after each release: a job
+    /// defers this way while a model is resident or loading, or another job holds the device.
+    pub async fn job(&self) -> DeviceJob {
+        let mut released = self.released.subscribe();
+        let mut sharing = self.sharing.subscribe();
+        loop {
+            if let Some(job) = self.try_job() {
+                return job;
+            }
+            // Every hold's end changes `released` after its release, and jobs held off and let go
+            // again change `sharing`; one since the subscriptions is not missed.
+            tokio::select! {
+                () = changed(&mut released) => {}
+                () = changed(&mut sharing) => {}
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A job excludes shares and shares exclude a job; a share ending lets a waiting job take
+    /// the device.
+    #[tokio::test]
+    async fn shares_and_a_job_exclude_each_other() {
+        let lock = DeviceLock::default();
+        let share = lock.try_share().unwrap();
+        assert!(lock.try_job().is_none());
+        let waiting = tokio::spawn({
+            let lock = lock.clone();
+            async move { lock.job().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        drop(share);
+        let job = waiting.await.unwrap();
+        assert!(lock.try_share().is_none());
+        drop(job);
+        assert!(lock.try_share().is_some());
+    }
+
+    /// A share wanted while a job holds the device preempts it, and is granted once the job
+    /// releases the device; a share taken while no job holds it preempts nothing.
+    #[tokio::test]
+    async fn a_wanted_share_preempts_the_job() {
+        let lock = DeviceLock::default();
+        drop(lock.share().await);
+        let mut job = lock.try_job().unwrap();
+        let waiting = tokio::spawn({
+            let lock = lock.clone();
+            async move { lock.share().await }
+        });
+        job.preempted().await;
+        drop(job);
+        let share = waiting.await.unwrap();
+        assert!(lock.try_job().is_none());
+        drop(share);
+    }
+
+    /// Another job holding the device is waited out, and the preemption a worker's owner keeps
+    /// apart from its hold fires when a share is wanted.
+    #[tokio::test]
+    async fn a_job_waits_out_another_job_and_is_preempted_by_a_load() {
+        let lock = DeviceLock::default();
+        let measuring = lock.try_job().unwrap();
+        let waiting = tokio::spawn({
+            let lock = lock.clone();
+            async move { lock.job().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        drop(measuring);
+        let job = waiting.await.unwrap();
+        let mut preemption = job.preemption();
+        let hold = DeviceHold::Job(job);
+        let load = tokio::spawn({
+            let lock = lock.clone();
+            async move { lock.share().await }
+        });
+        preemption.preempted().await;
+        drop(hold);
+        drop(load.await.unwrap());
+    }
+
+    /// `room`, idle as the load `instance`.
+    fn idle(instance: &str, room: Arc<dyn ResidentRoom>) -> Option<IdleResident> {
+        Some(IdleResident { instance: ModelInstanceId(instance.to_owned()), room })
+    }
+
+    /// A resident model that answers every claim at once.
+    struct Room;
+
+    impl ResidentRoom for Room {
+        fn claim(&self, _: u64) -> BoxFuture<'static, Result<RoomAnswer, RequestError>> {
+            Box::pin(async { Ok(RoomAnswer::Made) })
+        }
+        fn release(&self) {}
+        fn reprice(&self) {}
+    }
+
+    /// A request ending the model's idleness preempts the measurement beside it and is admitted
+    /// only once that measurement's hold ends; once a request holds the model, no measurement
+    /// starts beside it.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_is_admitted_only_once_the_measurement_beside_it_ends() {
+        let lock = DeviceLock::default();
+        let _resident = lock.try_share().unwrap();
+        lock.resident_idle(idle("load", Arc::new(Room)));
+        let mut job = lock.measurement().await;
+        assert!(job.beside().is_some());
+        // A lease: the model is no longer idle.
+        lock.resident_idle(None);
+        let admitted = tokio::spawn({
+            let lock = lock.clone();
+            async move { lock.admit_request().await }
+        });
+        job.preempted().await;
+        tokio::task::yield_now().await;
+        assert!(!admitted.is_finished(), "admitted while the measurement holds the device");
+        drop(job);
+        admitted.await.unwrap();
+        assert!(lock.try_beside().is_err(), "no measurement starts beside a leased model");
+    }
+
+    /// A preemption is seen once: once the idle model's change preempted the measurement beside
+    /// it, waiting again waits for a further change, so a retirement retried on the preemption
+    /// sleeps between its tries.
+    #[tokio::test(start_paused = true)]
+    async fn a_measurement_beside_the_idle_model_is_preempted_once_per_change() {
+        use futures_util::FutureExt;
+        let lock = DeviceLock::default();
+        let _resident = lock.try_share().unwrap();
+        lock.resident_idle(idle("load", Arc::new(Room)));
+        let mut job = lock.measurement().await;
+        assert!(job.preempted().now_or_never().is_none(), "preempted before any change");
+        lock.resident_idle(None);
+        assert!(job.preempted().now_or_never().is_some(), "the lease preempts it");
+        assert!(job.preempted().now_or_never().is_none(), "the same lease preempts it again");
+        lock.resident_idle(idle("load", Arc::new(Room)));
+        assert!(job.preempted().now_or_never().is_some(), "a further change preempts it");
+    }
+
+    /// A load that becomes idle is a change once: a request's lease and its end are none, however
+    /// its worker's room is allocated, and the next load is one whatever the last left behind.
+    #[tokio::test]
+    async fn each_load_that_becomes_idle_is_one_change() {
+        use std::time::Duration;
+        let lock = DeviceLock::default();
+        let mut changes = lock.changes();
+        let room: Arc<dyn ResidentRoom> = Arc::new(Room);
+        lock.resident_idle(idle("first", Arc::clone(&room)));
+        changes.changed().await;
+        lock.resident_idle(None);
+        lock.resident_idle(idle("first", Arc::new(Room)));
+        let waited = tokio::time::timeout(Duration::from_millis(20), changes.changed()).await;
+        assert!(waited.is_err(), "a request's lease and its end are no change");
+        lock.resident_idle(None);
+        // The same room, as an allocator may hand a later load the last one's address.
+        lock.resident_idle(idle("second", room));
+        changes.changed().await;
+    }
+
+    /// A resident model that counts its room's releases.
+    #[derive(Default)]
+    struct Releases(std::sync::atomic::AtomicUsize);
+
+    impl ResidentRoom for Releases {
+        fn claim(&self, _: u64) -> BoxFuture<'static, Result<RoomAnswer, RequestError>> {
+            Box::pin(async { Ok(RoomAnswer::Made) })
+        }
+        fn release(&self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn reprice(&self) {}
+    }
+
+    /// The measurement's room is the model's again before a request waiting on the measurement
+    /// is admitted: the hold's end releases it, once.
+    #[tokio::test(start_paused = true)]
+    async fn the_measurement_room_is_released_before_a_request_is_admitted() {
+        let lock = DeviceLock::default();
+        let _resident = lock.try_share().unwrap();
+        let room = Arc::new(Releases::default());
+        lock.resident_idle(idle("load", room.clone()));
+        let job = lock.measurement().await;
+        lock.resident_idle(None);
+        let admitted = tokio::spawn({
+            let (lock, room) = (lock.clone(), room.clone());
+            async move {
+                lock.admit_request().await;
+                room.0.load(std::sync::atomic::Ordering::SeqCst)
+            }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(room.0.load(std::sync::atomic::Ordering::SeqCst), 0, "released while held");
+        drop(job);
+        assert_eq!(admitted.await.unwrap(), 1, "admitted before its room was released");
+    }
+
+    /// The measurement starts beside the idle model only once it has been idle for twice the
+    /// 90th percentile of its idle periods between requests, doubled for each measurement in a
+    /// row a request preempted; one that ends without either preemption or its own finish (its
+    /// room unmade) leaves the doubling, and one that finishes resets it.
+    #[tokio::test(start_paused = true)]
+    async fn a_measurement_waits_for_the_quiet_period_and_backs_off_per_preemption() {
+        use std::time::Duration;
+        let lock = DeviceLock::default();
+        let _resident = lock.try_share().unwrap();
+        // Requests every 3 s.
+        for _ in 0..GAPS {
+            lock.resident_idle(idle("load", Arc::new(Room)));
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            lock.resident_leased();
+            lock.admit_request().await;
+        }
+        // The model's idle from now on: the measurement that starts once it has been idle long
+        // enough, and how long that was.
+        async fn quiet(lock: &DeviceLock) -> (DeviceJob, Duration) {
+            lock.resident_idle(idle("load", Arc::new(Room)));
+            let idle = Instant::now();
+            let job = lock.measurement().await;
+            (job, idle.elapsed())
+        }
+        let (mut job, waited) = quiet(&lock).await;
+        assert_eq!(waited, Duration::from_secs(6), "twice the 3 s gaps");
+        // A request preempts it, twice in a row.
+        lock.resident_leased();
+        job.preempted().await;
+        drop(job);
+        let (mut job, waited) = quiet(&lock).await;
+        assert_eq!(waited, Duration::from_secs(12));
+        lock.resident_leased();
+        job.preempted().await;
+        drop(job);
+        let (job, waited) = quiet(&lock).await;
+        assert_eq!(waited, Duration::from_secs(24), "doubled for each preemption");
+        // One dropped before it ran (its room unmade), and so before any preemption, leaves it.
+        drop(job);
+        lock.resident_idle(None);
+        let (mut job, waited) = quiet(&lock).await;
+        assert_eq!(waited, Duration::from_secs(24), "left by a job that neither finished nor was preempted");
+        // One that finishes resets it.
+        job.finished();
+        drop(job);
+        lock.resident_idle(None);
+        let (_job, waited) = quiet(&lock).await;
+        assert_eq!(waited, Duration::from_secs(6), "reset by a job that finished");
+    }
+
+    /// Only a request's lease ends an idle period the quiet period is judged by: an unload ending
+    /// a long one (an idle timeout), followed by a load's admission, records none.
+    #[tokio::test(start_paused = true)]
+    async fn only_a_lease_ends_an_idle_period_the_quiet_period_counts() {
+        use std::time::Duration;
+        let lock = DeviceLock::default();
+        let _resident = lock.try_share().unwrap();
+        // Requests every 3 s, each idle period ending in an unload after 10 min idle.
+        for _ in 0..GAPS {
+            lock.resident_idle(idle("load", Arc::new(Room)));
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            lock.resident_leased();
+            lock.admit_request().await;
+            lock.resident_idle(idle("load", Arc::new(Room)));
+            tokio::time::sleep(QUIET_CEILING).await;
+            lock.resident_idle(None);
+            lock.admit_request().await;
+        }
+        lock.resident_idle(idle("load", Arc::new(Room)));
+        let started = Instant::now();
+        let _job = lock.measurement().await;
+        assert_eq!(started.elapsed(), Duration::from_secs(6), "twice the 3 s gaps the leases ended");
+    }
+
+    /// No quiet period holds a measurement with no load resident: it takes the device at once.
+    #[tokio::test(start_paused = true)]
+    async fn with_no_load_resident_the_measurement_starts_at_once() {
+        let lock = DeviceLock::default();
+        let started = Instant::now();
+        let job = lock.measurement().await;
+        assert!(job.beside().is_none());
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+    }
+}

@@ -1,36 +1,43 @@
-//! LFM2 and LFM2-MoE artifact recognition and numerical interpretation.
+//! LFM2, LFM2-MoE and LFM3 artifact recognition and numerical interpretation.
 //!
-//! Both architectures share one decoder. Every layer is an operator sublayer
+//! The architectures share one decoder. Every layer is an operator sublayer
 //! (gated short convolution, or attention where the layer has key heads)
 //! followed by a feed-forward sublayer (dense, or routed after the leading
 //! dense layers of `lfm2moe`). Each sublayer is RMS-normalized on input and
-//! adds its output to the residual stream.
+//! adds its output to the residual stream. LFM3 adds window attention layers,
+//! a sigmoid output gate per attention head, an RMS norm of each sublayer's
+//! output before the residual add, and partial rotary on full attention.
 
 mod family;
+pub mod inputs;
+mod projector;
 
 pub use family::Lfm2Family;
+pub use projector::describe_projector;
 
 use magnitude_artifacts::{
     gguf::{Directory, Value},
     Package, PackageIdentity,
 };
-use magnitude_family_common::{rotary, HeaderError, Metadata, Tensors};
+use magnitude_family_common::{rotary, Metadata, Tensors};
 use magnitude_family_contracts::{
-    checked_product, ActivationDType, ActivationFunction, Attention, AttentionGate, Block,
-    Decoder, DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm, ExpertSelection, FamilyId,
-    FeedForwardUp, HeadNorm, HistoryDomain, HistoryReads, ImportTransform, InputNorm,
-    InputSemantics, KeyValue, MediaRowAttention, ModelDefinition, Operator, OutputForm,
-    ResidualForm, RmsNorm, RouteNormalization, RoutedFfn, Router, RouterInput, RowRange,
-    ScoreFunction, ShortConv, Sublayer, ValueNorm, ValueSource,
+    checked_product, ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder,
+    DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm, ExpertSelection, FamilyId,
+    FeedForwardUp, GateFunction, GateGranularity, HeadNorm, HistoryRows, HistorySource,
+    ImportTransform, InputNorm, InputSemantics, MediaRowAttention, ModelDefinition,
+    ProjectedRows, RowProducer, RowRounding, TokenDomain,
+    Operator, OutputForm, OutputProjection, QueryKeys, QueryProjection, ResidualForm, RmsNorm,
+    Rotary, RouteNormalization, RoutedFfn, Router,
+    RouterInput, RowRange, ScoreFunction, ShortConv, Sublayer, ValueNorm, ValueSource,
     WeightDescriptor,
 };
-use std::{error, fmt};
 
 /// LFM2 architecture recognized from literal artifact metadata.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Architecture {
     Dense,
     Routed,
+    Lfm3,
 }
 
 impl Architecture {
@@ -38,6 +45,7 @@ impl Architecture {
         match self {
             Self::Dense => "lfm2",
             Self::Routed => "lfm2moe",
+            Self::Lfm3 => "lfm3",
         }
     }
 
@@ -79,49 +87,61 @@ impl Architecture {
             "expert_gating_func",
             "leading_dense_block_count",
         ];
+        const LFM3: &[&str] = &[
+            "block_count",
+            "context_length",
+            "embedding_length",
+            "feed_forward_length",
+            "vocab_size",
+            "attention.head_count",
+            "attention.head_count_kv",
+            "attention.key_length",
+            "attention.value_length",
+            "attention.layer_norm_rms_epsilon",
+            "attention.sliding_window",
+            "attention.sliding_window_pattern",
+            "rope.freq_base",
+            "rope.freq_base_swa",
+            "rope.dimension_count",
+            "shortconv.l_cache",
+        ];
         match self {
             Self::Dense => DENSE,
             Self::Routed => ROUTED,
+            Self::Lfm3 => LFM3,
         }
     }
 }
 
-/// Failure to recognize or interpret an LFM2 artifact.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Error(String);
-
-impl fmt::Display for Error {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl error::Error for Error {}
-
-impl From<HeaderError> for Error {
-    fn from(error: HeaderError) -> Self {
-        match error {
-            HeaderError::UnknownMetadata(key) => {
-                invalid(format!("LFM2 metadata {key:?} is not understood"))
-            }
-            error => invalid(error.to_string()),
-        }
-    }
-}
+/// Failure to recognize or interpret an LFM2 artifact: the family error,
+/// which names every unsupported feature a header carries.
+pub use magnitude_family_contracts::FamilyError as Error;
 
 fn invalid(message: impl Into<String>) -> Error {
-    Error(message.into())
+    Error::invalid(message)
 }
 
 fn product(dimensions: &[u64]) -> Result<u64, Error> {
     checked_product(dimensions).map_err(|error| invalid(error.to_string()))
 }
 
-/// The operator of one layer, read from its key-head count.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// LFM3 full attention layers rotate the first half of each head's pairs at
+/// the frequencies of the whole head width (`partial_rotary_factor = 0.5` in
+/// the released configuration); the other pairs pass through. The GGUF
+/// records this only in the values of `rope_freqs.weight`, which headers do
+/// not carry; the importer checks those values against the table at load.
+const LFM3_FULL_ROTATED_PAIR_FRACTION: u64 = 2;
+
+/// The operator of one layer: a short convolution where it has no key heads,
+/// else attention over its history domain with its rotary.
+#[derive(Clone, Debug, PartialEq)]
 enum Mixer {
     ShortConv,
-    Attention { kv_heads: u64 },
+    Attention {
+        kv_heads: u64,
+        domain: TokenDomain,
+        rotary: Rotary,
+    },
 }
 
 /// Expert geometry of a routed (`lfm2moe`) artifact.
@@ -142,6 +162,7 @@ pub fn recognize(directory: &Directory) -> Result<Architecture, Error> {
     {
         "lfm2" => Ok(Architecture::Dense),
         "lfm2moe" => Ok(Architecture::Routed),
+        "lfm3" => Ok(Architecture::Lfm3),
         architecture => Err(invalid(format!(
             "unsupported LFM2 GGUF architecture {architecture:?}"
         ))),
@@ -164,9 +185,14 @@ pub fn inspect_components(
     identity: PackageIdentity,
 ) -> Result<ModelDefinition, Error> {
     let architecture = recognize(directory)?;
-    if projector.is_some() {
-        return Err(invalid("LFM2 packages have no projector"));
-    }
+    // Only LFM3-VL binds an image tower.
+    let projector = match (architecture, projector) {
+        (_, None) => None,
+        (Architecture::Lfm3, Some(projector)) => Some(projector),
+        (Architecture::Dense | Architecture::Routed, Some(_)) => {
+            return Err(Error::mismatch("LFM2 has no vision projector"));
+        }
+    };
     let family_id = architecture.family_id();
     let m = Metadata::new(directory, family_id, architecture.metadata_keys())?;
 
@@ -178,16 +204,12 @@ pub fn inspect_components(
     }
     // A layer without key heads is a short-convolution layer; the per-layer
     // array is the only source of the pattern.
-    let mixers = m
-        .layer_counts("attention.head_count_kv", layer_count)?
-        .into_iter()
-        .map(|kv_heads| match kv_heads {
-            0 => Mixer::ShortConv,
-            kv_heads => Mixer::Attention { kv_heads },
-        })
-        .collect::<Vec<_>>();
+    let kv_heads = m.layer_counts("attention.head_count_kv", layer_count)?;
 
     let hidden = m.integer("embedding_length")?;
+    let vision = projector
+        .map(|projector| describe_projector(projector, hidden))
+        .transpose()?;
     let heads = m.integer("attention.head_count")?;
     if !hidden.is_multiple_of(heads) {
         return Err(invalid("LFM2 hidden width is not a multiple of its heads"));
@@ -195,7 +217,9 @@ pub fn inspect_components(
     // Queries and outputs span the hidden width, so the head width follows.
     let width = hidden / heads;
     for key in ["attention.key_length", "attention.value_length"] {
-        if m.optional_integer(key)?.is_some_and(|length| length != width) {
+        if m.optional_integer(key)?
+            .is_some_and(|length| length != width)
+        {
             return Err(invalid(format!(
                 "{} differs from the hidden width per head",
                 m.key(key)
@@ -204,13 +228,21 @@ pub fn inspect_components(
     }
     let epsilon = m.positive_number("attention.layer_norm_rms_epsilon")?;
     let base = m.positive_number("rope.freq_base")?;
+    if m.optional_integer("rope.dimension_count")?
+        .is_some_and(|dimensions| dimensions != width)
+    {
+        return Err(invalid(format!(
+            "{} differs from the head width: partial rotary is stated only by rope_freqs",
+            m.key("rope.dimension_count")
+        )));
+    }
     let convolution_width = m.integer("shortconv.l_cache")?;
     if convolution_width < 2 {
         return Err(invalid("LFM2 short convolution needs at least two taps"));
     }
     let context_limit = m.integer("context_length")?;
     let (experts, leading_dense) = match architecture {
-        Architecture::Dense => (None, layer_count),
+        Architecture::Dense | Architecture::Lfm3 => (None, layer_count),
         Architecture::Routed => {
             let score = match m.count("expert_gating_func")? {
                 1 => ScoreFunction::Softmax,
@@ -222,9 +254,7 @@ pub fn inspect_components(
                     )))
                 }
             };
-            let leading_dense = m
-                .optional_count("leading_dense_block_count")?
-                .unwrap_or(0);
+            let leading_dense = m.optional_count("leading_dense_block_count")?.unwrap_or(0);
             if leading_dense > layer_count {
                 return Err(invalid(format!(
                     "{} must not exceed the layer count",
@@ -257,8 +287,14 @@ pub fn inspect_components(
 
     let rms = |weight: WeightDescriptor| RmsNorm { weight, epsilon };
     let embedding = tensors.bind("token_embd.weight", &[vocabulary, hidden])?;
-    // `token_embd_norm` is the decoder's final norm, not an entry norm.
-    let output_norm = tensors.bind("token_embd_norm.weight", &[hidden])?;
+    // LFM2's `token_embd_norm` is the decoder's final norm, not an entry norm.
+    let output_norm = tensors.bind(
+        match architecture {
+            Architecture::Dense | Architecture::Routed => "token_embd_norm.weight",
+            Architecture::Lfm3 => "output_norm.weight",
+        },
+        &[hidden],
+    )?;
     let output = tensors.bind(
         if tensors.contains("output.weight") {
             "output.weight"
@@ -267,17 +303,70 @@ pub fn inspect_components(
         },
         &[vocabulary, hidden],
     )?;
-    // NEOX rotation over the whole head: pair `p` rotates dimensions
-    // `(p, p + W/2)` at frequency `base^(-2p/W)`.
-    let rotary = rotary::table(width, width, base)?;
+    // Each attention layer's history domain and rotary. NEOX rotation over
+    // the whole head: pair `p` rotates dimensions `(p, p + W/2)` at frequency
+    // `base^(-2p/W)`. LFM3 flags its window layers, which rotate whole heads
+    // at the window base; its full layers rotate the leading pairs only, at
+    // the full base.
+    let (full, windows) = match architecture {
+        Architecture::Dense | Architecture::Routed => (
+            (TokenDomain::Token, rotary::table(width, width, base)?),
+            vec![None; kv_heads.len()],
+        ),
+        Architecture::Lfm3 => {
+            let divisors = tensors.bind("rope_freqs.weight", &[width / 2])?;
+            let full_rotary = rotary::zero_tail(
+                width,
+                base,
+                width / 2 / LFM3_FULL_ROTATED_PAIR_FRACTION,
+                divisors,
+            )?;
+            let window = (
+                TokenDomain::Window {
+                    tokens: m.integer("attention.sliding_window")?,
+                },
+                rotary::table(width, width, m.positive_number("rope.freq_base_swa")?)?,
+            );
+            let windows = m
+                .flags("attention.sliding_window_pattern", layer_count)?
+                .into_iter()
+                .map(|windowed| windowed.then(|| window.clone()))
+                .collect();
+            ((TokenDomain::Token, full_rotary), windows)
+        }
+    };
+    let mixers = kv_heads
+        .into_iter()
+        .zip(windows)
+        .enumerate()
+        .map(|(index, (kv_heads, window))| match (kv_heads, window) {
+            (0, None) => Ok(Mixer::ShortConv),
+            (0, Some(_)) => Err(invalid(format!(
+                "LFM3 layer {index}: a short-convolution layer has no attention window"
+            ))),
+            (kv_heads, window) => {
+                let (domain, rotary) = window.unwrap_or_else(|| full.clone());
+                Ok(Mixer::Attention {
+                    kv_heads,
+                    domain,
+                    rotary,
+                })
+            }
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
     let head_rows = product(&[heads, width])?;
 
     let mut blocks = Vec::with_capacity(mixers.len());
     for (index, mixer) in mixers.iter().enumerate() {
         let p = format!("blk.{index}.");
         let mut weight = |name: &str, shape: &[u64]| tensors.bind(&format!("{p}{name}"), shape);
-        let op = match *mixer {
-            Mixer::Attention { kv_heads } => {
+        let op = match mixer {
+            Mixer::Attention {
+                kv_heads,
+                domain,
+                rotary,
+            } => {
+                let kv_heads = *kv_heads;
                 if !heads.is_multiple_of(kv_heads) {
                     return Err(invalid(format!(
                         "LFM2 layer {index}: {heads} heads do not group over {kv_heads} key heads"
@@ -288,27 +377,46 @@ pub fn inspect_components(
                     heads,
                     kv_heads,
                     width,
-                    query: weight("attn_q.weight", &[head_rows, hidden])?,
-                    gate: AttentionGate::None,
-                    query_norm: HeadNorm::Rms(rms(weight("attn_q_norm.weight", &[width])?)),
-                    key_value: KeyValue::Owned {
-                        key: weight("attn_k.weight", &[kv_rows, hidden])?,
-                        value: ValueSource::Projected(weight("attn_v.weight", &[kv_rows, hidden])?),
-                        key_norm: HeadNorm::Rms(rms(weight("attn_k_norm.weight", &[width])?)),
-                        value_norm: ValueNorm::None,
-                        domain: HistoryDomain::Token,
+                    query: QueryProjection::Full(weight("attn_q.weight", &[head_rows, hidden])?),
+                    query_keys: QueryKeys::Direct,
+                    gate: match architecture {
+                        Architecture::Dense | Architecture::Routed => AttentionGate::None,
+                        Architecture::Lfm3 => AttentionGate::Separate {
+                            weight: weight("attn_gate.weight", &[heads, hidden])?,
+                            function: GateFunction::Sigmoid,
+                            granularity: GateGranularity::Head,
+                        },
                     },
+                    query_norm: HeadNorm::Rms(rms(weight("attn_q_norm.weight", &[width])?)),
+                    history: vec![HistorySource::visible(HistoryRows::Own(
+                        RowProducer::Projected(ProjectedRows {
+                            key: weight("attn_k.weight", &[kv_rows, hidden])?,
+                            value: ValueSource::Projected(
+                                weight("attn_v.weight", &[kv_rows, hidden])?,
+                            ),
+                            key_norm: HeadNorm::Rms(rms(weight("attn_k_norm.weight", &[width])?)),
+                            value_norm: ValueNorm::None,
+                            domain: *domain,
+                            rounding: RowRounding::None,
+                        }),
+                    ))],
                     rotary: rotary.clone(),
                     scale: 1.0 / (width as f64).sqrt(),
-                    reads: HistoryReads::Visible,
                     media_rows: MediaRowAttention::Causal,
-                    output: weight("attn_output.weight", &[hidden, head_rows])?,
+                    sinks: None,
+                    output: OutputProjection::Full(weight(
+                        "attn_output.weight",
+                        &[hidden, head_rows],
+                    )?),
                 }))
             }
             Mixer::ShortConv => {
                 // `in_proj` stores the B, C and X projections as consecutive
                 // row blocks of the hidden width.
-                let fused = weight("shortconv.in_proj.weight", &[product(&[3, hidden])?, hidden])?;
+                let fused = weight(
+                    "shortconv.in_proj.weight",
+                    &[product(&[3, hidden])?, hidden],
+                )?;
                 let chunk = |block: u64| WeightDescriptor {
                     name: fused.name.clone(),
                     shape: vec![hidden, hidden],
@@ -344,11 +452,13 @@ pub fn inspect_components(
                     selection: ExpertSelection::TopK {
                         bias: Some(weight("exp_probs_b.bias", &[e.count])?),
                     },
+                    media_bias: None,
                     normalization: RouteNormalization::SumPlusEpsilon(1e-6),
                     scale: 1.0,
                 },
                 expert_up: FeedForwardUp::Gated {
                     activation: ActivationFunction::Silu,
+                    limit: None,
                     gate: weight("ffn_gate_exps.weight", &[e.count, e.intermediate, hidden])?,
                     up: weight("ffn_up_exps.weight", &[e.count, e.intermediate, hidden])?,
                 },
@@ -359,15 +469,15 @@ pub fn inspect_components(
             })),
             _ => {
                 let intermediate = dense_intermediate.ok_or_else(|| {
-                    invalid(format!(
-                        "missing LFM2 metadata {} for dense layer {index}",
-                        m.key("feed_forward_length")
-                    ))
+                    let key = m.key("feed_forward_length");
+                    let detail = format!("missing LFM2 metadata {key} for dense layer {index}");
+                    Error::missing_metadata(key, detail)
                 })?;
                 Operator::DenseFfn(Box::new(DenseFfn {
                     intermediate,
                     up: FeedForwardUp::Gated {
                         activation: ActivationFunction::Silu,
+                        limit: None,
                         gate: weight("ffn_gate.weight", &[intermediate, hidden])?,
                         up: weight("ffn_up.weight", &[intermediate, hidden])?,
                     },
@@ -375,17 +485,27 @@ pub fn inspect_components(
                 }))
             }
         };
+        // LFM3 normalizes each sublayer's output before the residual add.
+        let (operator_output, feed_forward_output) = match architecture {
+            Architecture::Dense | Architecture::Routed => {
+                (OutputForm::Residual, OutputForm::Residual)
+            }
+            Architecture::Lfm3 => (
+                OutputForm::PostNorm(rms(weight("post_attention_norm.weight", &[hidden])?)),
+                OutputForm::PostNorm(rms(weight("post_ffw_norm.weight", &[hidden])?)),
+            ),
+        };
         blocks.push(Block {
             sublayers: vec![
                 Sublayer {
                     input: InputNorm::Rms(rms(weight("attn_norm.weight", &[hidden])?)),
                     op,
-                    output: OutputForm::Residual,
+                    output: operator_output,
                 },
                 Sublayer {
                     input: InputNorm::Rms(rms(weight("ffn_norm.weight", &[hidden])?)),
                     op: feed_forward,
-                    output: OutputForm::Residual,
+                    output: feed_forward_output,
                 },
             ],
         });
@@ -394,9 +514,7 @@ pub fn inspect_components(
     let definition = ModelDefinition {
         family: FamilyId(family_id.into()),
         artifact_identity: identity,
-        inputs: InputSemantics {
-            coordinate_axes: 1,
-        },
+        inputs: InputSemantics { coordinate_axes: 1 },
         decoder: Decoder {
             activation_dtype: ActivationDType::BF16,
             hidden,
@@ -408,7 +526,6 @@ pub fn inspect_components(
                 scale: EmbeddingScale::Unit,
                 norm: None,
                 per_layer: None,
-                hash_routing: None,
             },
             blocks,
             exit: ExitForm {
@@ -418,7 +535,7 @@ pub fn inspect_components(
             },
         },
         head: None,
-        vision: None,
+        vision,
         draft: None,
     };
     definition

@@ -4,6 +4,7 @@
 
 use lib::core::reduce;
 
+#[inline(always)]
 fn post_norm_residual<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
     let d = cx.dim_d() as usize;
@@ -15,8 +16,8 @@ fn post_norm_residual<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u
     let inverse = reduce::rms_inverse(projected, cx.arg_epsilon());
     let scale = cx.arg_scale();
     // SAFETY: each work item writes its own row.
-    let out = unsafe { cx.result_0().row_mut([row, 0]) };
+    let mut out = unsafe { cx.result_0().row_mut([row, 0]) };
     for (((target, r), p), w) in out.iter_mut().zip(residual).zip(projected).zip(norm.iter()) {
-        *target = (r + p * inverse * w) * scale;
+        target.set((r + p * inverse * w) * scale);
     }
 }

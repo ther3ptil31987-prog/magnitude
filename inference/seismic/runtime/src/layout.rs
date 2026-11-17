@@ -5,8 +5,11 @@
 use crate::api::kernel::ViewOperation;
 use crate::api::TensorError;
 use seismic_compiler::errors::ExecutionError;
+use seismic_compiler::prepared::ArgumentValue;
 use seismic_lang::ids::RepresentationId;
-use seismic_lang::registry::{representation_info, RepresentationKind};
+use seismic_lang::reference_math::conversion::canonical_nan;
+use seismic_lang::registry::{self, representation_info, RepresentationKind};
+use seismic_lang::types::DType;
 
 /// Canonical storage-unit strides and total byte length. Dense storage units
 /// are elements; a packed representation's final-axis unit is one packet.
@@ -16,98 +19,128 @@ pub(crate) struct Layout {
     pub alignment: u64,
 }
 
-/// The canonical representation layout. A size beyond `u64` is a real
-/// allocation failure: no device addresses it.
+/// The canonical representation layout: row-major strides over its storage
+/// units and their bytes, both the registry's (`registry::storage_units`,
+/// `registry::units_bytes`). A size beyond `u64` is a real allocation
+/// failure: no device addresses it.
 pub(crate) fn canonical(
     representation: RepresentationId,
     extents: &[u64],
 ) -> Result<Layout, ExecutionError> {
     let info = representation_info(representation);
-    match &info.kind {
-        RepresentationKind::Dense(dtype) => {
-            let (strides, logical_elements) =
-                row_major(extents).ok_or_else(|| unaddressable(info.name, extents))?;
-            let byte_len = logical_elements
-                .checked_mul(u64::from(dtype.bytes()))
-                .ok_or_else(|| unaddressable(info.name, extents))?;
-            Ok(Layout {
-                strides,
-                byte_len,
-                alignment: u64::from(dtype.bytes()),
-            })
-        }
-        RepresentationKind::Packed(packet) => packet_layout(
-            info.name,
-            extents,
-            packet.group,
-            packet.packet_size,
-            packet.packet_alignment,
-        ),
-        RepresentationKind::External(packet) => packet_layout(
-            info.name,
-            extents,
-            packet.logical_group,
-            packet.packet_size,
-            packet.packet_alignment,
-        ),
-        RepresentationKind::PackedRows(rows) => {
-            let too_low_rank = || {
+    let (units, width) =
+        registry::storage_units(representation, extents).ok_or_else(|| match &info.kind {
+            RepresentationKind::Packed(_) | RepresentationKind::External(_)
+                if extents.is_empty() =>
+            {
+                ExecutionError::AllocationFailed(format!(
+                    "packet representation `{}` requires a packing axis",
+                    info.name
+                ))
+            }
+            RepresentationKind::PackedRows(rows)
+                if extents.len() < 2 && rows.storage_units(extents).is_none() =>
+            {
                 ExecutionError::AllocationFailed(format!(
                     "`{}` storage requires rank at least {}",
                     info.name,
                     if rows.tile_rows() > 1 { 2 } else { 1 }
                 ))
-            };
-            let units = rows.storage_units(extents).ok_or_else(|| {
-                if extents.len() < 2 {
-                    too_low_rank()
-                } else {
-                    unaddressable(info.name, extents)
-                }
-            })?;
-            let (strides, _) =
-                row_major(&units).ok_or_else(|| unaddressable(info.name, extents))?;
-            let byte_len = rows
-                .bytes(extents)
-                .ok_or_else(|| unaddressable(info.name, extents))?;
-            Ok(Layout {
-                strides,
-                byte_len,
-                alignment: seismic_lang::registry::ROW_ALIGNMENT,
-            })
-        }
+            }
+            _ => unaddressable(info.name, extents),
+        })?;
+    let byte_len =
+        registry::units_bytes(&units, width).ok_or_else(|| unaddressable(info.name, extents))?;
+    let alignment = match &info.kind {
+        RepresentationKind::Dense(dtype) => u64::from(dtype.bytes()),
+        RepresentationKind::Packed(packet) => u64::from(packet.packet_alignment),
+        RepresentationKind::External(packet) => u64::from(packet.packet_alignment),
+        RepresentationKind::PackedRows(_) => registry::ROW_ALIGNMENT,
+    };
+    Ok(Layout {
+        strides: row_major_strides(&units),
+        byte_len,
+        alignment,
+    })
+}
+
+/// Row-major strides over `units`, whose bytes (`registry::units_bytes`)
+/// fit: every stride is a suffix of the product they accumulate.
+fn row_major_strides(units: &[u64]) -> Vec<u64> {
+    let mut strides = vec![0u64; units.len()];
+    let mut elements = 1u64;
+    for axis in (0..units.len()).rev() {
+        strides[axis] = elements;
+        elements = elements
+            .checked_mul(units[axis])
+            .expect("units whose bytes fit have a row-major product that fits");
+    }
+    strides
+}
+
+/// The bits of a 16-bit floating dtype's infinity: above it, a magnitude (`bits & 0x7fff`) is a NaN.
+fn half_infinity(dtype: DType) -> u16 {
+    match dtype {
+        DType::BF16 => 0x7f80,
+        DType::F16 => 0x7c00,
+        other => unreachable!("{other:?} is not a 16-bit floating dtype"),
     }
 }
 
-fn packet_layout(
-    name: &str,
-    extents: &[u64],
-    logical_group: u32,
-    packet_size: u32,
-    packet_alignment: u32,
-) -> Result<Layout, ExecutionError> {
-    let (&logical_extent, outer) = extents.split_last().ok_or_else(|| {
-        ExecutionError::AllocationFailed(format!(
-            "packet representation `{name}` requires a packing axis"
-        ))
-    })?;
-    let mut units = extents.to_vec();
-    *units.last_mut().expect("packet rank was checked") =
-        logical_extent.div_ceil(u64::from(logical_group));
-    let (strides, _) = row_major(&units).ok_or_else(|| unaddressable(name, extents))?;
-    let outer_rows = outer
-        .iter()
-        .try_fold(1u64, |rows, extent| rows.checked_mul(*extent))
-        .ok_or_else(|| unaddressable(name, extents))?;
-    let byte_len = outer_rows
-        .checked_mul(logical_extent.div_ceil(u64::from(logical_group)))
-        .and_then(|packets| packets.checked_mul(u64::from(packet_size)))
-        .ok_or_else(|| unaddressable(name, extents))?;
-    Ok(Layout {
-        strides,
-        byte_len,
-        alignment: u64::from(packet_alignment),
-    })
+fn f32_is_nan(bits: u32) -> bool {
+    bits & 0x7fff_ffff > 0x7f80_0000
+}
+
+/// A scalar result as it leaves the engine: a floating NaN of any sign and payload is the
+/// registry's one NaN, as in a tensor's bytes (`canonicalize_in_place`). Other scalars are
+/// unchanged.
+pub(crate) fn canonical_scalar(value: ArgumentValue) -> ArgumentValue {
+    let half = |dtype: DType, bits: u16| {
+        if bits & 0x7fff > half_infinity(dtype) {
+            canonical_nan(dtype) as u16
+        } else {
+            bits
+        }
+    };
+    match value {
+        ArgumentValue::F32(value) if f32_is_nan(value.to_bits()) => {
+            ArgumentValue::F32(f32::from_bits(canonical_nan(DType::F32)))
+        }
+        ArgumentValue::F16(bits) => ArgumentValue::F16(half(DType::F16, bits)),
+        ArgumentValue::BF16(bits) => ArgumentValue::BF16(half(DType::BF16, bits)),
+        other => other,
+    }
+}
+
+/// Every NaN of a dense floating tensor's bytes, of any sign and payload, becomes the registry's one
+/// NaN (`canonical_nan`). This is the way out of the engine (`TensorInner::read_with`), so a NaN's
+/// bits are unobservable: inside, they are whatever the backend's arithmetic and the host gave.
+/// Other representations are left alone. `bytes` is whole elements.
+pub(crate) fn canonicalize_in_place(representation: RepresentationId, bytes: &mut [u8]) {
+    let &RepresentationKind::Dense(dtype) = &representation_info(representation).kind else {
+        return;
+    };
+    match dtype {
+        DType::F32 => {
+            let one = canonical_nan(DType::F32).to_le_bytes();
+            for element in bytes.chunks_exact_mut(4) {
+                let bits = u32::from_le_bytes([element[0], element[1], element[2], element[3]]);
+                if f32_is_nan(bits) {
+                    element.copy_from_slice(&one);
+                }
+            }
+        }
+        DType::BF16 | DType::F16 => {
+            let infinity = half_infinity(dtype);
+            let one = (canonical_nan(dtype) as u16).to_le_bytes();
+            for element in bytes.chunks_exact_mut(2) {
+                if u16::from_le_bytes([element[0], element[1]]) & 0x7fff > infinity {
+                    element.copy_from_slice(&one);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Visit canonical host storage bytes in logical order and their corresponding
@@ -285,6 +318,21 @@ fn leading_slice(
     let (group, width) = match &info.kind {
         RepresentationKind::Dense(dtype) => (1, u64::from(dtype.bytes())),
         RepresentationKind::Packed(packet) => (packet.group, u64::from(packet.packet_size)),
+        // A source under a companion grid slices by matrices
+        // (`concrete_storage_units`).
+        RepresentationKind::External(packet) if packet.planes.is_some() => {
+            // Its rows share their matrix's grid: only whole matrices slice.
+            if extents.len() < 3 {
+                return Err(TensorError::UnalignedRowSlice {
+                    representation: info.name,
+                    start,
+                    end,
+                });
+            }
+            let (_, width) = seismic_ir::storage::concrete_storage_units(representation, extents)
+                .ok_or_else(|| TensorError::Execution(unaddressable(info.name, extents)))?;
+            (packet.logical_group, width)
+        }
         RepresentationKind::External(packet) => {
             (packet.logical_group, u64::from(packet.packet_size))
         }
@@ -338,16 +386,6 @@ fn leading_slice(
     })
 }
 
-fn row_major(extents: &[u64]) -> Option<(Vec<u64>, u64)> {
-    let mut strides = vec![0u64; extents.len()];
-    let mut elements = 1u64;
-    for axis in (0..extents.len()).rev() {
-        strides[axis] = elements;
-        elements = elements.checked_mul(extents[axis])?;
-    }
-    Some((strides, elements))
-}
-
 fn unaddressable(name: &str, extents: &[u64]) -> ExecutionError {
     ExecutionError::AllocationFailed(format!(
         "a `{name}` tensor of extents {extents:?} exceeds the addressable byte range"
@@ -359,6 +397,17 @@ mod tests {
     use super::*;
     use seismic_lang::registry;
     use seismic_lang::types::DType;
+
+    #[test]
+    fn a_zero_extent_tensor_has_no_bytes_however_large_its_other_extents() {
+        let representation = registry::dense(DType::F32);
+        let extents = [u64::MAX, 2, 0];
+        assert_eq!(registry::canonical_bytes(representation, &extents), Some(0));
+        let layout = canonical(representation, &extents).unwrap();
+        assert_eq!(layout.byte_len, 0);
+        assert_eq!(layout.strides, vec![0, 0, 1]);
+        assert!(canonical(representation, &[0, u64::MAX, 2]).is_err());
+    }
 
     #[test]
     fn dense_geometry_and_leading_slices_share_one_owner() {
@@ -431,6 +480,35 @@ mod tests {
         assert_eq!(&sparse[4..8], &[0xff; 4]);
         assert_eq!(&sparse[12..16], &[0xff; 4]);
         assert_eq!(&sparse[16..20], &3_u32.to_ne_bytes());
+    }
+
+    /// A planar source's rows share their matrix's grid, so a view of it
+    /// selects whole matrices only: a leading slice of one matrix's rows is
+    /// refused, one over the matrix axis offsets by whole matrices.
+    #[test]
+    fn a_planar_source_slices_by_matrices_only() {
+        let source = registry::representation("gguf_f8_e4m3_e8m0_32x32").unwrap();
+        let matrix = canonical(source, &[64, 128]).unwrap();
+        let stack = canonical(source, &[3, 64, 128]).unwrap();
+        assert_eq!(stack.byte_len, 3 * matrix.byte_len);
+        let slice = leading_slice(source, &[3, 64, 128], &stack.strides, 1, 3).unwrap();
+        assert_eq!((slice.relative_offset, slice.extents), (matrix.byte_len, vec![2, 64, 128]));
+        assert!(matches!(
+            leading_slice(source, &[64, 128], &matrix.strides, 16, 32).err(),
+            Some(TensorError::UnalignedRowSlice { start: 16, end: 32, .. })
+        ));
+    }
+
+    /// A planar source of no rows holds no bytes, whatever its grid: a
+    /// view of none of a stack's rows is addressable, as it is of any type.
+    #[test]
+    fn an_empty_planar_source_is_a_layout_of_no_bytes() {
+        for name in ["gguf_f8_e4m3_e8m0_1x32", "gguf_f8_e4m3_e8m0_32x32"] {
+            let source = registry::representation(name).unwrap();
+            for extents in [&[0, 256][..], &[3, 0, 256][..], &[2, 64, 0][..]] {
+                assert_eq!(canonical(source, extents).unwrap().byte_len, 0, "{name} {extents:?}");
+            }
+        }
     }
 
     #[test]

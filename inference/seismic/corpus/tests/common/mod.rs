@@ -14,7 +14,7 @@ use seismic::dynamic::{
     TensorAccess, Value,
 };
 use seismic::{
-    BackendName, BigUint, Device, DeviceCatalog, Element, FeedbackOptions, PrecisionPolicy,
+    BackendName, BigUint, Device, Devices, Element, FeedbackOptions, PrecisionPolicy,
     PreparationOptions,
 };
 use seismic_corpus::inputs::{generate, literal_bits, GeneratedArgument};
@@ -42,14 +42,22 @@ pub const CHECK_WORK_UNITS: u64 = 1 << 28;
 pub const RANKING_TIME: Duration = Duration::from_secs(2);
 
 pub fn corpus_path(relative: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
+    Path::new(&std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"))
+        .join(relative)
 }
 
 /// The backend's device; a missing device is a test failure, never a skip.
+/// `backend`'s device over tallies of its own: no other test's open shares
+/// a limit or a charge with it.
 pub fn device(backend: BackendName) -> Device {
-    DeviceCatalog::discover()
-        .expect("device discovery")
-        .open_backend(backend)
+    tallied_device(backend).0
+}
+
+/// [`device`], and its device store's tally, which the test reads and
+/// bounds.
+pub fn tallied_device(backend: BackendName) -> (Device, seismic::memory::Tally) {
+    let devices = Devices::discover(&[]).expect("device discovery");
+    seismic::testing::open_backend_tallied(&devices, backend, Default::default())
         .unwrap_or_else(|e| panic!("{} device required: {e}", backend.as_str()))
 }
 
@@ -402,7 +410,7 @@ fn check_oracle(
                 Arg::Tensor(interpreter.add_tensor(data))
             }
             GeneratedArgument::Scalar { dtype, bits } => {
-                Arg::Scalar(ReferenceScalar::from_bits(dtype.dtype(), bits as u32))
+                Arg::Scalar(ReferenceScalar::from_bits(dtype.dtype(), bits))
             }
             GeneratedArgument::Index(value) => Arg::Index(BigUint::from(value)),
             GeneratedArgument::Range { start, end } => {

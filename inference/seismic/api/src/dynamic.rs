@@ -36,7 +36,7 @@ impl From<CallError> for Error {
         let kind = match &e {
             CallError::Invocation(_) => "InvocationError",
             CallError::Output(_) => "OutputError",
-            CallError::Execution(_) => "ExecutionError",
+            CallError::Execution(_) | CallError::Unfenced { .. } => "ExecutionError",
             CallError::Workflow(_) => "WorkflowError",
         };
         Self::new(kind, e)
@@ -123,27 +123,13 @@ impl Module {
             path: name.into(),
             text: text.into(),
         });
-        let mut checked = seismic_lang::checked::check_source(sources)
-            .map_err(|e| Error::new("SourceError", e))?;
-        // Labels never implicitly grant filesystem access for inline native assets.
-        if base.is_none()
-            && checked.entries().iter().any(|e| {
-                checked
-                    .native_implementation(e.id, BackendName::Metal)
-                    .is_some()
-            })
-        {
-            return Err(Error::new(
-                "ValueError",
-                "inline native assets require base_dir",
-            ));
-        }
-        // Native includes of inline assets may resolve only inside `base`.
+        // Native includes of inline assets may resolve only inside `base`;
+        // labels never implicitly grant filesystem access for them.
         let roots = match base {
             Some(base) => seismic_lang::source::source_roots(&[base.to_path_buf()])?,
             None => Vec::new(),
         };
-        seismic_lang::source::capture_assets(&mut checked, base, &roots)?;
+        let (checked, _) = seismic_lang::source::check_with_assets(sources, base, &roots)?;
         Ok(Self {
             checked: Arc::new(checked),
         })
@@ -437,6 +423,7 @@ pub enum Scalar {
     BF16(u16),
     I32(i32),
     U32(u32),
+    U64(u64),
     Bool(bool),
     Index(seismic_lang::expr::BigUint),
     Range(seismic_lang::expr::BigUint, seismic_lang::expr::BigUint),
@@ -450,6 +437,7 @@ impl Scalar {
             Self::BF16(v) => E::BF16(v),
             Self::I32(v) => E::I32(v),
             Self::U32(v) => E::U32(v),
+            Self::U64(v) => E::U64(v),
             Self::Bool(v) => E::Bool(v),
             Self::Index(v) => E::Index(v),
             Self::Range(start, end) => E::Range { start, end },
@@ -463,6 +451,7 @@ impl Scalar {
                 | (Self::BF16(_), SignatureType::Scalar(DType::BF16))
                 | (Self::I32(_), SignatureType::Scalar(DType::I32))
                 | (Self::U32(_), SignatureType::Scalar(DType::U32))
+                | (Self::U64(_), SignatureType::Scalar(DType::U64))
                 | (Self::Bool(_), SignatureType::Scalar(DType::Bool))
                 | (Self::Index(_), SignatureType::Index)
                 | (Self::Range(..), SignatureType::Range)
@@ -700,12 +689,13 @@ fn decode(
                     "scalar result contract mismatch",
                 ));
             };
-            Value::Scalar(match v {
+            Value::Scalar(match v.into_value() {
                 ArgumentValue::F32(v) => Scalar::F32(v.to_bits()),
                 ArgumentValue::F16(v) => Scalar::F16(v),
                 ArgumentValue::BF16(v) => Scalar::BF16(v),
                 ArgumentValue::I32(v) => Scalar::I32(v),
                 ArgumentValue::U32(v) => Scalar::U32(v),
+                ArgumentValue::U64(v) => Scalar::U64(v),
                 ArgumentValue::Bool(v) => Scalar::Bool(v),
                 ArgumentValue::Index(v) => Scalar::Index(v),
                 ArgumentValue::Range { start, end } => Scalar::Range(start, end),
@@ -941,6 +931,7 @@ impl Scalar {
             Self::BF16(v) => f32::from_bits((v as u32) << 16) as f64,
             Self::I32(v) => v as f64,
             Self::U32(v) => v as f64,
+            Self::U64(v) => v as f64,
             Self::Bool(v) => u8::from(v) as f64,
             Self::Index(_) | Self::Range(..) => f64::NAN,
         }
@@ -953,6 +944,7 @@ impl Scalar {
             Self::BF16(v) => S::BF16(v),
             Self::I32(v) => S::I32(v),
             Self::U32(v) => S::U32(v),
+            Self::U64(v) => S::U64(v),
             Self::Bool(v) => S::Bool(v),
             Self::Index(v) => S::Nat(v),
             Self::Range(..) => unreachable!(),

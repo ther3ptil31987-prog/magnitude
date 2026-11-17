@@ -1,17 +1,22 @@
-//! CUDA's program toolchain.
+//! CUDA's program toolchains, one a source language: CUDA C++
+//! ([`CudaToolchain`]) and PTX ([`CudaPtxToolchain`]). Both keep a CUBIN for
+//! the device's architecture, which a load hands the driver: no compiler
+//! runs at a load.
 //!
-//! Compiling a program runs NVRTC once for the device's architecture with
+//! Compiling a CUDA C++ program runs NVRTC once for the device's architecture with
 //! every entry symbol as a name expression, so plain `extern "C"` kernels
 //! and template instances are requested alike. It keeps the CUBIN with each
 //! requested expression's lowered linker name, which NVRTC alone supplies:
 //! a kept image serves any entries it holds, and one the driver refuses, or
-//! that lacks an entry, is compiled again.
+//! that lacks an entry, is declined ([`Declined`]): a miss, compiled again.
 
-use crate::direct::{formation_error, DirectModule};
+use crate::direct::{formation_error, jit_report, DirectModule};
+use crate::driver::{compile_image, JitError};
 use crate::executor::Device;
 use crate::nvrtc;
 use seismic_native_target::{
-    NativeCompilationError, ProgramCache, ProgramSource, Toolchain, ToolchainIdentity,
+    Artifact, Declined, NativeCompilationError, ProgramEntry, ProgramSource, ProgramStatistic,
+    Toolchain, ToolchainIdentity,
 };
 
 pub struct CudaToolchain {
@@ -27,9 +32,7 @@ impl CudaToolchain {
     pub fn new(device: Device, architecture: u32) -> Self {
         let formation = nvrtc::formation(architecture).map_err(formation_error);
         let material = match &formation {
-            // The release, architecture and options determine the CUBIN; the
-            // driver only loads it.
-            Ok(formation) => format!("cuda;{formation}"),
+            Ok(formation) => material(formation),
             Err(error) => format!("cuda;sm_{architecture};unavailable: {error:?}"),
         };
         Self {
@@ -39,29 +42,56 @@ impl CudaToolchain {
             identity: ToolchainIdentity {
                 namespace: "cuda",
                 material,
+                stored: format!("build {FORMATION_BUILD}"),
             },
         }
     }
 
-    /// Load `source`'s entries from a kept image, if it holds them all.
-    fn load(&self, source: &ProgramSource, kept: &[u8]) -> Option<DirectModule> {
-        let (names, cubin) = unpack(kept)?;
-        let kernels = source
-            .entries
-            .iter()
-            .map(|entry| {
-                names
-                    .iter()
-                    .find(|(expression, _)| *expression == entry.symbol)
-                    .map(|(_, lowered)| lowered.as_str())
-            })
-            .collect::<Option<Vec<_>>>()?;
-        DirectModule::load(&self.device, cubin, &kernels).ok()
+}
+
+/// This build's formation code ([`build.rs`](../build.rs)): part of every
+/// stored artifact's key, never of tuning's.
+pub const FORMATION_BUILD: &str = env!("SEISMIC_FORMATION_BUILD");
+
+/// Everything besides the source and this build that determines a CUBIN: the release,
+/// architecture and options of `formation`. The driver only loads it.
+pub fn material(formation: &nvrtc::Formation) -> String {
+    format!("cuda;{formation}")
+}
+
+/// A CUDA program's artifact: its CUBIN, the architecture's final code,
+/// with each entry's name expression and lowered name.
+pub struct Cubin {
+    names: Vec<(String, String)>,
+    image: Vec<u8>,
+}
+
+impl Cubin {
+    /// Its bytes, as [`Artifact::decode`] reads them ([`pack`]).
+    fn encode(&self) -> Vec<u8> {
+        let expressions = self.names.iter().map(|(expression, _)| expression.as_str()).collect::<Vec<_>>();
+        let lowered = self.names.iter().map(|(_, lowered)| lowered.clone()).collect::<Vec<_>>();
+        pack(&expressions, &lowered, &self.image)
+    }
+}
+
+impl Artifact for Cubin {
+    const ENCODING: u32 = 1;
+
+    fn decode(bytes: &[u8], _: Option<&std::path::Path>) -> Option<Self> {
+        let (names, image) = unpack(bytes)?;
+        Some(Self {
+            names,
+            image: image.to_vec(),
+        })
     }
 }
 
 impl Toolchain for CudaToolchain {
+    type Artifact = Cubin;
     type Program = DirectModule;
+    /// The artifact itself: the compile made it.
+    type Pending = Cubin;
 
     fn identity(&self) -> &ToolchainIdentity {
         &self.identity
@@ -70,31 +100,143 @@ impl Toolchain for CudaToolchain {
     fn compile(
         &self,
         source: &ProgramSource,
-        cache: Option<&dyn ProgramCache>,
-    ) -> Result<DirectModule, NativeCompilationError> {
+    ) -> Result<(Cubin, DirectModule), NativeCompilationError> {
         self.formation.as_ref().map_err(Clone::clone)?;
-        if let Some(module) = cache
-            .and_then(|cache| cache.get())
-            .and_then(|kept| self.load(source, &kept))
-        {
-            return Ok(module);
-        }
-        let expressions = source
-            .entries
-            .iter()
-            .map(|entry| entry.symbol.as_str())
-            .collect::<Vec<_>>();
         let cubin = form_cubin(source, self.architecture)?;
-        if let Some(cache) = cache {
-            cache.put(&pack(&expressions, &cubin.lowered_names, &cubin.image));
-        }
-        let kernels = cubin
-            .lowered_names
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        DirectModule::load(&self.device, &cubin.image, &kernels)
+        let kernels = cubin.lowered_names.iter().map(String::as_str).collect::<Vec<_>>();
+        let program = DirectModule::load(&self.device, &cubin.image, &kernels)?;
+        let artifact = Cubin {
+            names: source
+                .entries
+                .iter()
+                .map(|entry| entry.symbol.clone())
+                .zip(cubin.lowered_names)
+                .collect(),
+            image: cubin.image,
+        };
+        Ok((artifact, program))
     }
+
+    fn artifact(&self, artifact: Cubin) -> Result<Vec<u8>, NativeCompilationError> {
+        Ok(artifact.encode())
+    }
+
+    /// A CUBIN without a requested entry, or one the driver refuses, is
+    /// declined: a miss, compiled again.
+    fn load(&self, artifact: &Cubin, entries: &[ProgramEntry]) -> Result<DirectModule, Declined> {
+        let kernels = entries
+            .iter()
+            .map(|entry| {
+                artifact
+                    .names
+                    .iter()
+                    .find(|(expression, _)| *expression == entry.symbol)
+                    .map(|(_, lowered)| lowered.as_str())
+                    .ok_or_else(|| Declined(format!("the CUBIN holds no `{}`", entry.symbol)))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(DirectModule::load(&self.device, &artifact.image, &kernels)?)
+    }
+
+    fn statistics(program: &DirectModule, entry: usize) -> &[ProgramStatistic] {
+        program.statistics(entry)
+    }
+}
+
+/// The toolchain of PTX programs (Seismic-IR kernels, the device's
+/// graph-cost and analytical-service probe kernels): the driver's JIT
+/// links the text to a CUBIN for the device's architecture once, and every
+/// later load hands the driver that CUBIN, so no PTX reaches the driver at
+/// a load. A PTX entry's name is its symbol: the CUBIN is kept with each
+/// name paired with itself.
+pub struct CudaPtxToolchain {
+    device: Device,
+    identity: ToolchainIdentity,
+}
+
+impl CudaPtxToolchain {
+    pub fn new(device: Device, architecture: u32) -> Self {
+        let version = device
+            .context()
+            .driver
+            .version()
+            .expect("the driver of an opened device reports its version");
+        Self {
+            device,
+            identity: ToolchainIdentity {
+                namespace: "cuda-ptx",
+                material: ptx_material(version, architecture),
+                stored: format!("build {FORMATION_BUILD}"),
+            },
+        }
+    }
+}
+
+/// Everything besides the source and this build (whose formation code
+/// holds the JIT's options) that determines a PTX program's CUBIN: the
+/// driver, whose JIT compiles it, and the architecture it targets.
+fn ptx_material(driver_version: i32, architecture: u32) -> String {
+    format!("cuda-ptx;driver {driver_version};sm_{architecture}")
+}
+
+impl Toolchain for CudaPtxToolchain {
+    type Artifact = Cubin;
+    type Program = DirectModule;
+    /// The artifact itself: the compile made it.
+    type Pending = Cubin;
+
+    fn identity(&self) -> &ToolchainIdentity {
+        &self.identity
+    }
+
+    fn compile(&self, source: &ProgramSource) -> Result<(Cubin, DirectModule), NativeCompilationError> {
+        let image = compile_image(self.device.context(), &source.text).map_err(|error| ptx_failure(error, &source.text))?;
+        let kernels = source.entries.iter().map(|entry| entry.symbol.as_str()).collect::<Vec<_>>();
+        let program = DirectModule::load(&self.device, &image, &kernels)?;
+        let artifact = Cubin {
+            names: source.entries.iter().map(|entry| (entry.symbol.clone(), entry.symbol.clone())).collect(),
+            image,
+        };
+        Ok((artifact, program))
+    }
+
+    fn artifact(&self, artifact: Cubin) -> Result<Vec<u8>, NativeCompilationError> {
+        Ok(artifact.encode())
+    }
+
+    /// A CUBIN without a requested entry, or one the driver refuses, is
+    /// declined: a miss, compiled again.
+    fn load(&self, artifact: &Cubin, entries: &[ProgramEntry]) -> Result<DirectModule, Declined> {
+        let kernels = entries
+            .iter()
+            .map(|entry| {
+                artifact
+                    .names
+                    .iter()
+                    .any(|(name, _)| *name == entry.symbol)
+                    .then_some(entry.symbol.as_str())
+                    .ok_or_else(|| Declined(format!("the CUBIN holds no `{}`", entry.symbol)))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(DirectModule::load(&self.device, &artifact.image, &kernels)?)
+    }
+
+    fn statistics(program: &DirectModule, entry: usize) -> &[ProgramStatistic] {
+        program.statistics(entry)
+    }
+}
+
+/// The JIT's failure on `ptx`, with the text's first lines, numbered as its
+/// log numbers them.
+fn ptx_failure(error: JitError, ptx: &str) -> NativeCompilationError {
+    let numbered = ptx
+        .lines()
+        .enumerate()
+        .take(160)
+        .map(|(line, text)| format!("{:>4}: {text}", line + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    NativeCompilationError::ToolchainFailure(format!("{}\nGenerated PTX (first 160 lines):\n{numbered}", jit_report(error)))
 }
 
 /// `source`'s CUBIN for `sm_<architecture>`, each entry requested by its

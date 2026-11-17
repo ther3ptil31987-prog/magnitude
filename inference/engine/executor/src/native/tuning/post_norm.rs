@@ -2,8 +2,8 @@
 //! publishing F32 for the `post_norm_residual` row op). The row op itself has
 //! no tuning parameters.
 
-use super::cases::{projection_shape, scale_extent};
-use super::{row_points, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits};
+use super::cases::{packing_statics, projection_shape, scale_extent};
+use super::{EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points};
 use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::project_rows;
 use seismic::{Element, Tensor};
@@ -15,6 +15,10 @@ pub(crate) struct ProjectRowsTuning {
     pub weight: Element,
     pub activation: Element,
     pub kind: WeightKind,
+    /// The weight's groups (`project_rows`' G): 1 but for a block-diagonal
+    /// weight, whose rows split into `groups` blocks each projecting its own
+    /// run of the input row.
+    pub groups: u64,
     /// The published element: F32 for a post-norm row op, activations for a
     /// latent down projection.
     pub output: Element,
@@ -26,6 +30,7 @@ pub(crate) struct ProjectRowsCase {
     source: Tensor,
     weight: Tensor,
     weight_scale: Tensor,
+    weight_bound: Tensor,
 }
 
 impl ProjectRowsTuning {
@@ -57,11 +62,24 @@ impl EntryTuning for ProjectRowsTuning {
 
     fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let (outputs, inputs_width) = projection_shape(inputs, &self.scopes, self.kind)?;
-        Ok(vec![
+        if self.groups == 0 || !outputs.is_multiple_of(self.groups) {
+            return Err(format!(
+                "{} weight rows do not split into {} groups",
+                outputs, self.groups
+            ));
+        }
+        let mut statics = vec![
+            ("G", self.groups),
             ("K", inputs_width),
-            ("N", outputs),
+            ("N", outputs / self.groups),
             ("WS", scale_extent(inputs, &self.scopes, self.kind)?),
-        ])
+        ];
+        statics.extend(packing_statics(
+            inputs,
+            &self.scopes,
+            &[("WB", Some(self.kind))],
+        )?);
+        Ok(statics)
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
@@ -72,7 +90,7 @@ impl EntryTuning for ProjectRowsTuning {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<Self::Case>, String> {
+    ) -> Result<Vec<Self::Case>, seismic::BuildError> {
         TuningInputs::rotation_scopes(&self.scopes, point)
             .into_iter()
             .enumerate()
@@ -82,11 +100,12 @@ impl EntryTuning for ProjectRowsTuning {
                 Ok(ProjectRowsCase {
                     source: inputs.activation(
                         self.activation,
-                        &[point.rows, width],
+                        &[point.rows, self.groups * width],
                         index as u64 + 1,
                     )?,
                     weight,
                     weight_scale: inputs.unit_scale(inputs.scale_extent(scope, self.kind)?)?,
+                    weight_bound: inputs.bound(scope, self.kind)?,
                 })
             })
             .collect()
@@ -97,6 +116,7 @@ impl EntryTuning for ProjectRowsTuning {
             source: &case.source,
             weight: &case.weight,
             weight_scale: &case.weight_scale,
+            weight_bound: &case.weight_bound,
         }
     }
 

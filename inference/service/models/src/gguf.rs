@@ -4,37 +4,184 @@
 //! ([`magnitude_artifacts::gguf::inspect_header`]), which validates header bounds, tensor
 //! geometry and offsets; this module only interprets catalog and inventory metadata.
 
-use magnitude_artifacts::gguf::{Directory, Scalar, Value};
+use crate::candidate_files::RecognizedArchitectures;
+use magnitude_artifacts::gguf::{Directory, Element, Encoding, PROJECTOR_ARCHITECTURE, Scalar, Value};
+use magnitude_service_contracts::models::{LocalModelHash, LocalModelLabel, ModelId, ModelIdError};
+use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::Path;
+use std::sync::Arc;
 
 const MAGIC: [u8; 4] = *b"GGUF";
 const SUPPORTED_VERSIONS: std::ops::RangeInclusive<u32> = 2..=3;
 
+/// The version of the rules that derive an inspection's facts and labels from a header. Every
+/// cache of something they derive carries it in its key, so changing it re-derives all of them;
+/// bump it with any change to what an inspection reports.
+pub const RULES: &str = "gguf-rules-v1";
+
+/// Header facts of one GGUF file. `header_digest` is the lowercase hex SHA-256 of the first
+/// `header_bytes` bytes, which identifies the file's content without reading tensor data.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GgufInspection {
     pub architecture: Option<String>,
     pub name: Option<String>,
     pub quantization: Option<String>,
     pub quantization_name: Option<String>,
+    /// llama.cpp's name for the declared `general.file_type` (`Q4_K_M`), when one is declared and
+    /// known.
+    pub file_type: Option<String>,
     pub parameter_count: Option<u64>,
     pub active_parameter_count: Option<u64>,
     pub training_context_length: Option<u32>,
     pub nextn_predict_layers: Option<u32>,
     pub tokenizer: Option<String>,
-    pub base_models: Vec<String>,
-    pub modalities: Vec<String>,
+    pub base_models: Vec<GgufBaseModel>,
     pub tensor_storage_bytes: u64,
     /// Bytes from the start of the file through the aligned tensor-data offset.
     pub header_bytes: u64,
+    pub header_digest: String,
+    /// The file's content sample (see [`content_sample_digest`]) when it was read from disk.
+    #[serde(default)]
+    pub content_sample: Option<String>,
     pub fingerprint_material: Vec<u8>,
-    pub execution_role: Option<GgufExecutionRole>,
+    pub tensors: GgufTensors,
+    #[serde(default)]
+    pub license: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
+/// What a GGUF file is, read from its header rather than its name. Which architectures are
+/// projectors and separate drafters is the engine's: a `Drafter` declares an architecture the
+/// engine binds only as a drafter, or an architecture the engine doesn't run as a target with
+/// `general.tags` marking it for speculative decoding, or its tensors are a prediction head.
+/// Whether the engine binds it is the engine's verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GgufRole {
+    Model { embedded_mtp: bool },
+    Projector,
+    Drafter,
+}
+
+/// What a GGUF's tensors hold, whichever architectures the engine knows: a model's blocks
+/// (with or without built-in prediction blocks), or a prediction head alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum GgufExecutionRole {
-    Draft,
+pub enum GgufTensors {
+    Model { embedded_mtp: bool },
+    PredictionHead,
+}
+
+impl GgufTensors {
+    /// A head file holds only its prediction blocks (each a full layer beside its `nextn.*`
+    /// tensors, or the trailing blocks its `nextn_predict_layers` declares) and at most the shared
+    /// embedding and head, or declares that it shares its target's tables. A file declaring
+    /// prediction layers with no block at all is a head file whose blocks are missing, which the
+    /// engine judges as a drafter. A full model declaring the same architecture and prediction
+    /// layers holds every block.
+    #[must_use]
+    pub fn of(directory: &Directory, architecture: Option<&str>) -> Self {
+        let nextn_tensors = directory
+            .tensors
+            .iter()
+            .filter(|tensor| is_nextn_tensor(&tensor.name))
+            .count();
+        let mut prediction_blocks = directory
+            .tensors
+            .iter()
+            .filter(|tensor| is_nextn_tensor(&tensor.name))
+            .filter_map(|tensor| block_index(&tensor.name))
+            .filter_map(|index| index.parse::<u64>().ok())
+            .collect::<std::collections::BTreeSet<_>>();
+        let unsigned = |key: &str| {
+            architecture
+                .and_then(|architecture| directory.value(&format!("{architecture}.{key}")))
+                .and_then(Value::unsigned)
+        };
+        if let (Some(blocks), Some(layers @ 1..)) =
+            (unsigned("block_count"), unsigned("nextn_predict_layers"))
+        {
+            prediction_blocks.extend(blocks.saturating_sub(layers)..blocks);
+        }
+        let only_prediction_blocks = !prediction_blocks.is_empty()
+            && directory
+                .tensors
+                .iter()
+                .filter_map(|tensor| block_index(&tensor.name))
+                .filter_map(|index| index.parse::<u64>().ok())
+                .all(|block| prediction_blocks.contains(&block));
+        let shares_target_tables = architecture.is_some_and(|architecture| {
+            matches!(
+                directory.value(&format!("{architecture}.nextn_shared_target_tensors")),
+                Some(Value::Scalar(Scalar::Bool(true)))
+            )
+        });
+        if shares_target_tables
+            || only_prediction_blocks
+            || (nextn_tensors > 0 && nextn_tensors == directory.tensors.len())
+        {
+            Self::PredictionHead
+        } else {
+            Self::Model {
+                embedded_mtp: nextn_tensors > 0,
+            }
+        }
+    }
+}
+
+/// A GGUF's role, from its declared architecture and `general.tags`, its tensors and the engine's
+/// architectures.
+#[must_use]
+pub fn role(
+    architecture: Option<&str>,
+    tags: &[String],
+    tensors: GgufTensors,
+    architectures: &RecognizedArchitectures,
+) -> GgufRole {
+    match (architecture, tensors) {
+        (Some(PROJECTOR_ARCHITECTURE), _) => GgufRole::Projector,
+        (Some(architecture), _) if architectures.declares_drafter(architecture, tags) => {
+            GgufRole::Drafter
+        }
+        (_, GgufTensors::PredictionHead) => GgufRole::Drafter,
+        (_, GgufTensors::Model { embedded_mtp }) => GgufRole::Model { embedded_mtp },
+    }
+}
+
+impl GgufInspection {
+    #[must_use]
+    pub fn role(&self, architectures: &RecognizedArchitectures) -> GgufRole {
+        role(
+            self.architecture.as_deref(),
+            &self.tags,
+            self.tensors,
+            architectures,
+        )
+    }
+}
+
+/// A header's `general.tags`; an error when the array's payload can't be read or decoded.
+pub fn header_tags(directory: &Directory) -> Result<Vec<String>, magnitude_artifacts::Error> {
+    Ok(match directory.value("general.tags") {
+        Some(Value::Array(values)) => values
+            .elements()?
+            .iter()
+            .filter_map(|value| match value {
+                Element::String(tag) => Some(tag.to_owned()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    })
+}
+
+/// One `general.base_model.N.*` lineage entry.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GgufBaseModel {
+    pub name: Option<String>,
+    pub organization: Option<String>,
+    pub repo_url: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -51,34 +198,465 @@ pub enum GgufError {
     UnknownFileType(u64),
 }
 
-pub fn inspect(path: &Path) -> Result<GgufInspection, GgufError> {
-    let mut preamble = [0_u8; 8];
-    File::open(path)?.read_exact(&mut preamble)?;
-    if preamble[..4] != MAGIC {
-        return Err(GgufError::InvalidMagic);
-    }
-    let version = u32::from_le_bytes([preamble[4], preamble[5], preamble[6], preamble[7]]);
-    if !SUPPORTED_VERSIONS.contains(&version) && !SUPPORTED_VERSIONS.contains(&version.swap_bytes())
-    {
-        return Err(GgufError::UnsupportedVersion(version));
-    }
-    let directory = magnitude_artifacts::gguf::inspect_header(path).map_err(GgufError::Header)?;
-    interpret(&directory)
+/// Header inspection of a file that must be complete on disk: a local file shorter than the tensor
+/// data its header declares is truncated, so it is refused as unreadable. Header-only previews use
+/// [`inspect`].
+pub fn inspect_complete(path: &Path) -> Result<GgufInspection, GgufError> {
+    read_local(path)?.gguf.complete()
 }
 
-fn interpret(directory: &Directory) -> Result<GgufInspection, GgufError> {
-    let architecture = string_value(directory, "general.architecture");
-    let execution_role = if architecture.as_deref() == Some("eagle3")
-        || string_value(directory, "dflash.decoder_arch").is_some()
-    {
-        Some(GgufExecutionRole::Draft)
-    } else {
-        None
+pub fn inspect(path: &Path) -> Result<GgufInspection, GgufError> {
+    Ok(read_local(path)?.gguf.inspection)
+}
+
+/// What one read of a GGUF on disk establishes: its inspection, content sample included, and why
+/// it is truncated when it holds less tensor data than its header declares.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LocalGguf {
+    pub inspection: GgufInspection,
+    pub truncated: Option<String>,
+}
+
+impl LocalGguf {
+    /// The inspection of a file that is complete on disk; a truncated file is unreadable
+    /// ([`inspect_complete`]).
+    pub fn complete(self) -> Result<GgufInspection, GgufError> {
+        match self.truncated {
+            Some(detail) => Err(GgufError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                detail,
+            ))),
+            None => Ok(self.inspection),
+        }
+    }
+}
+
+/// A GGUF read from disk with its header bytes (through the aligned tensor-data offset) and the
+/// directory they hold.
+pub struct LocalGgufRead {
+    pub gguf: LocalGguf,
+    /// Shared with the metadata arrays of `directory`.
+    pub header: Arc<Vec<u8>>,
+    pub directory: Directory,
+}
+
+/// Read a GGUF on disk once: its header, then the first and last [`CONTENT_SAMPLE_BYTES`] of its
+/// tensor data for its content sample. No byte of the file is read twice.
+pub fn read_local(path: &Path) -> Result<LocalGgufRead, GgufError> {
+    let mut file = Counted {
+        file: File::open(path)?,
+        read: 0,
     };
-    let training_context_length = architecture
+    let read = read_counted(&mut file);
+    LocalReads::record(path, file.read);
+    read
+}
+
+fn read_counted(file: &mut Counted) -> Result<LocalGgufRead, GgufError> {
+    let length = file.file.metadata()?.len();
+    let mut header = magnitude_artifacts::gguf::HeaderBytes::new();
+    let read = header.read(file).map(|walked| walked.data_offset);
+    let data_offset = match read {
+        Ok(read) => read,
+        Err(magnitude_artifacts::Error::Truncated { .. }) => {
+            return Err(GgufError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "GGUF header is shorter than its tensor-data offset",
+            )));
+        }
+        Err(error) => {
+            let bytes = header.bytes();
+            let version = bytes
+                .get(4..8)
+                .map(|version| u32::from_le_bytes(version.try_into().expect("four bytes")));
+            return Err(match version {
+                Some(_) if bytes[..4] != MAGIC => GgufError::InvalidMagic,
+                Some(version) if !SUPPORTED_VERSIONS.contains(&version) => {
+                    GgufError::UnsupportedVersion(version)
+                }
+                _ => GgufError::Header(error),
+            });
+        }
+    };
+    let header_bytes = (data_offset as u64).min(length);
+    let header_end = usize::try_from(header_bytes).expect("a read header fits in memory");
+    if header.bytes().len() < header_end {
+        let missing = header_end - header.bytes().len();
+        if header.read_from(file, missing)? != missing {
+            return Err(GgufError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "GGUF header is shorter than its tensor-data offset",
+            )));
+        }
+    }
+    // Sampled before the bytes read past the header are dropped, so no byte is read twice.
+    let content_sample = content_sample_digest(
+        &mut Prefixed {
+            prefix: header.bytes(),
+            file,
+            position: 0,
+        },
+        header_bytes,
+        length,
+    )?;
+    let header = header.into_shared(header_end).map_err(GgufError::Header)?;
+    let (directory, unknown_types) = known_tensors_and_unknown_types(header.directory())
+        .and_then(|(directory, unknown)| {
+            directory.require_execution_byte_order().map(|()| (directory, unknown))
+        })
+        .map_err(GgufError::Header)?;
+    let declared = declared_length(&directory);
+    let truncated = (length < declared).then(|| {
+        format!(
+            "GGUF file is truncated: it has {length} bytes of the {declared} its header declares"
+        )
+    });
+    let header_digest = format!("{:x}", Sha256::digest(header.bytes().as_slice()));
+    let mut inspection = interpret(&directory, &unknown_types, header_digest, header_bytes)?;
+    inspection.content_sample = Some(content_sample);
+    Ok(LocalGgufRead {
+        gguf: LocalGguf {
+            inspection,
+            truncated,
+        },
+        header: Arc::clone(header.bytes()),
+        directory,
+    })
+}
+
+/// A parsed header, or for one whose tensors use type ids the parser doesn't know (a quantization
+/// newer than it), the directory of its other tensors: its metadata, roles and identity are intact,
+/// and whether the engine runs those types is the engine's verdict, never the service's.
+pub fn known_tensors(
+    parsed: Result<Directory, magnitude_artifacts::Error>,
+) -> Result<Directory, magnitude_artifacts::Error> {
+    known_tensors_and_unknown_types(parsed).map(|(directory, _)| directory)
+}
+
+/// [`known_tensors`], with the type ids of the tensors left out of the directory.
+pub fn known_tensors_and_unknown_types(
+    parsed: Result<Directory, magnitude_artifacts::Error>,
+) -> Result<(Directory, Vec<u32>), magnitude_artifacts::Error> {
+    match parsed {
+        Err(magnitude_artifacts::Error::UnknownTensorTypes { types, directory }) => Ok((
+            *directory,
+            types.into_iter().map(|(id, _)| id).collect(),
+        )),
+        parsed => parsed.map(|directory| (directory, Vec::new())),
+    }
+}
+
+/// The length a file with this header has when it holds every byte of tensor data its directory
+/// declares (for a split file's shard, that shard's own tensors).
+#[must_use]
+pub fn declared_length(directory: &Directory) -> u64 {
+    directory
+        .tensors
+        .iter()
+        .map(|tensor| tensor.offset.saturating_add(tensor.nbytes))
+        .max()
+        .map_or(0, |end| end.saturating_add(directory.data_offset))
+}
+
+/// A file and how many bytes were read from it.
+struct Counted {
+    file: File,
+    read: u64,
+}
+
+impl Read for Counted {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let read = self.file.read(buffer)?;
+        self.read += read as u64;
+        Ok(read)
+    }
+}
+
+impl io::Seek for Counted {
+    fn seek(&mut self, position: io::SeekFrom) -> io::Result<u64> {
+        self.file.seek(position)
+    }
+}
+
+/// The reads of the local GGUFs being watched: how many times each was read and how many of its
+/// bytes, from when a watch starts until it is dropped. How often a file is read is part of what
+/// inspection guarantees, so it can be observed.
+pub struct LocalReads {
+    path: std::path::PathBuf,
+}
+
+static WATCHED: std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, (u64, u64)>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+impl LocalReads {
+    #[must_use]
+    pub fn watch(path: &Path) -> Self {
+        if let Ok(mut watched) = WATCHED.lock() {
+            watched.insert(path.to_path_buf(), (0, 0));
+        }
+        Self {
+            path: path.to_path_buf(),
+        }
+    }
+
+    /// How many times the file was read, and how many bytes in all.
+    #[must_use]
+    pub fn reads(&self) -> (u64, u64) {
+        WATCHED
+            .lock()
+            .ok()
+            .and_then(|watched| watched.get(&self.path).copied())
+            .unwrap_or_default()
+    }
+
+    fn record(path: &Path, bytes: u64) {
+        if let Ok(mut watched) = WATCHED.lock()
+            && let Some((reads, total)) = watched.get_mut(path)
+        {
+            *reads += 1;
+            *total += bytes;
+        }
+    }
+}
+
+impl Drop for LocalReads {
+    fn drop(&mut self) {
+        if let Ok(mut watched) = WATCHED.lock() {
+            watched.remove(&self.path);
+        }
+    }
+}
+
+/// A file whose first bytes were already read: reads inside `prefix` are served from it, so
+/// sampling the file after its header never reads those bytes again.
+struct Prefixed<'a> {
+    prefix: &'a [u8],
+    file: &'a mut Counted,
+    position: u64,
+}
+
+impl Read for Prefixed<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let read = match usize::try_from(self.position)
+            .ok()
+            .and_then(|position| self.prefix.get(position..))
+            .filter(|rest| !rest.is_empty())
+        {
+            Some(rest) => {
+                let count = rest.len().min(buffer.len());
+                buffer[..count].copy_from_slice(&rest[..count]);
+                count
+            }
+            None => {
+                use io::Seek as _;
+                self.file.seek(io::SeekFrom::Start(self.position))?;
+                self.file.read(buffer)?
+            }
+        };
+        self.position += read as u64;
+        Ok(read)
+    }
+}
+
+impl io::Seek for Prefixed<'_> {
+    fn seek(&mut self, position: io::SeekFrom) -> io::Result<u64> {
+        self.position = match position {
+            io::SeekFrom::Start(offset) => offset,
+            io::SeekFrom::End(_) | io::SeekFrom::Current(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "a content sample seeks from the start",
+                ));
+            }
+        };
+        Ok(self.position)
+    }
+}
+
+/// How much of each end of a file's tensor-data region its content sample reads.
+pub const CONTENT_SAMPLE_BYTES: u64 = 1024 * 1024;
+
+/// The lowercase hex SHA-256 of a file's header bytes, its length, and the first and last
+/// [`CONTENT_SAMPLE_BYTES`] of its tensor-data region: enough to tell files with the same header
+/// but different weights apart, without hashing a whole file.
+pub fn content_sample_digest(
+    reader: &mut (impl Read + io::Seek),
+    header_bytes: u64,
+    file_length: u64,
+) -> io::Result<String> {
+    use io::SeekFrom;
+    let mut digest = Sha256::new();
+    let mut copy = |reader: &mut dyn ReadSeek, start: u64, length: u64| -> io::Result<()> {
+        reader.seek(SeekFrom::Start(start))?;
+        let copied = io::copy(&mut reader.take(length), &mut digest)?;
+        if copied == length {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "file is shorter than its length",
+            ))
+        }
+    };
+    let header = header_bytes.min(file_length);
+    copy(reader, 0, header)?;
+    let data = file_length - header;
+    let first = data.min(CONTENT_SAMPLE_BYTES);
+    copy(reader, header, first)?;
+    let last_start = file_length
+        .saturating_sub(CONTENT_SAMPLE_BYTES)
+        .max(header + first);
+    copy(reader, last_start, file_length - last_start)?;
+    digest.update(file_length.to_le_bytes());
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+trait ReadSeek: Read + io::Seek {}
+impl<T: Read + io::Seek> ReadSeek for T {}
+
+/// The `local:` digest of a model: its shards' content samples, first shard first. Every
+/// identity of a file without a Hugging Face one, and every grouping of the same bytes, uses it.
+#[must_use]
+pub fn local_model_digest<'a>(shard_samples: impl IntoIterator<Item = &'a str>) -> String {
+    let mut digest = Sha256::new();
+    for sample in shard_samples {
+        digest.update(sample.as_bytes());
+        digest.update(b"\n");
+    }
+    format!("{:x}", digest.finalize())
+}
+
+/// The most characters of a `local:` label's name part.
+const LOCAL_LABEL_NAME_LENGTH: usize = 48;
+
+/// The `local:` ID of a model: `local:<label>:<hash>`, where the hash is the start of its
+/// [`local_model_digest`] and identifies it, and the label is `<name>-<quant>` from its first
+/// shard's header, for reading only. The name is `general.name`, else `general.architecture`,
+/// lowercased, with each run of characters outside `[a-z0-9.]` replaced by `-`, leading and
+/// trailing `-` and `.` trimmed, and cut to [`LOCAL_LABEL_NAME_LENGTH`] characters; a header with
+/// neither is named `model`. The quant is llama.cpp's name for the declared file type, lowercased,
+/// left out with its `-` when none is declared.
+pub fn local_model_id(
+    digest: &str,
+    name: Option<&str>,
+    architecture: Option<&str>,
+    file_type: Option<&str>,
+) -> Result<ModelId, ModelIdError> {
+    let readable = |value: &str| {
+        let mut replaced = String::with_capacity(value.len());
+        for character in value.chars().flat_map(char::to_lowercase) {
+            if character.is_ascii_lowercase() || character.is_ascii_digit() || character == '.' {
+                replaced.push(character);
+            } else if !replaced.ends_with('-') {
+                replaced.push('-');
+            }
+        }
+        let trim = |value: &str| value.trim_matches(['-', '.']).to_owned();
+        trim(&trim(&replaced).chars().take(LOCAL_LABEL_NAME_LENGTH).collect::<String>())
+    };
+    let name = [name, architecture]
+        .into_iter()
+        .flatten()
+        .map(readable)
+        .find(|name| !name.is_empty())
+        .unwrap_or_else(|| "model".to_owned());
+    let label = match file_type {
+        Some(file_type) => format!("{name}-{}", file_type.to_lowercase()),
+        None => name,
+    };
+    Ok(ModelId::local(
+        &LocalModelLabel::new(label)?,
+        &LocalModelHash::of_digest(digest)?,
+    ))
+}
+
+/// The `local:` digest of a model on disk, from its shards' paths, first shard first.
+pub fn local_model_digest_of(shards: &[impl AsRef<Path>]) -> Result<String, GgufError> {
+    let samples = shards
+        .iter()
+        .map(|shard| {
+            read_local(shard.as_ref())?
+                .gguf
+                .inspection
+                .content_sample
+                .ok_or_else(|| GgufError::Io(io::Error::other("a read file has a content sample")))
+        })
+        .collect::<Result<Vec<_>, GgufError>>()?;
+    Ok(local_model_digest(samples.iter().map(String::as_str)))
+}
+
+/// The lowercase hex SHA-256 of a GGUF's header bytes on disk, through the aligned tensor-data
+/// offset.
+pub fn file_header_digest(path: &Path) -> Result<String, GgufError> {
+    Ok(read_local(path)?.gguf.inspection.header_digest)
+}
+
+/// The context a model was trained for, as its header declares it.
+#[must_use]
+pub fn training_context_length(directory: &Directory) -> Option<u32> {
+    let architecture = string_value(directory, "general.architecture");
+    architecture
         .as_ref()
         .and_then(|architecture| u32_value(directory, &format!("{architecture}.context_length")))
-        .or_else(|| u32_value(directory, "llama.context_length"));
+        .or_else(|| u32_value(directory, "llama.context_length"))
+}
+
+/// The bytes of a GGUF that are its header: through the aligned tensor-data offset, or the whole
+/// file when it holds no tensor data and ends before that offset's padding (a split's
+/// metadata-only first shard).
+#[must_use]
+pub fn header_extent(directory: &Directory, file_length: u64) -> u64 {
+    directory.data_offset.min(file_length)
+}
+
+/// The block a `blk.<index>.*` tensor belongs to.
+fn block_index(name: &str) -> Option<&str> {
+    let (index, _) = name.strip_prefix("blk.")?.split_once('.')?;
+    index
+        .bytes()
+        .all(|byte| byte.is_ascii_digit())
+        .then_some(index)
+}
+
+fn is_nextn_tensor(name: &str) -> bool {
+    name.strip_prefix("blk.")
+        .and_then(|rest| rest.split_once('.'))
+        .is_some_and(|(index, rest)| {
+            index.bytes().all(|byte| byte.is_ascii_digit()) && rest.starts_with("nextn.")
+        })
+}
+
+/// The `general.base_model.N.*` lineage a header declares: each entry naming a model or its
+/// repository.
+#[must_use]
+pub fn base_models(directory: &Directory) -> Vec<GgufBaseModel> {
+    let base_model_count = u32_value(directory, "general.base_model.count").unwrap_or(0);
+    (0..base_model_count)
+        .map(|index| {
+            let field = |field: &str| {
+                string_value(directory, &format!("general.base_model.{index}.{field}"))
+            };
+            GgufBaseModel {
+                name: field("name"),
+                organization: field("organization"),
+                repo_url: field("repo_url"),
+            }
+        })
+        .filter(|base| base.name.is_some() || base.repo_url.is_some())
+        .collect()
+}
+
+/// `unknown_types` are the type ids of the header's tensors that `directory` leaves out (see
+/// [`known_tensors_and_unknown_types`]).
+pub(crate) fn interpret(
+    directory: &Directory,
+    unknown_types: &[u32],
+    header_digest: String,
+    header_bytes: u64,
+) -> Result<GgufInspection, GgufError> {
+    let architecture = string_value(directory, "general.architecture");
+    let tensors = GgufTensors::of(directory, architecture.as_deref());
+    let training_context_length = training_context_length(directory);
     let nextn_predict_layers = architecture.as_ref().and_then(|architecture| {
         u32_value(directory, &format!("{architecture}.nextn_predict_layers"))
     });
@@ -86,24 +664,14 @@ fn interpret(directory: &Directory) -> Result<GgufInspection, GgufError> {
     // shared experts, and output tensors remain active. Publish no active count unless GGUF grows
     // an authoritative aggregate field.
     let active_parameter_count = u64_value(directory, "general.active_parameter_count");
-    let base_model_count = u32_value(directory, "general.base_model.count").unwrap_or(0);
-    let base_models = (0..base_model_count)
-        .filter_map(|index| string_value(directory, &format!("general.base_model.{index}.name")))
-        .collect();
-    let modalities = if directory.metadata.iter().any(|entry| {
-        entry.name.contains("vision")
-            || entry.name.contains("clip")
-            || entry.name.contains("projector")
-    }) {
-        vec!["text".to_owned(), "image".to_owned()]
-    } else {
-        vec!["text".to_owned()]
-    };
-    let file_type = directory
+    let base_models = base_models(directory);
+    // `general.*` describes the file and never decides: a file type this service doesn't know
+    // (a quantization newer than it) is no declared quantization, and the label comes from the name.
+    let declared = directory
         .value("general.file_type")
         .and_then(Value::unsigned)
-        .map(FileType::from_raw)
-        .transpose()?;
+        .and_then(|raw| FileType::from_raw(raw).ok());
+    let quantization = Quantization::of(directory, unknown_types, declared);
     let tensor_storage_bytes = directory.tensors.iter().try_fold(0_u64, |total, tensor| {
         total.checked_add(tensor.nbytes).ok_or_else(|| {
             GgufError::Header(magnitude_artifacts::Error::Invalid(
@@ -145,22 +713,37 @@ fn interpret(directory: &Directory) -> Result<GgufInspection, GgufError> {
         fingerprint_material.extend_from_slice(&value.to_le_bytes());
     }
 
+    // `other` names its license in `general.license.name`.
+    let license = match string_value(directory, "general.license") {
+        Some(license) if license.eq_ignore_ascii_case("other") => {
+            string_value(directory, "general.license.name").or(Some(license))
+        }
+        license => license,
+    }
+    .filter(|license| !license.trim().is_empty());
     Ok(GgufInspection {
+        license,
         architecture,
         name: string_value(directory, "general.name"),
-        quantization: file_type.map(|file_type| file_type.name()),
-        quantization_name: file_type.map(|file_type| file_type.bit_width().to_owned()),
+        quantization: quantization.map(Quantization::name),
+        quantization_name: quantization.map(|quantization| quantization.bit_width().to_owned()),
+        file_type: declared
+            .filter(|file_type| !file_type.guessed)
+            .and_then(|file_type| quantization_label(file_type.kind.name()))
+            .map(str::to_owned),
         parameter_count,
         active_parameter_count,
         training_context_length,
         nextn_predict_layers,
         tokenizer: string_value(directory, "tokenizer.ggml.model"),
         base_models,
-        modalities,
         tensor_storage_bytes,
-        header_bytes: directory.data_offset,
+        header_bytes,
+        header_digest,
+        content_sample: None,
         fingerprint_material,
-        execution_role,
+        tensors,
+        tags: header_tags(directory).map_err(GgufError::Header)?,
     })
 }
 
@@ -211,6 +794,104 @@ enum FileTypeKind {
     MostlyNvfp4,
     MostlyQ1_0,
     MostlyQ2_0,
+    MostlyF8E4M3,
+}
+
+/// What a file's weights are stored as: its declared `general.file_type`, unless its tensors
+/// contradict it, as a file declaring a type none of its tensors is stored in does (a writer's
+/// slip: an MXFP4 file declaring `Q2_0`); then the type most of its weight bytes are stored in. A
+/// split set's shard holds only part of the set and a guessed type declares nothing, so those
+/// stand as declared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Quantization {
+    Declared(FileType),
+    Weights(Encoding),
+}
+
+impl Quantization {
+    fn of(directory: &Directory, unknown_types: &[u32], declared: Option<FileType>) -> Option<Self> {
+        let split = directory
+            .value("split.count")
+            .and_then(Value::unsigned)
+            .is_some_and(|count| count > 1);
+        let Some(file_type) = declared.filter(|file_type| !file_type.guessed && !split) else {
+            return declared.map(Self::Declared);
+        };
+        let declared_type = file_type.kind.weight_type();
+        if unknown_types.contains(&declared_type) {
+            return Some(Self::Declared(file_type));
+        }
+        // Weights are matrices; norms and biases are vectors kept in full precision. The token
+        // embedding and output head are stored apart from the body, often at a higher precision,
+        // and with a large vocabulary can outweigh it.
+        let body = |name: &str| !matches!(name, "token_embd.weight" | "output.weight");
+        let mut bytes = std::collections::BTreeMap::<u32, (Encoding, u64)>::new();
+        for tensor in directory
+            .tensors
+            .iter()
+            .filter(|tensor| tensor.shape.len() > 1 && body(&tensor.name))
+        {
+            let entry = bytes
+                .entry(tensor.encoding as u32)
+                .or_insert((tensor.encoding, 0));
+            entry.1 = entry.1.saturating_add(tensor.nbytes);
+        }
+        // The declared type names the file while it holds a good share of the body: llama.cpp's
+        // mixes keep some layers a step higher (a Q3_K_M's in Q4_K), but writers of other mixed
+        // quantizations (Unsloth's dynamic ones) declare one type for every file, which a few of
+        // its tensors use whatever the file mostly is. Otherwise the body's main type names it.
+        let total = bytes.values().map(|(_, bytes)| *bytes).sum::<u64>();
+        let declared_bytes = bytes.get(&declared_type).map_or(0, |(_, bytes)| *bytes);
+        if declared_bytes.saturating_mul(3) >= total {
+            return Some(Self::Declared(file_type));
+        }
+        Some(
+            bytes
+                .into_values()
+                .max_by_key(|(_, bytes)| *bytes)
+                .map_or(Self::Declared(file_type), |(encoding, _)| {
+                    Self::Weights(encoding)
+                }),
+        )
+    }
+
+    fn name(self) -> String {
+        match self {
+            Self::Declared(file_type) => file_type.name(),
+            Self::Weights(encoding) => encoding.ggml_name().to_owned(),
+        }
+    }
+
+    fn bit_width(self) -> &'static str {
+        match self {
+            Self::Declared(file_type) => file_type.bit_width(),
+            Self::Weights(encoding) => match encoding {
+                Encoding::F64 | Encoding::I64 => "64-bit",
+                Encoding::F32 | Encoding::I32 => "32-bit",
+                Encoding::F16 | Encoding::BF16 | Encoding::I16 => "16-bit",
+                Encoding::Q8_0 | Encoding::Q8_1 | Encoding::Q8K | Encoding::I8 | Encoding::F8E4M3 => {
+                    "8-bit"
+                }
+                Encoding::Q6K => "6-bit",
+                Encoding::Q5_0 | Encoding::Q5_1 | Encoding::Q5K => "5-bit",
+                Encoding::Q4_0
+                | Encoding::Q4_1
+                | Encoding::Q4K
+                | Encoding::Iq4Nl
+                | Encoding::Iq4Xs
+                | Encoding::Mxfp4
+                | Encoding::Nvfp4 => "4-bit",
+                Encoding::Q3K | Encoding::Iq3Xxs | Encoding::Iq3S => "3-bit",
+                Encoding::Q2K
+                | Encoding::Iq2Xxs
+                | Encoding::Iq2Xs
+                | Encoding::Iq2S
+                | Encoding::Tq2_0
+                | Encoding::Q2_0 => "2-bit",
+                Encoding::Iq1S | Encoding::Iq1M | Encoding::Tq1_0 | Encoding::Q1_0 => "1-bit",
+            },
+        }
+    }
 }
 
 /// The flag writers set when the file type was inferred rather than declared.
@@ -287,6 +968,7 @@ impl FileTypeKind {
             39 => Self::MostlyNvfp4,
             40 => Self::MostlyQ1_0,
             41 => Self::MostlyQ2_0,
+            42 => Self::MostlyF8E4M3,
             _ => return None,
         })
     }
@@ -298,6 +980,7 @@ impl FileTypeKind {
             Self::MostlyBf16 => "BF16",
             Self::MostlyQ1_0 => "Q1_0",
             Self::MostlyQ2_0 => "Q2_0",
+            Self::MostlyF8E4M3 => "F8_E4M3",
             Self::MostlyQ4_0 => "Q4_0",
             Self::MostlyQ4_1 => "Q4_1",
             Self::MostlyQ5_0 => "Q5_0",
@@ -332,11 +1015,49 @@ impl FileTypeKind {
         }
     }
 
+    /// The ggml type id (`ggml_type`) a file of this type stores its weights in by default
+    /// (`llama_model_quantize`'s default type), which every such file holds.
+    const fn weight_type(self) -> u32 {
+        match self {
+            Self::AllF32 => 0,
+            Self::MostlyF16 => 1,
+            Self::MostlyQ4_0 => 2,
+            Self::MostlyQ4_1 => 3,
+            Self::MostlyQ5_0 => 6,
+            Self::MostlyQ5_1 => 7,
+            Self::MostlyQ8_0 => 8,
+            Self::MostlyQ2K | Self::MostlyQ2KSmall => 10,
+            Self::MostlyQ3KSmall | Self::MostlyQ3KMedium | Self::MostlyQ3KLarge => 11,
+            Self::MostlyQ4KSmall | Self::MostlyQ4KMedium => 12,
+            Self::MostlyQ5KSmall | Self::MostlyQ5KMedium => 13,
+            Self::MostlyQ6K => 14,
+            Self::MostlyIq2Xxs => 16,
+            Self::MostlyIq2Xs => 17,
+            Self::MostlyIq3Xxs => 18,
+            Self::MostlyIq1Small => 19,
+            Self::MostlyIq4Nl => 20,
+            Self::MostlyIq3Xs | Self::MostlyIq3Small | Self::MostlyIq3Medium => 21,
+            // IQ2_S is a mix whose body is IQ2_XS; IQ2_M's body is IQ2_S.
+            Self::MostlyIq2Small => 17,
+            Self::MostlyIq2Medium => 22,
+            Self::MostlyIq4Xs => 23,
+            Self::MostlyIq1Medium => 29,
+            Self::MostlyBf16 => 30,
+            Self::MostlyTq1_0 => 34,
+            Self::MostlyTq2_0 => 35,
+            Self::MostlyMxfp4Moe => 39,
+            Self::MostlyNvfp4 => 40,
+            Self::MostlyQ1_0 => 41,
+            Self::MostlyQ2_0 => 42,
+            Self::MostlyF8E4M3 => 43,
+        }
+    }
+
     const fn bit_width(self) -> &'static str {
         match self {
             Self::AllF32 => "32-bit",
             Self::MostlyF16 | Self::MostlyBf16 => "16-bit",
-            Self::MostlyQ8_0 => "8-bit",
+            Self::MostlyQ8_0 | Self::MostlyF8E4M3 => "8-bit",
             Self::MostlyQ6K => "6-bit",
             Self::MostlyQ5_0 | Self::MostlyQ5_1 | Self::MostlyQ5KSmall | Self::MostlyQ5KMedium => {
                 "5-bit"
@@ -369,6 +1090,70 @@ impl FileTypeKind {
             }
         }
     }
+}
+
+/// The conventional short label of a header's quantization (`general.file_type` as
+/// [`GgufInspection::quantization`] names it): `Q4_K - Medium` is `Q4_K_M`, `IQ3_S mix - 3.66 bpw`
+/// is `IQ3_M`.
+#[must_use]
+pub fn quantization_label(quantization: &str) -> Option<&'static str> {
+    Some(match quantization {
+        "all F32" => "F32",
+        "F16" => "F16",
+        "BF16" => "BF16",
+        "Q1_0" => "Q1_0",
+        "Q2_0" => "Q2_0",
+        "F8_E4M3" => "F8_E4M3",
+        "Q4_0" => "Q4_0",
+        "Q4_1" => "Q4_1",
+        "Q5_0" => "Q5_0",
+        "Q5_1" => "Q5_1",
+        "Q8_0" => "Q8_0",
+        "MXFP4 MoE" => "MXFP4_MOE",
+        "NVFP4" => "NVFP4",
+        "F32" => "F32",
+        "MXFP4" => "MXFP4",
+        "Q2_K" => "Q2_K",
+        "Q3_K" => "Q3_K",
+        "Q4_K" => "Q4_K",
+        "Q5_K" => "Q5_K",
+        "TQ1_0" => "TQ1_0",
+        "TQ2_0" => "TQ2_0",
+        "IQ2_XXS" => "IQ2_XXS",
+        "IQ2_XS" => "IQ2_XS",
+        "IQ2_S" => "IQ2_S",
+        "IQ3_XXS" => "IQ3_XXS",
+        "IQ3_S" => "IQ3_S",
+        "IQ1_S" => "IQ1_S",
+        "IQ1_M" => "IQ1_M",
+        "IQ4_NL" => "IQ4_NL",
+        "IQ4_XS" => "IQ4_XS",
+        "Q2_K - Medium" => "Q2_K",
+        "Q2_K - Small" => "Q2_K_S",
+        "Q3_K - Small" => "Q3_K_S",
+        "Q3_K - Medium" => "Q3_K_M",
+        "Q3_K - Large" => "Q3_K_L",
+        "Q4_K - Small" => "Q4_K_S",
+        "Q4_K - Medium" => "Q4_K_M",
+        "Q5_K - Small" => "Q5_K_S",
+        "Q5_K - Medium" => "Q5_K_M",
+        "Q6_K" => "Q6_K",
+        "TQ1_0 - 1.69 bpw ternary" => "TQ1_0",
+        "TQ2_0 - 2.06 bpw ternary" => "TQ2_0",
+        "IQ2_XXS - 2.0625 bpw" => "IQ2_XXS",
+        "IQ2_XS - 2.3125 bpw" => "IQ2_XS",
+        "IQ2_S - 2.5 bpw" => "IQ2_S",
+        "IQ2_M - 2.7 bpw" => "IQ2_M",
+        "IQ3_XS - 3.3 bpw" => "IQ3_XS",
+        "IQ3_XXS - 3.0625 bpw" => "IQ3_XXS",
+        "IQ1_S - 1.5625 bpw" => "IQ1_S",
+        "IQ1_M - 1.75 bpw" => "IQ1_M",
+        "IQ4_NL - 4.5 bpw" => "IQ4_NL",
+        "IQ4_XS - 4.25 bpw" => "IQ4_XS",
+        "IQ3_S - 3.4375 bpw" => "IQ3_S",
+        "IQ3_S mix - 3.66 bpw" => "IQ3_M",
+        _ => return None,
+    })
 }
 
 fn string_value(directory: &Directory, key: &str) -> Option<String> {
@@ -413,20 +1198,34 @@ mod tests {
 
     /// A header-only GGUF with one Q8_0 tensor of shape [64, 2] (GGML order).
     fn header(metadata: impl FnOnce(&mut Vec<u8>) -> u64) -> Vec<u8> {
+        header_with_tensors(metadata, &[("blk.0.weight", &[64, 2], 8, 4 * 34)])
+    }
+
+    /// A header-only GGUF with these tensors: name, GGML-order dimensions, ggml type id and
+    /// stored bytes.
+    fn header_with_tensors(
+        metadata: impl FnOnce(&mut Vec<u8>) -> u64,
+        tensors: &[(&str, &[u64], u32, u64)],
+    ) -> Vec<u8> {
         let mut entries = Vec::new();
         let metadata_count = metadata(&mut entries);
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"GGUF");
         bytes.extend_from_slice(&3_u32.to_le_bytes());
-        bytes.extend_from_slice(&1_u64.to_le_bytes());
+        bytes.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
         bytes.extend_from_slice(&metadata_count.to_le_bytes());
         bytes.extend_from_slice(&entries);
-        push_string(&mut bytes, "blk.0.weight");
-        bytes.extend_from_slice(&2_u32.to_le_bytes());
-        bytes.extend_from_slice(&64_u64.to_le_bytes());
-        bytes.extend_from_slice(&2_u64.to_le_bytes());
-        bytes.extend_from_slice(&8_u32.to_le_bytes());
-        bytes.extend_from_slice(&0_u64.to_le_bytes());
+        let mut offset = 0_u64;
+        for (name, dimensions, ggml_type, size) in tensors {
+            push_string(&mut bytes, name);
+            bytes.extend_from_slice(&(dimensions.len() as u32).to_le_bytes());
+            for dimension in *dimensions {
+                bytes.extend_from_slice(&dimension.to_le_bytes());
+            }
+            bytes.extend_from_slice(&ggml_type.to_le_bytes());
+            bytes.extend_from_slice(&offset.to_le_bytes());
+            offset = (offset + size).next_multiple_of(32);
+        }
         bytes.resize(bytes.len().next_multiple_of(32), 0);
         bytes
     }
@@ -461,15 +1260,15 @@ mod tests {
         let bytes = header(|entries| {
             push_string_entry(entries, "general.architecture", "qwen35");
             push_string_entry(entries, "general.name", "Test");
-            push_u32_entry(entries, "general.file_type", 15);
+            push_u32_entry(entries, "general.file_type", 7);
             push_u32_entry(entries, "qwen35.context_length", 262_144);
             push_u32_entry(entries, "qwen35.nextn_predict_layers", 1);
             5
         });
         let inspection = inspect_bytes(&bytes).unwrap();
         assert_eq!(inspection.architecture.as_deref(), Some("qwen35"));
-        assert_eq!(inspection.quantization.as_deref(), Some("Q4_K - Medium"));
-        assert_eq!(inspection.quantization_name.as_deref(), Some("4-bit"));
+        assert_eq!(inspection.quantization.as_deref(), Some("Q8_0"));
+        assert_eq!(inspection.quantization_name.as_deref(), Some("8-bit"));
         assert_eq!(inspection.training_context_length, Some(262_144));
         assert_eq!(inspection.nextn_predict_layers, Some(1));
         // Two rows of 64 Q8_0 elements: two 32-element blocks of 34 bytes each per row.
@@ -485,6 +1284,232 @@ mod tests {
     }
 
     #[test]
+    fn the_license_is_the_header_license_or_the_name_an_other_license_gives() {
+        use crate::test_gguf::Meta;
+        let license = |metadata: &[(&str, Meta<'_>)]| {
+            inspect_bytes(&crate::test_gguf::gguf_bytes(
+                metadata,
+                &["token_embd.weight"],
+            ))
+            .unwrap()
+            .license
+        };
+        let arch = ("general.architecture", Meta::Str("llama"));
+        assert_eq!(
+            license(&[arch, ("general.license", Meta::Str("apache-2.0"))]),
+            Some("apache-2.0".to_owned())
+        );
+        let arch = ("general.architecture", Meta::Str("llama"));
+        assert_eq!(
+            license(&[
+                arch,
+                ("general.license", Meta::Str("other")),
+                ("general.license.name", Meta::Str("openmdw-1.1")),
+            ]),
+            Some("openmdw-1.1".to_owned())
+        );
+        let arch = ("general.architecture", Meta::Str("llama"));
+        assert_eq!(license(&[arch]), None);
+    }
+
+    #[test]
+    fn a_metadata_only_shard_without_trailing_padding_is_complete_and_its_whole_file_is_its_header()
+    {
+        let mut bytes = crate::test_gguf::gguf_bytes(
+            &[
+                (
+                    "general.architecture",
+                    crate::test_gguf::Meta::Str("qwen35moe"),
+                ),
+                ("split.count", crate::test_gguf::Meta::U32(6)),
+                ("general.name", crate::test_gguf::Meta::Str("Shard")),
+            ],
+            &[],
+        );
+        while bytes.last() == Some(&0) {
+            bytes.pop();
+        }
+        assert_ne!(bytes.len() % 32, 0);
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("model-00001-of-00006.gguf");
+        std::fs::write(&path, &bytes).unwrap();
+        for inspection in [inspect(&path).unwrap(), inspect_complete(&path).unwrap()] {
+            assert_eq!(inspection.header_bytes, u64::try_from(bytes.len()).unwrap());
+            assert_eq!(
+                inspection.header_digest,
+                format!("{:x}", Sha256::digest(&bytes))
+            );
+        }
+        assert_eq!(
+            crate::candidate_files::local_header_digest(&path).unwrap(),
+            format!("{:x}", Sha256::digest(&bytes))
+        );
+    }
+
+    fn engine() -> RecognizedArchitectures {
+        RecognizedArchitectures::new(
+            ["qwen35", "qwen4exp", "llama", "nemotron_h_moe"],
+            ["dflash", "gemma4-assistant", "qwen4exp"],
+        )
+    }
+
+    fn role_of(metadata: &[(&str, crate::test_gguf::Meta<'_>)], tensors: &[&str]) -> GgufRole {
+        inspect_bytes(&crate::test_gguf::gguf_bytes(metadata, tensors))
+            .unwrap()
+            .role(&engine())
+    }
+
+    #[test]
+    fn roles_come_from_the_engines_architectures_and_tensors() {
+        use crate::test_gguf::Meta;
+        let arch = |name| ("general.architecture", Meta::Str(name));
+        assert_eq!(
+            role_of(&[arch(PROJECTOR_ARCHITECTURE)], &["v.patch_embd.weight"]),
+            GgufRole::Projector
+        );
+        for drafter in ["dflash", "gemma4-assistant"] {
+            assert_eq!(
+                role_of(&[arch(drafter)], &["blk.0.attn_q.weight"]),
+                GgufRole::Drafter,
+                "{drafter}"
+            );
+        }
+        assert_eq!(
+            role_of(&[arch("eagle3")], &["blk.0.attn_q.weight"]),
+            GgufRole::Model {
+                embedded_mtp: false
+            },
+            "an architecture the engine doesn't list is no drafter; the engine judges it"
+        );
+        let speculative = ("general.tags", Meta::Strs(&["dflash", "speculative-decoding"]));
+        assert_eq!(
+            role_of(&[arch("dflash-draft"), speculative], &["blk.0.attn_q.weight"]),
+            GgufRole::Drafter,
+            "an architecture the engine doesn't know, tagged for speculative decoding, is a drafter"
+        );
+        assert_eq!(
+            role_of(
+                &[
+                    arch("qwen35"),
+                    ("general.tags", Meta::Strs(&["speculative-decoding"]))
+                ],
+                &["blk.0.attn_q.weight"]
+            ),
+            GgufRole::Model {
+                embedded_mtp: false
+            },
+            "a target architecture is told apart by its tensors, whatever its tags"
+        );
+        assert_eq!(
+            inspect_bytes(&crate::test_gguf::gguf_bytes(
+                &[arch("dflash")],
+                &["blk.0.attn_q.weight"]
+            ))
+            .unwrap()
+            .role(&RecognizedArchitectures::new(
+                ["llama"],
+                ["gemma4-assistant"]
+            )),
+            GgufRole::Model {
+                embedded_mtp: false
+            },
+            "the drafter set is the engine's, not the service's"
+        );
+        assert_eq!(
+            role_of(
+                &[
+                    arch("qwen4exp"),
+                    ("qwen4exp.nextn_shared_target_tensors", Meta::Bool(true)),
+                ],
+                &["blk.4.nextn.enorm.weight", "blk.4.attn_q.weight"],
+            ),
+            GgufRole::Drafter,
+            "a prediction head sharing its target's tables is a drafter"
+        );
+        assert_eq!(
+            role_of(&[arch("qwen35")], &["blk.3.nextn.eh_proj.weight"]),
+            GgufRole::Drafter,
+            "a file of prediction-head tensors only is a drafter"
+        );
+        assert_eq!(
+            role_of(
+                &[arch("qwen35")],
+                &[
+                    "token_embd.weight",
+                    "blk.0.attn_q.weight",
+                    "blk.1.nextn.eh_proj.weight"
+                ],
+            ),
+            GgufRole::Model { embedded_mtp: true }
+        );
+        assert_eq!(
+            role_of(
+                &[arch("nemotron_h_moe")],
+                &[
+                    "output.weight",
+                    "token_embd.weight",
+                    "blk.52.attn_q.weight",
+                    "blk.52.ffn_up_exps.weight",
+                    "blk.52.nextn.eh_proj.weight",
+                    "blk.52.nextn.enorm.weight",
+                ],
+            ),
+            GgufRole::Drafter,
+            "an MTP file keeping only its prediction blocks (bartowski's Nemotron-H mtp-*.gguf) is a drafter"
+        );
+        assert_eq!(
+            role_of(
+                &[arch("llama")],
+                &["token_embd.weight", "blk.0.nextnormal.weight"]
+            ),
+            GgufRole::Model {
+                embedded_mtp: false
+            }
+        );
+    }
+
+    #[test]
+    fn base_models_keep_every_lineage_field_and_the_header_digest_covers_the_header() {
+        use crate::test_gguf::Meta;
+        let bytes = crate::test_gguf::gguf_bytes(
+            &[
+                ("general.architecture", Meta::Str("llama")),
+                ("general.base_model.count", Meta::U32(2)),
+                ("general.base_model.0.name", Meta::Str("Qwen3.6 35B A3B")),
+                ("general.base_model.0.organization", Meta::Str("Qwen")),
+                (
+                    "general.base_model.0.repo_url",
+                    Meta::Str("https://huggingface.co/Qwen/Qwen3.6-35B-A3B"),
+                ),
+                ("general.base_model.1.organization", Meta::Str("Nobody")),
+            ],
+            &["token_embd.weight"],
+        );
+        let inspection = inspect_bytes(&bytes).unwrap();
+        assert_eq!(
+            inspection.base_models,
+            vec![GgufBaseModel {
+                name: Some("Qwen3.6 35B A3B".to_owned()),
+                organization: Some("Qwen".to_owned()),
+                repo_url: Some("https://huggingface.co/Qwen/Qwen3.6-35B-A3B".to_owned()),
+            }]
+        );
+        let header = usize::try_from(inspection.header_bytes).unwrap();
+        assert!(header < bytes.len(), "tensor data follows the header");
+        assert_eq!(
+            inspection.header_digest,
+            format!("{:x}", Sha256::digest(&bytes[..header]))
+        );
+        let mut changed_data = bytes.clone();
+        *changed_data.last_mut().unwrap() = 1;
+        assert_eq!(
+            inspect_bytes(&changed_data).unwrap().header_digest,
+            inspection.header_digest,
+            "tensor data is not part of the digest"
+        );
+    }
+
+    #[test]
     fn file_types_follow_the_writer_convention() {
         assert!(matches!(
             FileType::from_raw(4),
@@ -494,10 +1519,118 @@ mod tests {
         assert_eq!(guessed.name(), "(guessed) all F32");
         assert_eq!(guessed.bit_width(), "unknown");
         assert!(FileType::from_raw(GUESSED_FILE_TYPE | 15).is_err());
-        let mxfp4 = FileType::from_raw(38).unwrap();
+        // llama.cpp's `llama_ftype`: 38 MXFP4_MOE, 39 NVFP4, 40 Q1_0, 41 Q2_0, 42 F8_E4M3.
+        for (raw, name, bits) in [
+            (36, "TQ1_0 - 1.69 bpw ternary", "1-bit"),
+            (37, "TQ2_0 - 2.06 bpw ternary", "2-bit"),
+            (38, "MXFP4 MoE", "4-bit"),
+            (39, "NVFP4", "4-bit"),
+            (40, "Q1_0", "1-bit"),
+            (41, "Q2_0", "2-bit"),
+            (42, "F8_E4M3", "8-bit"),
+        ] {
+            let file_type = FileType::from_raw(raw).unwrap();
+            assert_eq!((file_type.name().as_str(), file_type.bit_width()), (name, bits), "{raw}");
+        }
+        assert!(FileType::from_raw(43).is_err());
+    }
+
+    /// A one-layer header declaring `file_type`, with these tensors (GGML-order dimensions,
+    /// ggml type id, stored bytes) beside an F32 norm.
+    fn quantization_of(
+        file_type: u32,
+        split: bool,
+        tensors: &[(&str, &[u64], u32, u64)],
+    ) -> (Option<String>, Option<String>) {
+        let mut all = vec![("blk.0.attn_norm.weight", &[256_u64][..], 0, 1024)];
+        all.extend_from_slice(tensors);
+        let bytes = header_with_tensors(
+            |entries| {
+                push_string_entry(entries, "general.architecture", "qwen35");
+                push_u32_entry(entries, "general.file_type", file_type);
+                if split {
+                    push_u32_entry(entries, "split.count", 2);
+                }
+                2 + u64::from(split)
+            },
+            &all,
+        );
+        let inspection = inspect_bytes(&bytes).unwrap();
+        (inspection.quantization, inspection.quantization_name)
+    }
+
+    #[test]
+    fn a_declared_file_type_no_tensor_is_stored_in_yields_to_the_weights() {
+        let pair = |name: &str, bits: &str| (Some(name.to_owned()), Some(bits.to_owned()));
+        // An MXFP4 file whose writer declared 41 (Q2_0): MXFP4 matrices (17 bytes per 32
+        // elements) and a Q8_0 embedding.
+        let mxfp4 = quantization_of(
+            41,
+            false,
+            &[
+                ("blk.0.ffn_up.weight", &[256, 64], 39, 256 * 64 / 32 * 17),
+                ("blk.0.ffn_down.weight", &[256, 64], 39, 256 * 64 / 32 * 17),
+                ("token_embd.weight", &[256, 16], 8, 256 * 16 / 32 * 34),
+            ],
+        );
+        assert_eq!(mxfp4, pair("MXFP4", "4-bit"));
+        assert_eq!(quantization_label(mxfp4.0.as_deref().unwrap()), Some("MXFP4"));
+        // A Q4_K_M file holds Q6_K tensors beside its Q4_K ones and keeps its declared type.
         assert_eq!(
-            (mxfp4.name().as_str(), mxfp4.bit_width()),
-            ("MXFP4 MoE", "4-bit")
+            quantization_of(
+                15,
+                false,
+                &[
+                    ("blk.0.ffn_up.weight", &[256, 64], 12, 64 * 144),
+                    ("output.weight", &[256, 256], 14, 256 * 210),
+                ],
+            ),
+            pair("Q4_K - Medium", "4-bit")
+        );
+        // A real Q2_0 file's Q2_0 tensors (ggml type 42) are newer than the parser, and count.
+        assert_eq!(
+            quantization_of(41, false, &[("blk.0.ffn_up.weight", &[256, 64], 42, 4096)]),
+            pair("Q2_0", "2-bit")
+        );
+        // A split set's shard holds part of the set: its declared type stands.
+        assert_eq!(
+            quantization_of(15, true, &[("output.weight", &[256, 256], 14, 256 * 210)]),
+            pair("Q4_K - Medium", "4-bit")
+        );
+    }
+
+    #[test]
+    fn an_iq2_s_file_stores_its_body_in_iq2_xs() {
+        // mradermacher's Qwen3.5-0.8B i1-IQ2_S: llama.cpp's IQ2_S recipe stores the body in
+        // IQ2_XS and bumps a few tensors to IQ3_S and Q4_K; no tensor is IQ2_S. The Q5_K
+        // embedding holds the most bytes.
+        let iq2_s = quantization_of(
+            28,
+            false,
+            &[
+                ("blk.0.ffn_up.weight", &[1024, 3584], 17, 1024 * 3584 / 256 * 74),
+                ("blk.0.attn_v.weight", &[1024, 512], 21, 1024 * 512 / 256 * 110),
+                ("token_embd.weight", &[1024, 248_320], 13, 1024 * 248_320 / 256 * 176),
+            ],
+        );
+        assert_eq!(iq2_s, (Some("IQ2_S - 2.5 bpw".to_owned()), Some("2-bit".to_owned())));
+        assert_eq!(quantization_label(iq2_s.0.as_deref().unwrap()), Some("IQ2_S"));
+    }
+
+    #[test]
+    fn the_weights_type_of_a_contradicted_file_type_leaves_out_the_embedding_and_output() {
+        // An MXFP4 body declared as Q2_0, with a Q8_0 embedding and output larger than the body.
+        assert_eq!(
+            quantization_of(
+                41,
+                false,
+                &[
+                    ("blk.0.ffn_up.weight", &[256, 64], 39, 256 * 64 / 32 * 17),
+                    ("token_embd.weight", &[256, 4096], 8, 256 * 4096 / 32 * 34),
+                    ("output.weight", &[256, 4096], 8, 256 * 4096 / 32 * 34),
+                ],
+            ),
+            (Some("MXFP4".to_owned()), Some("4-bit".to_owned()))
         );
     }
 }

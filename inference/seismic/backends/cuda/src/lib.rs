@@ -1,32 +1,141 @@
 //! CUDA backend: target discovery, the sealed capability registry, direct
 //! typed-kernel PTX compilation, and the CUDA device service/executor.
 
+mod blocks;
 mod buffer;
 pub mod capability;
 mod command;
 mod compile;
 pub mod direct;
 mod driver;
+mod enqueue;
 mod executor;
+mod graph_cost;
 pub mod model;
+#[cfg(not(target_os = "windows"))]
+mod nvml;
 pub mod nvrtc;
 mod open;
 mod profile;
 mod ptx;
+mod registered;
 mod registry;
 pub mod toolchain;
+pub mod topology;
+pub mod transfer;
+
+/// What `process` holds on the NVIDIA GPU `uuid` (`cuDeviceGetUuid_v2`,
+/// Vulkan's `deviceUUID`) through CUDA or graphics contexts, as NVML counts
+/// it; unobserved where NVML cannot say, and on Windows, which reads no
+/// NVML.
+pub fn process_footprint(
+    process: seismic_native_target::process::ProcessId,
+    uuid: [u8; 16],
+) -> seismic_native_target::process::ProcessFootprint {
+    #[cfg(not(target_os = "windows"))]
+    {
+        nvml::process_footprint(process, uuid)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = (process, uuid);
+        seismic_native_target::process::ProcessFootprint::Unobserved
+    }
+}
+
+/// The ledger a test's device and allocations charge: one tally of host
+/// RAM that bounds nothing, which every store and entry of a test is, so a
+/// range carved for a test's entry lies in its block's store.
+#[cfg(test)]
+fn test_tally() -> seismic_memory::entry::Tally {
+    static TALLY: std::sync::OnceLock<seismic_memory::entry::Tally> = std::sync::OnceLock::new();
+    TALLY.get_or_init(|| seismic_memory::entry::Tally::unbounded(seismic_topology::StoreIdentity::HostRam)).clone()
+}
+
+/// The stores a test opens a device with ([`test_tally`]).
+#[cfg(test)]
+pub(crate) fn test_stores() -> CudaStores {
+    let tally: std::sync::Arc<dyn seismic_memory::entry::Store> = std::sync::Arc::new(test_tally());
+    CudaStores { device: tally.clone(), host: tally }
+}
+
+/// The entry a test's allocations charge ([`test_tally`]).
+#[cfg(test)]
+pub(crate) fn test_entry() -> std::sync::Arc<dyn seismic_memory::entry::Entry> {
+    std::sync::Arc::new(test_tally())
+}
+
+/// Test-only: the first device, opened and held alone for the test; `None`
+/// only where the host has no CUDA driver or device, which is refused where
+/// `SEISMIC_TEST_BACKEND` selects CUDA. A device that is present and fails
+/// to open fails the test.
+///
+/// The tests that open the device run one at a time. They share the
+/// process's one context, and a test that parks a kernel on an answer its
+/// own transfers give (`transfer`'s) must meet no other test's
+/// context-holding call (a module load, a graph's instantiation, a pinned
+/// allocation) while it parks, as a served load keeps those off a flight
+/// (`seismic_runtime::native::cuda`).
+#[cfg(test)]
+pub(crate) fn test_device() -> Option<(std::sync::MutexGuard<'static, ()>, OpenedCuda)> {
+    static DEVICE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    seismic_lang::registry::test_device_reached("opens the CUDA test device");
+    let exclusive = DEVICE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let selected = seismic_lang::registry::requested_test_backend() == Some(BackendName::Cuda);
+    match device_count() {
+        Ok(count) if count > 0 => {}
+        absent => {
+            assert!(!selected, "no selected CUDA device: {absent:?}");
+            eprintln!("no CUDA device: {absent:?}");
+            return None;
+        }
+    }
+    let opened = open(0, test_stores()).unwrap_or_else(|error| panic!("the CUDA device fails to open: {error}"));
+    Some((exclusive, opened))
+}
+
+/// Test-only: PTX programs of `opened` that compile every source they are
+/// given and keep nothing, for this crate's tests of the driver below the
+/// runtime's program store.
+#[cfg(test)]
+pub(crate) fn test_ptx_programs(opened: &OpenedCuda) -> CudaPtxPrograms {
+    use seismic_native_target::{ArtifactKey, Compile, Formed, ProgramSource, Programs, Toolchain};
+    struct Compiling(toolchain::CudaPtxToolchain);
+    impl Programs<toolchain::CudaPtxToolchain> for Compiling {
+        fn form(&self, sources: &[ProgramSource]) -> Result<Vec<Formed<direct::DirectModule>>, NativeCompilationError> {
+            sources
+                .iter()
+                .map(|source| {
+                    let (_, program) = self.0.compile(source)?;
+                    let compile = std::sync::Arc::new(Compile::new(source.entries.clone(), program));
+                    Ok(Formed::new(ArtifactKey::of(&[source.text.as_bytes()]), vec![compile]))
+                })
+                .collect()
+        }
+    }
+    let capability = opened.device.facts().compute_capability;
+    let architecture = u32::from(capability.major) * 10 + u32::from(capability.minor);
+    std::sync::Arc::new(Compiling(toolchain::CudaPtxToolchain::new(opened.service.clone(), architecture)))
+}
 
 pub use buffer::Buffer;
 pub use capability::CudaIntrinsic;
 pub use command::{CompiledKernel, OccupancyRelation};
 pub use compile::NativeCandidate;
-pub use executor::{Device, Executor, MemoryInfo};
-pub use open::{open, open_analytical, OpenedCuda};
+pub use executor::{CudaStores, Device, Executor, MemoryInfo, NativeStream};
+pub use graph_cost::{graph_cost, UNMEASURED as UNMEASURED_GRAPH_COST};
+pub use open::{open, open_analytical, usable_memory_bytes, OpenedCuda};
 pub use profile::{
-    describe, device_count, max_allocation_bytes, ComputeCapability, CudaFacts, CudaKernelAbi,
-    DeviceDescriptor, DriverApiVersion, PtxFeatureSet, PtxTarget, TensorMemory, BACKEND_REVISION,
+    can_access_peer, describe, device_count, max_allocation_bytes, ComputeCapability, CudaFacts,
+    CudaKernelAbi, DeviceDescriptor, DriverApiVersion, PtxFeatureSet, PtxTarget, TensorMemory,
+    BACKEND_REVISION,
 };
 pub use registry::registry;
+
+/// The PTX programs of one opened device ([`toolchain::CudaPtxToolchain`]):
+/// the one way this backend forms Seismic-IR kernels and its device probe
+/// kernels.
+pub type CudaPtxPrograms = std::sync::Arc<dyn seismic_native_target::Programs<toolchain::CudaPtxToolchain>>;
 
 use seismic_estimator::ServiceClassId;
 use seismic_ir::physical_target::{
@@ -143,7 +252,9 @@ impl seismic_ir::physical_target::PhysicalDialect for Cuda {
                 Some(CudaLaunchMode::Independent)
             }
             seismic_ir::schedule::LaunchParticipation::CooperativeGrid => facts
+                .properties
                 .cooperative_launch
+                .holds()
                 .then_some(CudaLaunchMode::CooperativeGrid),
         }
     }
@@ -287,7 +398,7 @@ pub(crate) fn native_launch_constraints(
     let one = arena.nat(1);
     let resident =
         active_blocks_expression(arena, &native.properties, threads, locals.workgroup_bytes);
-    let multiprocessors = arena.nat(u64::from(facts.multiprocessors));
+    let multiprocessors = arena.nat(facts.properties.units.get());
     let capacity = arena.nat_mul(multiprocessors, resident);
     let mut constraints = vec![arena.nat_cmp(seismic_lang::expr::CmpOp::Ge, resident, one)];
     if launch.descriptor == CudaLaunchMode::CooperativeGrid {
@@ -469,17 +580,17 @@ pub(crate) fn lower_semantic_intrinsic(
 }
 
 impl seismic_native_target::NativeCompiler<Cuda> for CudaNativeCompiler {
-    type Context = ();
+    type Context = CudaPtxPrograms;
     type Candidate = NativeCandidate;
     type Handle = CompiledKernel;
     fn form(
         &self,
-        _context: &Self::Context,
+        programs: &Self::Context,
         target: &DeviceDescription<Cuda>,
         kernel: &seismic_ir::kernel::Kernel<Cuda>,
         layout: &seismic_ir::physical_target::KernelEmissionLayout,
     ) -> Result<Self::Candidate, NativeCompilationError> {
-        compile::compile_kernel(target, kernel, layout)
+        compile::compile_kernel(programs, target, kernel, layout)
     }
     fn reflect(
         &self,
@@ -489,8 +600,10 @@ impl seismic_native_target::NativeCompiler<Cuda> for CudaNativeCompiler {
         candidate: Self::Candidate,
     ) -> Result<NativeKernelReflection<Cuda, Self::Handle>, NativeCompilationError> {
         let reflection_started = Instant::now();
-        let context = candidate.module.context.clone();
-        let function = candidate.function;
+        let (program, position) = candidate.formed.entry(&candidate.entry);
+        let program = program.clone();
+        let context = program.program().context().clone();
+        let function = program.program().function(position);
         let attribute = |key| {
             crate::driver::function_attribute(&context, function, key)
                 .map_err(|error| NativeCompilationError::ToolchainFailure(error.to_string()))
@@ -581,15 +694,13 @@ impl seismic_native_target::NativeCompiler<Cuda> for CudaNativeCompiler {
             NativeClusterDomain::NotApplicable
         };
         let mut modes = vec![CudaLaunchMode::Independent];
-        if target.facts().cooperative_launch {
+        if target.facts().properties.cooperative_launch.holds() {
             modes.push(CudaLaunchMode::CooperativeGrid);
         }
         let handle = CompiledKernel {
-            module: candidate.module,
-            function,
+            program,
+            function: position,
             layout: candidate.layout,
-            image: candidate.image,
-            entry: candidate.entry,
             configured_dynamic_shared_bytes: candidate.configured_dynamic_shared_bytes,
         };
         let description = NativeKernelDescription {

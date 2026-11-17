@@ -60,6 +60,20 @@ cd packages/agent && bunx --bun vitest run    # single run
 cd packages/agent && bunx --bun vitest        # watch mode
 ```
 
+## Running checks and measurements
+
+Checks and measurements run on hardware through `mrig` (`uv run --project inference/evaluation mrig …`). `mrig --help` lists what each instrument answers. Run each one as a single background command; you are notified when it ends.
+
+Runs are the slowest part of the work, and you don't notice their time passing, so a long run feels free when it isn't. Before every run, go through these steps:
+
+1. **Decide what the result will change.** Write down what you expect it to show and what you will do if it shows something else. If you would do the same thing either way, skip the run. If reading the code can answer the question, read the code instead.
+2. **Pick the cheapest check that can decide it.** In order of cost: read the code, compile, run a unit test, test or time the kernel at its real shape, and only then run a whole model. A kernel timed at its shape answers in seconds what a model run answers in many minutes, with less noise. Prefer an exact check (identical bits, a count, a value derived from the code) to a statistical comparison, which needs many samples and still leaves doubt.
+3. **Check only what the change can affect.** Work out from the diff which code paths and shapes it reaches, and check one example of each. Don't add other models, contexts or backends: each one adds time and another chance of a failure unrelated to your change.
+4. **Know how long it should take, and how small an effect it can see.** Pass that duration as `--estimate`. If the run takes longer, your picture of the system is wrong, so find out why before you run anything else. If the effect you expect is smaller than the run's noise, the result tells you nothing, so choose a finer check.
+5. **Run once, on the finished change.** A run measures the code as it was when the run started, so finish editing first. If a run fails, read the failure before running anything again.
+
+While a run is in progress, keep working on whatever doesn't depend on it, and put independent runs on different hosts. If no instrument answers your question, write the check you need (a test, or a timing at the shape) rather than using a broad, slow one; it pays for itself the next time.
+
 ## Type Checking
 
 Run targeted type checks per package — do not run project-wide `tsc -b`
@@ -67,19 +81,6 @@ Run targeted type checks per package — do not run project-wide `tsc -b`
 ##  Project Documents
 
 When significant bug is being reported or a large spec is being created, place under `bugs/YY-MM-DD/` or `specs/YY-MM-DD/`.
-
-## Design Documents
-
-`design/` contains the durable source of truth for architecture and behavior. Follow `design/AGENTS.md`: use `bun design-docs` to find applicable documents, preserve their guarantees, and update them and their applicability whenever the design or ownership changes.
-
-```bash
-bun design-docs inference/engine/scheduler/src/worker.rs
-bun design-docs --changed --explain
-```
-
-## Info Docs
-
-Use `info/` for concise, high-level Markdown documents for humans and LLMs. These docs should describe architecture, systems, expected behavior, and durable project context without depending on brittle file names or code snippets unless they are highly relevant.
 
 ## Motel Tracing
 

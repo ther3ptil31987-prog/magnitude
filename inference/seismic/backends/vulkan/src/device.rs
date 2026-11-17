@@ -1,16 +1,21 @@
 //! One opened Vulkan device (§8.1–§8.5): the logical device with exactly
 //! the floor's features plus the gated ones it has, one queue (compute-only
-//! when the device has such a family), a timeline semaphore that numbers
-//! every submission, the block allocator, and host access to storage.
+//! when the device has such a family) and, where the family has one, a
+//! second that runs transfers and zeroes pool blocks, a timeline semaphore that
+//! numbers every submission, the block allocator, and host access to
+//! storage.
 
-use crate::facts::{self, Description, Facts};
+use crate::facts::{self, Description, Facts, FormationTarget, Probed, Properties};
 use crate::instance::{Instance, LoaderError};
-use crate::memory::{Buffer, Memory, Range, StorageKind};
+use crate::memory::{Buffer, DevicePools, Memory, MemoryStores, Pool, Range};
 use ash::vk;
 use seismic_compiler::errors::ExecutionError;
+use seismic_memory::entry::{Charge, Entry};
+use seismic_native_target::GateOpening;
 use std::ffi::CStr;
 use std::fmt;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard, Weak};
+use std::time::Instant;
 
 /// Map a Vulkan call's failure: device loss is its own error.
 pub(crate) fn call<T>(result: Result<T, vk::Result>, what: &str) -> Result<T, ExecutionError> {
@@ -28,36 +33,24 @@ pub enum OpenError {
     Missing,
     /// The device does not meet the floor.
     Floor(String),
-    /// Creating the device or one of its objects, or running its fma probe,
-    /// failed.
+    /// Creating the device or one of its objects failed.
     Creation(String),
-    /// Without `VK_KHR_shader_fma`, GLSL `fma` beside a `NoContraction`
-    /// `a * b + c` of the same operands is not one fused operation (or the
-    /// expression is contracted), so `seismic_fma_rn` cannot be bound: the
-    /// device fails the floor (§16.1). The bits of both witness results.
-    MultiplyAdd {
-        fma: u32,
-        separate: u32,
-    },
-    /// Where modules do not declare `RoundingModeRTE 32`, the device's
-    /// default fp32 rounding of `operation` is not round-to-nearest-even on
-    /// the witness `operands` (a, b, integer): the device fails the floor
-    /// (§16.1). The expected and actual result bits.
-    Rounding {
-        operation: Rounded,
-        operands: [u32; 3],
-        expected: u32,
-        actual: u32,
-    },
+    /// Creating the device or one of its objects failed for want of memory
+    /// (`VK_ERROR_OUT_OF_DEVICE_MEMORY`, `VK_ERROR_OUT_OF_HOST_MEMORY`), or
+    /// as another holds what it needs (`VK_ERROR_TOO_MANY_OBJECTS`): opening
+    /// it later may succeed.
+    Busy(String),
 }
 
-/// An fp32 operation whose rounding the open-time probe checks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Rounded {
-    Add,
-    Multiply,
-    SignedConversion,
-    UnsignedConversion,
+impl OpenError {
+    /// Why the device does not meet the floor, when that is the error: the
+    /// reason discovery reports as the device's unavailability.
+    pub fn floor_reason(&self) -> Option<String> {
+        match self {
+            Self::Floor(reason) => Some(reason.clone()),
+            Self::Loader(_) | Self::Missing | Self::Creation(_) | Self::Busy(_) => None,
+        }
+    }
 }
 
 impl fmt::Display for OpenError {
@@ -65,19 +58,8 @@ impl fmt::Display for OpenError {
         match self {
             Self::Loader(error) => write!(f, "{error}"),
             Self::Missing => f.write_str("the Vulkan device is no longer present"),
+            Self::Creation(reason) | Self::Busy(reason) => write!(f, "opening the Vulkan device failed: {reason}"),
             Self::Floor(reason) => write!(f, "the Vulkan device does not meet the floor: {reason}"),
-            Self::Creation(reason) => write!(f, "opening the Vulkan device failed: {reason}"),
-            Self::MultiplyAdd { fma, separate } => write!(
-                f,
-                "the Vulkan device does not meet the floor: it lacks VK_KHR_shader_fma and its fma is not fused \
-                 beside a NoContraction multiply-add (witness fma {fma:#010x}, multiply-add {separate:#010x}; \
-                 fused 0x33800000, rounded twice 0x00000000)"
-            ),
-            Self::Rounding { operation, operands, expected, actual } => write!(
-                f,
-                "the Vulkan device does not meet the floor: without RoundingModeRTE 32 its fp32 {operation:?} of \
-                 witness {operands:#010x?} gives {actual:#010x}, not the nearest-even {expected:#010x}"
-            ),
         }
     }
 }
@@ -89,6 +71,17 @@ struct Staging {
     pool: vk::CommandPool,
     command: vk::CommandBuffer,
     range: Range,
+}
+
+/// One step of unmapped device storage staged on the first queue
+/// (`Device::transfer`).
+enum Staged {
+    /// A copy from the staging range into the storage.
+    Upload(vk::BufferCopy),
+    /// A copy from the storage into the staging range.
+    Download(vk::BufferCopy),
+    /// Zero over the whole storage, whose bytes are whole words.
+    Zero,
 }
 
 /// Bytes of the staging range; larger transfers go in pieces.
@@ -111,13 +104,12 @@ pub(crate) enum RetiredCommand {
 }
 
 /// Submission-side state recorded under one lock: command buffers, query
-/// pools and argument chunks of finished submissions awaiting reuse.
+/// pools and retired submissions awaiting completion.
 pub(crate) struct Recording {
     pub(crate) pool: vk::CommandPool,
     free_commands: Vec<vk::CommandBuffer>,
     free_queries: Vec<(vk::QueryPool, u32)>,
-    free_chunks: Vec<Range>,
-    retired: Vec<Retired>,
+    retired: Vec<(Retired, Weak<Opened>)>,
 }
 
 impl Recording {
@@ -132,27 +124,333 @@ pub(crate) const ARGUMENT_CHUNK_BYTES: u64 = 256 << 10;
 
 pub(crate) struct Queue {
     raw: vk::Queue,
+    /// The device timeline value the next submission takes.
     next: u64,
+    /// Submissions taken but not yet given to the queue, in order, behind
+    /// the one [`Self::waiting`] (`Device::submit_with`).
+    held: std::collections::VecDeque<Held>,
+    /// The gates of the last submission handed to the queue, while the host
+    /// has not raised them all, and its stamps: the one submission waiting
+    /// on the host in the driver, with nothing behind it
+    /// ([`Inner::release`]).
+    waiting: Option<(Vec<(vk::Semaphore, u64)>, Handed)>,
+    /// The queue refused the submission of this value: it and every later
+    /// one fail with its refusal's error.
+    refused: Option<(u64, Refusal)>,
+}
+
+impl Queue {
+    /// The queue's refusal of `value`, where it refused it or one before
+    /// it held ([`Inner::refuse`]).
+    fn refused(&self, value: u64) -> Result<(), ExecutionError> {
+        match &self.refused {
+            Some((from, refusal)) if *from <= value => Err(refusal.error().clone()),
+            _ => Ok(()),
+        }
+    }
+
+    /// The device's loss, where the queue refused `value` or one before it
+    /// held and could not raise the timeline past them: nothing will ever
+    /// reach `value`.
+    fn lost(&self, value: u64) -> Result<(), ExecutionError> {
+        match &self.refused {
+            Some((from, Refusal::Lost(lost))) if *from <= value => Err(lost.clone()),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// How the queue refused submissions ([`Inner::refuse`]).
+enum Refusal {
+    /// The device timeline was raised past them (or none took a value),
+    /// so their waits end, with this error.
+    Raised(ExecutionError),
+    /// The queue refused raising the timeline too: the device is lost, and
+    /// waits on them end at once with its loss.
+    Lost(ExecutionError),
+}
+
+impl Refusal {
+    fn error(&self) -> &ExecutionError {
+        match self {
+            Self::Raised(error) | Self::Lost(error) => error,
+        }
+    }
+}
+
+/// A submission's way to the device ([`Stamps`]), shared with its
+/// `DirectSubmission`.
+pub(crate) type Handed = Arc<Stamps>;
+
+/// When a submission reached the device's queue, and, for one handed over
+/// while a gate it waits on was shut, when the host raised its last gate.
+#[derive(Default)]
+pub(crate) struct Stamps {
+    /// The instants before and after the `vkQueueSubmit2` that took it,
+    /// whether at its commit or at the release of the gate it was held
+    /// behind, set once that call succeeded; never for one the queue
+    /// refused.
+    pub(crate) handed: OnceLock<(Instant, Instant)>,
+    /// When the host raised the last of its gates it was handed over
+    /// waiting on, and why; never for one handed over with
+    /// its gates raised.
+    pub(crate) opened: OnceLock<(Instant, GateOpening)>,
+}
+
+/// A submission held on the host until its gates are raised.
+struct Held {
+    command: vk::CommandBuffer,
+    value: u64,
+    waits: Vec<(vk::Semaphore, u64)>,
+    signals: Vec<(vk::Semaphore, u64)>,
+    handed: Handed,
+}
+
+impl Inner {
+    /// Give the queue every held submission, in order, up to and including
+    /// the first whose gates are not all raised, unless one handed to it
+    /// still waits on the host. That one waits on the host inside the
+    /// driver, so the device starts it the moment the host raises its gate,
+    /// whether before or after the device got there, rather than once the
+    /// host has handed it over; every later one stays held until that gate
+    /// is raised. A driver blocks the queue's submissions on a "wait before
+    /// signal" only once enough work is queued behind one (NVIDIA:
+    /// `direct::park_tests`); with nothing behind the one waiting, no driver
+    /// call waits on a gate. Its gates stay in its wait: the host's writes
+    /// before raising them are ordered before its work as before.
+    /// `opening` is why the host raised the gate this release follows.
+    /// A gate query the device fails refuses the first submission held and
+    /// every one behind it (or, with none held, the next taken): the device
+    /// cannot make progress, and no gate is read as raised.
+    fn release(&self, queue: &mut Queue, opening: GateOpening) {
+        let raised = |gates: &[(vk::Semaphore, u64)]| -> Result<bool, ExecutionError> {
+            for &(semaphore, value) in gates {
+                let reached = call(
+                    unsafe { self.device.get_semaphore_counter_value(semaphore) },
+                    "vkGetSemaphoreCounterValue",
+                )?;
+                if reached < value {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        };
+        if let Some((gates, _)) = &queue.waiting {
+            match raised(gates) {
+                Ok(true) => {
+                    let (_, stamps) = queue.waiting.take().expect("a waiting submission");
+                    stamps.opened.set((Instant::now(), opening)).expect("a waiting submission opens once");
+                }
+                Ok(false) => {}
+                Err(failed) => {
+                    let value = queue.held.front().map_or(queue.next, |held| held.value);
+                    return self.refuse(queue, value, failed);
+                }
+            }
+        }
+        while let Some(held) = queue.held.front() {
+            if queue.waiting.is_some() {
+                return;
+            }
+            match raised(&held.waits) {
+                Ok(true) => {}
+                Ok(false) => queue.waiting = Some((held.waits.clone(), held.handed.clone())),
+                Err(failed) => {
+                    let value = held.value;
+                    return self.refuse(queue, value, failed);
+                }
+            }
+            let held = queue.held.pop_front().expect("a held submission is first");
+            self.handover.notify_all();
+            if let Err(refused) = self.submit_now(queue.raw, &held) {
+                self.refuse(queue, held.value, refused);
+                return;
+            }
+        }
+    }
+
+    fn submit_now(&self, raw: vk::Queue, held: &Held) -> Result<(), ExecutionError> {
+        let semaphore = |stages: vk::PipelineStageFlags2| {
+            move |&(semaphore, value): &(vk::Semaphore, u64)| {
+                vk::SemaphoreSubmitInfo::default().semaphore(semaphore).value(value).stage_mask(stages)
+            }
+        };
+        let signal = std::iter::once(&(self.timeline, held.value))
+            .chain(&held.signals)
+            .map(semaphore(vk::PipelineStageFlags2::ALL_COMMANDS))
+            .collect::<Vec<_>>();
+        // A host gate's wait: no stage of the batch, the compute shaders
+        // that read what the host wrote before signaling it included,
+        // starts before it (Vulkan spec, "Semaphore Waiting": the wait's second
+        // synchronization scope is limited to the stages of its mask).
+        let wait = held
+            .waits
+            .iter()
+            .map(semaphore(vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::ALL_COMMANDS))
+            .collect::<Vec<_>>();
+        let commands = [vk::CommandBufferSubmitInfo::default().command_buffer(held.command)];
+        let submit = vk::SubmitInfo2::default()
+            .command_buffer_infos(&commands)
+            .wait_semaphore_infos(&wait)
+            .signal_semaphore_infos(&signal);
+        let handing = Instant::now();
+        call(
+            unsafe { self.device.queue_submit2(raw, &[submit], vk::Fence::null()) },
+            "vkQueueSubmit2",
+        )?;
+        held.handed
+            .handed
+            .set((handing, Instant::now()))
+            .expect("a submission is handed to the queue once");
+        Ok(())
+    }
+
+    /// The queue refused the submission of `value`: it and every one held
+    /// behind it never run. Where any of them took a value (`value` below
+    /// `queue.next`), one empty submission raises the device timeline past
+    /// them (after the work submitted before, which the queue still
+    /// completes, a submission waiting on the host once the host raises
+    /// its gate), so every wait on them ends and reports `refused`
+    /// (`Device::wait`); if the queue refuses that too, the device is lost,
+    /// and every wait on them ends at once with its loss. Refusing the next
+    /// value, with nothing held, records the refusal alone: every value
+    /// taken belongs to a submission handed over, which signals it itself,
+    /// and a timeline signal must exceed the value it raises from.
+    fn refuse(&self, queue: &mut Queue, value: u64, refused: ExecutionError) {
+        queue.held.clear();
+        if value == queue.next {
+            queue.refused = Some((value, Refusal::Raised(refused)));
+            self.handover.notify_all();
+            return;
+        }
+        let last = queue.next - 1;
+        let signal = [vk::SemaphoreSubmitInfo::default()
+            .semaphore(self.timeline)
+            .value(last)
+            .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+        let submit = vk::SubmitInfo2::default().signal_semaphore_infos(&signal);
+        let refusal = match call(
+            unsafe { self.device.queue_submit2(queue.raw, &[submit], vk::Fence::null()) },
+            "vkQueueSubmit2",
+        ) {
+            Ok(()) => Refusal::Raised(refused),
+            Err(lost) => Refusal::Lost(ExecutionError::DeviceLost(format!(
+                "{refused}, and raising the timeline past the refused submissions then failed: {lost}"
+            ))),
+        };
+        queue.refused = Some((value, refusal));
+        self.handover.notify_all();
+    }
+}
+
+/// The second queue and what its zero fills record into, formed at its
+/// first fill.
+struct Side {
+    raw: vk::Queue,
+    pool: vk::CommandPool,
+    command: vk::CommandBuffer,
+    fence: vk::Fence,
 }
 
 pub(crate) struct Inner {
     pub(crate) device: ash::Device,
     pub(crate) facts: Facts,
+    pub(crate) properties: Properties,
     pub(crate) memory: Memory,
     pub(crate) layout: vk::PipelineLayout,
-    pub(crate) cache: vk::PipelineCache,
     pub(crate) timeline: vk::Semaphore,
     queue: Mutex<Queue>,
+    /// Notified whenever held submissions are handed to the queue or
+    /// refused: a wait on one held waits on it before the driver does
+    /// (`Device::ended`).
+    handover: Condvar,
+    /// The family's second queue, where it has one: pool blocks are zeroed
+    /// on it (`Inner::zero`) beside work the first runs.
+    side: Option<Mutex<Side>>,
+    /// `VK_KHR_pipeline_executable_properties`' functions, where formed
+    /// pipelines report their statistics (`Facts::pipeline_statistics`).
+    pub(crate) executables: Option<ash::khr::pipeline_executable_properties::Device>,
     recording: Mutex<Recording>,
+    /// Device memory recorded graphs took (their command memory), measured
+    /// while each is recorded: what each recording's own measure leaves to
+    /// the others recorded beside it (`DirectGraphBuilder`). The driver's
+    /// memory, which `Memory`'s reconciliation charges, holds it.
+    pub(crate) graphs: std::sync::atomic::AtomicU64,
+    /// Dropped after the logical device is destroyed (`Inner::drop`).
+    instance: Arc<Instance>,
+    /// Ends the destruction once every other field has dropped, last as it
+    /// is declared last, on a panic too.
+    destroyed: Ends,
+}
+
+/// Per-open state of a [`Device`]: its stores, pools, transfer staging,
+/// reusable argument chunks, and reconciled driver-memory charge. Dropping the
+/// last clone of an open releases its staging, argument chunks, and driver
+/// charge from its [`MemoryStores`] without disturbing other opens sharing the
+/// logical device.
+pub(crate) struct Opened {
+    inner: Arc<Inner>,
+    pub(crate) stores: MemoryStores,
+    pools: DevicePools,
     staging: Mutex<Option<Staging>>,
-    physical: vk::PhysicalDevice,
-    instance: &'static Instance,
+    free_chunks: Mutex<Vec<Range>>,
+    driver_charge: Mutex<Option<Charge>>,
+}
+
+impl Opened {
+    fn new(inner: Arc<Inner>, stores: MemoryStores) -> Result<Arc<Self>, OpenError> {
+        let pools = DevicePools::new(&inner.memory).map_err(OpenError::Creation)?;
+        Ok(Arc::new(Self {
+            inner,
+            stores,
+            pools,
+            staging: Mutex::new(None),
+            free_chunks: Mutex::new(Vec::new()),
+            driver_charge: Mutex::new(None),
+        }))
+    }
+}
+
+impl Drop for Opened {
+    fn drop(&mut self) {
+        self.inner.retire_completed_best_effort();
+        if let Some(staging) = self
+            .staging
+            .get_mut()
+            .expect("staging lock is never poisoned")
+            .take()
+        {
+            unsafe { self.inner.device.destroy_command_pool(staging.pool, None) };
+            self.inner.memory.release(&self.inner.device, &staging.range);
+        }
+        for chunk in self
+            .free_chunks
+            .get_mut()
+            .expect("free chunks lock is never poisoned")
+            .drain(..)
+        {
+            self.inner.memory.release(&self.inner.device, &chunk);
+        }
+        if let Some(mut charge) = self
+            .driver_charge
+            .get_mut()
+            .expect("driver charge lock poisoned")
+            .take()
+        {
+            let bytes = charge.bytes();
+            if bytes > 0 {
+                let change = charge.entry().change();
+                charge.shrink(&change, bytes);
+            }
+        }
+    }
 }
 
 /// An opened Vulkan device.
 #[derive(Clone)]
 pub struct Device {
     pub(crate) inner: Arc<Inner>,
+    opened: Arc<Opened>,
 }
 
 /// Memory-budget sample of the device-local heap (`VK_EXT_memory_budget`).
@@ -162,81 +460,254 @@ pub struct MemoryBudget {
     pub heap_usage_bytes: u64,
 }
 
+/// The process's Vulkan devices: the one logical device of each physical
+/// device that something holds, by its UUID, and when it is destroyed.
+#[derive(Default)]
+struct Registry {
+    opened: Vec<([u8; 16], Weak<Inner>, Arc<Destroyed>)>,
+}
+
+/// Whether a logical device's destruction has ended (`Inner::drop`): an
+/// open of its physical device that finds it no longer held waits for that
+/// before creating another. A flag, so a panic that poisoned its lock left
+/// nothing inconsistent.
+#[derive(Default)]
+struct Destroyed {
+    ended: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl Destroyed {
+    fn ended(&self) -> bool {
+        *self.ended.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn end(&self) {
+        *self.ended.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        self.changed.notify_all();
+    }
+
+    // A raw condition-variable wait in the load path (a device open);
+    // adopt the bottom-layer wait primitive here once seismic can use it.
+    fn wait(&self) {
+        let mut ended = self.ended.lock().unwrap_or_else(PoisonError::into_inner);
+        while !*ended {
+            ended = self.changed.wait(ended).unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+
+/// A logical device's last field: its drop ends the destruction.
+struct Ends(Arc<Destroyed>);
+
+impl Drop for Ends {
+    fn drop(&mut self) {
+        self.0.end();
+    }
+}
+
+/// Held shared while the process creates pipelines on any of its logical
+/// devices, and exclusively while it destroys one: NVIDIA 580 deadlocks when
+/// one logical device is destroyed while another compiles pipelines, which
+/// two of a process's devices would otherwise do, whatever their physical
+/// devices.
+static PIPELINES: RwLock<()> = RwLock::new(());
+
+/// Hold off every device's destruction while pipelines are created.
+pub(crate) fn creating_pipelines() -> RwLockReadGuard<'static, ()> {
+    PIPELINES.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn registry() -> MutexGuard<'static, Registry> {
+    static REGISTRY: std::sync::OnceLock<Mutex<Registry>> = std::sync::OnceLock::new();
+    REGISTRY
+        .get_or_init(Mutex::default)
+        .lock()
+        .expect("the device registry lock is never poisoned")
+}
+
+impl Inner {
+    /// What the driver holds beyond every block, and what recorded graphs
+    /// took, now: the mark a graph's recording measures its command memory
+    /// from (`DirectGraphBuilder`), read from `Memory`'s exact snapshot so
+    /// no block in transition is ever counted as a graph's.
+    pub(crate) fn unheld_mark(&self) -> (u64, u64) {
+        (self.memory.unheld().1.driver, self.graphs.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// What the driver took since `mark` that no graph recorded meanwhile
+    /// accounts for.
+    pub(crate) fn unheld_since(&self, (unheld, graphs): (u64, u64)) -> u64 {
+        let grown = self.memory.unheld().1.driver.saturating_sub(unheld);
+        let recorded = self.graphs.load(std::sync::atomic::Ordering::Relaxed).saturating_sub(graphs);
+        grown.saturating_sub(recorded)
+    }
+}
+
 impl Device {
     /// Open the physical device with this UUID, revalidating it against
-    /// the floor; without `RoundingModeRTE 32`, its default fp32 rounding
-    /// must pass the rounding probe, and without `VK_KHR_shader_fma`, its
-    /// `fma` must pass the multiply-add probe.
+    /// the floor.
     ///
-    /// A physical device has one logical device for the process, created by
-    /// the first open and shared by every later one, like CUDA's primary
-    /// context: NVIDIA 580 deadlocks when one logical device is destroyed
-    /// while another compiles pipelines, which independent opens in one
-    /// process would do.
-    pub fn open(uuid: [u8; 16]) -> Result<Self, OpenError> {
-        static OPENED: std::sync::OnceLock<Mutex<Vec<Device>>> = std::sync::OnceLock::new();
-        let mut opened = OPENED
-            .get_or_init(|| Mutex::new(Vec::new()))
-            .lock()
-            .expect("the opened-device registry lock is never poisoned");
-        if let Some(device) = opened.iter().find(|device| device.facts().uuid == uuid) {
-            return Ok(device.clone());
-        }
+    /// A physical device has one logical device at a time, created by an
+    /// open when none is held and shared by every open while one is, like
+    /// CUDA's primary context. The last holder of a device (its `Device`s
+    /// and buffers) destroys it, never while any of
+    /// the process's devices creates pipelines ([`creating_pipelines`]), and
+    /// an open meanwhile waits for that destruction to end, without the
+    /// registry, before creating another.
+    ///
+    /// What is allocated through the returned device lies in `stores`: each
+    /// buffer charged to the entry its allocation names, its blocks' free
+    /// space, its staging and argument chunks to their store's own entry,
+    /// and the driver's memory, as each reconciliation finds it
+    /// ([`Device::reconcile_driver_memory`]), to the own entry of the
+    /// device's store ([`MemoryStores::own`]): an open
+    /// sharing a held logical device charges its own to its own, and what
+    /// others allocated keeps theirs.
+    ///
+    /// The device's properties take its probes as `probed` holds them, what
+    /// the measurement job stored for the device and driver version; each
+    /// probe not run takes its safe value. Opening runs no probe.
+    pub fn open(uuid: [u8; 16], stores: MemoryStores, probed: &Probed) -> Result<Self, OpenError> {
+        let mut registry = loop {
+            let mut registry = registry();
+            let Some(index) = registry.opened.iter().position(|(opened, _, _)| *opened == uuid) else {
+                break registry;
+            };
+            if let Some(inner) = registry.opened[index].1.upgrade() {
+                drop(registry);
+                let opened = Opened::new(inner.clone(), stores)?;
+                return Ok(Self { inner, opened });
+            }
+            let destroyed = registry.opened[index].2.clone();
+            if destroyed.ended() {
+                registry.opened.swap_remove(index);
+                break registry;
+            }
+            drop(registry);
+            destroyed.wait();
+        };
         let instance = crate::instance::instance().map_err(OpenError::Loader)?;
-        let (physical, Description { facts, floor }) = instance
+        let description = instance
             .physical_devices()
             .map_err(OpenError::Loader)?
             .into_iter()
-            .map(|physical| (physical, facts::describe(instance, physical)))
-            .find(|(_, description)| description.facts.uuid == uuid)
+            .map(|physical| facts::describe(&instance, physical))
+            .find(|description| description.facts.uuid == uuid)
             .ok_or(OpenError::Missing)?;
-        floor.map_err(OpenError::Floor)?;
-        let device = Self {
-            inner: Arc::new(Inner::create(instance, physical, facts)?),
-        };
-        if !device.facts().rounding_rte_32 {
-            crate::probe::rounding(&device)?;
-        }
-        if !device.facts().shader_fma.float32 {
-            crate::probe::multiply_add(&device)?;
-        }
-        opened.push(device.clone());
-        Ok(device)
+        let properties = description.properties(probed).map_err(OpenError::Floor)?;
+        let Description { handle, facts, .. } = description;
+        let inner = Arc::new(Inner::create(instance, handle.physical, facts, properties)?);
+        registry.opened.push((uuid, Arc::downgrade(&inner), inner.destroyed.0.clone()));
+        drop(registry);
+        let opened = Opened::new(inner.clone(), stores)?;
+        Ok(Self { inner, opened })
     }
 
     pub fn facts(&self) -> &Facts {
         &self.inner.facts
     }
 
-    /// Device-local storage.
-    pub fn allocate(&self, bytes: u64, alignment: u64) -> Result<Buffer, ExecutionError> {
-        self.allocate_kind(StorageKind::Device, bytes, alignment)
+    /// The device's properties (`seismic_lang::device::vulkan`).
+    pub fn properties(&self) -> &Properties {
+        &self.inner.properties
     }
 
-    /// Storage the host writes before each submission with plain memory
-    /// writes that never wait for device work.
-    pub fn allocate_upload(&self, bytes: u64, alignment: u64) -> Result<Buffer, ExecutionError> {
-        self.allocate_kind(StorageKind::Upload, bytes, alignment)
+    /// The target this device forms sources in.
+    pub fn formation(&self) -> FormationTarget {
+        self.inner.facts.formation(&self.inner.properties)
     }
 
-    fn allocate_kind(
+    /// Storage in the backend's own device placement, for what it allocates
+    /// beside the topology's, charged to `entry`.
+    pub fn allocate(
         &self,
-        kind: StorageKind,
         bytes: u64,
         alignment: u64,
+        entry: &Arc<dyn Entry>,
+    ) -> Result<Buffer, ExecutionError> {
+        self.allocate_in(self.opened.pools.device().clone(), bytes, alignment, entry)
+    }
+
+    /// Storage in the backend's own upload placement (record tables), which
+    /// the host writes with plain memory writes that never wait for device
+    /// work, charged to `entry`.
+    pub fn allocate_upload(
+        &self,
+        bytes: u64,
+        alignment: u64,
+        entry: &Arc<dyn Entry>,
+    ) -> Result<Buffer, ExecutionError> {
+        self.allocate_in(self.opened.pools.upload().clone(), bytes, alignment, entry)
+    }
+
+    /// Storage in `kinds`, in order (kinds of one store): an allocation
+    /// lands on the first with room, charged to `entry`; the buffer names
+    /// the kind it landed on ([`Buffer::kind`]).
+    pub fn allocate_kinds(
+        &self,
+        kinds: &[u32],
+        bytes: u64,
+        alignment: u64,
+        entry: &Arc<dyn Entry>,
+    ) -> Result<Buffer, ExecutionError> {
+        self.allocate_in(self.opened.pools.pool(&self.inner.memory, kinds)?, bytes, alignment, entry)
+    }
+
+    /// A range of `pool`, its bytes carved from its block for `entry`.
+    fn allocate_in(
+        &self,
+        pool: Arc<Pool>,
+        bytes: u64,
+        alignment: u64,
+        entry: &Arc<dyn Entry>,
     ) -> Result<Buffer, ExecutionError> {
         let range = self
             .inner
             .memory
-            .allocate(&self.inner.device, kind, bytes, alignment)?;
-        Ok(Buffer::new(self.inner.clone(), range))
+            .allocate(&self.inner.device, &pool, bytes, alignment, &self.opened.stores)?;
+        let carved = range.carve(entry);
+        Ok(Buffer::new(self.inner.clone(), range, Some(carved)))
     }
+
+    /// A pool block (`seismic_memory::pool`): one memory object and
+    /// the buffer bound to it, of memory type `kind`, never shared, every
+    /// byte zero and backed, charged exactly to `entry` (its bytes rounded
+    /// to whole words and the driver's rounding included) and returned to
+    /// the driver when it drops. Zeroed through its mapping where its type
+    /// is mappable, else on the second queue, beside work the first runs
+    /// or holds parked; on a device without one, on the first queue behind
+    /// its submissions.
+    pub fn allocate_block(&self, kind: u32, bytes: u64, entry: &Arc<dyn Entry>) -> Result<Buffer, ExecutionError> {
+        let range = self.inner.memory.block(&self.inner.device, kind, bytes, entry)?;
+        // Freed by its drop where zeroing fails.
+        let buffer = Buffer::new(self.inner.clone(), range, None);
+        let range = buffer.range();
+        match range.mapped() {
+            // SAFETY: the block's own mapping, which nothing else reaches yet.
+            Some(base) => unsafe { std::ptr::write_bytes(base, 0, range.bytes() as usize) },
+            None if self.inner.side.is_some() => self.inner.zero(&[(range, 0, range.bytes())])?,
+            None => drop(self.transfer(range, |_| Staged::Zero)?),
+        }
+        Ok(buffer)
+    }
+
+    /// The own entry of the store of the device's own storage
+    /// ([`MemoryStores::own`]).
+    pub(crate) fn own(&self) -> Arc<dyn Entry> {
+        self.opened.stores.own(&self.inner.memory)
+    }
+
 
     /// Host write: through the mapping when the storage is host-visible,
     /// else through staging and a transfer on the queue, waited on. The
     /// caller orders it after device work using the storage.
     pub fn write(&self, buffer: &Buffer, offset: u64, bytes: &[u8]) -> Result<(), ExecutionError> {
-        let range = buffer.range();
+        self.write_range(buffer.range(), offset, bytes)
+    }
+
+    /// [`Device::write`] of a range of a block.
+    pub(crate) fn write_range(&self, range: &Range, offset: u64, bytes: &[u8]) -> Result<(), ExecutionError> {
         if range.mapped().is_some() {
             range.write_mapped(offset, bytes);
             return Ok(());
@@ -244,18 +715,14 @@ impl Device {
         let mut done = 0usize;
         while done < bytes.len() {
             let length = (bytes.len() - done).min(STAGING_BYTES as usize);
-            let _staging = self.transfer(
-                |staging| {
-                    staging.write_mapped(0, &bytes[done..done + length]);
-                    vk::BufferCopy {
-                        src_offset: staging.offset(),
-                        dst_offset: range.offset() + offset + done as u64,
-                        size: length as u64,
-                    }
-                },
-                range,
-                true,
-            )?;
+            let _staging = self.transfer(range, |staging| {
+                staging.write_mapped(0, &bytes[done..done + length]);
+                Staged::Upload(vk::BufferCopy {
+                    src_offset: staging.offset(),
+                    dst_offset: range.offset() + offset + done as u64,
+                    size: length as u64,
+                })
+            })?;
             done += length;
         }
         Ok(())
@@ -268,7 +735,11 @@ impl Device {
         offset: u64,
         into: &mut [u8],
     ) -> Result<(), ExecutionError> {
-        let range = buffer.range();
+        self.read_range(buffer.range(), offset, into)
+    }
+
+    /// [`Device::read`] of a range of a block.
+    pub(crate) fn read_range(&self, range: &Range, offset: u64, into: &mut [u8]) -> Result<(), ExecutionError> {
         if range.mapped().is_some() {
             range.read_mapped(offset, into);
             return Ok(());
@@ -276,15 +747,13 @@ impl Device {
         let mut done = 0usize;
         while done < into.len() {
             let length = (into.len() - done).min(STAGING_BYTES as usize);
-            let staging = self.transfer(
-                |staging| vk::BufferCopy {
+            let staging = self.transfer(range, |staging| {
+                Staged::Download(vk::BufferCopy {
                     src_offset: range.offset() + offset + done as u64,
                     dst_offset: staging.offset(),
                     size: length as u64,
-                },
-                range,
-                false,
-            )?;
+                })
+            })?;
             staging
                 .as_ref()
                 .expect("a transfer leaves its staging in place")
@@ -295,31 +764,26 @@ impl Device {
         Ok(())
     }
 
-    /// One staged copy between `range` and the staging range, submitted and
-    /// waited on. `upload` copies staging to `range`, else `range` to
-    /// staging. Returns the staging lock so a read can copy out.
+    /// One staged step of `range`, as `step` gives it from the staging
+    /// range ([`Staged`]), submitted and waited on. Returns the staging lock
+    /// so a read can copy out.
     fn transfer(
         &self,
-        region: impl FnOnce(&Range) -> vk::BufferCopy,
         range: &Range,
-        upload: bool,
+        step: impl FnOnce(&Range) -> Staged,
     ) -> Result<MutexGuard<'_, Option<Staging>>, ExecutionError> {
         let inner = &self.inner;
         let device = &inner.device;
-        let mut guard = inner
+        let mut guard = self
+            .opened
             .staging
             .lock()
             .expect("staging lock is never poisoned");
         if guard.is_none() {
-            *guard = Some(inner.create_staging()?);
+            *guard = Some(inner.create_staging(&self.opened.pools, &self.opened.stores)?);
         }
         let staging = guard.as_mut().expect("staging was created above");
-        let copy = region(&staging.range);
-        let (source, destination) = if upload {
-            (staging.range.raw(), range.raw())
-        } else {
-            (range.raw(), staging.range.raw())
-        };
+        let step = step(&staging.range);
         let command = staging.command;
         unsafe {
             call(
@@ -342,7 +806,11 @@ impl Device {
                 vk::PipelineStageFlags2::TRANSFER,
                 vk::AccessFlags2::TRANSFER_READ | vk::AccessFlags2::TRANSFER_WRITE,
             );
-            device.cmd_copy_buffer(command, source, destination, &[copy]);
+            match step {
+                Staged::Upload(copy) => device.cmd_copy_buffer(command, staging.range.raw(), range.raw(), &[copy]),
+                Staged::Download(copy) => device.cmd_copy_buffer(command, range.raw(), staging.range.raw(), &[copy]),
+                Staged::Zero => device.cmd_fill_buffer(command, range.raw(), range.offset(), range.bytes(), 0),
+            }
             barrier(
                 device,
                 command,
@@ -362,41 +830,116 @@ impl Device {
 
     /// Submit `command`, signalling the timeline with the next value.
     pub(crate) fn submit(&self, command: vk::CommandBuffer) -> Result<u64, ExecutionError> {
-        let inner = &self.inner;
-        let mut queue = inner.queue.lock().expect("queue lock is never poisoned");
+        self.submit_with(command, &[], &[], Handed::default())
+    }
+
+    /// Submit `command` once every host gate of `waits` (a timeline the
+    /// host raises, `HostTimeline::signal`) reaches its value, after every
+    /// earlier submission, signalling the device timeline with the next
+    /// value and each of `signals` with its own once the command completes;
+    /// `handed` takes the instant the queue takes it.
+    ///
+    /// The queue holds at most one submission whose gate is shut, with
+    /// nothing behind it: the first such one goes to the queue, so the
+    /// device starts it the moment the host raises its gate; every later
+    /// one is held on the host, with every one behind it, until that gate
+    /// is raised ([`Inner::release`]). A driver that takes a submission
+    /// waiting on a value no signal operation is pending for (a "wait
+    /// before signal") may block every queue's `vkQueueSubmit2` once enough
+    /// work is queued behind it, and with it whichever host thread would
+    /// raise the gate (NVIDIA: `direct::park_tests`); with none queued
+    /// behind the one waiting, no driver call waits on a gate.
+    ///
+    /// The hold is order, not a means to answer: whatever the host needs to
+    /// raise a gate must never be submitted to this queue, where it would be
+    /// held behind that gate. An answer's work runs on the host, on the
+    /// second queue (`TransferQueue`), which no hold delays, or behind the
+    /// gate it opens; never as a staged copy of this queue
+    /// ([`Self::transfer`]: a device tensor's host read or write).
+    pub(crate) fn submit_with(
+        &self,
+        command: vk::CommandBuffer,
+        waits: &[(vk::Semaphore, u64)],
+        signals: &[(vk::Semaphore, u64)],
+        handed: Handed,
+    ) -> Result<u64, ExecutionError> {
+        let mut queue = self.queue();
+        if let Some((_, refusal)) = &queue.refused {
+            return Err(refusal.error().clone());
+        }
         let value = queue.next;
-        let signal = [vk::SemaphoreSubmitInfo::default()
-            .semaphore(inner.timeline)
-            .value(value)
-            .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
-        let commands = [vk::CommandBufferSubmitInfo::default().command_buffer(command)];
-        let submit = vk::SubmitInfo2::default()
-            .command_buffer_infos(&commands)
-            .signal_semaphore_infos(&signal);
+        queue.next += 1;
+        queue.held.push_back(Held {
+            command,
+            value,
+            waits: waits.to_vec(),
+            signals: signals.to_vec(),
+            handed,
+        });
+        // Taking a submission raises no gate: one found raised here was
+        // raised by a signal whose own release saw it first.
+        self.inner.release(&mut queue, GateOpening::Signalled);
+        queue.refused(value).map(|()| value)
+    }
+
+    /// Submit the held submissions whose gates the host has raised, in
+    /// order: after a host signal raised one, for `opening`.
+    pub(crate) fn release(&self, opening: GateOpening) {
+        let mut queue = self.queue();
+        self.inner.release(&mut queue, opening);
+    }
+
+    /// The device timeline value of the latest submission.
+    pub(crate) fn submitted(&self) -> u64 {
+        self.queue().next - 1
+    }
+
+    /// The timeline value every completed submission has reached; the
+    /// device's loss where it cannot say.
+    fn completed(&self) -> Result<u64, ExecutionError> {
         call(
             unsafe {
-                inner
+                self.inner
                     .device
-                    .queue_submit2(queue.raw, &[submit], vk::Fence::null())
+                    .get_semaphore_counter_value(self.inner.timeline)
             },
-            "vkQueueSubmit2",
-        )?;
-        queue.next += 1;
-        Ok(value)
+            "vkGetSemaphoreCounterValue",
+        )
     }
 
-    /// The timeline value every completed submission has reached. A failed
-    /// query means the work cannot make progress: it reads as complete.
-    pub(crate) fn completed(&self) -> u64 {
-        unsafe {
-            self.inner
-                .device
-                .get_semaphore_counter_value(self.inner.timeline)
+    /// Whether the submission that took `value` completed, without waiting:
+    /// `Ok(false)` while it runs; its error where the queue refused it or
+    /// one before it held ([`Self::submit_with`]), or the device is lost.
+    pub(crate) fn reached(&self, value: u64) -> Result<bool, ExecutionError> {
+        self.queue().lost(value)?;
+        if self.completed()? < value {
+            return Ok(false);
         }
-        .unwrap_or(u64::MAX)
+        self.queue().refused(value).map(|()| true)
     }
 
+    /// Wait for the submission that took `value` to end; its error where
+    /// the queue refused it or one before it held ([`Self::submit_with`]),
+    /// or the device is lost.
     pub(crate) fn wait(&self, value: u64) -> Result<(), ExecutionError> {
+        self.ended(value)?;
+        self.queue().refused(value)
+    }
+
+    /// Wait for the submission that took `value` to end, run or refused,
+    /// so the device uses nothing it used any more; the device's loss
+    /// where it cannot say. The driver waits only on a submission handed
+    /// to the queue, or refused with the timeline raised past it: one held
+    /// is waited on here until it is either, so a refusal that loses the
+    /// device ends the wait with its loss ([`Inner::refuse`]).
+    pub(crate) fn ended(&self, value: u64) -> Result<(), ExecutionError> {
+        self.inner
+            .handover
+            .wait_while(self.queue(), |queue| {
+                queue.held.front().is_some_and(|held| held.value <= value)
+            })
+            .expect("queue lock is never poisoned")
+            .lost(value)?;
         let semaphores = [self.inner.timeline];
         let values = [value];
         let info = vk::SemaphoreWaitInfo::default()
@@ -408,32 +951,26 @@ impl Device {
         )
     }
 
-    pub(crate) fn recording(&self) -> MutexGuard<'_, Recording> {
-        let mut recording = self
-            .inner
+    fn queue(&self) -> MutexGuard<'_, Queue> {
+        self.inner.queue.lock().expect("queue lock is never poisoned")
+    }
+
+    /// The recording lock, without retiring what completed submissions
+    /// used: for recording that takes nothing they free.
+    pub(crate) fn locked(&self) -> MutexGuard<'_, Recording> {
+        self.inner
             .recording
             .lock()
-            .expect("recording lock is never poisoned");
-        let completed = self.completed();
-        let mut index = 0;
-        while index < recording.retired.len() {
-            if recording.retired[index].value <= completed {
-                let retired = recording.retired.swap_remove(index);
-                match retired.command {
-                    RetiredCommand::Primary(command) => recording.free_commands.push(command),
-                    RetiredCommand::Secondary(command) => unsafe {
-                        self.inner
-                            .device
-                            .free_command_buffers(recording.pool, &[command])
-                    },
-                }
-                recording.free_queries.extend(retired.queries);
-                recording.free_chunks.extend(retired.arguments);
-            } else {
-                index += 1;
-            }
-        }
-        recording
+            .expect("recording lock is never poisoned")
+    }
+
+    /// The recording lock, with what completed submissions used retired
+    /// for reuse; the device's loss where it cannot say which completed.
+    pub(crate) fn recording(&self) -> Result<MutexGuard<'_, Recording>, ExecutionError> {
+        let mut recording = self.locked();
+        let completed = self.completed()?;
+        self.inner.retire_up_to(&mut recording, completed);
+        Ok(recording)
     }
 
     /// A primary command buffer, reset and ready to begin.
@@ -492,15 +1029,22 @@ impl Device {
     /// An argument chunk in upload storage.
     pub(crate) fn argument_chunk(
         &self,
-        recording: &mut Recording,
+        _recording: &mut Recording,
     ) -> Result<Range, ExecutionError> {
-        match recording.free_chunks.pop() {
+        let reused = self
+            .opened
+            .free_chunks
+            .lock()
+            .expect("free chunks lock is never poisoned")
+            .pop();
+        match reused {
             Some(chunk) => Ok(chunk),
             None => self.inner.memory.allocate(
                 &self.inner.device,
-                StorageKind::Upload,
+                self.opened.pools.upload(),
                 ARGUMENT_CHUNK_BYTES,
                 256,
+                &self.opened.stores,
             ),
         }
     }
@@ -511,34 +1055,119 @@ impl Device {
             .lock()
             .expect("recording lock is never poisoned")
             .retired
-            .push(retired);
+            .push((retired, Arc::downgrade(&self.opened)));
     }
 
-    /// `VK_EXT_memory_budget` of the device-local heap.
-    pub fn memory_budget(&self) -> MemoryBudget {
-        let inner = &self.inner;
-        let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
-        let mut properties = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
-        unsafe {
-            inner
-                .instance
-                .raw()
-                .get_physical_device_memory_properties2(inner.physical, &mut properties)
-        };
-        let memory = properties.memory_properties;
-        let heap = (0..memory.memory_heap_count as usize)
-            .filter(|index| {
-                memory.memory_heaps[*index]
-                    .flags
-                    .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
-            })
-            .max_by_key(|index| memory.memory_heaps[*index].size)
-            .expect("the floor requires a device-local heap");
-        MemoryBudget {
-            heap_budget_bytes: budget.heap_budget[heap],
-            heap_usage_bytes: budget.heap_usage[heap],
-        }
+    /// Settle the charge of the driver's own memory for the device (the
+    /// logical device, pipelines, command, query and graph memory) to what
+    /// the driver holds now, on the own entry of the store of the device's
+    /// own storage ([`MemoryStores::own`]): grown or shrunk, never refused.
+    /// The embedder's ledger runs it before each reading of the store.
+    /// Returns what the driver grants the process of the device heaps
+    /// beyond its usage (budget less usage), read in the one
+    /// `VK_EXT_memory_budget` query the charge was settled from: the grant
+    /// and the usage the ledger counts are of one instant, so a driver that
+    /// shows a free late shows it late in both, and the freed bytes stay
+    /// counted as the driver's until it does.
+    pub fn reconcile_driver_memory(&self) -> u64 {
+        self.inner.memory.reconcile(&self.own(), &self.opened.driver_charge)
     }
+
+    /// The driver memory charged, as last reconciled (`DriverMemory`).
+    pub fn driver_charged(&self) -> u64 {
+        self.opened
+            .driver_charge
+            .lock()
+            .expect("driver charge lock poisoned")
+            .as_ref()
+            .map_or(0, Charge::bytes)
+    }
+
+    /// The driver memory held now, read exactly (no block in transition),
+    /// without charging it: what the next reconciliation will find at
+    /// least.
+    pub fn driver_held(&self) -> u64 {
+        self.inner.memory.unheld().1.driver
+    }
+
+    /// `VK_EXT_memory_budget` of the heaps device storage is allocated
+    /// from.
+    pub fn memory_budget(&self) -> MemoryBudget {
+        self.inner.memory.memory_budget()
+    }
+}
+
+/// `VK_EXT_memory_budget` of the heaps `facts`' device storage is allocated
+/// from, together. The budget is what the driver grants this process of the
+/// heaps, its own usage included.
+pub(crate) fn memory_budget(instance: &Instance, physical: vk::PhysicalDevice, heaps: &[u32]) -> MemoryBudget {
+    let budgets = heap_budgets(instance, physical);
+    heaps
+        .iter()
+        .map(|&heap| budgets[heap as usize])
+        .fold(
+            MemoryBudget {
+                heap_budget_bytes: 0,
+                heap_usage_bytes: 0,
+            },
+            |sum, heap| MemoryBudget {
+                heap_budget_bytes: sum.heap_budget_bytes + heap.budget,
+                heap_usage_bytes: sum.heap_usage_bytes + heap.usage,
+            },
+        )
+}
+
+/// One heap's `VK_EXT_memory_budget`: what the driver grants this process
+/// of the heap, and what the process uses of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeapBudget {
+    /// `heapBudget`: what the driver grants this process of the heap, its
+    /// own usage included.
+    pub budget: u64,
+    /// `heapUsage`: what this process uses of the heap.
+    pub usage: u64,
+}
+
+/// An unopened physical device. It holds its instance, so the handle is
+/// valid for as long as it is held.
+#[derive(Clone)]
+pub struct DeviceHandle {
+    pub(crate) instance: Arc<Instance>,
+    pub(crate) physical: vk::PhysicalDevice,
+}
+
+impl DeviceHandle {
+    /// Every heap's `VK_EXT_memory_budget` budget and usage, in heap order,
+    /// read without a logical device. The extension is in the floor, so
+    /// every device meeting it reports budgets.
+    pub fn heap_budgets(&self) -> Vec<HeapBudget> {
+        heap_budgets(&self.instance, self.physical)
+    }
+}
+
+impl std::fmt::Debug for DeviceHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("DeviceHandle").field(&self.physical).finish()
+    }
+}
+
+/// Every heap's budget of `physical`, a device meeting the floor (which
+/// requires the extension); a physical-device query needs no logical
+/// device.
+pub(crate) fn heap_budgets(instance: &Instance, physical: vk::PhysicalDevice) -> Vec<HeapBudget> {
+    let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+    let mut properties = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+    unsafe {
+        instance
+            .raw()
+            .get_physical_device_memory_properties2(physical, &mut properties)
+    };
+    (0..properties.memory_properties.memory_heap_count as usize)
+        .map(|heap| HeapBudget {
+            budget: budget.heap_budget[heap],
+            usage: budget.heap_usage[heap],
+        })
+        .collect()
 }
 
 /// One global memory barrier.
@@ -562,34 +1191,56 @@ pub(crate) unsafe fn barrier(
 }
 
 fn creation<T>(result: Result<T, vk::Result>, what: &str) -> Result<T, OpenError> {
-    result.map_err(|error| OpenError::Creation(format!("{what} failed: {error}")))
+    result.map_err(|error| {
+        let reason = format!("{what} failed: {error}");
+        match error {
+            vk::Result::ERROR_OUT_OF_DEVICE_MEMORY | vk::Result::ERROR_OUT_OF_HOST_MEMORY | vk::Result::ERROR_TOO_MANY_OBJECTS => {
+                OpenError::Busy(reason)
+            }
+            _ => OpenError::Creation(reason),
+        }
+    })
 }
 
 impl Inner {
     fn create(
-        instance: &'static Instance,
+        instance: Arc<Instance>,
         physical: vk::PhysicalDevice,
         facts: Facts,
+        properties: Properties,
     ) -> Result<Self, OpenError> {
+        let target = facts.formation(&properties);
+        let usage_before = memory_budget(
+            &instance,
+            physical,
+            &facts.allocation.device_heaps,
+        )
+        .heap_usage_bytes;
         let raw = instance.raw();
         let mut extensions: Vec<&CStr> = facts::FLOOR_EXTENSIONS.to_vec();
-        if facts.matrix {
+        // Enabled wherever the device supports it, whether or not formation
+        // takes the path, so the measurement job's probes reach it.
+        let matrix = properties.matrix.holds();
+        if matrix {
             extensions.push(ash::khr::cooperative_matrix::NAME);
         }
-        if facts.f32_atomic_add {
+        if target.f32_atomic_add {
             extensions.push(ash::ext::shader_atomic_float::NAME);
         }
-        if facts.shader_fma.float32 {
+        if properties.fma_32.holds() {
             extensions.push(facts::SHADER_FMA_EXTENSION);
+        }
+        if facts.pipeline_statistics {
+            extensions.push(ash::khr::pipeline_executable_properties::NAME);
         }
         let extension_names = extensions
             .iter()
             .map(|name| name.as_ptr())
             .collect::<Vec<_>>();
         let mut shader_fma = facts::ShaderFmaFeatures::default();
-        shader_fma.float16 = facts.shader_fma.float16.into();
-        shader_fma.float32 = facts.shader_fma.float32.into();
-        shader_fma.float64 = facts.shader_fma.float64.into();
+        shader_fma.float16 = facts.shader_fma().float16.into();
+        shader_fma.float32 = properties.fma_32.holds().into();
+        shader_fma.float64 = facts.shader_fma().float64.into();
 
         let mut explicit = vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR::default()
             .workgroup_memory_explicit_layout(true)
@@ -605,14 +1256,15 @@ impl Inner {
         let mut f12 = vk::PhysicalDeviceVulkan12Features::default()
             .buffer_device_address(true)
             .shader_int8(true)
-            .shader_float16(facts.float16)
+            .shader_float16(target.float16)
             .storage_buffer8_bit_access(true)
             .scalar_block_layout(true)
             .timeline_semaphore(true)
             .vulkan_memory_model(true)
             .vulkan_memory_model_device_scope(true)
             .shader_subgroup_extended_types(true)
-            .shader_shared_int64_atomics(facts.shared_int64_atomics);
+            .shader_buffer_int64_atomics(true)
+            .shader_shared_int64_atomics(target.shared_int64_atomics);
         let mut f13 = vk::PhysicalDeviceVulkan13Features::default()
             .synchronization2(true)
             .maintenance4(true)
@@ -630,19 +1282,30 @@ impl Inner {
             .push_next(&mut f12)
             .push_next(&mut f13)
             .push_next(&mut explicit);
-        if facts.matrix {
+        if matrix {
             features = features.push_next(&mut cooperative);
         }
-        if facts.f32_atomic_add {
+        if target.f32_atomic_add {
             features = features.push_next(&mut atomic_float);
         }
-        if facts.shader_fma.float32 {
+        if properties.fma_32.holds() {
             features = features.push_next(&mut shader_fma);
         }
-        let priorities = [1.0f32];
-        let queues = [vk::DeviceQueueCreateInfo::default()
+        let mut executables =
+            vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default().pipeline_executable_info(true);
+        if facts.pipeline_statistics {
+            features = features.push_next(&mut executables);
+        }
+        let priorities = [1.0f32; 2];
+        // The second queue, of the first's family or of a family of its own.
+        let side_family = facts.side_family;
+        let shares_family = side_family == Some(facts.queue_family);
+        let mut queues = vec![vk::DeviceQueueCreateInfo::default()
             .queue_family_index(facts.queue_family)
-            .queue_priorities(&priorities)];
+            .queue_priorities(&priorities[..if shares_family { 2 } else { 1 }])];
+        if let Some(family) = side_family.filter(|_| !shares_family) {
+            queues.push(vk::DeviceQueueCreateInfo::default().queue_family_index(family).queue_priorities(&priorities[..1]));
+        }
         let info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queues)
             .enabled_extension_names(&extension_names)
@@ -654,10 +1317,21 @@ impl Inner {
         // From here every created object is destroyed by `Drop` (null
         // handles are ignored), so partial construction cleans up.
         let queue = unsafe { device.get_device_queue(facts.queue_family, 0) };
-        let memory_properties = unsafe { raw.get_physical_device_memory_properties(physical) };
-        let memory = match Memory::new(&memory_properties, &facts) {
+        let side = side_family.map(|family| {
+            Mutex::new(Side {
+                raw: unsafe { device.get_device_queue(family, u32::from(shares_family)) },
+                pool: vk::CommandPool::null(),
+                command: vk::CommandBuffer::null(),
+                fence: vk::Fence::null(),
+            })
+        });
+        let executables = facts
+            .pipeline_statistics
+            .then(|| ash::khr::pipeline_executable_properties::Device::new(raw, &device));
+        let memory = match Memory::new(&facts, instance.clone(), physical, usage_before) {
             Ok(memory) => memory,
             Err(reason) => {
+                let _destroying = PIPELINES.write().unwrap_or_else(PoisonError::into_inner);
                 unsafe { device.destroy_device(None) };
                 return Err(OpenError::Creation(reason.into()));
             }
@@ -665,24 +1339,29 @@ impl Inner {
         let mut inner = Self {
             device,
             facts,
+            properties,
             memory,
             layout: vk::PipelineLayout::null(),
-            cache: vk::PipelineCache::null(),
             timeline: vk::Semaphore::null(),
             queue: Mutex::new(Queue {
                 raw: queue,
                 next: 1,
+                held: std::collections::VecDeque::new(),
+                waiting: None,
+                refused: None,
             }),
+            handover: Condvar::new(),
+            side,
+            executables,
             recording: Mutex::new(Recording {
                 pool: vk::CommandPool::null(),
                 free_commands: Vec::new(),
                 free_queries: Vec::new(),
-                free_chunks: Vec::new(),
                 retired: Vec::new(),
             }),
-            staging: Mutex::new(None),
-            physical,
+            graphs: std::sync::atomic::AtomicU64::new(0),
             instance,
+            destroyed: Ends(Arc::default()),
         };
         let device = &inner.device;
         let ranges = [vk::PushConstantRange::default()
@@ -697,10 +1376,6 @@ impl Inner {
                 )
             },
             "vkCreatePipelineLayout",
-        )?;
-        inner.cache = creation(
-            unsafe { device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None) },
-            "vkCreatePipelineCache",
         )?;
         let mut timeline = vk::SemaphoreTypeCreateInfo::default()
             .semaphore_type(vk::SemaphoreType::TIMELINE)
@@ -728,7 +1403,49 @@ impl Inner {
         Ok(inner)
     }
 
-    fn create_staging(&self) -> Result<Staging, ExecutionError> {
+    fn retire_up_to(&self, recording: &mut Recording, completed: u64) {
+        let mut index = 0;
+        while index < recording.retired.len() {
+            if recording.retired[index].0.value <= completed {
+                let (retired, owner) = recording.retired.swap_remove(index);
+                match retired.command {
+                    RetiredCommand::Primary(command) => recording.free_commands.push(command),
+                    RetiredCommand::Secondary(command) => unsafe {
+                        self.device
+                            .free_command_buffers(recording.pool, &[command])
+                    },
+                }
+                recording.free_queries.extend(retired.queries);
+                match owner.upgrade() {
+                    Some(opened) => opened
+                        .free_chunks
+                        .lock()
+                        .expect("free chunks lock is never poisoned")
+                        .extend(retired.arguments),
+                    None => {
+                        for chunk in retired.arguments {
+                            self.memory.release(&self.device, &chunk);
+                        }
+                    }
+                }
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    fn retire_completed_best_effort(&self) {
+        let Ok(completed) = (unsafe { self.device.get_semaphore_counter_value(self.timeline) }) else {
+            return;
+        };
+        let mut recording = self
+            .recording
+            .lock()
+            .expect("recording lock is never poisoned");
+        self.retire_up_to(&mut recording, completed);
+    }
+
+    fn create_staging(&self, pools: &DevicePools, stores: &MemoryStores) -> Result<Staging, ExecutionError> {
         let device = &self.device;
         let pool = call(
             unsafe {
@@ -752,7 +1469,7 @@ impl Inner {
         };
         let range = match self
             .memory
-            .allocate(device, StorageKind::Staging, STAGING_BYTES, 256)
+            .allocate(device, pools.staging(), STAGING_BYTES, 256, stores)
         {
             Ok(range) => range,
             Err(error) => {
@@ -766,6 +1483,105 @@ impl Inner {
             range,
         })
     }
+}
+
+impl Device {
+    /// Whether the second queue is open (`Facts::side_family`): what zeroes
+    /// pool blocks and runs transfers beside the first's work.
+    pub(crate) fn has_side_queue(&self) -> bool {
+        self.inner.side.is_some()
+    }
+
+    /// Submit `submits` to the second queue, with no fence: their own
+    /// semaphores signal their completion.
+    pub(crate) fn submit_side(&self, submits: &[vk::SubmitInfo2<'_>]) -> Result<(), ExecutionError> {
+        let side = self
+            .inner
+            .side
+            .as_ref()
+            .expect("a transfer queue exists only beside a second queue")
+            .lock()
+            .expect("side queue lock is never poisoned");
+        call(unsafe { self.inner.device.queue_submit2(side.raw, submits, vk::Fence::null()) }, "vkQueueSubmit2")
+    }
+}
+
+impl Inner {
+    /// Write zero over each `(range, offset, bytes)` (whole words, with
+    /// `offset` within the range's block) on the second queue, waited on:
+    /// beside work the first queue runs or holds parked, which never waits
+    /// for it. The fence's signal makes the zeros available, and the
+    /// leading barrier of every later submission
+    /// (`direct::compute_barrier`) makes them visible to its work.
+    ///
+    /// # Panics
+    /// On a device without a second queue, which zeroes on its first
+    /// (`Device::allocate_block`).
+    pub(crate) fn zero(&self, regions: &[(&Range, u64, u64)]) -> Result<(), ExecutionError> {
+        let device = &self.device;
+        let mut side = self
+            .side
+            .as_ref()
+            .expect("only a device with a second queue zeroes on it")
+            .lock()
+            .expect("side queue lock is never poisoned");
+        // Formed whole or not at all: the pool, then its command buffer and
+        // the fence, each kept only once all are formed (`Drop` destroys a
+        // formed pool and fence).
+        if side.fence == vk::Fence::null() {
+            let pool = call(
+                unsafe { device.create_command_pool(&command_pool_info(self.facts.side_family.expect("a second queue has a family")), None) },
+                "vkCreateCommandPool",
+            )?;
+            let info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            let formed = call(unsafe { device.allocate_command_buffers(&info) }, "vkAllocateCommandBuffers")
+                .and_then(|commands| {
+                    call(unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }, "vkCreateFence")
+                        .map(|fence| (commands[0], fence))
+                });
+            match formed {
+                Ok((command, fence)) => (side.pool, side.command, side.fence) = (pool, command, fence),
+                Err(error) => {
+                    unsafe { device.destroy_command_pool(pool, None) };
+                    return Err(error);
+                }
+            }
+        }
+        let command = side.command;
+        unsafe {
+            call(
+                device.reset_command_buffer(command, vk::CommandBufferResetFlags::empty()),
+                "vkResetCommandBuffer",
+            )?;
+            call(
+                device.begin_command_buffer(
+                    command,
+                    &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                ),
+                "vkBeginCommandBuffer",
+            )?;
+            for &(range, offset, bytes) in regions {
+                device.cmd_fill_buffer(command, range.raw(), range.offset() + offset, bytes, 0);
+            }
+            call(device.end_command_buffer(command), "vkEndCommandBuffer")?;
+            let commands = [vk::CommandBufferSubmitInfo::default().command_buffer(command)];
+            call(
+                device.queue_submit2(
+                    side.raw,
+                    &[vk::SubmitInfo2::default().command_buffer_infos(&commands)],
+                    side.fence,
+                ),
+                "vkQueueSubmit2",
+            )?;
+            let waited = call(device.wait_for_fences(&[side.fence], true, u64::MAX), "vkWaitForFences");
+            call(device.reset_fences(&[side.fence]), "vkResetFences")?;
+            waited
+        }
+    }
+
 }
 
 fn command_pool_info<'a>(family: u32) -> vk::CommandPoolCreateInfo<'a> {
@@ -783,26 +1599,82 @@ impl Drop for Inner {
                 .recording
                 .get_mut()
                 .expect("recording lock is never poisoned");
-            for retired in recording.retired.drain(..) {
+            for (retired, _) in recording.retired.drain(..) {
                 recording.free_queries.extend(retired.queries);
+                for chunk in retired.arguments {
+                    self.memory.release(device, &chunk);
+                }
             }
             for (pool, _) in recording.free_queries.drain(..) {
                 device.destroy_query_pool(pool, None);
             }
             device.destroy_command_pool(recording.pool, None);
-            if let Some(staging) = self
-                .staging
-                .get_mut()
-                .expect("staging lock is never poisoned")
-                .take()
-            {
-                device.destroy_command_pool(staging.pool, None);
+            if let Some(side) = self.side.as_mut() {
+                let side = side.get_mut().expect("side queue lock is never poisoned");
+                device.destroy_fence(side.fence, None);
+                device.destroy_command_pool(side.pool, None);
             }
             self.memory.destroy(device);
             device.destroy_semaphore(self.timeline, None);
-            device.destroy_pipeline_cache(self.cache, None);
             device.destroy_pipeline_layout(self.layout, None);
+            let _destroying = PIPELINES.write().unwrap_or_else(PoisonError::into_inner);
             device.destroy_device(None);
+        }
+    }
+}
+
+#[cfg(test)]
+mod reconcile_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const BLOCK: u64 = 256 << 20;
+
+    /// The opened devices meeting the floor.
+    fn devices() -> Vec<Device> {
+        let Ok(devices) = crate::discover() else {
+            return Vec::new();
+        };
+        devices
+            .into_iter()
+            .filter(|description| description.floor.is_ok())
+            .map(|description| Device::open(description.facts.uuid, crate::unbounded_stores(&description.facts), &Default::default()).expect("a device meeting the floor opens"))
+            .collect()
+    }
+
+    /// A reconciliation under block churn is exact both ways: pooled
+    /// blocks and blocks of their own of 256 MiB created and freed on one
+    /// thread while another reconciles in a loop leave the charge at what
+    /// the driver holds once churn ends, holding no block (it moved by far
+    /// less than one).
+    #[test]
+    fn a_reconciliation_under_churn_is_exact() {
+        for device in devices() {
+            let memory = &device.inner.memory;
+            let driver = device.own();
+            device.reconcile_driver_memory();
+            let before = device.driver_charged();
+            let stop = Arc::new(AtomicBool::new(false));
+            let reconciler = {
+                let (device, stop) = (device.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        device.reconcile_driver_memory();
+                    }
+                })
+            };
+            let kind = device.opened.pools.device().kinds()[0];
+            for _ in 0..20 {
+                drop(device.allocate(BLOCK, 256, &driver).expect("a pooled block allocates"));
+                drop(device.allocate_block(kind, BLOCK, &driver).expect("a block of its own allocates"));
+            }
+            stop.store(true, Ordering::Relaxed);
+            reconciler.join().unwrap();
+            device.reconcile_driver_memory();
+            let unheld = memory.unheld().1.driver;
+            let charged = device.driver_charged();
+            assert_eq!(charged, unheld, "the charge is what the driver holds");
+            assert!(charged.abs_diff(before) < BLOCK / 2, "a block charged as the driver's: moved {}", charged.abs_diff(before));
         }
     }
 }

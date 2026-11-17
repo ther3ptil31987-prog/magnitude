@@ -1,210 +1,104 @@
-// attention_project: RMS prologue over the F32 hidden rows, then one
-// segmented projection query | gate | key | value, each segment with its own
-// representation and result (a segment of zero rows has no blocks). GEMV for
-// M <= 16 (`gemv` to 8 rows, `gemv16` beyond; at M = 1 the block forms the A
-// row in shared memory, else `stage` forms the A rows first), GEMM otherwise:
-// `gemm_small` to 64 rows (A rows, or the INT8 candidate's q8_1 rows staged by
-// `stage_s8`), `gemm` beyond (A rows).
+// attention_project: the query, gate, key and value projections of the
+// normalized input rows, the forms of the `dense` projection
+// (`lib/projection/operator.cuh`), segmented. A call in mode 1 zeroes the
+// query and gate segments.
 #define KERNEL_W0 SEISMIC_QUERY_WEIGHT
 #define KERNEL_W1 SEISMIC_GATE_WEIGHT
 #define KERNEL_W2 SEISMIC_KEY_WEIGHT
 #define KERNEL_W3 SEISMIC_VALUE_WEIGHT
-#include "lib/projection/projection.cuh"
+#include "lib/projection/operator.cuh"
 
 SEISMIC_PROGRAMMATIC_DEPENDENCY
 
-using Pro = projection::Rms<ELEMENT_OF(SEISMIC_INPUT_NORM), projection::AllRows>;
-using Source = projection::GemvSource<Pro>;
-using Out = projection::Store<ELEMENT_OF(SEISMIC_ELEMENT_A)>;
-
-#define PROLOGUE                                                                                          \
-    Pro {                                                                                                 \
-        reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN)), SEISMIC_HIDDEN_STRIDE_0,      \
-            SEISMIC_PTR(SEISMIC_BUFFER_INPUT_NORM), __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON),      \
-            SEISMIC_DIM_D, projection::AllRows{}                                                                  \
-    }
-#define STAGING SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED)
-#define GROUPS SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GROUPS)
+using Raw = projection::Input<ELEMENT_OF(SEISMIC_INPUT_NORM), projection::AllRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>;
+using Pro = projection::Operands<
+    projection::OperandRecipe<packets::W0_OPERANDS_NVFP4, packets::W1_OPERANDS_NVFP4, packets::W2_OPERANDS_NVFP4,
+                              packets::W3_OPERANDS_NVFP4>::NVFP4,
+    Raw>;
+// A segment's result, after its weight's second-level scale where any
+// segment has a scale port (an absent port's factor is 1), published in Y.
+using Store = projection::Store<ELEMENT_OF(SEISMIC_ELEMENT_Y)>;
+using Scaling = projection::scaling<(SEISMIC_DIM_QS != 0 || SEISMIC_DIM_GS != 0 || SEISMIC_DIM_KS != 0 ||
+                                     SEISMIC_DIM_VS != 0)>;
+using Out = Scaling::type<Store>;
 
 // The four segments: rows, weights and results in segment order.
-struct Segments {
-    unsigned long long rows[4];
-    packets::W0 query;
-    packets::W1 gate;
-    packets::W2 key;
-    packets::W3 value;
-    Out out[4];
-};
+#define SEGMENT_ROWS SEISMIC_DIM_Q, SEISMIC_DIM_GR, SEISMIC_DIM_K, SEISMIC_DIM_V
+using Segments = projection::op::SegmentSet<1, projection::op::Types<packets::W0, packets::W1, packets::W2, packets::W3>,
+                                            projection::op::Types<Out, Out, Out, Out>,
+                                            projection::op::empty_mask(SEGMENT_ROWS)>;
 
-#define SEGMENTS                                                                                          \
-    Segments {                                                                                            \
-        {SEISMIC_DIM_Q, SEISMIC_DIM_GR, SEISMIC_DIM_K, SEISMIC_DIM_V},                                     \
-            KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_QUERY_WEIGHT)),                                        \
-            KERNEL_W1_AT(SEISMIC_PTR(SEISMIC_BUFFER_GATE_WEIGHT)),                                         \
-            KERNEL_W2_AT(SEISMIC_PTR(SEISMIC_BUFFER_KEY_WEIGHT)),                                          \
-            KERNEL_W3_AT(SEISMIC_PTR(SEISMIC_BUFFER_VALUE_WEIGHT)),                                        \
-        {                                                                                                 \
-            Out{SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), SEISMIC_RESULT_0_STRIDE_0, 0},                       \
-                Out{SEISMIC_PTR(SEISMIC_RESULT_1_BUFFER), SEISMIC_RESULT_1_STRIDE_0, 0},                   \
-                Out{SEISMIC_PTR(SEISMIC_RESULT_2_BUFFER), SEISMIC_RESULT_2_STRIDE_0, 0},                   \
-                Out{SEISMIC_PTR(SEISMIC_RESULT_3_BUFFER), SEISMIC_RESULT_3_STRIDE_0, 0},                   \
+#define SEGMENT_OUT(RESULT, STRIDE, SCALE, EXTENT)                                                        \
+    Scaling::wrap(Store{RESULT, STRIDE, 0}, projection::scale_factor(SEISMIC_PTR(SCALE), EXTENT, 0, 0), \
+                  1.0f)
+
+#define PROJECTION_M SEISMIC_DIM_M
+#define PROJECTION_K SEISMIC_DIM_D
+#define PROJECTION_ZERO SEISMIC_PARAM_PROJECT_MODE
+// An empty segment's binding is irrelevant to the INT8 path.
+#define PROJECTION_INT8                                                                                      \
+    SEISMIC_DIM_Q == 0 || PACKETS_FORM_INT8(KERNEL_W0), SEISMIC_DIM_GR == 0 || PACKETS_FORM_INT8(KERNEL_W1), \
+        SEISMIC_DIM_K == 0 || PACKETS_FORM_INT8(KERNEL_W2), SEISMIC_DIM_V == 0 || PACKETS_FORM_INT8(KERNEL_W3)
+#define PROJECTION_WEIGHT_TYPES Segments::Weights
+#define PROJECTION_ROWS(g)                                                                                \
+    Pro {                                                                                                 \
+        Raw {                                                                                             \
+            reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN)), SEISMIC_HIDDEN_STRIDE_0,  \
+                SEISMIC_PTR(SEISMIC_BUFFER_INPUT_NORM), __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON),  \
+                SEISMIC_DIM_D, projection::AllRows{}                                                      \
         }                                                                                                 \
     }
-
-__device__ __forceinline__ void project_zero(const Out &out, unsigned M, unsigned long long columns,
-                                              unsigned row_start, unsigned row_count,
-                                              unsigned long long column_start, unsigned column_count,
-                                              unsigned tid, unsigned threads) {
-    for (unsigned item = tid; item < row_count * column_count; item += threads) {
-        const unsigned row = row_start + item / column_count;
-        const unsigned long long column = column_start + item % column_count;
-        if (row < M && column < columns)
-            out(row, column, 0.0f, 0.0f);
+#define PROJECTION_STAGING SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED)
+#define PROJECTION_GROUPS SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_GROUPS)
+#define PROJECTION_SEGMENTS                                                                               \
+    Segments {                                                                                            \
+        {SEGMENT_ROWS},                                                                                    \
+            {KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_QUERY_WEIGHT)),                                       \
+             KERNEL_W1_AT(SEISMIC_PTR(SEISMIC_BUFFER_GATE_WEIGHT)),                                        \
+             KERNEL_W2_AT(SEISMIC_PTR(SEISMIC_BUFFER_KEY_WEIGHT)),                                         \
+             KERNEL_W3_AT(SEISMIC_PTR(SEISMIC_BUFFER_VALUE_WEIGHT))},                                      \
+        {SEGMENT_OUT(SEISMIC_RESULT_0_OUT, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_BUFFER_QUERY_SCALE,     \
+                        SEISMIC_DIM_QS),                                                                  \
+                SEGMENT_OUT(SEISMIC_RESULT_1_OUT, SEISMIC_RESULT_1_STRIDE_0, SEISMIC_BUFFER_GATE_SCALE, \
+                            SEISMIC_DIM_GS),                                                              \
+                SEGMENT_OUT(SEISMIC_RESULT_2_OUT, SEISMIC_RESULT_2_STRIDE_0, SEISMIC_BUFFER_KEY_SCALE,  \
+                            SEISMIC_DIM_KS),                                                              \
+                SEGMENT_OUT(SEISMIC_RESULT_3_OUT, SEISMIC_RESULT_3_STRIDE_0, SEISMIC_BUFFER_VALUE_SCALE, \
+                            SEISMIC_DIM_VS)}                                                              \
     }
-}
-
-// The segmented GEMV over NB column blocks of 8 rows: query | gate | key |
-// value.
-template <int NB, int KSPLIT>
-__device__ __forceinline__ void project_gemv(const Pro &pro, projection::u8 *row, const projection::u8 *staged,
-                                             unsigned M, unsigned long long D, const Segments &s,
-                                             unsigned project_mode) {
-    using Shape = projection::GemvShape<8, 1, KSPLIT, NB>;
-    __shared__ projection::GemvShared<Shape, Source::type> shared;
-    const unsigned long long kblocks = D / 64;
-    unsigned long long group = Shape::tile_group();
-    const unsigned long long groups[4] = {
-        projection::gemv_groups<Shape>(s.rows[0]), projection::gemv_groups<Shape>(s.rows[1]),
-        projection::gemv_groups<Shape>(s.rows[2]), projection::gemv_groups<Shape>(s.rows[3])};
-    const int segment = projection::locate_segment(group, groups);
-    if (project_mode != 0 && segment < 2) {
-        seismic_dependency_start();
-        project_zero(s.out[segment], M, s.rows[segment], 0, M, group * Shape::TPW * 16,
-                     Shape::TPW * 16, threadIdx.x % (32 * Shape::KSPLIT), 32 * Shape::KSPLIT);
-        return;
-    }
-    // Every other warp runs `x` (block-collective at M = 1), including a
-    // group past the last segment, which has no rows.
-    const auto x = projection::source_after_dependency(pro, row, M, D, staged);
-    switch (segment) {
-    case 0:
-        projection::gemv_segment_ready<Shape>(shared, x, M, kblocks, group, s.rows[0], s.query,
-                                              projection::NoWeight{}, s.out[0]);
-        break;
-    case 1:
-        projection::gemv_segment_ready<Shape>(shared, x, M, kblocks, group, s.rows[1], s.gate,
-                                              projection::NoWeight{}, s.out[1]);
-        break;
-    case 2:
-        projection::gemv_segment_ready<Shape>(shared, x, M, kblocks, group, s.rows[2], s.key,
-                                              projection::NoWeight{}, s.out[2]);
-        break;
-    case 3:
-        projection::gemv_segment_ready<Shape>(shared, x, M, kblocks, group, s.rows[3], s.value,
-                                              projection::NoWeight{}, s.out[3]);
-        break;
-    default:
-        projection::gemv_segment_ready<Shape>(shared, x, M, kblocks, 0, 0, s.value, projection::NoWeight{}, s.out[3]);
-        break;
-    }
-}
-
-// The segmented GEMM of one row band over the staged rows (A rows, or q8_1
-// rows with Q): block column `gemm_column` of query | gate | key | value.
-template <class Shape, bool Q>
-__device__ __forceinline__ void project_gemm(const projection::u8 *staged, const void *groups, unsigned M,
-                                             unsigned long long D, const Segments &s,
-                                             unsigned project_mode) {
-    extern __shared__ uint4 dynamic_shared[];
-    seismic_dependency_start();
-    projection::u8 *shared = reinterpret_cast<projection::u8 *>(dynamic_shared);
-    unsigned long long column = projection::gemm_column<Shape>();
-    const unsigned long long columns[4] = {
-        projection::gemm_columns(s.rows[0]), projection::gemm_columns(s.rows[1]),
-        projection::gemm_columns(s.rows[2]), projection::gemm_columns(s.rows[3])};
-    const int segment = projection::locate_segment(column, columns);
-    if (project_mode != 0 && segment < 2) {
-        project_zero(s.out[segment], M, s.rows[segment],
-                     projection::gemm_band<Shape>() * Shape::BM, Shape::BM,
-                     column * 128, 128, threadIdx.x, Shape::THREADS);
-        return;
-    }
-    switch (segment) {
-    case 0:
-        projection::gemm_run<Shape, Q>(shared, staged, D, groups, M, D, column, s.rows[0], s.query,
-                                       projection::NoWeight{}, s.out[0]);
-        break;
-    case 1:
-        projection::gemm_run<Shape, Q>(shared, staged, D, groups, M, D, column, s.rows[1], s.gate,
-                                       projection::NoWeight{}, s.out[1]);
-        break;
-    case 2:
-        projection::gemm_run<Shape, Q>(shared, staged, D, groups, M, D, column, s.rows[2], s.key,
-                                       projection::NoWeight{}, s.out[2]);
-        break;
-    case 3:
-        projection::gemm_run<Shape, Q>(shared, staged, D, groups, M, D, column, s.rows[3], s.value,
-                                       projection::NoWeight{}, s.out[3]);
-        break;
-    }
-}
-
-// The INT8 path needs every non-empty segment packed (an empty segment's
-// binding is irrelevant).
-#define QUANTIZABLE                                                                                       \
-    ((SEISMIC_DIM_Q == 0 || projection::quantizable<packets::W0>) &&                                      \
-     (SEISMIC_DIM_GR == 0 || projection::quantizable<packets::W1>) &&                                     \
-     (SEISMIC_DIM_K == 0 || projection::quantizable<packets::W2>) &&                                      \
-     (SEISMIC_DIM_V == 0 || projection::quantizable<packets::W3>))
 
 #ifdef SEISMIC_FORMING_ATTENTION_PROJECT_STAGE
-template <unsigned INT8>
+template <unsigned INT8, unsigned OPERAND>
 __global__ void attention_project_stage(SEISMIC_KERNEL_PARAMS) {
-    seismic_dependency_start();
-    projection::stage_row<false>(PROLOGUE, blockIdx.x, SEISMIC_DIM_D, STAGING, GROUPS);
-}
-#endif
-
-#ifdef SEISMIC_FORMING_ATTENTION_PROJECT_STAGE_S8
-template <unsigned INT8>
-__global__ void attention_project_stage_s8(SEISMIC_KERNEL_PARAMS) {
-    seismic_dependency_start();
-    constexpr bool S8 = INT8 == 1 && QUANTIZABLE;
-    projection::stage_row<S8>(PROLOGUE, blockIdx.x, SEISMIC_DIM_D, STAGING, GROUPS);
+    PROJECTION_STAGE;
 }
 #endif
 
 #ifdef SEISMIC_FORMING_ATTENTION_PROJECT_GEMV
-template <unsigned KSPLIT>
+template <unsigned STAGING, unsigned KSPLIT>
 __global__ void attention_project_gemv(SEISMIC_KERNEL_PARAMS) {
     extern __shared__ uint4 dynamic_shared[];
-    project_gemv<1, KSPLIT>(PROLOGUE, reinterpret_cast<projection::u8 *>(dynamic_shared), STAGING,
-                            (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_D, SEGMENTS,
-                            (unsigned)SEISMIC_PARAM_PROJECT_MODE);
+    PROJECTION_SEGMENTED_GEMV(1, KSPLIT, STAGING, reinterpret_cast<projection::u8 *>(dynamic_shared));
 }
 #endif
 
 #ifdef SEISMIC_FORMING_ATTENTION_PROJECT_GEMV16
-template <unsigned KSPLIT>
+template <unsigned STAGING, unsigned KSPLIT>
 __global__ void attention_project_gemv16(SEISMIC_KERNEL_PARAMS) {
-    project_gemv<2, KSPLIT>(PROLOGUE, nullptr, STAGING, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_D,
-                            SEGMENTS, (unsigned)SEISMIC_PARAM_PROJECT_MODE);
+    PROJECTION_SEGMENTED_GEMV(2, KSPLIT, STAGING, nullptr);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_ATTENTION_PROJECT_GEMM_SMALL
-template <unsigned INT8>
+template <unsigned INT8, unsigned OPERAND>
 __global__ void attention_project_gemm_small(SEISMIC_KERNEL_PARAMS) {
-    constexpr bool S8 = INT8 == 1 && QUANTIZABLE;
-    project_gemm<projection::SmallGemm, S8>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_D,
-                                             SEGMENTS, (unsigned)SEISMIC_PARAM_PROJECT_MODE);
+    PROJECTION_SEGMENTED_GEMM(projection::SmallGemm, PROJECTION_OPERANDS);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_ATTENTION_PROJECT_GEMM
-template <unsigned ROTATE>
+template <unsigned INT8, unsigned OPERAND, unsigned ROTATE>
 __global__ void attention_project_gemm(SEISMIC_KERNEL_PARAMS) {
-    project_gemm<projection::LargeGemm<ROTATE>, false>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_D,
-                                                       SEGMENTS, (unsigned)SEISMIC_PARAM_PROJECT_MODE);
+    PROJECTION_SEGMENTED_GEMM(projection::LargeGemm<ROTATE>, PROJECTION_OPERANDS);
 }
 #endif

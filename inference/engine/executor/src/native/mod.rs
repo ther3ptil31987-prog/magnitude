@@ -5,47 +5,62 @@ mod head;
 mod import;
 mod preparation;
 mod qualification;
+mod readout;
+mod shared_head;
 mod specialization;
 mod target;
 mod tuning;
 mod vision;
 
-pub(crate) use attestation::AttestedImport;
+pub(crate) use attestation::{AttestedImport, AttestedLanding};
 pub use attestation::AttestedPrograms;
 pub(crate) use attestation::{
     AttestedDraft, AttestedFeedForward, AttestedHead, AttestedHeadBlock, AttestedMixer,
-    AttestedState, AttestedTarget, AttestedTargetBlock, AttestedVision, OutputScales,
+    AttestedSharedHead, AttestedState, AttestedTarget, AttestedTargetBlock, AttestedVision,
+    OutputScales, output_tails, reads_layer_scale,
 };
 use draft::DraftKernels;
 pub(crate) use draft::{
-    AttestedDflash2, Dflash2Kernels, Dflash2Projections,
-    DraftBlockKernels, MarkovKernels,
+    AttestedConvolved, AttestedCorrector, AttestedSelector, ConvolvedKernels, CorrectorKernels,
+    DraftBlockKernels, MarkovKernels, SelectorKernels,
 };
 use glue::GlueKernels;
 use head::HeadKernels;
-pub use head::HeadLogitsKernels;
 pub(crate) use import::ImportKernels;
-pub(crate) use preparation::kernel_requests;
 use preparation::NativePreparationCache;
+pub(crate) use specialization::entry_statics;
+pub(crate) use preparation::kernel_requests;
+pub(crate) use qualification::admit_site;
 use qualification::QualificationView;
+pub use readout::ProjectionKernels;
+use shared_head::SharedHeadKernels;
 use target::TargetKernels;
 pub(crate) use target::{
-    AttentionHistoryKernels, AttentionKernels, DenseExpansionKernel, DenseKernels, ExpertKernels,
-    GeneralRoutedKernels, ParallelKernels, PerLayerEntryKernels, PerLayerKernels, PostNormKernels,
-    ProgressiveReadoutKernels, ReadoutHeadKernels, ReadoutKernels, RecurrentKernels,
-    RecurrentStepKernels, RoutedDecodeKernels, RoutedKernels, ShortConvKernels, StateSpaceKernels,
-    SublayerOutput, TableConversion, TapKernels,
+    AttentionHistoryKernels, AttentionKernels, BankCombine, DenseDecodeKernels, BankRouteForm, BankRouteKernels, DevicePlacement,
+    BankSite, SiteAdmission, SiteForm,
+    DenseExpansionKernel, DenseKernels, ExpertBankKernels, ExpertKernels,
+    GeneralRoutedKernels, NGramKernels, NGramOutputKernel, ParallelKernels, PerLayerEntryKernels, PerLayerKernels,
+    PostNormKernels, ProgressiveReadoutKernels, ReadoutHeadKernels, ReadoutKernels,
+    KimiKernels, RecurrentFormKernels, RecurrentKernels, RecurrentStepKernels, RoutedDecodeKernels,
+    RoutedKernels,
+    CandidateKernels, IndexerKernels, LowRankQueryKernels, PickedKernels, PoolKernel, PooledKernels, RangedKernels,
+    SelectedPrefillKernel, SelectionKernels, SelectionKeyKernels,
+    MixingKernels, ShortConvKernels, SinkhornKernels, StateSpaceKernels, StreamsEntryKernels,
+    StreamsKernels,
+    SublayerOutput, TableConversion,
+    TapKernels,
 };
-#[cfg(feature = "pinned-tuning")]
 pub use tuning::pinned as pinned_tuning;
 #[cfg(feature = "tuning-survey")]
 pub use tuning::survey as tuning_survey;
+pub(crate) use tuning::workload as tuning_workload;
 pub use tuning::{
-    attention_points, row_points, AdmittedErrorClasses, PointShape, SearchProgress, TunedEntry,
-    TuningContext,
-    TuningEvent, TuningLimits, NO_ERROR_CLASSES,
-    TuningObserver, TuningOrigin, TuningWeightSource, UnreportedTuning, ZeroTuningWeights,
-    ROTATION_LAYERS, TUNING_CONTEXTS, TUNING_ROWS,
+    MIN_SAMPLE_SECONDS, NumericalProfile, PinnedChoice, PointShape, ROTATION_LAYERS, Receipt,
+    ResolvedNumericalProfile, SEARCH_SETTINGS, SEARCH_VERSION, STANDARD_TUNING_BUDGET,
+    SearchProgress, TRACE_SCHEMA, TUNING_CONTEXTS, TUNING_ROWS, TracedWork, TunedEntry,
+    TuningContext, TuningEvent, TuningLimits, TuningObserver, TuningOrigin, TuningRoom, RoomNow,
+    TuningSettings, TuningTrace, TuningWeightSource, UnpreparedUnits, UnreportedTuning,
+    ZeroTuningWeights, attention_points, row_points,
 };
 pub(crate) use vision::VisionKernels;
 
@@ -54,20 +69,21 @@ use crate::{
     ProgramPlan, RecurrentBinding, RoutedBinding, SublayerTail, VisionEntry,
 };
 use magnitude_kernels::{
-    attention_append_k8v4, attention_decode, attention_decode_k8v4, attention_output, attention_prefill,
-    attention_prefill_k8v4, attention_project, conditioning_overlay, copy_rows, dense_expand,
-    dense_output, dense_up, draft_rows, embedding_rows, gated_delta_chunk, gated_delta_project,
-    gated_delta_project_convolved, gated_delta_step, gated_delta_step_convolved, head_logits_rows,
-    import_dense, moe_tail,
-    per_layer_gate, per_layer_inputs, post_norm_residual, project_rows, readout_exact_rows,
-    readout_features_rows, readout_head_rows, readout_planes_rows, readout_refine_rows,
-    readout_selected_rows, readout_top_rows, repack_weight, routed_combine, routed_down,
-    routed_expand, routed_experts, routed_experts_up, routed_gate_up, routed_group, routed_output,
-    routed_route, routed_route_shared, routed_scatter, routed_select, routed_up, sample_rows,
-    shape_rows,
+    attention_append_k8v4, attention_decode, attention_decode_k8v4, attention_output,
+    attention_prefill, attention_prefill_k8v4, attention_project, conditioning_overlay, copy_rows,
+    dense_expand, dense_output, dense_up, draft_rows, embedding_rows, feature_copy,
+    gated_delta_chunk, gated_delta_project, gated_delta_project_convolved, gated_delta_step,
+    gated_delta_step_convolved, import_dense, kimi_delta_chunk, kimi_delta_step, moe_tail,
+    per_layer_gate,
+    per_layer_inputs,
+    post_norm_residual, project_rows, readout_exact_rows, readout_features_rows, readout_head_rows,
+    readout_planes_rows, readout_project_rows, readout_refine_rows, readout_selected_rows,
+    readout_top_rows, repack_weight, routed_combine, routed_down, routed_expand, routed_experts,
+    routed_experts_up, routed_gate_up, routed_group, routed_output, routed_route,
+    routed_route_shared, routed_scatter, routed_select, routed_up, sample_rows, shape_rows,
     short_conv_project, short_conv_rows, state_space_chunk, state_space_gate, state_space_step,
-    vision_attention, vision_clamp, vision_linear, vision_norm, vision_patch_stem, vision_pool,
-    vision_position,
+    vision_attention, vision_clamp, vision_gated_convolution, vision_linear, vision_norm,
+    vision_patch_stem, vision_pool, vision_position, widen_rows,
 };
 use seismic::{BackendName, DType, Device, Element, NativeKernel, Tensor};
 use std::{collections::HashMap, fmt};
@@ -114,6 +130,14 @@ pub enum CatalogFailure {
         entry: &'static str,
         statics: Vec<(String, u64)>,
     },
+    /// Not a failure of the model or the device: a load asked to report
+    /// tuning units without a stored record
+    /// ([`UnpreparedUnits::Report`](tuning::UnpreparedUnits)) met this one
+    /// and stopped before placing anything.
+    Unprepared {
+        entry: &'static str,
+        bindings: String,
+    },
 }
 
 impl fmt::Display for CatalogError {
@@ -156,6 +180,10 @@ impl fmt::Display for CatalogError {
                     "{entry} has no admissible {backend} configuration at {statics}"
                 )
             }
+            CatalogFailure::Unprepared { entry, bindings } => write!(
+                formatter,
+                "{entry} on {path} ({backend}) with {bindings} has no stored tuning record"
+            ),
         }
     }
 }
@@ -202,14 +230,16 @@ fn element_binding_name(source: Element, resident: Element) -> String {
 #[cfg(test)]
 mod qualification_tests {
     use super::*;
-    use crate::RecurrentBinding;
+    use crate::{RecurrentBinding, RecurrentForm};
 
     #[test]
     fn packed_recurrent_prepares_with_the_qwen_4b_binding() {
-        let catalog = seismic::DeviceCatalog::discover().unwrap();
-        let Ok(device) = catalog.open_backend(BackendName::Metal) else {
+        let catalog = seismic::Devices::discover(&[]).unwrap();
+        // Only a host with Metal runs it; a Metal executor it has must open.
+        if !crate::test_support::available(&catalog, BackendName::Metal) {
             return;
-        };
+        }
+        let device = crate::test_support::open_backend(&catalog, BackendName::Metal).expect("an available Metal executor opens");
         // Native Metal residents use the rows16 layout.
         let rows16 =
             |representation| Element::stored(representation, seismic::Layout::Rows16).unwrap();
@@ -221,6 +251,9 @@ mod qualification_tests {
             value_heads: 32,
             width: 128,
             convolution_width: 4,
+            decay_width: 1,
+            key_norm_epsilon: 1.0e-6_f32.to_bits(),
+            gate_function: 0,
             norm: Element::bf16(),
             qkv: q5k,
             gate: q4k,
@@ -229,102 +262,100 @@ mod qualification_tests {
             recurrent_norm: Element::bf16(),
             output: q5k,
             activation: Element::bf16(),
+            form: RecurrentForm::PerHead,
         };
         let heads = seismic::NativeSpecialization::new()
             .with_static("NK", binding.key_heads)
             .with_static("NV", binding.value_heads)
             .with_static("W", binding.width);
-        let projections = heads.clone().with_static("H", 2560);
-        let statics = heads.with_static("C", binding.convolution_width);
-        /// The declared defaults of `E` at `statics`.
-        fn defaults<E: seismic::Entry>(
+        let projections = heads
+            .clone()
+            .with_static("H", 2560)
+            .with_static("PT", 1)
+            .with_static("NM", 2560);
+        let statics = heads.clone().with_static("C", binding.convolution_width);
+        /// Prepares `entry` in its default configuration at `statics`, which
+        /// its element bindings decide (`where` reads their forms).
+        fn prepare<E: seismic::Entry>(
             device: &seismic::Device,
+            entry: seismic::BoundEntry<E>,
             statics: &seismic::NativeSpecialization,
-        ) -> seismic::NativeSpecialization {
-            seismic::generated::native_implementation::<E>(device)
+        ) {
+            let specialization = entry
+                .default_specialization(device, statics)
                 .unwrap()
-                .unwrap()
-                .default_specialization(statics)
-                .unwrap()
+                .unwrap();
+            entry.prepare(device, &specialization).unwrap();
         }
-        gated_delta_project::native_for_device_with(
+        prepare(
             &device,
-            gated_delta_project::Elements {
+            gated_delta_project::native_entry_with(gated_delta_project::Elements {
                 NW: binding.norm,
                 QW: binding.qkv,
                 GW: binding.gate,
                 AW: binding.alpha,
                 BW: binding.beta,
                 A: binding.activation,
-            },
-            &defaults::<gated_delta_project::Entry>(&device, &projections),
-        )
-        .unwrap();
-        let step = defaults::<gated_delta_step::Entry>(&device, &statics);
-        gated_delta_step::native_for_device_with(
+            }),
+            // Unbounded projections (no packing bound).
+            &projections
+                .clone()
+                .with_static("QB", 0)
+                .with_static("ZB", 0),
+        );
+        prepare(
             &device,
-            gated_delta_step::Elements {
+            gated_delta_step::native_entry_with(gated_delta_step::Elements {
                 RN: binding.recurrent_norm,
                 A: binding.activation,
-            },
-            &step,
-        )
-        .unwrap();
-        gated_delta_project_convolved::native_for_device_with(
+            }),
+            &statics,
+        );
+        prepare(
             &device,
-            gated_delta_project_convolved::Elements {
-                NW: binding.norm,
-                QW: binding.qkv,
-                GW: binding.gate,
-                AW: binding.alpha,
-                BW: binding.beta,
-                A: binding.activation,
-            },
-            &defaults::<gated_delta_project_convolved::Entry>(
-                &device,
-                &projections
-                    .clone()
-                    .with_static("C", binding.convolution_width),
+            gated_delta_project_convolved::native_entry_with(
+                gated_delta_project_convolved::Elements {
+                    NW: binding.norm,
+                    QW: binding.qkv,
+                    GW: binding.gate,
+                    AW: binding.alpha,
+                    BW: binding.beta,
+                    A: binding.activation,
+                },
             ),
-        )
-        .unwrap();
-        gated_delta_step_convolved::native_for_device_with(
+            &projections.with_static("C", binding.convolution_width),
+        );
+        prepare(
             &device,
-            gated_delta_step_convolved::Elements {
+            gated_delta_step_convolved::native_entry_with(gated_delta_step_convolved::Elements {
                 RN: binding.recurrent_norm,
                 A: binding.activation,
-            },
-            &defaults::<gated_delta_step_convolved::Entry>(
-                &device,
-                &seismic::NativeSpecialization::new()
-                    .with_static("NK", binding.key_heads)
-                    .with_static("NV", binding.value_heads)
-                    .with_static("W", binding.width),
-            ),
-        )
-        .unwrap();
-        let chunk = defaults::<gated_delta_chunk::Entry>(&device, &statics);
-        gated_delta_chunk::native_for_device_with(
+            }),
+            &heads,
+        );
+        prepare(
             &device,
-            gated_delta_chunk::Elements {
+            gated_delta_chunk::native_entry_with(gated_delta_chunk::Elements {
                 RN: binding.recurrent_norm,
                 A: binding.activation,
-            },
-            &chunk,
-        )
-        .unwrap();
+            }),
+            &statics,
+        );
         let output = seismic::NativeSpecialization::new()
             .with_static("D", 2560)
+            .with_static("SN", 1)
+            .with_static("IN", 0)
             .with_static("Q", binding.value_heads)
-            .with_static("W", binding.width);
-        attention_output::native_for_device_with(
+            .with_static("W", binding.width)
+            .with_static("OS", 0)
+            .with_static("OB", 0);
+        prepare(
             &device,
-            attention_output::Elements {
+            attention_output::native_entry_with(attention_output::Elements {
                 OW: binding.output,
                 A: binding.activation,
-            },
-            &defaults::<attention_output::Entry>(&device, &output),
-        )
-        .unwrap();
+            }),
+            &output,
+        );
     }
 }

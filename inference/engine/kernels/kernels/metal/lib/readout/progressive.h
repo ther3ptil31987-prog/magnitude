@@ -1,6 +1,6 @@
 // Progressive head readout (`readout.seismic`): the bit planes of a Q8_0 head
 // in significance order, the levels of a certified selection over them, and
-// the full exact pass. Selection rows: at most PROGRESSIVE_ROWS.
+// the full exact pass. Selection rows: at most SEISMIC_CONST_VERIFY_ROWS.
 //
 //   top[v, w]       bits 7..4 of codes 8w..8w+7, code 8w + e in nibble e
 //   bit3[v, g]      bit 3 of the codes of group g, code 32g + 8q + e in bit 4e + q
@@ -11,22 +11,42 @@
 // shift and mask away: `(plane >> q) & 0x11111111` holds the bit of code
 // 8q + e in nibble e, as `top` holds its high bits.
 //
-// The top level and the full pass are the projection library's GEMV,
-// batched GEMV and GEMM over the views' packets; the later levels gather the
+// The top level and the full pass are the `dense` projection's GEMV, batched
+// GEMV and GEMM over the views' packets, the exact view's GEMV by the exact
+// level's own recipe (`gemv_recipe`), so the full pass and a certified
+// selection project a row alike bit for bit; the later levels gather the
 // survivors' remaining planes. The views are bounded (`radius`) rather than
 // exact; their comparisons keep a relative margin of PROGRESSIVE_MARGIN, so
 // F32 rounding only ever keeps extra rows.
 #include "../projection/projection.h"
 #include "../core/arrive.h"
 #include "../core/gumbel.h"
+#include "../core/order.h"
 
-#define PROGRESSIVE_ROWS 8u
+#define PROGRESSIVE_LOW_PLANES uint(SEISMIC_DIM_P)
+#define PROGRESSIVE_HALF_BITS (PROGRESSIVE_LOW_PLANES + 1u)
+#define PROGRESSIVE_OFFSET (1u << (2u * PROGRESSIVE_HALF_BITS - 1u))
+#define PROGRESSIVE_COARSE_SCALE (1u << PROGRESSIVE_HALF_BITS)
+#define PROGRESSIVE_COARSE_BIAS (0.5f * float(PROGRESSIVE_COARSE_SCALE - 1u) - float(PROGRESSIVE_OFFSET))
+
+inline uint4 progressive_high(device const uint *row, uint group) {
+    if constexpr (PROGRESSIVE_LOW_PLANES == 3u)
+        return *reinterpret_cast<device const uint4 *>(row + 4u * group);
+    const uint2 words = *reinterpret_cast<device const uint2 *>(row + 2u * group);
+    uint4 high = uint4(0u);
+    for (uint k = 0; k < 32u; ++k)
+        high[k / 8u] |= ((words[k / 16u] >> (2u * (k % 16u))) & 3u) << (4u * (k % 8u));
+    return high;
+}
+
 #define PROGRESSIVE_MARGIN 0x1p-18f
 // The largest Gumbel noise the sampler draws: -log(-log u) at the largest
 // uniform u = 1 - 2^-24, about 16.64.
 #define PROGRESSIVE_NOISE 16.65f
-// Threadgroup words (uint4) a later level stages its features in: four rows
-// of 2,048 A values.
+// Threadgroup words (uint4) a later level stages its features in, at most:
+// four rows of 2,048 A values. Its launch declares the rows' own bytes,
+// min(O × D × 2, 16 KiB), so a level of fewer rows keeps more threadgroups
+// resident.
 #define PROGRESSIVE_STAGE_WORDS 1024u
 
 // The two views of a progressive head as projection-library packets, so the
@@ -44,19 +64,37 @@ struct ProgressiveTop {
         float scale;
         float bias;
     };
-    static void codes(thread const packet &k, uint step, thread float4 &even, thread float4 &odd) {
+    // Step `step`'s eight values, fma(scale, H, bias), and two of them.
+    static void values(thread const packet &k, uint step, thread float4 &even, thread float4 &odd) {
         uint e, o;
         split_nibbles(k.low[step], e, o);
-        even = unsigned_bytes(e);
-        odd = unsigned_bytes(o);
+        even = metal::fma(float4(k.scale), unsigned_bytes(e), float4(k.bias));
+        odd = metal::fma(float4(k.scale), unsigned_bytes(o), float4(k.bias));
     }
-    static float2 pair(thread const packet &k, uint step, uint j) {
+    static float2 pair_values(thread const packet &k, uint step, uint j) {
         uint b = (k.low[step] >> (8u * j)) & 0xffu;
-        return code_pair((b & 15u) | ((b >> 4) << 16), 1024.0h);
+        return metal::fma(float2(k.scale), code_pair((b & 15u) | ((b >> 4) << 16), 1024.0h), float2(k.bias));
     }
-    static float scale(thread const packet &k, uint) { return k.scale; }
-    static float bias(thread const packet &k, uint) { return k.bias; }
-    static float value(thread const packet &k, uint, float code) { return metal::fma(k.scale, code, k.bias); }
+    // The factored form the library's GEMV sums (`projection::gemv_factored`):
+    // step `step`'s eight values over `factor`, H + bias / scale, each exact in
+    // half (a multiple of 1/32 below 8 in magnitude). Two nibbles move to bit 5
+    // of each half of a word, under the exponent of 32 (an ulp of 1/32), and
+    // one half subtraction takes 32 - bias / scale off. The GEMV then scales
+    // a step's sum once instead of each weight: at half a byte a weight, the
+    // per-weight scale and bias bound the one-row GEMV on instruction issue
+    // below the head's bandwidth.
+    static void codes(thread const packet &k, uint step, thread float4 &even, thread float4 &odd) {
+        constexpr half lift = half(32.0f - PROGRESSIVE_COARSE_BIAS / float(PROGRESSIVE_COARSE_SCALE));
+        const uint w = k.low[step];
+        const half2 c04 = as_type<half2>(((w << 5) & 0x01e001e0u) | 0x50005000u) - lift;
+        const half2 c26 = as_type<half2>(((w >> 3) & 0x01e001e0u) | 0x50005000u) - lift;
+        const half2 c15 = as_type<half2>(((w << 1) & 0x01e001e0u) | 0x50005000u) - lift;
+        const half2 c37 = as_type<half2>(((w >> 7) & 0x01e001e0u) | 0x50005000u) - lift;
+        even = float4(c04.x, c26.x, c04.y, c26.y);
+        odd = float4(c15.x, c37.x, c15.y, c37.y);
+    }
+    static constexpr bool factored() { return true; }
+    static float factor(thread const packet &k, uint) { return k.scale; }
 };
 
 // The exact view: the offset-binary codes u of every plane, as c = u - 128,
@@ -71,26 +109,25 @@ struct ProgressiveExact {
     // Step q's code bytes u: codes 8q, 8q + 2, ... in `even`, the others in
     // `odd`.
     static void bytes(thread const packet &k, uint step, thread uint &even, thread uint &odd) {
-        const uint low = (((k.low.x >> step) & 0x11111111u) << 3) | (((k.low.y >> step) & 0x11111111u) << 2)
+        const uint low = (((k.low.x >> step) & 0x11111111u) << PROGRESSIVE_LOW_PLANES) | (((k.low.y >> step) & 0x11111111u) << (PROGRESSIVE_LOW_PLANES - 1u))
             | (((k.low.z >> step) & 0x11111111u) << 1) | ((k.low.w >> step) & 0x11111111u);
         const uint high = k.high[step];
-        even = ((high & 0x0f0f0f0fu) << 4) | (low & 0x0f0f0f0fu);
-        odd = (high & 0xf0f0f0f0u) | ((low >> 4) & 0x0f0f0f0fu);
+        even = ((high & 0x0f0f0f0fu) << PROGRESSIVE_HALF_BITS) | (low & 0x0f0f0f0fu);
+        odd = ((high & 0xf0f0f0f0u) >> (4u - PROGRESSIVE_HALF_BITS)) | ((low >> 4) & 0x0f0f0f0fu);
     }
-    static void codes(thread const packet &k, uint step, thread float4 &even, thread float4 &odd) {
+    // Step `step`'s eight values, s c, and two of them.
+    static void values(thread const packet &k, uint step, thread float4 &even, thread float4 &odd) {
         uint e, o;
         bytes(k, step, e, o);
-        even = byte_floats(e, 1152.0h);
-        odd = byte_floats(o, 1152.0h);
+        even = k.scale * byte_floats(e, half(1024u + PROGRESSIVE_OFFSET));
+        odd = k.scale * byte_floats(o, half(1024u + PROGRESSIVE_OFFSET));
     }
-    static float2 pair(thread const packet &k, uint step, uint j) {
+    static float2 pair_values(thread const packet &k, uint step, uint j) {
         uint e, o;
         bytes(k, step, e, o);
-        return code_pair(((e >> (8u * j)) & 0xffu) | (((o >> (8u * j)) & 0xffu) << 16), 1152.0h);
+        return k.scale
+            * code_pair(((e >> (8u * j)) & 0xffu) | (((o >> (8u * j)) & 0xffu) << 16), half(1024u + PROGRESSIVE_OFFSET));
     }
-    static float scale(thread const packet &k, uint) { return k.scale; }
-    static float bias(thread const packet &, uint) { return 0.0f; }
-    static float value(thread const packet &k, uint, float code) { return k.scale * code; }
 };
 
 } // namespace packets
@@ -106,8 +143,8 @@ struct Weights<packets::ProgressiveTop> {
     ulong scale_stride;
     packets::ProgressiveTop::packet packet(uint n, uint p) const {
         const float s = float(scales[ulong(n) * scale_stride + p]);
-        return {*reinterpret_cast<device const uint4 *>(top + ulong(n) * top_stride + 4u * p), 16.0f * s,
-            -120.5f * s};
+        return {progressive_high(top + ulong(n) * top_stride, p), float(PROGRESSIVE_COARSE_SCALE) * s,
+            PROGRESSIVE_COARSE_BIAS * s};
     }
     // The planes keep no coefficient run (every packet has its own scale)
     // and no row tiles.
@@ -125,6 +162,14 @@ struct Weights<packets::ProgressiveTop> {
     static located after(located at, uint r) { return at + r; }
 };
 
+// The exact view's step assembles all eight of its codes from five planes at
+// once, so its batched GEMV decodes by quarter (`gemv_batch_quarters`): a
+// pair alone costs the whole step.
+template <>
+struct gemv_batch_quarters<packets::ProgressiveExact> {
+    static constant constexpr bool value = true;
+};
+
 template <>
 struct Weights<packets::ProgressiveExact> {
     device const uint *top;
@@ -137,8 +182,8 @@ struct Weights<packets::ProgressiveExact> {
     ulong scale_stride;
     packets::ProgressiveExact::packet packet(uint n, uint p) const {
         device const uint *low = rest + ulong(n) * rest_row + ulong(p) * rest_group;
-        return {*reinterpret_cast<device const uint4 *>(top + ulong(n) * top_stride + 4u * p),
-            uint4(bit3[ulong(n) * bit3_stride + p], low[0], low[rest_plane], low[2u * rest_plane]),
+        return {progressive_high(top + ulong(n) * top_stride, p),
+            uint4(bit3[ulong(n) * bit3_stride + p], low[0], PROGRESSIVE_LOW_PLANES == 3u ? low[rest_plane] : 0u, PROGRESSIVE_LOW_PLANES == 3u ? low[2u * rest_plane] : 0u),
             float(scales[ulong(n) * scale_stride + p])};
     }
     // The planes keep no coefficient run: every packet has its own scale.
@@ -163,32 +208,25 @@ typedef element::Act activation;
 static_assert(activation::bytes == 2, "the progressive readout requires a bf16 or f16 activation element");
 
 // Order-preserving key of an F32 (larger float, larger key; every key of a
-// non-NaN float is nonzero, so zero is below every key), and back.
+// non-NaN float is nonzero, so zero is below every key); back through
+// `order::value`. Unlike `order::key` it keeps -0.0 and 0.0 apart.
 inline uint key(float value) {
     const uint bits = as_type<uint>(value);
     return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
-inline float value_of(uint k) {
-    return as_type<float>((k & 0x80000000u) ? (k & 0x7fffffffu) : ~k);
-}
 
-// Quarter q of a bit plane word: the bit of code 8q + e in nibble e.
-inline uint quarter(uint plane, uint q) {
-    return (plane >> q) & 0x11111111u;
+// The bits of quarter q of a plane word (code 8q + e at bit 4e + q) as +1
+// where set and -1 elsewhere: the even codes (8q, 8q + 2, ...) and the odd.
+// Two codes 16 bits apart move to the sign bits of a half2 of -1s, a set bit
+// clearing its sign: three integer operations a pair and no conversion.
+inline void signs(uint plane, uint q, thread float4 &even, thread float4 &odd) {
+    const half2 s04 = as_type<half2>(((plane << (15u - q)) & 0x80008000u) ^ 0xbc00bc00u);
+    const half2 s26 = as_type<half2>(((plane << (7u - q)) & 0x80008000u) ^ 0xbc00bc00u);
+    const half2 s15 = as_type<half2>(((plane << (11u - q)) & 0x80008000u) ^ 0xbc00bc00u);
+    const half2 s37 = as_type<half2>(((plane << (3u - q)) & 0x80008000u) ^ 0xbc00bc00u);
+    even = float4(s04.x, s26.x, s04.y, s26.y);
+    odd = float4(s15.x, s37.x, s15.y, s37.y);
 }
-
-// The even (0, 2, 4, 6) and odd codes of a nibble word, as 0..15.
-inline void nibbles(uint word, thread float4 &even, thread float4 &odd) {
-    even = float4(as_type<uchar4>(word & 0x0f0f0f0fu));
-    odd = float4(as_type<uchar4>((word >> 4) & 0x0f0f0f0fu));
-}
-
-// One group's planes.
-struct Group {
-    uint4 high;
-    uint bit3, rest0, rest1, rest2;
-    float scale;
-};
 
 // A group's 32 decoded codes, by quarter: the even (8q, 8q + 2, ...) and odd
 // codes. Decoded once per vocabulary row, they serve every output row.
@@ -196,15 +234,16 @@ struct Codes {
     float4 even[4], odd[4];
 };
 
-// The group's exact signed codes c = u - 128.
-inline Codes exact_codes(thread const Group &group) {
+// The group's exact signed codes c = u - 128: the exact view's code bytes
+// (`packets::ProgressiveExact`) as exact floats, by half subtraction rather
+// than integer conversion.
+inline Codes exact_codes(thread const packets::ProgressiveExact::packet &group) {
     Codes codes;
     for (uint q = 0; q < 4u; ++q) {
-        const uint low = (quarter(group.bit3, q) << 3) | (quarter(group.rest0, q) << 2)
-            | (quarter(group.rest1, q) << 1) | quarter(group.rest2, q);
-        const uint high = group.high[q];
-        codes.even[q] = float4(as_type<char4>((((high & 0x0f0f0f0fu) << 4) | (low & 0x0f0f0f0fu)) ^ 0x80808080u));
-        codes.odd[q] = float4(as_type<char4>(((high & 0xf0f0f0f0u) | ((low >> 4) & 0x0f0f0f0fu)) ^ 0x80808080u));
+        uint even, odd;
+        packets::ProgressiveExact::bytes(group, q, even, odd);
+        codes.even[q] = packets::byte_floats(even, half(1024u + PROGRESSIVE_OFFSET));
+        codes.odd[q] = packets::byte_floats(odd, half(1024u + PROGRESSIVE_OFFSET));
     }
     return codes;
 }
@@ -235,6 +274,11 @@ struct Selection {
     ulong mask_row, mask_word;
     device const int *constrained;
     ulong constrained_stride;
+    float softcap;
+
+    float transform(float logit) const {
+        return softcap > 0.0f ? functions::softcap(softcap, logit) : logit;
+    }
 
     bool competes(uint m, uint v) const {
         return constrained[m * constrained_stride] == 0
@@ -243,34 +287,51 @@ struct Selection {
     float divisor(uint m) const {
         return temperature[ulong(m) * temperature_stride];
     }
-    float score(uint m, uint v, float logit) const {
-        return logit / divisor(m) + gumbel::noise(v, draws + ulong(m) * draw_row, draw_word);
+    // A score is its noise-free part plus noise of at most PROGRESSIVE_NOISE,
+    // so a score whose noise-free part is further than that below where it
+    // must reach (`reaches`, `raise`) is decided without drawing the noise.
+    float noise(uint m, uint v) const {
+        return gumbel::noise(v, draws + ulong(m) * draw_row, draw_word);
+    }
+    // Whether the score of `logit` in row m reaches `bar`.
+    bool reaches(uint m, uint v, float logit, float bar) const {
+        const float plain = transform(logit) / divisor(m);
+        return plain + PROGRESSIVE_NOISE >= bar && plain + noise(m, v) >= bar;
     }
     // Whether a competing row whose view logit is within `reach` of its
     // exact logit can reach `threshold`.
     bool survives(uint m, uint v, float logit, float reach, float threshold) const {
         if (!(logit > -INFINITY) || !competes(m, v))
             return false;
-        return score(m, v, logit + reach) >= threshold - PROGRESSIVE_MARGIN * (1.0f + metal::abs(threshold));
+        return reaches(m, v, logit + reach, threshold - PROGRESSIVE_MARGIN * (1.0f + metal::abs(threshold)));
+    }
+    // Raises row m's key `lowest` to the score of a competing row's lower
+    // bound `logit`, unless that score cannot reach the key already there.
+    void raise(threadgroup atomic_uint *lowest, uint m, uint v, float logit) const {
+        const float plain = transform(logit) / divisor(m);
+        const uint best = atomic_load_explicit(lowest, memory_order_relaxed);
+        if (best != 0u && plain + PROGRESSIVE_NOISE < order::value(best))
+            return;
+        atomic_fetch_max_explicit(lowest, key(plain + noise(m, v)), memory_order_relaxed);
     }
 };
 
 // Each row's largest lower-bound score, raised by every threadgroup; the
 // last to arrive publishes max(floor, raised), or -inf where the row's length
 // is not finite (no bound holds), and clears the keys. `bounds`: sync scratch,
-// PROGRESSIVE_ROWS keys then the arrival counter.
+// SEISMIC_CONST_VERIFY_ROWS keys then the arrival counter.
 inline void publish(threadgroup atomic_uint *lowest, device atomic_uint *bounds, threadgroup uint *last, uint tiles,
     uint rows, uint tid, device const float *floor, ulong floor_stride, device const float *lengths,
-    ulong length_stride, device float *threshold, ulong threshold_stride) {
+    ulong length_stride, element::Out<element::F32> threshold, ulong threshold_stride) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid < rows)
         atomic_fetch_max_explicit(&bounds[tid], atomic_load_explicit(&lowest[tid], memory_order_relaxed),
             memory_order_relaxed);
-    if (arrive::last(&bounds[PROGRESSIVE_ROWS], tiles, last, tid) && tid < rows) {
+    if (arrive::last(&bounds[SEISMIC_CONST_VERIFY_ROWS], tiles, last, tid) && tid < rows) {
         const uint k = atomic_load_explicit(&bounds[tid], memory_order_relaxed);
-        const float raised = k == 0u ? -INFINITY : value_of(k);
+        const float raised = k == 0u ? -INFINITY : order::value(k);
         const float floored = floor ? metal::max(floor[tid * floor_stride], raised) : raised;
-        threshold[tid * threshold_stride] = metal::isfinite(lengths[tid * length_stride]) ? floored : -INFINITY;
+        threshold.put(tid * threshold_stride, metal::isfinite(lengths[tid * length_stride]) ? floored : -INFINITY);
         atomic_store_explicit(&bounds[tid], 0u, memory_order_relaxed);
     }
 }
@@ -295,7 +356,7 @@ struct Planes {
     ulong scale_stride;
 
     uint4 high(uint v, uint g) const {
-        return *reinterpret_cast<device const uint4 *>(top + ulong(v) * top_stride + 4u * g);
+        return progressive_high(top + ulong(v) * top_stride, g);
     }
     float scale(uint v, uint g) const {
         return float(scales[ulong(v) * scale_stride + g]);
@@ -303,9 +364,10 @@ struct Planes {
     uint third(uint v, uint g) const {
         return bit3[ulong(v) * bit3_stride + g];
     }
-    Group group(uint v, uint g) const {
+    packets::ProgressiveExact::packet group(uint v, uint g) const {
         device const uint *low = rest + ulong(v) * rest_row + ulong(g) * rest_group;
-        return Group{high(v, g), third(v, g), low[0], low[rest_plane], low[2u * rest_plane], scale(v, g)};
+        return {high(v, g), uint4(third(v, g), low[0], PROGRESSIVE_LOW_PLANES == 3u ? low[rest_plane] : 0u,
+            PROGRESSIVE_LOW_PLANES == 3u ? low[2u * rest_plane] : 0u), scale(v, g)};
     }
 };
 
@@ -313,17 +375,19 @@ struct Planes {
 // for every output row: it survives when the previous level's upper-bound
 // score reaches `floor` (that level's threshold); −inf elsewhere. The
 // simdgroup then projects each survivor, lane l summing groups l, l + 32, ...
-// REFINE: the 5-bit view, the 4-bit logit plus `s * (8 b3 - 4) x`, whose
-// lower-bound scores raise the next threshold. Otherwise: the exact logit.
+// REFINE: the 5-bit view, the 4-bit logit plus `s 2^(P-1) (2 b3 - 1) x` (the
+// code's missing bits move from their midpoint by half their span, up where
+// bit 3 is set), whose lower-bound scores raise the next threshold.
+// Otherwise: the exact logit.
 template <bool REFINE>
 inline void gather(device const uchar *features, ulong feature_stride, thread const Planes &planes,
     device const float *radius_previous, device const float *radius_next, ulong radius_stride, device const float *coarse,
     ulong coarse_row, ulong coarse_col, device const float *floor, ulong floor_stride, device const float *lengths, ulong length_stride,
-    thread const Selection &selection, device float *out, ulong out_row, ulong out_col, device float *threshold,
-    ulong threshold_stride, device atomic_uint *bounds, uint rows, uint vocabulary, uint d,
+    thread const Selection &selection, element::Out<element::F32> out, ulong out_row, ulong out_col,
+    element::Out<element::F32> threshold, ulong threshold_stride, device atomic_uint *bounds, uint rows, uint vocabulary, uint d,
     threadgroup atomic_uint *lowest, threadgroup uint *last, threadgroup uint4 *stage, uint tile, uint tiles, uint tid,
     uint threads, uint simdgroups, uint sg, uint lane) {
-    if (REFINE && tid < PROGRESSIVE_ROWS)
+    if (REFINE && tid < SEISMIC_CONST_VERIFY_ROWS)
         atomic_store_explicit(&lowest[tid], 0u, memory_order_relaxed);
     // The features in threadgroup memory when they fit, quarter-major
     // ([row][quarter][group]) so a simdgroup's reads are contiguous; every
@@ -350,7 +414,7 @@ inline void gather(device const uchar *features, ulong feature_stride, thread co
                     floor[m * floor_stride]))
                 candidate |= 1u << m;
             else
-                out[m * out_row + ulong(n) * out_col] = -INFINITY;
+                out.put(m * out_row + ulong(n) * out_col, -INFINITY);
         }
     for (uint pending = uint(uint64_t(simd_ballot(candidate != 0u))); pending != 0u; pending &= pending - 1u) {
         const uint i = ctz(pending);
@@ -369,14 +433,13 @@ inline void gather(device const uchar *features, ulong feature_stride, thread co
                     features_group(features, feature_stride, m, g, xe, xo);
                 if (REFINE) {
                     const uint plane = planes.third(v, g);
-                    float dot = 0.0f, sum = 0.0f;
+                    float dot = 0.0f;
                     for (uint q = 0; q < 4u; ++q) {
-                        float4 be, bo;
-                        nibbles(quarter(plane, q), be, bo);
-                        dot += metal::dot(be, xe[q]) + metal::dot(bo, xo[q]);
-                        sum += (xe[q].x + xe[q].y + xe[q].z + xe[q].w) + (xo[q].x + xo[q].y + xo[q].z + xo[q].w);
+                        float4 se, so;
+                        signs(plane, q, se, so);
+                        dot += metal::dot(se, xe[q]) + metal::dot(so, xo[q]);
                     }
-                    acc = metal::fma(planes.scale(v, g), metal::fma(8.0f, dot, -4.0f * sum), acc);
+                    acc = metal::fma(planes.scale(v, g) * float(1u << (PROGRESSIVE_LOW_PLANES - 1u)), dot, acc);
                 } else {
                     acc += exact(planes.scale(v, g), exact_codes(planes.group(v, g)), xe, xo);
                 }
@@ -385,11 +448,9 @@ inline void gather(device const uchar *features, ulong feature_stride, thread co
             if (lane != 0u)
                 continue;
             const float logit = REFINE ? coarse[m * coarse_row + ulong(v) * coarse_col] + acc : acc;
-            out[m * out_row + ulong(v) * out_col] = logit;
+            out.put(m * out_row + ulong(v) * out_col, REFINE ? logit : selection.transform(logit));
             if (REFINE && selection.competes(m, v))
-                atomic_fetch_max_explicit(&lowest[m],
-                    key(selection.score(m, v, logit - radius_next[v * radius_stride] * lengths[m * length_stride])),
-                    memory_order_relaxed);
+                selection.raise(&lowest[m], m, v, logit - radius_next[v * radius_stride] * lengths[m * length_stride]);
         }
     }
     if (REFINE)
@@ -398,3 +459,20 @@ inline void gather(device const uchar *features, ulong feature_stride, thread co
 }
 
 } // namespace progressive
+
+namespace projection {
+
+// The exact view at the GEMV's rows: the exact level's recipe.
+template <>
+struct gemv_recipe<packets::ProgressiveExact> {
+    static constant constexpr bool value = true;
+    static progressive::Codes decode(thread const packets::ProgressiveExact::packet &packet) {
+        return progressive::exact_codes(packet);
+    }
+    static float dot(thread const packets::ProgressiveExact::packet &packet, thread const progressive::Codes &codes,
+        thread const float4 (&even)[4], thread const float4 (&odd)[4]) {
+        return progressive::exact(packet.scale, codes, even, odd);
+    }
+};
+
+} // namespace projection

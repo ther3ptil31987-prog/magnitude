@@ -1,19 +1,19 @@
 /// <reference path="./assets.d.ts" />
-import { inspectHarnessConnection } from "./inspection"
-import { SqliteDriver } from "@magnitudedev/daemon-management/sqlite-driver"
+import { inspectHarnessConnection, skillText } from "./inspection"
+import { SqliteDriver } from "@magnitudedev/storage/sqlite"
 import * as CommandExecutor from "@effect/platform/CommandExecutor"
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as HttpClient from "@effect/platform/HttpClient"
 import * as Path from "@effect/platform/Path"
 import {
-  type DesktopHarnessConnection,
   HarnessConnectionError,
   HarnessIdSchema,
   type HarnessConnection,
   type HarnessConnectOptions,
   type HarnessDestination,
   type HarnessId,
-} from "@magnitudedev/client-common"
+} from "./types"
+import type { HarnessConnectionStatus } from "@magnitudedev/sdk"
 import {
   makeInferenceClient,
   ProviderModelIdSchema,
@@ -22,7 +22,7 @@ import {
   type ProviderModelId,
 } from "@magnitudedev/sdk"
 import { makeStateDocument } from "@magnitudedev/storage"
-import { Cause, Effect, Option, Schema } from "effect"
+import { Cause, DateTime, Effect, Option, Schema } from "effect"
 import { ConnectionTransaction, connectionTransaction } from "./transaction"
 import { withConnectionLock } from "./lock"
 import { delimiter } from "node:path"
@@ -39,9 +39,12 @@ import {
   HarnessRestoreSchema,
 } from "./contract"
 import { resolveHarnessConnectionPaths, type HarnessConnectionPaths } from "./paths"
+import { describeHarnessSetup } from "./setup"
 import { makeHarnessConnectorRegistry, type HarnessConnectorRegistry } from "./registry"
 import { OPENAI_BASE_URL, readOr } from "./shared"
-import skillContents from "./magnitude-skill.md" with { type: "text" }
+import bundledSkill from "./magnitude-skill.md" with { type: "text" }
+
+const skillContents = skillText(bundledSkill)
 
 export {
   ANTHROPIC_BASE_URL,
@@ -54,7 +57,7 @@ export {
   updateYaml,
 } from "./shared"
 export { clineModelCatalog, clineModelRegistryEntry, clineProviderSettings } from "./connectors/cline"
-export { CLAUDE_GATEWAY_DISCOVERY } from "./connectors/claude-code"
+export { CLAUDE_AUTH_TOKEN_PLACEHOLDER, CLAUDE_GATEWAY_DISCOVERY } from "./connectors/claude-code"
 export { codexModelCatalog } from "./connectors/codex"
 export { hermesProviderConfig, hermesReasoningOverrides } from "./connectors/hermes"
 export { ohMyPiProviderConfig } from "./connectors/oh-my-pi"
@@ -68,6 +71,9 @@ export {
   piProviderConfig,
 } from "./connectors/pi"
 export { makeHarnessConnectorRegistry } from "./registry"
+export { describeHarnessSetup, type HarnessSetup, type HarnessSetupTarget, type SetupPlatform } from "./setup"
+export { resolveHarnessEnvironment, harnessCommandExecutor } from "./shell-env"
+export * from "./types"
 export { harnessConnectionPaths, resolveHarnessConnectionPaths, type HarnessConnectionPaths } from "./paths"
 export type { HarnessConnectionSpec, HarnessConnector, HarnessInstallation, HarnessModel } from "./contract"
 
@@ -98,10 +104,15 @@ export const harnessExecutableSearchPath = (value = process.env.PATH ?? ""): str
   .filter((directory) => !directory.replaceAll("\\", "/").endsWith("/node_modules/.bin"))
   .join(delimiter)
 
+/**
+ * `canonicalModel` names the model an ID now means: a catalog model's ID for the ID its files had as a
+ * found model before an upgrade, otherwise the ID itself. Sync moves a harness selection to it.
+ */
 export interface HarnessConnectionOptions {
+  readonly canonicalModel?: (modelId: ProviderModelId) => Effect.Effect<ProviderModelId>
   readonly paths?: HarnessConnectionPaths
   readonly serviceEndpoint?: string
-  readonly detect?: (connector: HarnessConnector) => Effect.Effect<Option.Option<HarnessInstallation>>
+  readonly detect?: (connector: HarnessConnector) => Effect.Effect<Option.Option<HarnessInstallation>, never, CommandExecutor.CommandExecutor>
   readonly resolveModels?: Effect.Effect<ReadonlyArray<HarnessModel>, unknown, HttpClient.HttpClient>
   readonly now?: () => Date
   readonly registry?: HarnessConnectorRegistry
@@ -189,6 +200,17 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
     return yield* transaction.commit(state.update(f))
   })
   const detect = options.detect ?? ((connector: HarnessConnector) => connector.detect(harnessExecutableSearchPath()))
+  const canonicalModel = options.canonicalModel ?? Effect.succeed
+  /** The selection a sync writes: the harness's current Magnitude model, when that ID now names another model. */
+  const renamedSelection = (connector: HarnessConnector, models: ReadonlyArray<HarnessModel>) =>
+    connector.selectedModel.pipe(
+      Effect.flatMap(Option.match({
+        onNone: () => Effect.succeed(Option.none<ProviderModelId>()),
+        onSome: (selected) => canonicalModel(selected).pipe(Effect.map((canonical) =>
+          canonical !== selected && containsModel(models, canonical) ? Option.some(canonical) : Option.none())),
+      })),
+      Effect.orElseSucceed(() => Option.none<ProviderModelId>()),
+    )
   const resolveModels = options.resolveModels ?? discoverMagnitudeModels(options.serviceEndpoint === undefined ? undefined : `${options.serviceEndpoint}/inference/`)
   const mutationLock = yield* Effect.makeSemaphore(1)
   const provide = <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.provide(effect, runtime)
@@ -227,11 +249,12 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
         id: connector.id,
         name: connector.name,
         installed: Option.isSome(installation),
+        version: Option.flatMapNullable(installation, ({ version }) => version),
         managed: entry !== undefined,
         inspection,
         configurationFiles: connector.configurationFiles,
         plugin: Option.fromNullable(connector.companion).pipe(Option.map(({ description }) => ({ name: description.name, source: description.source }))),
-      } satisfies DesktopHarnessConnection
+      } satisfies HarnessConnectionStatus
     }))
   })).pipe(Effect.mapError((error) => error instanceof HarnessConnectionError ? error : failure("list", String(error))))
 
@@ -267,15 +290,18 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
     if (Option.isNone(installation)) return yield* failure("connect", `${connector.name} is not installed`, harness)
     const models = uniqueModels(yield* resolveModels)
     if (models.length === 0) return yield* failure("connect", "No installed Magnitude models are available", harness)
-    if (Option.isSome(connectOptions.model) && !containsModel(models, connectOptions.model.value)) {
-      return yield* failure("connect", `Magnitude model is not installed: ${connectOptions.model.value}`, harness)
+    const requested = Option.isSome(connectOptions.model)
+      ? Option.some(yield* canonicalModel(connectOptions.model.value))
+      : Option.none<ProviderModelId>()
+    if (Option.isSome(requested) && !containsModel(models, requested.value)) {
+      return yield* failure("connect", `Magnitude model is not installed: ${requested.value}`, harness)
     }
     const manifest = yield* readManifest
     const existing = manifest.connections.find((entry) => entry.harness === harness)
     const previousModels = existing?.models
     const spec: HarnessConnectionSpec = {
       models,
-      model: connectOptions.model,
+      model: requested,
       installation: installation.value,
       ...(previousModels === undefined ? {} : { previousModels }),
     }
@@ -329,6 +355,48 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
     ? error
     : failure("connect", String(error), harness)))))
 
+  /** Applies each managed connection again with the current model set, moving an alias selection as it goes. */
+  const syncEntries = (entries: ReadonlyArray<ManifestEntry>, models: ReadonlyArray<HarnessModel>) =>
+    Effect.forEach(entries, (entry) => connectionTransaction(Effect.gen(function* () {
+      const connector = registry.get(entry.harness)
+      const installation = connector.id === "codex" || connector.companion !== undefined
+        ? yield* installed(connector)
+        : Option.some({ executable: connector.executable })
+      if (Option.isNone(installation)) return yield* failure(
+        "sync",
+        `${connector.name} is not installed`,
+        connector.id,
+      )
+      const spec: HarnessConnectionSpec = {
+        models,
+        model: yield* renamedSelection(connector, models),
+        installation: installation.value,
+        previousModels: entry.models,
+      }
+      const companionResult = connector.companion === undefined
+        ? Option.none<{
+            readonly state: HarnessCompanionState
+          }>()
+        : Option.some(yield* connectorOperation("sync", connector, connector.companion.reconcile({
+            installation: installation.value,
+            previous: entry.companion,
+          })))
+      if (connector.skillRequired === true || Option.getOrElse(entry.skillInstalled, () => false)) yield* installSkill(entry.harness)
+      yield* connectorOperation("sync", connector, connector.connect(spec))
+      yield* updateManifest((current) => upsertManifest(
+        current,
+        entry.harness,
+        models,
+        entry.restore,
+        Option.match(companionResult, {
+          onNone: () => Option.none(),
+          onSome: ({ state }) => Option.some(state),
+        }),
+        entry.skillInstalled,
+        now,
+      ))
+    })), { discard: true })
+
   const sync: HarnessConnection["sync"] = (harness) => provide(Effect.gen(function* () {
     const manifest = yield* readManifest
     const entries = harness === undefined
@@ -339,51 +407,49 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
     }
     const models = uniqueModels(yield* resolveModels)
     if (models.length === 0) return yield* failure("sync", "No installed Magnitude models are available", harness)
-    for (const entry of entries) {
-      yield* connectionTransaction(Effect.gen(function* () {
-        const connector = registry.get(entry.harness)
-        const installation = connector.id === "codex" || connector.companion !== undefined
-          ? yield* installed(connector)
-          : Option.some({ executable: connector.executable })
-        if (Option.isNone(installation)) return yield* failure(
-          "sync",
-          `${connector.name} is not installed`,
-          connector.id,
-        )
-        const spec: HarnessConnectionSpec = {
-          models,
-          model: Option.none(),
-          installation: installation.value,
-          previousModels: entry.models,
-        }
-        const companionResult = connector.companion === undefined
-          ? Option.none<{
-              readonly state: HarnessCompanionState
-            }>()
-          : Option.some(yield* connectorOperation("sync", connector, connector.companion.reconcile({
-              installation: installation.value,
-              previous: entry.companion,
-            })))
-        if (connector.skillRequired === true || Option.getOrElse(entry.skillInstalled, () => false)) yield* installSkill(entry.harness)
-        yield* connectorOperation("sync", connector, connector.connect(spec))
-        yield* updateManifest((current) => upsertManifest(
-          current,
-          entry.harness,
-          models,
-          entry.restore,
-          Option.match(companionResult, {
-            onNone: () => Option.none(),
-            onSome: ({ state }) => Option.some(state),
-          }),
-          entry.skillInstalled,
-          now,
-        ))
-      }))
-    }
+    yield* syncEntries(entries, models)
     return yield* list
   }).pipe(Effect.mapError((error) => error instanceof HarnessConnectionError
     ? error
     : failure("sync", String(error), harness))))
+
+  /**
+   * Syncs only the managed connections that are stale, and returns them: those whose selection names an
+   * ID that now means another model, and those written with a context window a model is no longer served
+   * at (this computer serves it at another context tier). Connections that are current, and configuration
+   * Magnitude doesn't manage, are not touched, so running it again changes nothing.
+   */
+  const syncStaleConnections: HarnessConnection["syncStaleConnections"] = provide(Effect.gen(function* () {
+    const manifest = yield* readManifest
+    if (manifest.connections.length === 0) return []
+    const models = uniqueModels(yield* resolveModels)
+    const windows = new Map(models.map((model) => [model.id, model.contextWindow]))
+    const resized = (entry: ManifestEntry) => entry.models.some((written) => {
+      const served = windows.get(written.id)
+      return served !== undefined && served !== written.contextWindow
+    })
+    const stale = yield* Effect.filter(manifest.connections, (entry) => resized(entry)
+      ? Effect.succeed(true)
+      : registry.get(entry.harness).selectedModel.pipe(
+        Effect.flatMap(Option.match({
+          onNone: () => Effect.succeed(false),
+          onSome: (selected) => canonicalModel(selected).pipe(Effect.map((canonical) => canonical !== selected)),
+        })),
+        Effect.orElseSucceed(() => false),
+      ))
+    if (stale.length === 0) return []
+    if (models.length === 0) return yield* failure("sync", "No installed Magnitude models are available")
+    // Each connection syncs on its own: one harness that can't be synced never keeps the others stale.
+    const outcomes = yield* Effect.forEach(stale, (entry) => syncEntries([entry], models).pipe(
+      Effect.as(entry.harness),
+      Effect.either,
+    ))
+    const synced = outcomes.flatMap((outcome) => outcome._tag === "Right" ? [outcome.right] : [])
+    const failures = outcomes.flatMap((outcome) => outcome._tag === "Left" ? [outcome.left] : [])
+    if (synced.length === 0 && failures.length > 0) return yield* Effect.fail(failures[0]!)
+    yield* Effect.forEach(failures, (error) => Effect.logWarning(`Syncing a stale harness connection failed: ${String(error)}`), { discard: true })
+    return synced
+  })).pipe(Effect.mapError((error) => error instanceof HarnessConnectionError ? error : failure("sync", String(error))))
 
   const disconnect = (harness: HarnessId) => provide(connectionTransaction(Effect.gen(function* () {
     const manifest = yield* readManifest
@@ -437,9 +503,17 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
     list: mutationLock.withPermits(1)(list),
     connect: (harness, options) => withMutationLock("connect", connect(harness, options)),
     sync: (harness?: HarnessId) => withMutationLock("sync", sync(harness)),
+    syncStaleConnections: withMutationLock("sync", syncStaleConnections),
     disconnect: (harness) => withMutationLock("disconnect", disconnect(harness)),
     installSkill,
     installStartup,
+    describe: (target) => provide(Effect.gen(function* () {
+      const models = uniqueModels(yield* resolveModels)
+      const canonical = yield* canonicalModel(target.model)
+      const model = models.find(candidate => candidate.id === canonical)
+      if (model === undefined) return yield* failure("describe", `Magnitude model is not installed: ${target.model}`, target.harness)
+      return describeHarnessSetup({ ...target, models, model, updatedAt: DateTime.formatIso(yield* DateTime.now) })
+    })).pipe(Effect.mapError((error) => error instanceof HarnessConnectionError ? error : failure("describe", String(error), target.harness))),
   } satisfies HarnessConnection
   return { ...service, inspect: mutationLock.withPermits(1)(inspectConnections) }
 })

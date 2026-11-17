@@ -9,11 +9,12 @@
 //! stated values, then asserts that every run-owned backing was released
 //! (`charged == base`, IF §2.8) and restores the limit.
 //!
-//! Every test opens its own device, and an open creates a private memory
-//! domain, so concurrently running tests never share a limit or a charge.
+//! Every test opens its own device with its own ledgers
+//! (`seismic::testing::open_tallied`), so concurrently running tests
+//! never share a limit or a charge.
 //! Budgets keep at least 4 KiB of margin for the run's own small acquisitions
 //! (failure record, scalar cells; each at most 64 bytes, IF §2.6).
-use crate::common::{device, prepare, Selection, CHECK_MEMORY_BYTES, CHECK_WORK_UNITS};
+use crate::common::{prepare, tallied_device, Selection, CHECK_MEMORY_BYTES, CHECK_WORK_UNITS};
 use seismic::dynamic::{Module, Scalar, Tensor, Value};
 use seismic::{BackendName, Element, PrecisionPolicy};
 use seismic_lang::checked::{check_source, SourceFile, SourceSet};
@@ -125,7 +126,7 @@ fn interpret(entry: &str, inputs: &[Input]) -> (Option<String>, Vec<(usize, Vec<
                     .unwrap_or_else(|e| panic!("{entry}: {e}"));
                 Arg::Tensor(interpreter.add_tensor(data))
             }
-            Input::I32(value) => Arg::Scalar(ReferenceScalar::from_bits(DType::I32, *value as u32)),
+            Input::I32(value) => Arg::Scalar(ReferenceScalar::from_bits(DType::I32, *value as u32 as u64)),
         })
         .collect();
     let outcome = interpreter
@@ -154,7 +155,7 @@ fn interpret(entry: &str, inputs: &[Input]) -> (Option<String>, Vec<(usize, Vec<
 /// `charged + budget`, checks the outcome and every tensor argument against the
 /// interpreter, and checks that the run released everything it acquired.
 fn run_under_budget(backend: BackendName, entry: &str, inputs: &[Input], budget: u64) -> Run {
-    let device = device(backend);
+    let (device, tally) = tallied_device(backend);
     let module = Module::source(MODULE, MODULE_PATH, false, None)
         .unwrap_or_else(|e| panic!("the resource module must load: {e}"));
     let values: Vec<Value> = inputs
@@ -172,9 +173,8 @@ fn run_under_budget(backend: BackendName, entry: &str, inputs: &[Input], budget:
             Input::I32(value) => Value::Scalar(Scalar::I32(*value)),
         })
         .collect();
-    let usage = device.memory_usage();
-    let base = usage.charged;
-    device.set_memory_limit(Some(base + budget));
+    let base = tally.held();
+    tally.bound(base + budget);
     let function = module.function(entry).expect("declared entry");
     let (kernel, _) = prepare(
         &function,
@@ -231,11 +231,11 @@ fn run_under_budget(backend: BackendName, entry: &str, inputs: &[Input], budget:
         );
     }
     assert_eq!(
-        device.memory_usage().charged,
+        tally.held(),
         base,
         "{entry}: the run did not release every backing it acquired"
     );
-    device.set_memory_limit(usage.limit);
+    tally.bound(u64::MAX);
     Run { failed, tensors }
 }
 

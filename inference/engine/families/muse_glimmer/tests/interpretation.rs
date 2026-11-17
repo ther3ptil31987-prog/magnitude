@@ -1,22 +1,23 @@
 use magnitude_artifacts::{
-    gguf::{Directory, Scalar, Value},
+    gguf::{Array, Directory, Scalar, Value},
     ArtifactIdentity, InputLayout, PackageIdentity, TokenId,
 };
 use magnitude_family_contracts::{
-    AttentionGate, CellReduction, ExitNorm, GateFunction, GateGranularity, HeadNorm,
-    HistoryDomain, ImportTransform, InputNorm, KeyValue, ModelDefinition, ModelFamily, Operator,
-    OutputForm, PositionSampling, Rotary, TokenPlan, ValueSource, VisionAttentionSpan, VisionNorm,
-    VisionResampling, VisionResize, WeightDescriptor,
+    AttentionGate, CellReduction, ExitNorm, GateFunction, GateGranularity, HeadNorm, HistoryRows,
+    HistorySource, ImportTransform, InputNorm, ModelDefinition, ModelFamily, Operator, OutputForm,
+    ProjectedRows, RowProducer, TokenDomain,
+    PositionSampling, QueryProjection, Rotary, TokenPlan, ValueSource, VisionAttentionSpan, VisionNorm,
+    VisionOperator, VisionResampling, VisionResize, WeightDescriptor,
 };
 use magnitude_family_common::headers;
 use magnitude_family_muse_glimmer::{inspect_components, recognize, MuseGlimmerFamily};
 
 /// Every catalog variant of the target.
 const VARIANTS: [&str; 4] = [
-    "muse-glimmer-30b__target-gguf_q4.json",
-    "muse-glimmer-30b__target-gguf_q5.json",
-    "muse-glimmer-30b__target-gguf_q6.json",
-    "muse-glimmer-30b__target-gguf_q8.json",
+    "muse-glimmer-30b:gguf:q4",
+    "muse-glimmer-30b:gguf:q5",
+    "muse-glimmer-30b:gguf:q6",
+    "muse-glimmer-30b:gguf:q8",
 ];
 
 fn identity() -> PackageIdentity {
@@ -40,11 +41,35 @@ fn transforms(weight: &WeightDescriptor) -> &[ImportTransform] {
     &weight.transforms
 }
 
+/// Another model's projector, or its own at another target's width, disagrees with the target.
+#[test]
+fn another_models_projector_is_a_mismatch() {
+    let own = headers::projector("muse-glimmer-30b:gguf:q4");
+    let width = own
+        .value("clip.vision.projection_dim")
+        .and_then(Value::unsigned)
+        .unwrap();
+    for (projector, width) in [
+        (headers::projector("gemma-4-e4b-it-qat:gguf:q4"), width),
+        (own, width + 1),
+    ] {
+        let error =
+            magnitude_family_muse_glimmer::describe_projector(&projector, width, 1e-6).unwrap_err();
+        assert!(
+            matches!(
+                error.reasons[..],
+                [magnitude_artifacts::UnsupportedReason::TargetMismatch { .. }]
+            ),
+            "{error}"
+        );
+    }
+}
+
 #[test]
 fn every_catalog_variant_binds_to_the_released_geometry() {
     let epsilon = f64::from(1e-5f32);
     for variant in VARIANTS {
-        let directory = headers::directory(variant);
+        let directory = headers::target(variant);
         assert!(recognize(&directory), "{variant}");
         let model = inspect(&directory).unwrap_or_else(|error| panic!("{variant}: {error}"));
         assert_eq!(model.family.0, "muse-glimmer");
@@ -92,31 +117,38 @@ fn every_catalog_variant_binds_to_the_released_geometry() {
                     granularity: GateGranularity::Element,
                 } if weight.shape == [4096, 6656] && weight.transforms.is_empty()
             ));
-            let KeyValue::Owned {
-                key,
-                value: ValueSource::Projected(value),
-                key_norm: HeadNorm::Rms(key_norm),
-                domain,
+            let [HistorySource {
+                rows:
+                    HistoryRows::Own(RowProducer::Projected(ProjectedRows {
+                        key,
+                        value: ValueSource::Projected(value),
+                        key_norm: HeadNorm::Rms(key_norm),
+                        domain,
+                        ..
+                    })),
                 ..
-            } = &attention.key_value
+            }] = &attention.history[..]
             else {
                 panic!("layer {layer} owns projected history");
             };
             let HeadNorm::Rms(query_norm) = &attention.query_norm else {
                 panic!("layer {layer} normalizes its queries");
             };
+            let QueryProjection::Full(query) = &attention.query else {
+                panic!("layer {layer} projects its queries whole");
+            };
             assert!(value.transforms.is_empty());
             // Full layers are the last of every four; they have no rotary
             // and keep the whole history.
             if layer % 4 == 3 {
-                assert_eq!(*domain, HistoryDomain::Token);
+                assert_eq!(*domain, TokenDomain::Token);
                 assert_eq!(attention.rotary, Rotary::None);
-                for weight in [&attention.query, key, &query_norm.weight, &key_norm.weight] {
+                for weight in [query, key, &query_norm.weight, &key_norm.weight] {
                     assert!(weight.transforms.is_empty(), "{}", weight.name);
                 }
             } else {
                 windowed += 1;
-                assert_eq!(*domain, HistoryDomain::Window { tokens: 2048 });
+                assert_eq!(*domain, TokenDomain::Window { tokens: 2048 });
                 let Rotary::Table { pairs, .. } = &attention.rotary else {
                     panic!("layer {layer} rotates");
                 };
@@ -125,7 +157,7 @@ fn every_catalog_variant_binds_to_the_released_geometry() {
                     assert_eq!(pair.frequency, 500_000f64.powf(-2.0 * p as f64 / 128.0));
                     assert_eq!(pair.amplitude, 1.0);
                 }
-                for weight in [&attention.query, key, &query_norm.weight, &key_norm.weight] {
+                for weight in [query, key, &query_norm.weight, &key_norm.weight] {
                     assert_eq!(
                         transforms(weight),
                         [ImportTransform::PermuteRows { order: paired() }],
@@ -141,8 +173,8 @@ fn every_catalog_variant_binds_to_the_released_geometry() {
 
 #[test]
 fn a_per_layer_window_pattern_and_partial_rotary_are_read_from_the_header() {
-    let mut directory = headers::directory(VARIANTS[0]);
-    let flags = (0..52).map(|layer| Scalar::Bool(layer % 2 == 0)).collect();
+    let mut directory = headers::target(VARIANTS[0]);
+    let flags = (0..52).map(|layer| layer % 2 == 0).collect::<Vec<_>>().into();
     headers::set(
         &mut directory,
         "muse-glimmer.attention.sliding_window_pattern",
@@ -165,10 +197,11 @@ fn a_per_layer_window_pattern_and_partial_rotary_are_read_from_the_header() {
                 .chain((0..32).map(|i| 2 * i + 1))
                 .chain(64..128)
                 .collect();
-            assert_eq!(
-                attention.query.transforms,
-                [ImportTransform::PermuteRows { order }]
-            );
+            assert!(matches!(
+                &attention.query,
+                QueryProjection::Full(query)
+                    if query.transforms == [ImportTransform::PermuteRows { order }]
+            ));
         } else {
             assert_eq!(attention.rotary, Rotary::None);
         }
@@ -177,7 +210,7 @@ fn a_per_layer_window_pattern_and_partial_rotary_are_read_from_the_header() {
 
 #[test]
 fn rejects_missing_misshapen_unbound_and_unknown_roles() {
-    let base = headers::directory(VARIANTS[0]);
+    let base = headers::target(VARIANTS[0]);
     let rejected = |edit: &dyn Fn(&mut Directory), reason: &str| {
         let mut directory = base.clone();
         edit(&mut directory);
@@ -198,7 +231,7 @@ fn rejects_missing_misshapen_unbound_and_unknown_roles() {
     );
     rejected(
         &|d| headers::add_tensor(d, "blk.0.attn_sinks.weight", &[32]),
-        "unbound weight role \"blk.0.attn_sinks.weight\"",
+        "unbound weight roles [\"blk.0.attn_sinks.weight\"]",
     );
     rejected(
         &|d| {
@@ -208,14 +241,14 @@ fn rejects_missing_misshapen_unbound_and_unknown_roles() {
                 Value::Scalar(Scalar::String("yarn".into())),
             )
         },
-        "unknown metadata \"muse-glimmer.rope.scaling.type\"",
+        "unknown metadata [\"muse-glimmer.rope.scaling.type\"]",
     );
     rejected(
         &|d| {
             headers::set(
                 d,
                 "muse-glimmer.attention.head_count",
-                Value::Array(vec![Scalar::Unsigned(32); 52]),
+                Value::Array(vec![32_u64; 52].into()),
             )
         },
         "muse-glimmer.attention.head_count must be a positive integer",
@@ -225,7 +258,7 @@ fn rejects_missing_misshapen_unbound_and_unknown_roles() {
             headers::set(
                 d,
                 "muse-glimmer.attention.sliding_window_pattern",
-                Value::Array(vec![Scalar::Bool(true); 51]),
+                Value::Array(vec![true; 51].into()),
             )
         },
         "one flag per layer",
@@ -242,25 +275,25 @@ fn rejects_missing_misshapen_unbound_and_unknown_roles() {
 #[test]
 fn recognizes_only_the_target() {
     for other in [
-        "muse-glimmer-30b__draft.json",
-        "muse-glimmer-30b__projector.json",
-        "laguna-s-2.1__target-gguf_q4-allshards.json",
+        headers::draft(VARIANTS[0]),
+        headers::projector(VARIANTS[0]),
+        headers::target("laguna-s-2.1:gguf:q4"),
     ] {
-        assert!(!recognize(&headers::directory(other)), "{other}");
+        assert!(!recognize(&other));
     }
 }
 
 #[test]
 fn the_projector_windows_sparse_layers_and_shuffles_channel_outer() {
-    let directory = headers::directory(VARIANTS[0]);
-    let projector = headers::directory("muse-glimmer-30b__projector.json");
+    let directory = headers::target(VARIANTS[0]);
+    let projector = headers::projector(VARIANTS[0]);
     let model = inspect_components(&directory, Some(&projector), identity()).unwrap();
     let vision = model.vision.unwrap();
     assert_eq!((vision.hidden, vision.output_hidden), (1536, 6656));
     assert_eq!(vision.window, Some(32));
     assert_eq!(vision.stem.frames(), 1);
     assert_eq!(
-        vision.stem.positions().sampling,
+        vision.stem.positions().expect("position table").sampling,
         PositionSampling::PixelCenters { side: 32 }
     );
     assert_eq!(
@@ -274,7 +307,12 @@ fn the_projector_windows_sparse_layers_and_shuffles_channel_outer() {
         .blocks
         .iter()
         .enumerate()
-        .filter(|(_, block)| block.attention.span == VisionAttentionSpan::Full)
+        .filter(|(_, block)| {
+            matches!(
+                &block.operator,
+                VisionOperator::Attention(attention) if attention.span == VisionAttentionSpan::Full
+            )
+        })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     assert_eq!(
@@ -283,7 +321,9 @@ fn the_projector_windows_sparse_layers_and_shuffles_channel_outer() {
     );
     // llama.cpp's adjacent rotary pairs are reordered on q/k rows and biases.
     let order: Vec<u64> = (0..48).map(|i| 2 * i).chain((0..48).map(|i| 2 * i + 1)).collect();
-    let attention = &vision.blocks[0].attention;
+    let VisionOperator::Attention(attention) = &vision.blocks[0].operator else {
+        panic!("Muse Glimmer vision blocks attend");
+    };
     for linear in [&attention.query, &attention.key] {
         assert_eq!(transforms(&linear.weight), [ImportTransform::PermuteRows { order: order.clone() }]);
         assert_eq!(
@@ -304,7 +344,7 @@ fn the_projector_windows_sparse_layers_and_shuffles_channel_outer() {
 fn text_input_takes_absolute_positions_and_refuses_media() {
     let family = MuseGlimmerFamily;
     let model = family
-        .inspect(&headers::directory(VARIANTS[0]), None, identity())
+        .inspect(&headers::target(VARIANTS[0]), None, identity())
         .unwrap();
     struct NoMarkers;
     impl magnitude_family_contracts::MarkerTokens for NoMarkers {

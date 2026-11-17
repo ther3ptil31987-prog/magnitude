@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
 
-use crate::ExecutionBackend;
+/// The version of the HTTP API the service serves, stated in its identity
+/// and its startup record. ACN refuses a service of any other version
+/// (`supportedApiVersion`), so it rises with every change a client of the
+/// version before cannot read.
+pub const API_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -21,9 +25,6 @@ pub struct IcnBinaryIdentity {
     pub profile: String,
     #[cfg_attr(feature = "openapi", schema(min_length = 1))]
     pub rustc: String,
-    /// Backends compiled into the engine build.
-    #[cfg_attr(feature = "openapi", schema(min_items = 1))]
-    pub backends: Vec<ExecutionBackend>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -69,48 +70,6 @@ pub enum IcnParentCommandType {
     Shutdown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct IcnStartupProgressRecord {
-    #[serde(rename = "type")]
-    pub record_type: IcnStartupProgressRecordType,
-    pub backend: IcnStartupBackend,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum IcnStartupProgressRecordType {
-    PreparingBackend,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[serde(
-    tag = "type",
-    rename_all = "snake_case",
-    rename_all_fields = "camelCase"
-)]
-pub enum IcnStartupBackend {
-    Cpu {
-        #[serde(rename = "hardwareLabel")]
-        hardware_label: String,
-    },
-    Metal {
-        #[serde(rename = "hardwareLabel")]
-        hardware_label: String,
-    },
-    Cuda {
-        #[serde(rename = "hardwareLabel")]
-        hardware_label: String,
-    },
-    Vulkan {
-        #[serde(rename = "hardwareLabel")]
-        hardware_label: String,
-    },
-}
-
 /// Installation declaration written by the installer or the local build beside the installed
 /// service. The service selects its execution device at runtime, so the declaration names no
 /// backend; it binds the installation to one engine build.
@@ -144,17 +103,6 @@ mod tests {
         assert_eq!(startup["protocolVersion"], 1);
         assert_eq!(startup["instanceId"], "instance");
 
-        let progress = serde_json::to_value(IcnStartupProgressRecord {
-            record_type: IcnStartupProgressRecordType::PreparingBackend,
-            backend: IcnStartupBackend::Cuda {
-                hardware_label: "NVIDIA GPU".to_owned(),
-            },
-        })
-        .expect("serialize progress");
-        assert_eq!(progress["type"], "preparing_backend");
-        assert_eq!(progress["backend"]["type"], "cuda");
-        assert_eq!(progress["backend"]["hardwareLabel"], "NVIDIA GPU");
-
         let installation = serde_json::to_value(IcnInstallationDeclaration {
             schema_version: 1,
             native_build: "native".to_owned(),
@@ -164,21 +112,5 @@ mod tests {
             installation,
             serde_json::json!({ "schemaVersion": 1, "nativeBuild": "native" })
         );
-    }
-
-    #[test]
-    fn identity_names_compiled_backends_in_lowercase() {
-        let identity = serde_json::to_value(IcnBinaryIdentity {
-            version: "0.0.0".to_owned(),
-            api_version: 1,
-            native_build: "native".to_owned(),
-            capabilities: vec!["hardware".to_owned()],
-            target: "aarch64-apple-darwin".to_owned(),
-            profile: "release".to_owned(),
-            rustc: "rustc".to_owned(),
-            backends: vec![ExecutionBackend::Cpu, ExecutionBackend::Metal],
-        })
-        .expect("serialize identity");
-        assert_eq!(identity["backends"], serde_json::json!(["cpu", "metal"]));
     }
 }

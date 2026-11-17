@@ -4,7 +4,7 @@ use crate::{Metal, MetalBuffer, MetalDevice, MetalLaunchMode, Pipeline};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
+    MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder, MTLSize,
 };
 use seismic_compiler::errors::ExecutionError;
 use seismic_compiler::executable::{
@@ -66,7 +66,7 @@ struct WordTableRead {
 
 impl WordTableRead {
     fn overlaps(&self, other: &Self) -> bool {
-        std::ptr::eq(self.buffer.raw(), other.buffer.raw())
+        std::ptr::eq(&*self.buffer.raw(), &*other.buffer.raw())
             && self.bytes.start < other.bytes.end
             && other.bytes.start < self.bytes.end
     }
@@ -211,7 +211,8 @@ impl MetalSubmission {
         self.pending
             .retain(|pending| !pending.words.overlaps(&words));
         completed?;
-        words.buffer.write_bytes(words.bytes.start, &bytes);
+        // The schedule plans the word table as this submission's own input.
+        unsafe { words.buffer.write_device_bytes(words.bytes.start, &bytes) };
         Ok(words)
     }
 
@@ -224,7 +225,7 @@ impl MetalSubmission {
         // the input before the infallible native commit; no uncommitted command
         // can reach a normal failure path between registration and commit.
         self.pending.push(PendingCommand { command, words });
-        self.pending.last().unwrap().command.commit();
+        crate::pooled(|| self.pending.last().unwrap().command.commit());
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -304,45 +305,50 @@ impl MetalSubmission {
         let participant = scratch_buffer(scratch.allocation(LaunchLocalKind::Participant), env);
         let registers = scratch_buffer(scratch.allocation(LaunchLocalKind::Register), env);
 
-        let command = self.device.queue().commandBuffer().ok_or_else(|| {
-            ExecutionError::SubmissionFailed("Metal could not create a command buffer".into())
-        })?;
-        let encoder = command.computeCommandEncoder().ok_or_else(|| {
-            ExecutionError::SubmissionFailed("Metal could not create a compute encoder".into())
-        })?;
-        encoder.setComputePipelineState(&kernel.state);
-        for (index, (buffer, offset)) in resolved.iter().enumerate() {
-            unsafe { encoder.setBuffer_offset_atIndex(Some(buffer.raw()), *offset as usize, index) }
-        }
-        let first_aux = bindings.len();
-        unsafe {
-            encoder.setBuffer_offset_atIndex(
-                Some(word_table.buffer.raw()),
-                word_table.bytes.start as usize,
-                first_aux,
+        let command = crate::pooled(|| {
+            let command = self.device.command_buffer().ok_or_else(|| {
+                ExecutionError::SubmissionFailed("Metal could not create a command buffer".into())
+            })?;
+            let encoder = command.computeCommandEncoder().ok_or_else(|| {
+                ExecutionError::SubmissionFailed("Metal could not create a compute encoder".into())
+            })?;
+            encoder.setComputePipelineState(&kernel.pipeline().state);
+            for (index, (buffer, offset)) in resolved.iter().enumerate() {
+                unsafe {
+                    encoder.setBuffer_offset_atIndex(Some(&buffer.raw()), *offset as usize, index)
+                }
+            }
+            let first_aux = bindings.len();
+            unsafe {
+                encoder.setBuffer_offset_atIndex(
+                    Some(&word_table.buffer.raw()),
+                    word_table.bytes.start as usize,
+                    first_aux,
+                );
+                encoder.setBuffer_offset_atIndex(
+                    Some(&results.buffer.raw()),
+                    results.base_offset as usize,
+                    first_aux + 1,
+                );
+                set_optional_buffer(&encoder, participant, first_aux + 2);
+                set_optional_buffer(&encoder, registers, first_aux + 3);
+                encoder.setThreadgroupMemoryLength_atIndex(total_values[0] as usize, 0);
+            }
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: grid[0] as usize,
+                    height: grid[1] as usize,
+                    depth: grid[2] as usize,
+                },
+                MTLSize {
+                    width: workgroup[0] as usize,
+                    height: workgroup[1] as usize,
+                    depth: workgroup[2] as usize,
+                },
             );
-            encoder.setBuffer_offset_atIndex(
-                Some(results.buffer.raw()),
-                results.base_offset as usize,
-                first_aux + 1,
-            );
-            set_optional_buffer(&encoder, participant, first_aux + 2);
-            set_optional_buffer(&encoder, registers, first_aux + 3);
-            encoder.setThreadgroupMemoryLength_atIndex(total_values[0] as usize, 0);
-        }
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(
-            MTLSize {
-                width: grid[0] as usize,
-                height: grid[1] as usize,
-                depth: grid[2] as usize,
-            },
-            MTLSize {
-                width: workgroup[0] as usize,
-                height: workgroup[1] as usize,
-                depth: workgroup[2] as usize,
-            },
-        );
-        encoder.endEncoding();
+            encoder.endEncoding();
+            Ok::<_, ExecutionError>(command)
+        })?;
         self.commit(command, word_table);
         if !result_slots.is_empty() {
             self.synchronize()?;
@@ -371,8 +377,9 @@ impl MetalSubmission {
         let mut data = vec![0u8; bytes as usize];
         self.device
             .read(source.buffer, source.byte_offset, &mut data)?;
-        self.device
-            .write(destination.buffer, destination.byte_offset, &data)
+        // The schedule plans the destination as written by this command.
+        unsafe { destination.buffer.write_device_bytes(destination.byte_offset, &data) };
+        Ok(())
     }
     fn fill(
         &self,
@@ -387,8 +394,9 @@ impl MetalSubmission {
         for (index, byte) in data.iter_mut().enumerate() {
             *byte = pattern[index % pattern.len()];
         }
-        self.device
-            .write(destination.buffer, destination.byte_offset, &data)
+        // The schedule plans the destination as written by this command.
+        unsafe { destination.buffer.write_device_bytes(destination.byte_offset, &data) };
+        Ok(())
     }
     fn scalar_read(
         &self,
@@ -414,14 +422,16 @@ impl MetalSubmission {
 }
 
 fn complete_command(command: &ProtocolObject<dyn MTLCommandBuffer>) -> Result<(), ExecutionError> {
-    command.waitUntilCompleted();
-    if let Some(error) = command.error() {
-        Err(ExecutionError::SynchronizationFailed(
-            error.localizedDescription().to_string(),
-        ))
-    } else {
-        Ok(())
-    }
+    crate::pooled(|| {
+        command.waitUntilCompleted();
+        if let Some(error) = command.error() {
+            Err(ExecutionError::SynchronizationFailed(
+                error.localizedDescription().to_string(),
+            ))
+        } else {
+            Ok(())
+        }
+    })
 }
 
 fn complete_pending(pending: &mut Vec<PendingCommand>) -> Result<(), ExecutionError> {
@@ -489,16 +499,16 @@ mod completion_tests {
         words: [u64; 2],
     ) {
         let words = submission.write_words(table, &words).unwrap();
-        let command = submission.device.queue().commandBuffer().unwrap();
+        let command = submission.device.command_buffer().unwrap();
         let encoder = command.computeCommandEncoder().unwrap();
         encoder.setComputePipelineState(pipeline);
         unsafe {
             encoder.setBuffer_offset_atIndex(
-                Some(words.buffer.raw()),
+                Some(&words.buffer.raw()),
                 words.bytes.start as usize,
                 0,
             );
-            encoder.setBuffer_offset_atIndex(Some(output.raw()), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(&output.raw()), 0, 1);
         }
         let one = MTLSize {
             width: 1,
@@ -523,11 +533,11 @@ mod completion_tests {
     fn repeated_launches_preserve_each_word_table_version_until_its_native_read() {
         let device = metal_device();
         let pipeline = capture_pipeline(&device);
-        let output = device.allocate_bytes(64 * 8).unwrap();
+        let output = device.allocate_bytes(64 * 8, &crate::test_support::entry()).unwrap();
         device.write(&output, 0, &vec![0xff; 64 * 8]).unwrap();
         let table = RuntimeBuffer {
             tensor: None,
-            buffer: device.allocate_bytes(32).unwrap(),
+            buffer: MetalBuffer::clone(&device.allocate_bytes(32, &crate::test_support::entry()).unwrap()),
             base_offset: 8,
             accessible_bytes: 16,
         };
@@ -561,9 +571,9 @@ mod completion_tests {
     fn host_word_write_completes_overlapping_ranges_and_retains_independent_readers() {
         let device = metal_device();
         let pipeline = capture_pipeline(&device);
-        let output = device.allocate_bytes(3 * 8).unwrap();
-        let shared = device.allocate_bytes(32).unwrap();
-        let separate = device.allocate_bytes(16).unwrap();
+        let output = device.allocate_bytes(3 * 8, &crate::test_support::entry()).unwrap();
+        let shared = device.allocate_bytes(32, &crate::test_support::entry()).unwrap();
+        let separate = device.allocate_bytes(16, &crate::test_support::entry()).unwrap();
         let mut submission = MetalExecutor::new(device.clone())
             .begin_submission()
             .unwrap();
@@ -573,7 +583,7 @@ mod completion_tests {
                 &pipeline,
                 &RuntimeBuffer {
                     tensor: None,
-                    buffer: buffer.clone(),
+                    buffer: MetalBuffer::clone(buffer),
                     base_offset: offset,
                     accessible_bytes: 16,
                 },
@@ -588,7 +598,7 @@ mod completion_tests {
         );
         let middle = RuntimeBuffer {
             tensor: None,
-            buffer: shared,
+            buffer: MetalBuffer::clone(&shared),
             base_offset: 8,
             accessible_bytes: 16,
         };
@@ -601,8 +611,8 @@ mod completion_tests {
             "only the two overlapping readers are completed"
         );
         assert!(std::ptr::eq(
-            submission.pending[0].words.buffer.raw(),
-            separate.raw()
+            &*submission.pending[0].words.buffer.raw(),
+            &*separate.raw()
         ));
         submission.submit().complete().unwrap();
         assert_eq!(captured_words(&device, &output), vec![11, 12, 13]);
@@ -633,7 +643,7 @@ unsafe fn set_optional_buffer(
 ) {
     match buffer {
         Some(buffer) => encoder.setBuffer_offset_atIndex(
-            Some(buffer.buffer.raw()),
+            Some(&buffer.buffer.raw()),
             buffer.base_offset as usize,
             index,
         ),

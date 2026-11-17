@@ -1,5 +1,6 @@
 import { Schema } from 'effect'
 import { CustomEndpointDeclarationsSchema } from './custom-endpoints'
+import { CustomModelsConfigSchema } from './custom-models'
 
 const NullableOptional = <A, I, R>(schema: Schema.Schema<A, I, R>) =>
   Schema.optionalWith(Schema.NullishOr(schema), {
@@ -26,6 +27,12 @@ export const NetworkAccessConfigSchema = Schema.Struct({
 })
 export type NetworkAccessConfig = Schema.Schema.Type<typeof NetworkAccessConfigSchema>
 
+/**
+ * Each model's saved chat defaults by serving model ID. Entries are kept as written and decoded one
+ * at a time by their reader, so an entry a later version can't read never makes the file unreadable.
+ */
+export const ChatModelDefaultsConfigSchema = Schema.Record({ key: Schema.String, value: Schema.Unknown })
+
 export const MagnitudeConfigSchema = Schema.Struct({
   contextLimits: Schema.optional(ContextLimitPolicySchema),
   providers: SerializableOptional(CustomEndpointDeclarationsSchema),
@@ -33,6 +40,9 @@ export const MagnitudeConfigSchema = Schema.Struct({
   appearance: SerializableOptional(Schema.Literal("system", "light", "dark")),
   modelsDirectory: SerializableOptional(Schema.NonEmptyTrimmedString.pipe(Schema.maxLength(4_096))),
   network: SerializableOptional(NetworkAccessConfigSchema),
+  models: SerializableOptional(CustomModelsConfigSchema),
+  chatModelDefaults: SerializableOptional(ChatModelDefaultsConfigSchema),
+  onboarding: SerializableOptional(Schema.Literal("Pending", "Completed")),
 })
 
 export type MagnitudeConfig = Schema.Schema.Type<typeof MagnitudeConfigSchema>

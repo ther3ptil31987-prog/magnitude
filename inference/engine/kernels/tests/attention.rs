@@ -3,9 +3,12 @@
 // model of that body (Qwen3.5-4B geometry, long contexts), on the local GPU
 // (Metal, or Vulkan elsewhere) and the CPU.
 
+mod common;
+mod declared;
+
 use magnitude_kernels::{attention_append_dense, attention_decode, attention_prefill};
 use seismic::{
-    BackendName, Device, DeviceCatalog, Element, NativeSpecialization, SlabRegion, SlabTensor,
+    BackendName, Device, Element, NativeSpecialization, SlabRegion, SlabTensor,
     Tensor,
 };
 
@@ -21,6 +24,8 @@ struct Bound {
     query_norm: Tensor,
     key_norm: Tensor,
     value_norm: Tensor,
+    /// No sinks (`[0, heads]`).
+    sinks: Tensor,
     components: Tensor,
     frequencies: Tensor,
     amplitudes: Tensor,
@@ -28,6 +33,13 @@ struct Bound {
     visible: Tensor,
     fresh: Tensor,
     destinations: Tensor,
+    selection: Tensor,
+    block_slots: Tensor,
+    /// No index-list source (`KS` = 0, `TS` = 0).
+    selected_rows: Tensor,
+    selected: Tensor,
+    rotary_layout: Tensor,
+    append_layout: Tensor,
     _history_key_slabs: SlabTensor,
     _history_value_slabs: SlabTensor,
     history_key: Tensor,
@@ -43,30 +55,26 @@ fn history_slabs(
     case: &Case,
     slab_rows: u32,
     reuse_middle: bool,
+    element: Element,
 ) -> [(SlabTensor, Tensor); 2] {
     let (rows, kv, width) = (case.history_rows, case.geometry.kv, case.geometry.w());
     let slab_rows = u64::from(slab_rows);
-    let row_bytes = kv * width * 2;
+    let row_bytes = kv * width * stored_bytes(element, &[0.0]).len();
     let mut tensors = [&case.history_key, &case.history_value].map(|values| {
-        let slabs = SlabTensor::new(
+        let slabs = crate::common::slab_tensor(
             device,
             slab_rows,
             rows as u64,
-            vec![SlabRegion {
-                element: Element::bf16(),
+            &vec![SlabRegion {
+                element,
                 row_shape: vec![kv as u64, width as u64],
-            }],
-        )
-        .unwrap();
-        let bytes = values
-            .iter()
-            .flat_map(|value| bf16_bits(*value).to_le_bytes())
-            .collect::<Vec<_>>();
+            }]);
+        let bytes = stored_bytes(element, values);
         (slabs, bytes)
     });
     for index in 0..(rows as u64).div_ceil(slab_rows) {
         for (slabs, bytes) in &mut tensors {
-            slabs.add_slab().unwrap();
+            slabs.add_slab(seismic::SlabFill::Zeroed).unwrap();
             let start = index * slab_rows;
             let count = slab_rows.min(rows as u64 - start);
             slabs
@@ -81,13 +89,8 @@ fn history_slabs(
     if reuse_middle {
         assert!(rows as u64 > 2 * slab_rows);
         for (slabs, bytes) in &mut tensors {
-            let old = slabs.slab(1).unwrap().observe_storage();
             slabs.free_slab(1).unwrap();
-            assert_eq!(slabs.add_slab().unwrap(), 1);
-            assert_ne!(
-                old.identity(),
-                slabs.slab(1).unwrap().observe_storage().identity()
-            );
+            assert_eq!(slabs.add_slab(seismic::SlabFill::Zeroed).unwrap(), 1);
             let start = slab_rows as usize;
             slabs
                 .region_rows(0, slab_rows, slab_rows)
@@ -110,26 +113,37 @@ impl Bound {
     }
 
     fn new_with_slab_rows(device: &Device, case: &Case, slab_rows: u32) -> Self {
-        Self::new_with_options(device, case, slab_rows, false)
+        Self::new_with_options(device, case, slab_rows, false, Element::bf16())
     }
 
     fn new_with_reused_slab_rows(device: &Device, case: &Case, slab_rows: u32) -> Self {
-        Self::new_with_options(device, case, slab_rows, true)
+        Self::new_with_options(device, case, slab_rows, true, Element::bf16())
     }
 
-    fn new_with_options(device: &Device, case: &Case, slab_rows: u32, reuse_middle: bool) -> Self {
+    /// The case's tensors with its activations and history stored in
+    /// `element`.
+    fn new_with_options(device: &Device, case: &Case, slab_rows: u32, reuse_middle: bool, element: Element) -> Self {
         let Geometry { kv, g, p, .. } = case.geometry;
         let (m, w) = (case.rows, case.geometry.w());
-        let [(history_key_slabs, history_key), (history_value_slabs, history_value)] =
-            history_slabs(device, case, slab_rows, reuse_middle);
+        let [
+            (history_key_slabs, history_key),
+            (history_value_slabs, history_value),
+        ] = history_slabs(device, case, slab_rows, reuse_middle, element);
+        let (selected_rows, _) = no_picks(device, m, kv, w);
+        let stored = |shape: &[usize], values: &[f32]| {
+            let shape = shape.iter().map(|x| *x as u64).collect::<Vec<_>>();
+            Tensor::from_host(device, element, &shape, &stored_bytes(element, values)).unwrap()
+        };
+        let selected = stored(&[0, kv, w], &[]);
         Self {
-            query: bf16_tensor(device, &[m, kv * g, 2 * w], &case.query_gate),
-            gate: bf16_tensor(device, &[m, kv * g, 0], &[]),
-            key: bf16_tensor(device, &[1, m, kv * w], &case.key),
-            value: bf16_tensor(device, &[1, m, kv * w], &case.value),
+            query: stored(&[m, kv * g, 2 * w], &case.query_gate),
+            gate: stored(&[m, kv * g, 0], &[]),
+            key: stored(&[1, m, kv * w], &case.key),
+            value: stored(&[1, m, kv * w], &case.value),
             query_norm: f32_tensor(device, &[1, w], &case.query_norm),
             key_norm: f32_tensor(device, &[1, w], &case.key_norm),
             value_norm: f32_tensor(device, &[0, w], &[]),
+            sinks: f32_tensor(device, &[0, kv * g], &[]),
             components: i32_tensor(device, &[p], &case.components),
             frequencies: f32_tensor(device, &[p], &case.frequencies),
             amplitudes: f32_tensor(device, &[p], &vec![1.0; p]),
@@ -137,6 +151,12 @@ impl Bound {
             visible: i32_tensor(device, &[m, case.spans, 2], &case.visible),
             fresh: i32_tensor(device, &[m, 2], &case.fresh),
             destinations: i32_tensor(device, &[m], &case.destinations),
+            selection: no_selection(device, m),
+            block_slots: block_slots(device, 1),
+            selected_rows,
+            selected,
+            rotary_layout: dense_layout(device),
+            append_layout: dense_append_layout(device),
             _history_key_slabs: history_key_slabs,
             _history_value_slabs: history_value_slabs,
             history_key,
@@ -146,27 +166,27 @@ impl Bound {
     }
 }
 
-/// The CPU decode's partition counts.
-const CPU_PARTS: [u64; 4] = [8, 4, 16, 1];
+/// `values` as `element` (BF16, F16 or F32) stores them, little-endian.
+fn stored_bytes(element: Element, values: &[f32]) -> Vec<u8> {
+    use seismic_lang::{registry::f16_bits, types::DType};
+    match element.dtype() {
+        Some(DType::BF16) => values.iter().flat_map(|value| bf16_bits(*value).to_le_bytes()).collect(),
+        Some(DType::F16) => values.iter().flat_map(|value| f16_bits(*value).to_le_bytes()).collect(),
+        Some(DType::F32) => values.iter().flat_map(|value| value.to_le_bytes()).collect(),
+        other => panic!("no dense test storage for {other:?}"),
+    }
+}
 
 /// The decode specializations to run on `device`, labelled: on the GPU the
 /// statics with each (SPAN, PARTS, SIMDS) of `configs`; on CPU (no statics)
-/// each of its declared PARTS.
+/// its one form, partitioned by the pool (`device.units`).
 fn decode_specializations_on(
     device: &Device,
     geometry: Geometry,
     configs: &[(u64, u64, u64)],
 ) -> Vec<(String, NativeSpecialization)> {
     if is_cpu(device) {
-        return CPU_PARTS
-            .iter()
-            .map(|parts| {
-                (
-                    format!("Cpu PARTS {parts}"),
-                    cpu_statics(geometry).with_param("PARTS", *parts),
-                )
-            })
-            .collect();
+        return vec![("Cpu".to_owned(), cpu_statics(geometry))];
     }
     configs
         .iter()
@@ -286,8 +306,8 @@ fn cpu_statics(geometry: Geometry) -> NativeSpecialization {
 }
 
 /// The prefill specializations to run on `device`, labelled: on the GPU the
-/// statics with each (QT, SPLIT_GROUPS) of `configs`; on CPU its one form
-/// (no statics, no parameters).
+/// statics with each (QT, SPLIT_GROUPS) of `configs`; on CPU its statics
+/// alone, every parameter at its declared default.
 fn prefill_specializations_on(
     device: &Device,
     geometry: Geometry,
@@ -309,16 +329,17 @@ fn prefill_specializations_on(
                 .map(move |direct| ((query_tile, split_groups), direct))
         })
         .map(|((query_tile, split_groups), direct)| {
-            // Vulkan tiles ROWS = 64 matrix rows (query tile x query heads), the
-            // one tile admissible at every tested geometry, whatever QT asks for.
-            let tile = if device.backend() == BackendName::Vulkan {
-                ("ROWS", 64)
+            // Vulkan's matrix form tiles ROWS = 64 matrix rows (query tile x
+            // query heads), the one tile admissible at every tested
+            // geometry, whatever QT asks for.
+            let params = if device.backend() == BackendName::Vulkan {
+                vulkan_prefill_matrix(64, split_groups)
             } else {
-                ("QT", query_tile)
+                vec![("QT", query_tile), ("SPLIT_GROUPS", split_groups)]
             };
-            let specialization = qwen_form(statics(geometry), geometry)
-                .with_param(tile.0, tile.1)
-                .with_param("SPLIT_GROUPS", split_groups);
+            let specialization = params
+                .into_iter()
+                .fold(qwen_form(statics(geometry), geometry), |s, (name, value)| s.with_param(name, value));
             (
                 format!(
                     "{:?} (QT, SPLIT_GROUPS, DIRECT) {:?}",
@@ -329,11 +350,9 @@ fn prefill_specializations_on(
                 // here one group, the smallest declared value holding them.
                 if device.backend() == BackendName::Metal {
                     specialization
-                        .with_param(
-                            "HEADS",
-                            (geometry.g.next_power_of_two() as u64).min(16),
-                        )
+                        .with_param("HEADS", (geometry.g.next_power_of_two() as u64).min(16))
                         .with_param("DIRECT", direct)
+                        .with_param("KEYS", 8)
                 } else {
                     specialization
                 },
@@ -346,24 +365,39 @@ fn decode_kernel(
     device: &Device,
     specialization: &NativeSpecialization,
 ) -> seismic::NativeKernel<attention_decode::Entry> {
-    attention_decode::native_for_device_with(
+    decode_kernel_in(device, specialization, Element::bf16())
+}
+
+/// [`decode_kernel`] with activations and history in `element`.
+fn decode_kernel_in(
+    device: &Device,
+    specialization: &NativeSpecialization,
+    element: Element,
+) -> seismic::NativeKernel<attention_decode::Entry> {
+    // Without sinks (`attention_family.rs` covers them); every parameter a
+    // case leaves unpinned at its declared default.
+    let entry = attention_decode::native_entry_with(attention_decode::Elements { A: element });
+    let specialization = declared::declared_at(
         device,
-        attention_decode::Elements { A: Element::bf16() },
-        specialization,
+        &entry,
+        &dense_statics(specialization.clone().with_static("SK", 0)),
     )
-    .unwrap()
+    .unwrap();
+    entry.prepare(device, &specialization).unwrap()
 }
 
 fn prefill_kernel(
     device: &Device,
     specialization: &NativeSpecialization,
 ) -> seismic::NativeKernel<attention_prefill::Entry> {
-    attention_prefill::native_for_device_with(
+    let entry = attention_prefill::native_entry_with(attention_prefill::Elements { A: Element::bf16() });
+    let specialization = declared::declared_at(
         device,
-        attention_prefill::Elements { A: Element::bf16() },
-        specialization,
+        &entry,
+        &visible_prefill(device, dense_statics(specialization.clone().with_static("SK", 0))),
     )
-    .unwrap()
+    .unwrap();
+    entry.prepare(device, &specialization).unwrap()
 }
 
 /// The family entries' arguments of a bound case.
@@ -381,8 +415,48 @@ macro_rules! args {
             destinations: &$bound.destinations,
             history_key: &mut $bound.history_key,
             history_value: &mut $bound.history_value,
+            form: &$bound.append_layout,
             epsilon: $case.epsilon,
             slab_rows: $bound.slab_rows,
+            key_block: 0,
+            key_element: 0,
+            key_scale: 0,
+            key_amax_floor: 0.0,
+        }
+    };
+    (attention_prefill, $bound:expr, $case:expr) => {
+        attention_prefill::Args {
+            query: &$bound.query,
+            gate: &$bound.gate,
+            key: &$bound.key,
+            value: &$bound.value,
+            query_norm: &$bound.query_norm,
+            key_norm: &$bound.key_norm,
+            value_norm: &$bound.value_norm,
+            sinks: &$bound.sinks,
+            rotary_components: &$bound.components,
+            rotary_frequencies: &$bound.frequencies,
+            rotary_amplitudes: &$bound.amplitudes,
+            coordinates: &$bound.coordinates,
+            visible: &$bound.visible,
+            fresh: &$bound.fresh,
+            destinations: &$bound.destinations,
+            selection: &$bound.selection,
+            block_slots: &$bound.block_slots,
+            selected_rows: &$bound.selected_rows,
+            selected: &$bound.selected,
+            history_key: &mut $bound.history_key,
+            history_value: &mut $bound.history_value,
+            form: &$bound.rotary_layout,
+            epsilon: $case.epsilon,
+            scale: $case.scale,
+            gate_function: 0,
+            slab_rows: $bound.slab_rows,
+            selected_slab_rows: 1,
+            key_block: 0,
+            key_element: 0,
+            key_scale: 0,
+            key_amax_floor: 0.0,
         }
     };
     ($module:ident, $bound:expr, $case:expr) => {
@@ -394,6 +468,7 @@ macro_rules! args {
             query_norm: &$bound.query_norm,
             key_norm: &$bound.key_norm,
             value_norm: &$bound.value_norm,
+            sinks: &$bound.sinks,
             rotary_components: &$bound.components,
             rotary_frequencies: &$bound.frequencies,
             rotary_amplitudes: &$bound.amplitudes,
@@ -401,12 +476,20 @@ macro_rules! args {
             visible: &$bound.visible,
             fresh: &$bound.fresh,
             destinations: &$bound.destinations,
+            selected_rows: &$bound.selected_rows,
+            selected: &$bound.selected,
             history_key: &mut $bound.history_key,
             history_value: &mut $bound.history_value,
+            form: &$bound.rotary_layout,
             epsilon: $case.epsilon,
             scale: $case.scale,
             gate_function: 0,
             slab_rows: $bound.slab_rows,
+            selected_slab_rows: 1,
+            key_block: 0,
+            key_element: 0,
+            key_scale: 0,
+            key_amax_floor: 0.0,
         }
     };
 }
@@ -477,7 +560,6 @@ fn check(
 /// reach.
 fn check_host_model_against_portable_body(entry: &str, case: &Case) {
     use seismic_lang::{
-        checked::{check_source, SourceFile},
         entry::ElementBindings,
         failure::SourceTermination,
         interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -485,12 +567,7 @@ fn check_host_model_against_portable_body(entry: &str, case: &Case) {
         registry,
         types::DType,
     };
-    let mut sources = seismic_std::sources();
-    sources.push(SourceFile {
-        path: "attention.seismic".into(),
-        text: include_str!("../kernels/attention.seismic").into(),
-    });
-    let module = check_source(sources).unwrap();
+    let module = crate::common::kernels();
     let logical = module
         .entry(
             module.entry_named(entry).unwrap(),
@@ -505,7 +582,7 @@ fn check_host_model_against_portable_body(entry: &str, case: &Case) {
     };
     let floats = |values: &[f32]| values.iter().map(|x| f64::from(*x)).collect::<Vec<_>>();
     let ints = |values: &[i32]| values.iter().map(|x| f64::from(*x)).collect::<Vec<_>>();
-    let args = vec![
+    let mut args = vec![
         tensor(
             DType::BF16,
             vec![m, kv * g, 2 * w],
@@ -517,6 +594,8 @@ fn check_host_model_against_portable_body(entry: &str, case: &Case) {
         tensor(DType::F32, vec![1, w], floats(&case.query_norm)),
         tensor(DType::F32, vec![1, w], floats(&case.key_norm)),
         tensor(DType::F32, vec![0, w], Vec::new()),
+        // No sinks.
+        tensor(DType::F32, vec![0, kv * g], Vec::new()),
         tensor(DType::I32, vec![p], ints(&case.components)),
         tensor(DType::F32, vec![p], floats(&case.frequencies)),
         tensor(DType::F32, vec![p], vec![1.0; p]),
@@ -524,13 +603,33 @@ fn check_host_model_against_portable_body(entry: &str, case: &Case) {
         tensor(DType::I32, vec![m, case.spans, 2], ints(&case.visible)),
         tensor(DType::I32, vec![m, 2], ints(&case.fresh)),
         tensor(DType::I32, vec![m], ints(&case.destinations)),
+        // No index-list source (KS = 0, TS = 0).
+        tensor(DType::I32, vec![m, 0], Vec::new()),
+        tensor(DType::BF16, vec![0, kv, w], Vec::new()),
         tensor(DType::BF16, vec![t, kv, w], floats(&case.history_key)),
         tensor(DType::BF16, vec![t, kv, w], floats(&case.history_value)),
+        // Half-split leading rotary pairs, no output rotary, own values, no
+        // key rounding.
+        tensor(DType::I32, vec![0, 0, 0, 0, 0, 0, 0], Vec::new()),
         Arg::Scalar(ReferenceScalar::F32(case.epsilon.to_bits())),
         Arg::Scalar(ReferenceScalar::F32(case.scale.to_bits())),
         Arg::Scalar(ReferenceScalar::I32(0)),
         Arg::Scalar(ReferenceScalar::U32(t as u32)),
+        Arg::Scalar(ReferenceScalar::U32(1)),
+        Arg::Scalar(ReferenceScalar::I32(0)),
+        Arg::Scalar(ReferenceScalar::I32(0)),
+        Arg::Scalar(ReferenceScalar::I32(0)),
+        Arg::Scalar(ReferenceScalar::F32(0.0f32.to_bits())),
     ];
+    // The prefill takes its WorkList bitmap (none: B = 0) and block keys
+    // (BR = 1) after the destinations.
+    let prefill = entry == "attention_prefill";
+    if prefill {
+        args.insert(15, tensor(DType::I32, vec![0, 1], Vec::new()));
+        args.insert(15, tensor(DType::U32, vec![m, 0], Vec::new()));
+    }
+    // The history planes' parameter ordinals.
+    let planes = if prefill { 19 } else { 17 };
     let outcome = interpreter.run(&args).unwrap();
     if let SourceTermination::Failed(failure) = outcome.termination() {
         panic!("{entry} portable body failed: {failure}");
@@ -549,8 +648,8 @@ fn check_host_model_against_portable_body(entry: &str, case: &Case) {
     }
     let inputs = outcome.inputs().collect::<Vec<_>>();
     for (ordinal, expected, name) in [
-        (14, &expected.1, "history_key"),
-        (15, &expected.2, "history_value"),
+        (planes, &expected.1, "history_key"),
+        (planes + 1, &expected.2, "history_value"),
     ] {
         let input = inputs
             .iter()
@@ -594,15 +693,35 @@ fn decode_matches_portable_body_on(device: &Device, case: &Case) {
     }
 }
 
+// 300 history rows are 10 key tiles: SPLIT_GROUPS 1 keeps one key partition
+// per query tile; 256 splits the first sequence's history spans over two
+// partitions and merges them, while its short second sequence stays unsplit.
+fn prefill_case() -> Case {
+    Case::new(SMALL, 400, 2, &prefill_rows(20, 300), 23)
+}
+
 #[test]
-fn prefill_matches_portable_body() {
-    // 300 history rows are 10 key tiles: SPLIT_GROUPS 1 keeps one key
-    // partition per query tile; 256 splits the first sequence's history
-    // spans over two partitions and merges them, while its short second
-    // sequence stays unsplit.
-    let case = Case::new(SMALL, 400, 2, &prefill_rows(20, 300), 23);
-    check_host_model_against_portable_body("attention_prefill", &case);
+fn prefill_host_model_matches_portable_body() {
+    check_host_model_against_portable_body("attention_prefill", &prefill_case());
+}
+
+#[test]
+fn prefill_natives_match_host_model() {
+    let case = prefill_case();
     for device in devices() {
+        seismic_native_tests::progress(format_args!("prefill on {:?}", device.backend()));
+        prefill_matches_portable_body_on(&device, &case);
+    }
+}
+
+/// A 192-column head: each lane holds six columns, a count no staged uvec4
+/// divides, so the matrix form gathers each uvec4 of a staged row from the
+/// lanes holding its columns.
+#[test]
+fn prefill_with_six_columns_a_lane_matches_host_model() {
+    let case = Case::new(Geometry { kv: 1, g: 2, p: 48, s: 96 }, 400, 2, &prefill_rows(20, 300), 29);
+    for device in devices() {
+        seismic_native_tests::progress(format_args!("six-column prefill on {:?}", device.backend()));
         prefill_matches_portable_body_on(&device, &case);
     }
 }
@@ -610,8 +729,9 @@ fn prefill_matches_portable_body() {
 fn prefill_matches_portable_body_on(device: &Device, case: &Case) {
     let expected = case.expected();
     for (config, specialization) in
-        prefill_specializations_on(device, SMALL, &[(16, 1), (8, 1), (16, 256), (8, 256)])
+        prefill_specializations_on(device, case.geometry, &[(16, 1), (8, 1), (16, 256), (8, 256)])
     {
+        seismic_native_tests::progress(format_args!("small prefill {config}"));
         let kernel = prefill_kernel(device, &specialization);
         let mut bound = Bound::new(device, case);
         let gated = run_prefill(&kernel, &mut bound, case);
@@ -645,9 +765,9 @@ fn attention_reads_and_writes_across_history_slabs() {
     check_attention_slab_case(&case, false);
 }
 
-/// Visible spans crossing slab edges, as the device measurement binds them
-/// (one span over the whole synthetic history, several slabs deep): the
-/// entries walk each slab's part of a span.
+/// Visible spans crossing slab edges (one span over the whole synthetic
+/// history, several slabs deep): the entries walk each slab's part of a
+/// span.
 #[test]
 fn attention_reads_spans_crossing_history_slabs() {
     let rows = [
@@ -675,7 +795,7 @@ fn attention_reads_spans_crossing_history_slabs() {
             decode_specializations_on(&device, SMALL, &[(32, 16, 4), (64, 8, 8), (128, 32, 4)])
         {
             for reused in [false, true] {
-                let mut bound = Bound::new_with_options(&device, &case, 32, reused);
+                let mut bound = Bound::new_with_options(&device, &case, 32, reused, Element::bf16());
                 let gated = run_decode(&decode_kernel(&device, &specialization), &mut bound, &case);
                 check(
                     &format!("crossing-span decode {config} reused={reused}"),
@@ -711,7 +831,7 @@ fn attention_reads_and_writes_after_reusing_an_interior_slab() {
 
 fn check_attention_slab_case(case: &Case, reused: bool) {
     let expected = case.expected();
-    let catalog = DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     for backend in [
         BackendName::Cpu,
         BackendName::Metal,
@@ -733,6 +853,7 @@ fn check_attention_slab_case(case: &Case, reused: bool) {
                         .with_param("MATRIX", matrix)
                         .with_param("STAGES", stages)
                         .with_param("COLUMNS", columns)
+                        .with_param("QREG", 0)
                 })
                 .collect::<Vec<_>>()
         } else {
@@ -846,107 +967,56 @@ fn eight_query_group_prefill_matches_host_model() {
     }
 }
 
-/// Device time of one decode layer's attention at Qwen3.5-4B geometry
-/// (indicative only on a shared development GPU): `cargo test --release
-/// --test attention -- --ignored --nocapture decode_timing`. Context 1 (the
-/// row sees only itself) is the entry's launch floor.
-#[test]
-#[ignore]
-fn decode_timing() {
-    for device in devices() {
-        decode_timing_on(&device);
-    }
-}
-
-fn decode_timing_on(device: &Device) {
-    let configs = [
-        (32, 16, 4),
-        (32, 8, 4),
-        (64, 8, 4),
-        (64, 16, 4),
-        (128, 16, 4),
-        (32, 16, 8),
-        (64, 32, 4),
-    ];
-    for context in [1usize, 256, 4096, 16384] {
-        let rows = [Row {
-            spans: vec![(0, context as i32 - 1)],
-            fresh: (0, 1),
-            destination: context as i32 - 1,
-            position: context as i32 - 1,
-        }];
-        let case = Case::new(QWEN, context + 64, 1, &rows, 3);
-        for (config, specialization) in decode_specializations_on(device, QWEN, &configs) {
-            let kernel = decode_kernel(device, &specialization);
-            let mut bound = Bound::new(device, &case);
-            let measurement = kernel
-                .measure(vec![args!(attention_decode, bound, case)], &TIMING)
-                .unwrap();
-            let kv_bytes = (context * QWEN.kv * QWEN.w() * 2 * 2) as f64;
-            eprintln!(
-                "decode context {context} {config}: {:.1} us (KV read {:.0} GB/s)",
-                measurement.median * 1e6,
-                kv_bytes / measurement.median / 1e9
-            );
-        }
-    }
-}
-
-/// Device time of one prefill layer's attention at Qwen3.5-4B geometry, rows
-/// of one sequence after `history` rows (indicative only on a shared
-/// development GPU): `cargo test --release --test attention -- --ignored
-/// --nocapture prefill_timing`. FLOP counts both products of every visible
-/// (row, key) pair.
-#[test]
-#[ignore]
-fn prefill_timing() {
-    for device in devices() {
-        prefill_timing_on(&device);
-    }
-}
-
-fn prefill_timing_on(device: &Device) {
-    for (rows, history) in [(128usize, 0i32), (128, 4096), (512, 0), (512, 16384)] {
-        let spans = if history > 0 {
-            vec![(0, history)]
-        } else {
-            vec![]
-        };
-        let rows = (0..rows)
-            .map(|row| Row {
-                spans: spans.clone(),
-                fresh: (0, row as i32 + 1),
-                destination: history + row as i32,
-                position: history + row as i32,
-            })
-            .collect::<Vec<_>>();
-        let pairs = rows
-            .iter()
-            .map(|row| (history + row.fresh.1 - row.fresh.0) as f64)
-            .sum::<f64>();
-        let flop = pairs * (QWEN.kv * QWEN.g * QWEN.w() * 4) as f64;
-        let case = Case::new(QWEN, history as usize + rows.len(), 1, &rows, 9);
-        let configs = [(16, 1), (16, 128), (16, 256), (16, 512), (8, 1), (8, 256), (32, 1), (32, 256), (32, 512)];
-        for (config, specialization) in prefill_specializations_on(device, QWEN, &configs) {
-            let kernel = prefill_kernel(device, &specialization);
-            let mut bound = Bound::new(device, &case);
-            let measurement = kernel
-                .measure(vec![args!(attention_prefill, bound, case)], &TIMING)
-                .unwrap();
-            eprintln!(
-                "prefill {} rows after {history} history {config}: {:.1} us ({:.2} TFLOP/s)",
-                rows.len(),
-                measurement.median * 1e6,
-                flop / measurement.median / 1e12
-            );
-        }
-    }
-}
-
 #[test]
 fn qwen_geometry_speculative_decode_matches_host_model() {
     for device in devices() {
         qwen_geometry_speculative_decode_matches_host_model_on(&device);
+    }
+}
+
+/// Register-held queries reuse the operand stage region only after every
+/// query fragment is captured. Exercise empty partitions, padded query rows,
+/// and the long-history verification shape against the dense host model.
+#[test]
+#[ignore = "bounded CUDA register-query decode qualification"]
+fn cuda_register_query_decode_matches_host_model() {
+    let device = seismic::Devices::discover(&[])
+        .unwrap()
+        .open_backend(BackendName::Cuda)
+        .expect("CUDA qualification requires CUDA");
+    let geometry = Geometry {
+        kv: 4,
+        g: 6,
+        p: 32,
+        s: 192,
+    };
+    let specialization = qwen_form(statics(geometry), geometry)
+        .with_param("PARTS", 12)
+        .with_param("WARPS", 4)
+        .with_param("SLICES", 1)
+        .with_param("MATRIX", 1)
+        .with_param("STAGES", 2)
+        .with_param("COLUMNS", 1)
+        .with_param("QREG", 1);
+    let kernel = decode_kernel(&device, &specialization);
+    for (rows, context) in [(1, 1), (8, 1), (8, 65536)] {
+        let case = Case::new(
+            geometry,
+            context as usize + rows,
+            1,
+            &speculative_rows(rows, context),
+            13,
+        );
+        let expected = case.expected();
+        let mut bound = Bound::new(&device, &case);
+        let gated = run_decode(&kernel, &mut bound, &case);
+        check(
+            &format!("CUDA register-query decode {rows} rows context {context}"),
+            &case,
+            &gated,
+            &bound,
+            &expected,
+        );
     }
 }
 
@@ -1041,43 +1111,250 @@ fn qwen_geometry_decode_and_prefill_match_host_model_on(device: &Device) {
     }
 }
 
-
 /// State-only priming must publish the same K/V as ordinary attention,
 /// including slab boundaries and ignored destinations, without an output.
 #[test]
 fn dense_append_publishes_only_the_same_history_as_prefill() {
     let rows = [
-        Row { spans: vec![(0, 16)], fresh: (0, 1), destination: 31, position: 16 },
-        Row { spans: vec![(0, 16)], fresh: (1, 2), destination: 32, position: 17 },
-        Row { spans: vec![(0, 16)], fresh: (2, 3), destination: -1, position: 18 },
+        Row {
+            spans: vec![(0, 16)],
+            fresh: (0, 1),
+            destination: 31,
+            position: 16,
+        },
+        Row {
+            spans: vec![(0, 16)],
+            fresh: (1, 2),
+            destination: 32,
+            position: 17,
+        },
+        Row {
+            spans: vec![(0, 16)],
+            fresh: (2, 3),
+            destination: -1,
+            position: 18,
+        },
     ];
     let case = Case::new(SMALL, 64, 1, &rows, 97);
     let expected = case.expected();
-    let catalog = DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     for backend in [BackendName::Cpu, BackendName::Metal] {
-        let Ok(device) = catalog.open_backend(backend) else { continue; };
-        let specialization = if is_cpu(&device) { cpu_statics(SMALL) }
-            else { qwen_form(statics(SMALL), SMALL) };
-        let append = attention_append_dense::native_for_device_with(
-            &device, attention_append_dense::Elements { A: Element::bf16() }, &append_specialization(&specialization),
-        ).unwrap();
+        let Ok(device) = catalog.open_backend(backend) else {
+            continue;
+        };
+        let specialization = if is_cpu(&device) {
+            cpu_statics(SMALL)
+        } else {
+            qwen_form(statics(SMALL), SMALL)
+        };
+        let append = declared::prepared(
+            &device,
+            &attention_append_dense::native_entry_with(attention_append_dense::Elements { A: Element::bf16() }),
+            &append_specialization(&specialization),
+        )
+        .unwrap();
         let mut appended = Bound::new_with_slab_rows(&device, &case, 32);
-        append.call(args!(attention_append_dense, appended, case)).unwrap();
+        append
+            .call(args!(attention_append_dense, appended, case))
+            .unwrap();
         let mut full = Bound::new_with_slab_rows(&device, &case, 32);
-        let prefill = prefill_specializations_on(&device, SMALL, &[(16, 1)]).remove(0).1;
+        let prefill = prefill_specializations_on(&device, SMALL, &[(16, 1)])
+            .remove(0)
+            .1;
         let _ = run_prefill(&prefill_kernel(&device, &prefill), &mut full, &case);
         let actual_key = bf16_values(&appended.history_key);
-        assert_eq!(actual_key, bf16_values(&full.history_key), "{backend:?}: keys");
-        assert_eq!(bf16_values(&appended.history_value), bf16_values(&full.history_value), "{backend:?}: values");
+        assert_eq!(
+            actual_key,
+            bf16_values(&full.history_key),
+            "{backend:?}: keys"
+        );
+        assert_eq!(
+            bf16_values(&appended.history_value),
+            bf16_values(&full.history_value),
+            "{backend:?}: values"
+        );
         for (a, e) in actual_key.iter().zip(&expected.1) {
-            assert!((a - e).abs() <= 8.0e-3 * e.abs().max(1.0), "{backend:?}: host key {a} != {e}");
+            assert!(
+                (a - e).abs() <= 8.0e-3 * e.abs().max(1.0),
+                "{backend:?}: host key {a} != {e}"
+            );
         }
-        assert_eq!(bf16_values(&appended.history_value), expected.2, "{backend:?}: host values");
+        assert_eq!(
+            bf16_values(&appended.history_value),
+            expected.2,
+            "{backend:?}: host values"
+        );
         eprintln!("{backend:?}: dense append exact prefill state; host reference agrees");
     }
 }
 
 fn append_specialization(specialization: &NativeSpecialization) -> NativeSpecialization {
-    specialization.statics().iter().filter(|(name, _)| !matches!(name.as_str(), "G" | "I" | "U"))
-        .fold(NativeSpecialization::new(), |spec, (name, value)| spec.with_static(name, *value))
+    specialization
+        .statics()
+        .iter()
+        .filter(|(name, _)| !matches!(name.as_str(), "G" | "I" | "U" | "NQ" | "RO" | "AB"))
+        .fold(NativeSpecialization::new(), |spec, (name, value)| {
+            spec.with_static(name, *value)
+        })
+        // No key rounding.
+        .with_static("KR", 0)
+}
+
+/// One kv head of twelve query heads (a tile of eight, then four).
+const WIDE_GROUP: Geometry = Geometry { kv: 1, g: 12, p: 16, s: 32 };
+/// LFM2.5-2.6B's attention: eight kv heads of four query heads, 64 columns.
+const LFM: Geometry = Geometry { kv: 8, g: 4, p: 32, s: 0 };
+
+/// The CPU's vector tier against its portable tier, bit for bit: x86-64-v2
+/// runs the portable body (over rows widened into scratch,
+/// the body every x86 tier ran before the vector body), the detected tier
+/// the vector body. Dense decode at each activation element over the pool's
+/// partitions, histories of 17, 77 and 1000 keys (none a whole number of
+/// 32-key blocks), and query groups of 2, 4 and 12.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn cpu_vector_tier_matches_portable_tier() {
+    let device = seismic::Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap();
+    if !std::arch::is_x86_feature_detected!("avx2") {
+        return;
+    }
+    for (geometry, base) in [(SMALL, 5), (WIDE_GROUP, 65), (LFM, 988)] {
+        let case = Case::new(geometry, base as usize + 64, 2, &decode_rows(base), 31);
+        for element in [Element::bf16(), Element::f16(), Element::f32()] {
+            let run = |tier: u64| {
+                let specialization = cpu_statics(geometry).with_param("cpu.tier", tier);
+                let kernel = decode_kernel_in(&device, &specialization, element);
+                let mut bound = Bound::new_with_options(&device, &case, 48, false, element);
+                run_decode(&kernel, &mut bound, &case).read_to_host().unwrap()
+            };
+            // Tier 0 is the detected tier; 1 names x86-64-v2.
+            assert!(
+                run(0) == run(1),
+                "KV {} G {} W {} {element:?}: the vector tier differs from the portable tier",
+                geometry.kv,
+                geometry.g,
+                geometry.w()
+            );
+        }
+    }
+}
+
+/// On the CPU, each (kv head, row) splits its keys into one partition per
+/// pool participant (`device.units`), max(128, ceil(keys / units)) keys
+/// each. Histories set against the pool fill one partition and leave the
+/// rest empty (one partition's merge), fill about half of them, and fill
+/// every one with more than 128 keys; each matches the host model, beside a
+/// row that sees nothing (every partition empty).
+#[test]
+fn cpu_decode_matches_host_model_at_every_partition_fill() {
+    use seismic::device::DeviceValues;
+    let device = seismic::Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap();
+    let units = device.properties().value("units") as i32;
+    for base in [5, 64 * units, 128 * units + 65] {
+        let case = Case::new(SMALL, base as usize + 64, 2, &decode_rows(base), 43);
+        let expected = case.expected();
+        let kernel = decode_kernel(&device, &cpu_statics(SMALL));
+        let mut bound = Bound::new(&device, &case);
+        let gated = run_decode(&kernel, &mut bound, &case);
+        check(
+            &format!("Cpu decode over {} history keys on {units} participants", base + 12),
+            &case,
+            &gated,
+            &bound,
+            &expected,
+        );
+    }
+}
+
+/// Qwen3-8B's attention: eight kv heads of four query heads, 128 columns.
+const QWEN3_8B: Geometry = Geometry { kv: 8, g: 4, p: 64, s: 0 };
+
+/// The CPU prefill's row blocks never change result bits: every declared
+/// ROWS gives the same bits over rows of two sequences (blocks whose rows
+/// share their keys, blocks across the boundary, padding rows), and they
+/// match the host model.
+#[test]
+fn cpu_prefill_row_blocks_keep_result_bits() {
+    let device = seismic::Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap();
+    let case = Case::new(QWEN35B, 448, 2, &prefill_rows(70, 300), 61);
+    let expected = case.expected();
+    let mut first = None;
+    for rows in [16, 8, 32, 4] {
+        let kernel = prefill_kernel(&device, &cpu_statics(QWEN35B).with_param("ROWS", rows));
+        let mut bound = Bound::new(&device, &case);
+        let gated = run_prefill(&kernel, &mut bound, &case);
+        check(&format!("Cpu prefill ROWS {rows}"), &case, &gated, &bound, &expected);
+        let bits = gated.read_to_host().unwrap();
+        assert!(first.get_or_insert_with(|| bits.clone()) == &bits, "ROWS {rows} changes the result bits");
+    }
+}
+
+/// The CPU prefill's shared key blocks give the bits each row's own walk
+/// gives: rows of two sequences (runs sharing their keys' whole blocks)
+/// against the same rows with a WorkList bitmap that reads every key, whose
+/// rows share none and each walk their keys alone.
+#[test]
+fn cpu_prefill_shared_blocks_match_each_row_alone() {
+    let device = seismic::Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap();
+    let rows = 70;
+    let case = Case::new(QWEN35B, 448, 2, &prefill_rows(rows, 300), 67);
+    let kernel = prefill_kernel(&device, &cpu_statics(QWEN35B));
+    let mut shared = Bound::new(&device, &case);
+    let mut alone = Bound::new(&device, &case);
+    // Sixteen words a row: 512 one-key blocks, past every row's keys.
+    let every = vec![u32::MAX; rows * 16].iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
+    alone.selection = Tensor::from_host(&device, Element::u32(), &[rows as u64, 16], &every).unwrap();
+    let shared = run_prefill(&kernel, &mut shared, &case).read_to_host().unwrap();
+    let alone = run_prefill(&kernel, &mut alone, &case).read_to_host().unwrap();
+    assert!(shared == alone, "shared key blocks change the result bits");
+}
+
+/// This process's CPU seconds (user and system, every thread): the work a
+/// call does, which a shared host's other load does not stretch as it
+/// stretches the call's wall time.
+#[cfg(unix)]
+fn cpu_seconds() -> f64 {
+    // `struct rusage`: user and system `timeval`s, then fourteen longs.
+    unsafe extern "C" {
+        fn getrusage(who: i32, usage: *mut [i64; 18]) -> i32;
+    }
+    let mut usage = [0i64; 18];
+    // SAFETY: RUSAGE_SELF (0) into a buffer of the struct's 144 bytes.
+    assert_eq!(unsafe { getrusage(0, &mut usage) }, 0);
+    let seconds = |at: usize| usage[at] as f64 + (usage[at + 1] & 0xffff_ffff) as f64 * 1e-6;
+    seconds(0) + seconds(2)
+}
+
+/// CPU prefill attention at a long prompt's last 512-row chunk (after 24,576
+/// and 39,424 history rows: a 25k and a 40k prompt), Qwen3-8B's geometry, at
+/// each declared ROWS: the median wall and CPU seconds of five calls after
+/// one warm call, per call and layer, and a hash of the result.
+#[test]
+#[cfg(unix)]
+#[ignore = "timing at shape; run alone on a quiet host"]
+fn cpu_prefill_timing_at_shape() {
+    let device = seismic::Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap();
+    for history in [24_576, 39_424] {
+        let case = Case::new(QWEN3_8B, history as usize + 512, 1, &speculative_rows(512, history), 53);
+        for rows in [16, 8, 32, 4] {
+            let kernel = prefill_kernel(&device, &cpu_statics(QWEN3_8B).with_param("ROWS", rows));
+            let mut bound = Bound::new(&device, &case);
+            let bits = run_prefill(&kernel, &mut bound, &case).read_to_host().unwrap();
+            let hash = bits.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x100_0000_01b3));
+            let (mut wall, mut cpu): (Vec<f64>, Vec<f64>) = (0..5)
+                .map(|_| {
+                    let (started, used) = (std::time::Instant::now(), cpu_seconds());
+                    run_prefill(&kernel, &mut bound, &case).read_to_host().unwrap();
+                    (started.elapsed().as_secs_f64(), cpu_seconds() - used)
+                })
+                .unzip();
+            wall.sort_by(f64::total_cmp);
+            cpu.sort_by(f64::total_cmp);
+            eprintln!(
+                "cpu prefill: 512 rows after {history} history rows, ROWS {rows}: wall {:.1} ms, cpu {:.2} s, result hash {hash:016x}",
+                1e3 * wall[2],
+                cpu[2]
+            );
+        }
+    }
 }

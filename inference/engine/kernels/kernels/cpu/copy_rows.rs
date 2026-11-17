@@ -5,6 +5,7 @@
 
 use seismic::cpu::slab::SlabTensor;
 
+#[inline(always)]
 fn copy_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let item = group[0] as usize;
     let slab_rows = cx.arg_slab_rows() as usize;
@@ -20,13 +21,10 @@ fn copy_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _
     for head in 0..cx.dim_kv() as usize {
         // SAFETY: compaction names distinct destination rows, so each item
         // writes its own rows.
-        let (source, length) = {
-            let source = rows.row([from, head, 0]);
-            (source.as_ptr(), source.len())
-        };
-        let target = unsafe { rows.row_mut([to, head, 0]) };
-        // SAFETY: a compaction source is occupied and its destination is free.
-        // They cannot overlap, and the row bounds were checked above.
-        unsafe { std::ptr::copy_nonoverlapping(source, target.as_mut_ptr(), length) };
+        let source = rows.stored([from, head, 0]);
+        let mut target = unsafe { rows.row_mut([to, head, 0]) };
+        // A compaction source is occupied and its destination is free: the
+        // values are ones a store already holds.
+        <E::A as Element>::move_stored(&mut target, source);
     }
 }

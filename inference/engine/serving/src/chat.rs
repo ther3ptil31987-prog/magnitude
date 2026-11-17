@@ -31,14 +31,12 @@ use utoipa::openapi::schema::AnyOfBuilder;
 use utoipa::{PartialSchema, ToSchema};
 
 use crate::error::{ApiError, ApiErrorBody, ErrorResponse, ServingError};
+use crate::sampling::{SamplingRequest, sampling};
 use crate::source::{
-    GenerationEvent, GenerationStream, LoadProgress, ModelLoadProgress, ModelLoadStage,
+    GenerationEvent, GenerationStream, LoadProgress, ModelLoadDetails, ModelLoadProgress, ModelLoadStage,
 };
 use magnitude_engine::chat::AppliedTemplate;
 use crate::{Serving, include_progress, media, unix_timestamp, with_request_id};
-
-const DEFAULT_TEMPERATURE: f32 = 0.8;
-const DEFAULT_TOP_P: f32 = 0.95;
 
 fn deserialize_bool_or_false<'de, D>(deserializer: D) -> Result<bool, D::Error>
 where
@@ -424,6 +422,9 @@ pub enum ChatCompletionProgress {
     ModelLoading {
         stage: ModelLoadStage,
         fraction: f32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schema(nullable = false)]
+        details: Option<ModelLoadDetails>,
     },
     Queued,
     Preparing,
@@ -441,6 +442,7 @@ impl ChatCompletionProgress {
         Self::ModelLoading {
             stage: load.stage,
             fraction: load.fraction.clamp(0.0, 1.0),
+            details: load.details,
         }
     }
 }
@@ -657,7 +659,10 @@ pub(crate) async fn collect(
                 journal.push(&event).map_err(ServingError::Output)?
             }
             Some(GenerationEvent::Completed(completion)) => {
-                return Ok((journal.finish().map_err(ServingError::Output)?, completion));
+                let output = journal
+                    .finish(&completion.termination)
+                    .map_err(ServingError::Output)?;
+                return Ok((output, completion));
             }
             Some(GenerationEvent::Failed(error)) => return Err(error),
             None => return Err(ended_without_outcome()),
@@ -949,8 +954,9 @@ pub(crate) fn adapt_request(request: ChatCompletionRequest) -> Result<AdaptedCha
     })
 }
 
-fn finite_in(value: f32, range: std::ops::RangeInclusive<f32>) -> bool {
-    value.is_finite() && range.contains(&value)
+/// Convert a completion request to the host input shared by rendering and counting.
+pub fn chat_input(request: ChatCompletionRequest) -> Result<ChatInput, ApiError> {
+    Ok(adapt_request(request)?.request.input)
 }
 
 pub(crate) fn validate_request(
@@ -983,39 +989,16 @@ pub(crate) fn validate_request(
                 .ok_or_else(|| ApiError::invalid("max tokens must be greater than zero"))
         })
         .transpose()?;
-    let temperature = request.temperature.unwrap_or(DEFAULT_TEMPERATURE);
-    if !finite_in(temperature, 0.0..=2.0) {
-        return Err(ApiError::invalid(
-            "temperature must be finite and between 0 and 2",
-        ));
-    }
-    let top_p = request.top_p.unwrap_or(DEFAULT_TOP_P);
-    if !finite_in(top_p, 0.0..=1.0) || top_p == 0.0 {
-        return Err(ApiError::invalid(
-            "top_p must be finite, greater than 0 and at most 1",
-        ));
-    }
-    let min_p = request.min_p.unwrap_or(0.0);
-    if !finite_in(min_p, 0.0..=1.0) {
-        return Err(ApiError::invalid("min_p must be finite and between 0 and 1"));
-    }
-    let repetition_penalty = request.repetition_penalty.unwrap_or(1.0);
-    if !repetition_penalty.is_finite() || repetition_penalty <= 0.0 {
-        return Err(ApiError::invalid(
-            "repetition_penalty must be finite and positive",
-        ));
-    }
-    let presence_penalty = request.presence_penalty.unwrap_or(0.0);
-    let frequency_penalty = request.frequency_penalty.unwrap_or(0.0);
-    if !finite_in(presence_penalty, -2.0..=2.0) || !finite_in(frequency_penalty, -2.0..=2.0) {
-        return Err(ApiError::invalid(
-            "presence_penalty and frequency_penalty must be finite and between -2 and 2",
-        ));
-    }
-    let top_k = request.top_k.unwrap_or(0);
-    if top_k > 1 << 24 {
-        return Err(ApiError::invalid("top_k exceeds the supported range"));
-    }
+    let sampling = sampling(SamplingRequest {
+        temperature: request.temperature,
+        top_p: request.top_p,
+        top_k: request.top_k,
+        min_p: request.min_p,
+        repetition_penalty: request.repetition_penalty,
+        presence_penalty: request.presence_penalty,
+        frequency_penalty: request.frequency_penalty,
+        seed: request.seed,
+    })?;
     let conversation = chat_context(request.messages)?;
     let (tools, tool_names) = tools(request.tools.unwrap_or_default())?;
     let tool_choice = tool_choice(request.tool_choice, &tool_names)?;
@@ -1039,16 +1022,7 @@ pub(crate) fn validate_request(
         template_args,
         stop,
         max_tokens,
-        sampling: SamplingControls {
-            temperature,
-            top_p,
-            top_k,
-            min_p,
-            repetition_penalty,
-            presence_penalty,
-            frequency_penalty,
-            seed: crate::responses::request_seed(request.seed),
-        },
+        sampling,
         cache_prompt: request.cache_prompt,
         ignore_eos: request.ignore_eos,
         timings_per_token: request.timings_per_token,
@@ -1766,9 +1740,8 @@ pub async fn count_chat_tokens(
         .await
         .map_err(ApiError::from)?;
     let input = adapted.request.input;
-    let prompt_tokens = tokio::task::spawn_blocking(move || host.count(&input))
+    let prompt_tokens = magnitude_service_utils::blocking::run(move || host.count(&input))
         .await
-        .map_err(|error| ApiError::server(format!("token-count task failed: {error}")))?
         .map_err(ApiError::from)?;
     Ok(Json(CountResponse { prompt_tokens }))
 }
@@ -1803,9 +1776,8 @@ pub async fn apply_template(
     tracing::Span::current().record("model.id", model.as_str());
     let input = validate_apply_template_request(request)?;
     let host = state.models.host(&model).await.map_err(ApiError::from)?;
-    let applied = tokio::task::spawn_blocking(move || host.apply_template(&input))
+    let applied = magnitude_service_utils::blocking::run(move || host.apply_template(&input))
         .await
-        .map_err(|error| ApiError::server(format!("template task failed: {error}")))?
         .map_err(ApiError::from)?;
     Ok(Json(apply_template_response(applied)))
 }

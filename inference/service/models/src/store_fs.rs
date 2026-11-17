@@ -1,4 +1,5 @@
 use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -25,6 +26,38 @@ pub(crate) async fn ensure_store_layout(root: &Path) -> Result<(), InventoryErro
 
     for relative in ["hub", "locks"] {
         ensure_owned_directory(&root.join(relative)).await?;
+    }
+    Ok(())
+}
+
+/// Atomically replaces `root/name` with `bytes`: written to a private temporary file, flushed,
+/// renamed over the destination, and the directory flushed on Unix.
+pub(crate) fn replace_file_sync(root: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = root.join(format!("{name}.tmp-{nonce}"));
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary)?;
+    if let Err(error) = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, root.join(name))?;
+        #[cfg(unix)]
+        File::open(root)?.sync_all()?;
+        Ok(())
+    })() {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
     }
     Ok(())
 }
@@ -117,6 +150,46 @@ fn io_error(error: impl std::fmt::Display) -> InventoryError {
     InventoryError::Io(error.to_string())
 }
 
+/// Removes a repository folder of Magnitude's own store that no longer holds a model: once no
+/// snapshot remains, its empty `snapshots`, `.incomplete` and `refs` folders, and a `blobs` folder
+/// left with only integrity checkpoints of blobs that are gone, then the folder itself. A partial
+/// download, a blob, or anything else unexpected keeps the folder. Callers hold the repository
+/// lock.
+pub(crate) fn prune_empty_repository(repo_root: &Path) {
+    let entries = |path: &Path| -> Option<Vec<std::path::PathBuf>> {
+        match fs::read_dir(path) {
+            Ok(entries) => Some(entries.filter_map(|entry| entry.ok().map(|entry| entry.path())).collect()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(Vec::new()),
+            Err(_) => None,
+        }
+    };
+    let Some(snapshots) = entries(&repo_root.join("snapshots")) else {
+        return;
+    };
+    if !snapshots.is_empty() {
+        return;
+    }
+    let blobs = repo_root.join("blobs");
+    if let Some(blob_entries) = entries(&blobs) {
+        for checkpoint in &blob_entries {
+            let orphaned = checkpoint
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_suffix(".integrity"))
+                .is_some_and(|blob| {
+                    !blobs.join(blob).exists() && !blobs.join(format!("{blob}.incomplete")).exists()
+                });
+            if orphaned {
+                let _ = fs::remove_file(checkpoint);
+            }
+        }
+    }
+    for folder in ["snapshots", ".incomplete", "refs", "blobs"] {
+        let _ = fs::remove_dir(repo_root.join(folder));
+    }
+    let _ = fs::remove_dir(repo_root);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,5 +235,30 @@ mod tests {
             fs::read(outside).expect("outside file retained"),
             b"outside"
         );
+    }
+
+    #[test]
+    fn an_empty_repository_folder_is_pruned_and_one_with_a_partial_download_is_kept() {
+        let temporary = tempfile::tempdir().unwrap();
+        let empty = temporary.path().join("models--owner--empty");
+        fs::create_dir_all(empty.join("snapshots")).unwrap();
+        fs::create_dir_all(empty.join(".incomplete")).unwrap();
+        fs::create_dir_all(empty.join("blobs")).unwrap();
+        fs::write(empty.join("blobs").join("abc.integrity"), b"{}").unwrap();
+        prune_empty_repository(&empty);
+        assert!(!empty.exists());
+
+        let resuming = temporary.path().join("models--owner--resuming");
+        fs::create_dir_all(resuming.join("blobs")).unwrap();
+        fs::write(resuming.join("blobs").join("abc.incomplete"), b"part").unwrap();
+        fs::write(resuming.join("blobs").join("abc.integrity"), b"{}").unwrap();
+        prune_empty_repository(&resuming);
+        assert!(resuming.join("blobs").join("abc.incomplete").exists());
+        assert!(resuming.join("blobs").join("abc.integrity").exists());
+
+        let published = temporary.path().join("models--owner--published");
+        fs::create_dir_all(published.join("snapshots").join("commit")).unwrap();
+        prune_empty_repository(&published);
+        assert!(published.join("snapshots").join("commit").exists());
     }
 }

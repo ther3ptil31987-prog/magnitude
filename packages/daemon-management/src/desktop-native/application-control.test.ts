@@ -1,4 +1,4 @@
-import { ApplicationUpdateControlFailed, DesktopUpdateState, LoginStartupFailed, type LoginStartupState } from "@magnitudedev/sdk/desktop-host"
+import { ApplicationUpdateControlFailed, ApplicationUpdateState, LoginStartupFailed, type LoginStartupState } from "@magnitudedev/sdk/desktop-host"
 import { mkdtemp, rm, writeFile, stat } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -15,7 +15,7 @@ describe("local application control", () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const root = yield* setup
       const path = join(root, "application.sock")
-      const ready = DesktopUpdateState.make({ transfer: { _tag: "Ready", version: "2.0.0" }, check: { _tag: "Succeeded", at: 1 }, preference: { _tag: "Known", autoDownload: false } })
+      const ready = ApplicationUpdateState.make({ transfer: { _tag: "Ready", version: "2.0.0" }, check: { _tag: "Succeeded", at: 1 }, preference: { _tag: "Known", autoDownload: false } })
       const actions = yield* Ref.make<string[]>([])
       yield* serveApplicationControl(path, { snapshot: Effect.succeed(snapshot), login: () => Effect.die("Unexpected login request"), dispatch: () => Effect.die("Updates cannot show a window"),
         update: action => action === "download" ? new ApplicationUpdateControlFailed({ message: "Already prepared" }) : Effect.succeed({ state: ready, afterReply: Ref.update(actions, values => [...values, action]) }),
@@ -84,6 +84,20 @@ describe("local application control", () => {
       if (result._tag === "Left") expect(result.left._tag).toBe("ApplicationControlClosed")
     })))
   })
+  it("treats an owner that resets the connection while exiting as gone, not as a control failure", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const path = join(yield* setup, "exiting.sock")
+      // A dying owner closes the accepted connection with the request still unread, which resets it.
+      const server = yield* Effect.acquireRelease(Effect.sync(() => createLocalServer({ pauseOnConnect: true }, socket => {
+        socket.on("error", () => {})
+        setTimeout(() => socket.destroy(), 50)
+      })), server => Effect.promise(() => new Promise<void>(resolve => server.close(() => resolve()))))
+      yield* Effect.promise(() => new Promise<void>(resolve => server.listen(path, resolve)))
+      const result = yield* requestApplication(path, "ShowWindow").pipe(Effect.either)
+      expect(result._tag).toBe("Left")
+      if (result._tag === "Left") expect(result.left._tag).toBe("ApplicationControlClosed")
+    })))
+  })
   it("reports cold-start connection failure inside an HTTP callback without crashing the host", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const path = join(yield* setup, "missing.sock")
@@ -113,6 +127,18 @@ describe("local application control", () => {
       expect(yield* Ref.get(intents)).toEqual(["EnsureRunning", "ShowWindow", "Observe", "Retry", "Quit", "Yield"])
       yield* Fiber.interrupt(server)
       expect(yield* Effect.promise(() => stat(path).then(() => true, () => false))).toBe(false)
+    })))
+  })
+  it("forwards an opened link to the owner after replying, and rejects an unbounded one before dispatch", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const path = join(yield* setup, "app.sock")
+      const intents = yield* Ref.make<ApplicationIntent[]>([])
+      yield* serveApplicationControl(path, { snapshot: Effect.succeed(snapshot), update: () => Effect.die("Unexpected update request"), login: () => Effect.succeed({ _tag: "Disabled" }), dispatch: intent => Ref.update(intents, list => [...list, intent]) })
+      const url = "magnitude://open_from_hf?model=owner/repo&file=model-Q4_K_M.gguf"
+      expect((yield* requestApplication(path, { _tag: "OpenUrl", url })).pid).toBe(process.pid)
+      const overlong = yield* requestApplication(path, { _tag: "OpenUrl", url: `magnitude://${"a".repeat(5000)}` }).pipe(Effect.either)
+      expect(overlong._tag).toBe("Left")
+      expect(yield* Ref.get(intents)).toEqual([{ _tag: "OpenUrl", url }])
     })))
   })
   it("does not remove ordinary files at the socket path", async () => {

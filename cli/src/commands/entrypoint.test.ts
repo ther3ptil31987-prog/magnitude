@@ -3,6 +3,8 @@ import { mkdtemp, rm, stat } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { fileURLToPath } from "node:url"
+import { Command, CommanderError } from "@commander-js/extra-typings"
+import { registerServeCommand } from "./serve"
 
 const invoke = async (args: readonly string[], environment: Record<string, string> = {}) => {
   const process = Bun.spawn([Bun.which("bun")!, fileURLToPath(new URL("../index.ts", import.meta.url)), ...args], {
@@ -22,7 +24,7 @@ describe("headless CLI entrypoint", () => {
     const result = await invoke([])
     expect(result.code).toBe(0)
     expect(result.stdout).toContain("Usage: magnitude")
-    expect(result.stdout).toContain("catalog")
+    expect(result.stdout).toContain("models")
     expect(result.stdout).not.toMatch(/\x1b\[/)
     expect(result.stderr).toBe("")
   })
@@ -32,34 +34,34 @@ describe("headless CLI entrypoint", () => {
     expect(result.stderr).toContain(argument.startsWith("--") ? "unknown option" : "too many arguments")
     expect(result.stdout).toBe("")
   })
-  it.each(["", "catalog", "models", "connections", "status", "serve", "docs", "update"])("supports finite help for %s", async (command) => {
+  it.each(["", "models", "connections", "hf", "status", "serve", "docs", "update"])("supports finite help for %s", async (command) => {
     const result = await invoke([...(command ? [command] : []), "--help"])
     expect(result.code).toBe(0)
     expect(result.stdout).toContain("Usage:")
     expect(result.stderr).toBe("")
   })
-  it("serve help and rejected configuration flags never create ownership state", async () => {
-    const root = await mkdtemp(join(tmpdir(), "mag-help-"))
-    const profile = join(root, "unused")
-    try {
-      const env = { MAGNITUDE_DEV_DATA_DIR: profile }
-      expect((await invoke(["serve", "--help"], env)).code).toBe(0)
-      for (const flag of ["--port", "--data-dir", "--host"]) {
-        const result = await invoke(["serve", flag, "invalid"], env)
-        expect(result.code).toBe(1)
-        expect(result.stderr).toContain("unknown option")
-      }
-      await expect(stat(profile)).rejects.toMatchObject({ code: "ENOENT" })
-    } finally { await rm(root, { recursive: true, force: true }) }
+  // Parsed in this process: the service starts only from the serve action, and commander ends the
+  // parse with help or a rejected flag before any action runs, so no ownership state can be created.
+  it("serve help and rejected configuration flags end before the serve action", async () => {
+    const parse = async (args: readonly string[]) => {
+      const program = new Command().exitOverride().configureOutput({ writeOut: () => {}, writeErr: () => {} })
+      registerServeCommand(program)
+      const failure = await program.parseAsync(args, { from: "user" }).then(() => undefined, (error: unknown) => error)
+      return failure instanceof CommanderError ? failure.code : undefined
+    }
+    expect(await parse(["serve", "--help"])).toBe("commander.helpDisplayed")
+    for (const flag of ["--port", "--data-dir", "--host"]) {
+      expect(await parse(["serve", flag, "invalid"])).toBe("commander.unknownOption")
+    }
   })
   it.each([
     ["hardware"],
-    ["catalog", "status"], ["catalog", "list"], ["catalog", "recommendations"],
-    ["catalog", "show", "test:gguf:q4"], ["catalog", "pull", "test:gguf:q4"],
-    ["catalog", "cancel", "test:gguf:q4"], ["catalog", "remove", "test:gguf:q4"],
-    ["models", "status"], ["models", "status", "test:gguf:q4"],
+    ["models", "list"], ["models", "recommend"], ["models", "families"],
+    ["models", "show", "test:gguf:q4"], ["models", "pull", "test:gguf:q4"],
+    ["models", "cancel", "test:gguf:q4"], ["models", "rm", "test:gguf:q4"],
     ["models", "load", "test:gguf:q4"], ["models", "stop"],
-    ["connections", "add", "pi"], ["connections", "sync", "pi"],
+    ["connections", "connect", "pi"], ["connections", "sync", "pi"],
+    ["hf", "login"], ["hf", "status"], ["hf", "logout"],
   ])("%j requires an existing owner without creating a profile", async (...args) => {
     const root = await mkdtemp(join(tmpdir(), "mag-connect-only-"))
     const profile = join(root, "absent")
@@ -85,6 +87,21 @@ describe("headless CLI entrypoint", () => {
       await expect(stat(profile)).rejects.toMatchObject({ code: "ENOENT" })
     } finally { await rm(root, { recursive: true, force: true }) }
   })
+  it.skipIf(process.platform === "win32").each([["--version"], ["docs"], ["status"]])(
+    "%j ends quietly and successfully when its reader closes stdout early",
+    async (...args) => {
+      const root = await mkdtemp(join(tmpdir(), "mag-closed-output-"))
+      try {
+        const reader = Bun.spawn(["bash", "-c", '"$@" | true; exit "${PIPESTATUS[0]}"', "closed-output",
+          Bun.which("bun")!, fileURLToPath(new URL("../index.ts", import.meta.url)), ...args], {
+          stdin: "ignore", stdout: "pipe", stderr: "pipe",
+          env: { ...globalThis.process.env, MAGNITUDE_DEV_DATA_DIR: join(root, "absent") },
+        })
+        const [code, stderr] = await Promise.all([reader.exited, new Response(reader.stderr).text()])
+        expect({ code, stderr }).toEqual({ code: 0, stderr: "" })
+      } finally { await rm(root, { recursive: true, force: true }) }
+    },
+  )
   it("prints only the version", async () => {
     const result = await invoke(["--version"])
     expect(result.code).toBe(0)

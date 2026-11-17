@@ -1,976 +1,1349 @@
-//! The engine's memory policy over Seismic facts and observations.
+//! The engine's sole fit policy over the topology's stores, grants and
+//! placements ([`Fit`]).
 //!
-//! Seismic establishes pools, capacities and scoped observations and enforces
-//! the limits it is given; it holds no reserve policy. The host (service or
-//! CLI) chooses the threshold policy, [`MemoryReserves`], and this module
-//! applies it to every memory domain a load uses:
+//! Seismic's topology reports stores, their capacities, the access paths
+//! executors place storage along and the grants on them, and a status sample
+//! reads each store's headroom and what is left of each grant. No store
+//! keeps a reserve here: the speed guarantee of the store's ledger is the
+//! only reserve (`memory::ledger::Estimate::guarantee`), and this module
+//! applies the topology to every store a load reaches:
 //!
-//! - Stable fit compares a workload with the domain's capacity, bounded by
-//!   applicable process limits (and, on Metal, the recommended working set),
-//!   less the domain's planning reserve. It uses no current free memory.
-//! - Every live claim must leave the domain's observed headroom above the
-//!   planning reserve: the claimable ceiling is `headroom − planning`. Bytes
-//!   Seismic already charged are absent from observed headroom and are never
-//!   subtracted again.
-//! - Headroom at or below the planning reserve is the Reclaim band. No
-//!   engine claim crosses that line.
-//! - A host that reports displacement is also in Reclaim while it is in
-//!   distress ([`HostDistress`]): programs' memory is being swapped out or
-//!   thrashed through the compressor, whoever caused it.
+//! - Stable fit compares a workload with each store's capacity, bounded by
+//!   the applicable process limits for host RAM and by the grants of the
+//!   paths it is placed along. It uses no current free memory. An
+//!   executor's stable fit for a storage kind is the sum along its
+//!   placement of each grant within its store's fit, a store reached by
+//!   several paths or executors counted once.
+//! - A live claim takes at most each store's observed headroom, and along
+//!   a placement each grant's remaining reading bounds it too.
 //!
-//! Process limits are the visible ones. A container's own cgroup limit is
-//! visible; limits of cgroups above it may be hidden, and are then bounded
-//! only by host headroom, which already reflects the host's memory.
+//! Host RAM is read as the OS gives it ([`seismic::HostSample`]): where a
+//! cgroup or job limits the process, its total and supply are the limit's.
+//! No figure here counts what the process holds: that is the memory
+//! ledger's alone.
 
 use seismic::{
-    DeviceCatalog, DeviceInfo, DeviceMeasurements, DeviceMemory, DeviceMemoryInfo, DeviceSelector,
-    DeviceTopology, DisplacementWindow, HostMemoryStatus, KernelPressure, MemoryPoolId,
-    MemoryPoolKind, ObservationError,
+    AccessPathId, DeviceTopology, Executor, ExecutorId, Contract, HostSample, ObservationError, Status,
+    Store, StoreId, StoreKind,
 };
-use std::fmt;
+use std::{
+    collections::BTreeMap,
+    fmt,
+    time::{Duration, Instant},
+};
 
-/// Harm to other programs that host headroom does not show: their memory is
-/// leaving RAM faster than the system can absorb. A host in distress is in
-/// the Reclaim band whatever its headroom.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HostDistress {
-    /// Pages were written to swap in each of the two most recent
-    /// displacement windows.
-    Swapping,
-    /// Each of the two most recent displacement windows compressed and
-    /// decompressed pages at the rates the kernel itself treats as thrashing.
-    Thrashing,
-    /// The kernel classifies system memory pressure as critical.
-    KernelCritical,
+/// Host RAM's fit as `host` reads it: its capacity within the binding
+/// scope's total, and the OS's supply ([`seismic::Supply`]) as headroom.
+fn host_ram_fit(store: &Store, host: &HostSample) -> StoreFit {
+    store_fit(store, store.capacity().value.min(host.total), host.supply.total(), MemoryConstraint::HostRam)
 }
 
-impl fmt::Display for HostDistress {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Swapping => "the system is swapping",
-            Self::Thrashing => "the system is thrashing compressed memory",
-            Self::KernelCritical => "the kernel reports critical memory pressure",
+/// `store`'s fit from its capacity within process limits and its headroom.
+fn store_fit(store: &Store, capacity_bytes: u64, headroom_bytes: u64, constraint: MemoryConstraint) -> StoreFit {
+    StoreFit { store: store.id(), capacity_bytes, headroom_bytes, constraint }
+}
+
+/// The bytes one round of the page-release probe takes and frees, at most
+/// ([`page_release`]).
+const PAGE_RELEASE_ROUND_BYTES: usize = 256 << 20;
+
+/// The page-release probe's rounds a sample times back to back, and its
+/// samples: one round alone varies twofold between runs on an idle
+/// machine, the median over five samples of four does not
+/// ([`page_release`]).
+const PAGE_RELEASE_ROUNDS_PER_SAMPLE: usize = 4;
+const PAGE_RELEASE_SAMPLES: usize = 5;
+
+/// The rate a load releases memory at, measured and positive: a finished
+/// release's bytes over the span they took to release (its wait for queued
+/// steps apart, `ResizeTimes::releasing`), the slowest
+/// measured; before any, the machine's page-release rate
+/// ([`Self::of_machine`]).
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "f64", into = "f64")]
+pub struct ReleaseRate(f64);
+
+/// A release rate is finite by construction ([`ReleaseRate::new`]).
+impl Eq for ReleaseRate {}
+
+impl TryFrom<f64> for ReleaseRate {
+    type Error = String;
+
+    fn try_from(rate: f64) -> Result<Self, String> {
+        match rate.is_finite() && rate > 0.0 {
+            true => Ok(Self(rate)),
+            false => Err(format!("a release rate is measured and positive, not {rate}")),
+        }
+    }
+}
+
+impl From<ReleaseRate> for f64 {
+    fn from(rate: ReleaseRate) -> f64 {
+        rate.0
+    }
+}
+
+impl ReleaseRate {
+    /// # Panics
+    /// Where `bytes_per_second` is not a positive finite rate.
+    pub fn new(bytes_per_second: f64) -> Self {
+        Self::try_from(bytes_per_second).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// The rate the machine returns pages to the OS at, as a release is
+    /// counted on to ([`page_release`]): a generic figure of the machine,
+    /// measured once and kept ([`machine_rate`]).
+    pub fn of_machine(machine: Option<(&std::path::Path, &DeviceTopology)>) -> Self {
+        Self::new(page_release_rate(machine))
+    }
+
+    pub fn bytes_per_second(&self) -> f64 {
+        self.0
+    }
+}
+
+/// A rate the machine's figures keep: host RAM's page-release rate, a
+/// volume's sequential write rate.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MachineRate {
+    bytes_per_second: f64,
+}
+
+impl seismic::measure::Stored for MachineRate {
+    const SCHEMA: &'static str = "machine-rate-v1";
+}
+
+/// The most bytes a stored [`MachineRate`] is read as.
+const MACHINE_RATE_RECORD_BYTES: u64 = 4096;
+
+/// A generic figure of the machine, measured once: where `figure` names a
+/// kernel cache and the figure's key there, the rate its machine figures
+/// (`KernelCache::machine_figures`) keep under that key, `measure`d and
+/// stored there when they keep none; elsewhere, `measure`d.
+pub(super) fn machine_rate<E>(
+    figure: Option<(&std::path::Path, String)>,
+    measure: impl FnOnce() -> Result<f64, E>,
+) -> Result<f64, E> {
+    let Some((cache, key)) = figure else { return measure() };
+    let figures = crate::kernel_cache::KernelCache::machine_figures(cache);
+    match figures.load::<MachineRate>(&key, MACHINE_RATE_RECORD_BYTES) {
+        Ok(Some(MachineRate { bytes_per_second })) if bytes_per_second.is_finite() && bytes_per_second > 0.0 => {
+            return Ok(bytes_per_second);
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!("machine figures: the {key} rate stored is unreadable: {error}"),
+    }
+    let bytes_per_second = measure()?;
+    if let Err(error) = figures.store(&key, &MachineRate { bytes_per_second }, MACHINE_RATE_RECORD_BYTES) {
+        tracing::warn!("machine figures: the {key} rate could not be stored: {error}");
+    }
+    Ok(bytes_per_second)
+}
+
+/// The host's identity in `topology` (`PhysicalIdentity::Host`): its CPU
+/// as the OS reports it and its RAM, what a machine's figures are keyed by.
+fn host_identity(topology: &DeviceTopology) -> Option<String> {
+    topology.physical_devices().iter().find_map(|device| match device.identity() {
+        seismic::PhysicalIdentity::Host { machine } => Some(machine.clone()),
+        _ => None,
+    })
+}
+
+/// The machine's page-release rate, kept under
+/// `page-release-median:{host}` (named by its method, so a figure another
+/// method stored is never read as its; [`machine_rate`]); the probe runs at most once
+/// per process, bounded by half of host RAM's supply
+/// (`seismic::host_sample`), so it never causes the pressure a release
+/// relieves.
+fn page_release_rate(machine: Option<(&std::path::Path, &DeviceTopology)>) -> f64 {
+    static PROBED: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    let key = machine.and_then(|(cache, topology)| Some((cache, format!("page-release-median:{}", host_identity(topology)?))));
+    let probe = || {
+        let room = seismic::host_sample().supply.total();
+        let bound = usize::try_from(room / 2).unwrap_or(usize::MAX).max(4096);
+        page_release(bound.min(PAGE_RELEASE_ROUND_BYTES))
+    };
+    machine_rate(key, || Ok::<_, std::convert::Infallible>(*PROBED.get_or_init(probe))).unwrap_or_else(|never| match never {})
+}
+
+/// The rate the machine returns pages to the OS at, as a release is
+/// counted on to: one round discarded, then [`PAGE_RELEASE_SAMPLES`]
+/// samples of [`PAGE_RELEASE_ROUNDS_PER_SAMPLE`] rounds back to back of
+/// `bytes` each ([`page_round`]), the median sample's rate. A release is
+/// help counted on, so a smaller rate is the safe side: the median, never
+/// the fastest.
+fn page_release(bytes: usize) -> f64 {
+    page_round(bytes);
+    let mut samples = (0..PAGE_RELEASE_SAMPLES)
+        .map(|_| {
+            let released = (0..PAGE_RELEASE_ROUNDS_PER_SAMPLE).map(|_| page_round(bytes)).sum::<Duration>();
+            (PAGE_RELEASE_ROUNDS_PER_SAMPLE * bytes) as f64 / released.as_secs_f64().max(f64::MIN_POSITIVE)
         })
+        .collect::<Vec<_>>();
+    samples.sort_by(f64::total_cmp);
+    samples[PAGE_RELEASE_SAMPLES / 2]
+}
+
+/// One round of the page-release probe: a byte written to every page of
+/// `bytes` of new memory, then the memory freed, the free timed.
+fn page_round(bytes: usize) -> Duration {
+    let page = 4096;
+    let layout = std::alloc::Layout::from_size_align(bytes, page).expect("the probe's layout");
+    // SAFETY: a non-zero layout; every write lies within it, and it is
+    // freed with the same layout.
+    unsafe {
+        let memory = std::alloc::alloc(layout);
+        assert!(!memory.is_null(), "the page-release probe could not take {bytes} bytes");
+        for offset in (0..bytes).step_by(page) {
+            std::ptr::write_volatile(memory.add(offset), 1);
+        }
+        let started = Instant::now();
+        std::alloc::dealloc(memory, layout);
+        started.elapsed()
     }
 }
 
-/// XNU's compressor thrashing rule (`compute_swapout_target_age`): at least
-/// 20 compressions and 20 decompressions per 10 ms, and more than 50
-/// decompressions per 10 ms.
-const THRASHING_COMPRESSIONS_PER_SECOND: u64 = 2_000;
-const THRASHING_DECOMPRESSIONS_PER_SECOND: u64 = 5_000;
-
-fn rate_reaches(pages: u64, window: &DisplacementWindow, per_second: u64) -> bool {
-    u128::from(pages) * 1_000 >= u128::from(per_second) * window.duration.as_millis()
-}
-
-fn thrashed(window: &DisplacementWindow) -> bool {
-    rate_reaches(window.compressed_pages, window, THRASHING_COMPRESSIONS_PER_SECOND)
-        && rate_reaches(window.decompressed_pages, window, THRASHING_DECOMPRESSIONS_PER_SECOND)
-}
-
-/// The distress `host` reports, most severe first. A host that reports no
-/// displacement and no kernel pressure is never in distress. Displacement
-/// is distress only when two consecutive windows show it: one window of a
-/// load's own first compressions, or one burst of another program's swap,
-/// is the system absorbing demand.
-pub fn host_distress(host: &HostMemoryStatus) -> Option<HostDistress> {
-    if host.kernel_pressure == Some(KernelPressure::Critical) {
-        return Some(HostDistress::KernelCritical);
-    }
-    let displacement = host.displacement?;
-    let (latest, previous) = (displacement.latest?, displacement.previous?);
-    if thrashed(&latest) && thrashed(&previous) {
-        Some(HostDistress::Thrashing)
-    } else if latest.swapped_out_pages > 0 && previous.swapped_out_pages > 0 {
-        Some(HostDistress::Swapping)
-    } else {
-        None
-    }
-}
-
-/// The constraint that bounds a domain's claimable ceiling.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MemoryConstraint {
-    /// Host RAM and its applicable process limits.
-    HostRam,
-    /// A device-local pool.
-    DeviceLocal,
-    /// Metal's recommended working set for the device.
-    DeviceWorkingSet,
-}
-
-impl fmt::Display for MemoryConstraint {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::HostRam => "host RAM",
-            Self::DeviceLocal => "device memory",
-            Self::DeviceWorkingSet => "the device's recommended working set",
-        })
-    }
-}
-
+/// Why fit could not answer: never a verdict that a demand does not fit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MemoryPolicyError {
-    /// Seismic reports the device's backing as not normalized.
-    UnsupportedBacking { device: String, reason: String },
     /// A required observation is unavailable; missing observations never
     /// authorize allocation.
     Observation(ObservationError),
-    /// The device's observation does not belong to its established backing.
-    MismatchedObservation { device: String },
+    /// The fit subject belongs to another topology revision.
+    ForeignIdentifier,
+    /// Storage demanded of an executor that places none of that kind: an
+    /// unavailable executor.
+    Unplaced {
+        executor: ExecutorId,
+        kind: Contract,
+    },
 }
 
 impl fmt::Display for MemoryPolicyError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnsupportedBacking { device, reason } => {
-                write!(formatter, "device {device} has no qualified memory backing: {reason}")
+            Self::Observation(error) => error.fmt(f),
+            Self::ForeignIdentifier => {
+                f.write_str("fit subject belongs to another topology revision")
             }
-            Self::Observation(error) => write!(formatter, "{error}"),
-            Self::MismatchedObservation { device } => write!(
-                formatter,
-                "device {device} reported an observation for a different memory backing"
-            ),
+            Self::Unplaced { executor, kind } => {
+                write!(f, "executor {executor:?} places no {kind:?} storage")
+            }
         }
     }
 }
 
 impl std::error::Error for MemoryPolicyError {}
 
-fn established(device: &DeviceInfo) -> Result<&DeviceMemoryInfo, MemoryPolicyError> {
-    match &device.memory {
-        DeviceMemory::Established(memory) => Ok(memory),
-        DeviceMemory::Unsupported { reason } => Err(MemoryPolicyError::UnsupportedBacking {
-            device: device.selector.to_string(),
-            reason: reason.clone(),
-        }),
-    }
-}
-
-const GIB: u64 = 1024 * 1024 * 1024;
-
-/// The threshold policy: how much of each memory domain a loaded model may
-/// not use. The host (service or CLI) chooses it and passes it to the engine;
-/// the engine never defaults it. `standard` is the only place the values live.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct MemoryReserves {
-    planning_fraction_divisor: u64,
-    planning_floor_bytes: u64,
-    emergency_fraction_divisor: u64,
-    emergency_floor_bytes: u64,
-}
-
-/// One domain's thresholds. Stable fit and every engine claim keep headroom
-/// above `planning_bytes`; the hosting service kills the worker at or below
-/// `emergency_bytes`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DomainThresholds {
-    pub planning_bytes: u64,
-    pub emergency_bytes: u64,
-}
-
-impl MemoryReserves {
-    /// Planning reserve `max(capacity / 10, 2 GiB)`; emergency reserve
-    /// `max(capacity / 20, 1 GiB)`.
-    pub fn standard() -> Self {
-        Self {
-            planning_fraction_divisor: 10,
-            planning_floor_bytes: 2 * GIB,
-            emergency_fraction_divisor: 20,
-            emergency_floor_bytes: GIB,
-        }
-    }
-
-    pub fn for_domain(&self, capacity_bytes: u64) -> DomainThresholds {
-        DomainThresholds {
-            planning_bytes: (capacity_bytes / self.planning_fraction_divisor)
-                .max(self.planning_floor_bytes),
-            emergency_bytes: (capacity_bytes / self.emergency_fraction_divisor)
-                .max(self.emergency_floor_bytes),
-        }
-    }
-
-    /// Stable identity of the policy for assessment cache keys.
-    pub fn identity(&self) -> String {
-        format!(
-            "reserves-v1:{}:{}:{}:{}",
-            self.planning_fraction_divisor,
-            self.planning_floor_bytes,
-            self.emergency_fraction_divisor,
-            self.emergency_floor_bytes
-        )
-    }
-}
-
-/// Stable fit capacity of one memory domain a load touches. A workload fits
-/// the domain when `required ≤ capacity − reserve`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FitCapacity {
-    pub domain: MemoryPoolId,
-    pub kind: MemoryPoolKind,
-    /// Pool capacity bounded by process limits and, on Metal, the recommended
-    /// working set.
-    pub capacity_bytes: u64,
-    /// The domain's planning reserve.
-    pub reserve_bytes: u64,
-}
-
-impl FitCapacity {
-    /// The most a stable workload may use of this domain.
-    pub fn fit_bytes(&self) -> u64 {
-        self.capacity_bytes.saturating_sub(self.reserve_bytes)
-    }
-}
-
-/// What a domain is used for by one load.
+/// What a store holds for an executor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DomainRole {
-    /// The device's allocation domain: weights, state, workspace.
+    /// The executor's device storage is placed on it.
     Allocation,
-    /// Host RAM used by a dedicated device's staged uploads.
+    /// Host-side work (staging, host tables) and nothing of device storage.
     Staging,
 }
 
-/// Stable fit capacities of every domain a load on `device` touches: its
-/// allocation domain first, then host RAM for staging when the device is
-/// dedicated. Uses no live availability.
-pub fn fit_capacities(
-    topology: &DeviceTopology,
-    device: &DeviceInfo,
-    host: &HostMemoryStatus,
-    reserves: &MemoryReserves,
-) -> Result<Vec<(DomainRole, FitCapacity)>, MemoryPolicyError> {
-    let memory = established(device)?;
-    let host_pool = topology.host_pool();
-    let host_capacity = host
-        .limits
-        .iter()
-        .map(|limit| limit.limit_bytes)
-        .fold(host_pool.capacity_bytes, u64::min);
-    let host_fit = FitCapacity {
-        domain: host_pool.id,
-        kind: MemoryPoolKind::HostRam,
-        capacity_bytes: host_capacity,
-        reserve_bytes: reserves.for_domain(host_pool.capacity_bytes).planning_bytes,
-    };
-    if memory.allocates_host_memory() {
-        let capacity_bytes = device
-            .recommended_working_set_bytes()
-            .map_or(host_fit.capacity_bytes, |working_set| {
-                host_fit.capacity_bytes.min(working_set)
-            });
-        return Ok(vec![(
-            DomainRole::Allocation,
-            FitCapacity {
-                capacity_bytes,
-                ..host_fit
-            },
-        )]);
+impl DomainRole {
+    /// A store `executor`'s device storage is placed on holds its
+    /// allocations; any other store it charges holds host-side work.
+    pub fn of(topology: &DeviceTopology, executor: &Executor, store: StoreId) -> Self {
+        let allocates = executor.paths(Contract::DeviceOnly).iter().any(|id| {
+            topology
+                .access_path(*id)
+                .expect("placement belongs to its topology")
+                .store()
+                == store
+        });
+        if allocates {
+            Self::Allocation
+        } else {
+            Self::Staging
+        }
     }
-    let pool = topology
-        .pool(memory.allocation_pool)
-        .expect("a device's pools belong to its topology");
-    Ok(vec![
-        (
-            DomainRole::Allocation,
-            FitCapacity {
-                domain: pool.id,
-                kind: pool.kind,
-                capacity_bytes: pool.capacity_bytes,
-                reserve_bytes: reserves.for_domain(pool.capacity_bytes).planning_bytes,
-            },
-        ),
-        (DomainRole::Staging, host_fit),
-    ])
 }
 
-/// The band of one observed domain. No engine claim takes headroom to the
-/// planning reserve; other programs can, and on a host that reports
-/// displacement the engine's own load can put the host in distress.
+/// What bounds a fit: a store's own room or an access path's grant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MemoryBand {
-    /// Headroom above the planning reserve and no host distress.
-    Normal,
-    /// Headroom at or below the planning reserve, or a host in distress:
-    /// pause growth and release.
-    Reclaim,
+pub enum MemoryConstraint {
+    /// Host RAM and its applicable process limits.
+    HostRam,
+    /// A device memory store: memory the OS does not manage.
+    DeviceLocal,
+    /// What the executor's driver lets this process place along an access
+    /// path (CUDA's usable memory, a Vulkan heap's budget, Metal's working
+    /// set), as reported and, where a reading exists, what is left of it.
+    Grant,
+    /// A volume's space available to this process.
+    Volume,
 }
 
-/// One fresh observation of a domain a loaded device uses.
+impl fmt::Display for MemoryConstraint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::HostRam => "host RAM",
+            Self::DeviceLocal => "device memory",
+            Self::Grant => "executor placement grant",
+            Self::Volume => "volume space",
+        })
+    }
+}
+
+/// One store's fit: its capacity within process limits, what
+/// metadata-only fit plans on, and its live headroom, what a live claim
+/// may take.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DomainReading {
-    pub role: DomainRole,
-    pub domain: MemoryPoolId,
-    /// Observed available bytes, bounded by every applicable process limit.
-    /// Existing Seismic charges are already absent from it.
+pub struct StoreFit {
+    pub store: StoreId,
+    /// The store's capacity, host RAM's within its binding scope.
+    pub capacity_bytes: u64,
+    /// What a live claim may take: host RAM's supply, a volume's space, a
+    /// device memory's capacity, each within what is left of its grants.
     pub headroom_bytes: u64,
-    /// What bounds `ceiling_bytes`.
+    /// What bounds the store's room.
     pub constraint: MemoryConstraint,
-    pub thresholds: DomainThresholds,
-    /// Additional bytes the engine may still claim: headroom above the
-    /// planning reserve and, on Metal, the room left in the working set.
+}
+
+/// What an executor's placement of one storage kind holds, stable and live.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlacementFit {
+    /// Along the placement, each grant within its store's stable fit.
+    pub stable_bytes: u64,
+    /// Along the placement, what is left of each grant within its store's
+    /// live ceiling: what a live claim may take.
     pub ceiling_bytes: u64,
-    /// The host's distress, for a host RAM domain; a dedicated device's own
-    /// memory has none.
-    pub distress: Option<HostDistress>,
-    pub band: MemoryBand,
 }
 
-impl DomainReading {
-    fn new(
-        role: DomainRole,
-        domain: MemoryPoolId,
-        headroom_bytes: u64,
-        constraint: MemoryConstraint,
-        thresholds: DomainThresholds,
-        distress: Option<HostDistress>,
-    ) -> Self {
-        Self {
-            role,
-            domain,
-            headroom_bytes,
-            constraint,
-            thresholds,
-            ceiling_bytes: headroom_bytes.saturating_sub(thresholds.planning_bytes),
-            distress,
-            band: if headroom_bytes > thresholds.planning_bytes && distress.is_none() {
-                MemoryBand::Normal
-            } else {
-                MemoryBand::Reclaim
-            },
-        }
-    }
-
-    /// Bound the claimable ceiling by a further device constraint without a
-    /// reserve of its own; the band stays the domain's.
-    fn bounded(mut self, bytes: u64, constraint: MemoryConstraint) -> Self {
-        if bytes < self.ceiling_bytes {
-            self.ceiling_bytes = bytes;
-            self.constraint = constraint;
-        }
-        self
-    }
+/// Whether fit plans on stable capacity or on live headroom.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FitMode {
+    /// Capacity within process limits and grants: no current free memory.
+    Stable,
+    /// Observed headroom and what is left of each grant.
+    Live,
 }
 
-/// The most restrictive band among `readings`: a load is Normal only while
-/// every domain it uses is.
-pub fn band_of(readings: &[DomainReading]) -> MemoryBand {
-    if readings
-        .iter()
-        .all(|reading| reading.band == MemoryBand::Normal)
-    {
-        MemoryBand::Normal
-    } else {
-        MemoryBand::Reclaim
+/// Bytes of one storage kind on one executor. Demands are placed in order,
+/// sharing store and path budgets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StorageDemand {
+    /// The executor whose placement the bytes go along.
+    pub executor: ExecutorId,
+    /// The storage kind, whose placement it is.
+    pub kind: Contract,
+    pub bytes: u64,
+}
+
+/// A demand that does not fit, by the store where it ran out of room.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FitRefusal {
+    /// The last store the demand reached.
+    pub store: StoreId,
+    /// The demand's bytes.
+    pub required_bytes: u64,
+    /// Its bytes no store or grant had room for.
+    pub missing_bytes: u64,
+    /// What ran out: the store's room or a grant.
+    pub constraint: MemoryConstraint,
+}
+
+/// Where a demand's bytes landed, and what of it did not fit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DemandFit {
+    /// The bytes placed in each store, in store order.
+    pub placed: Vec<(StoreId, u64)>,
+    /// Each demand some of whose bytes did not fit.
+    pub refused: Vec<FitRefusal>,
+}
+
+impl DemandFit {
+    /// Whether every byte of the demand was placed.
+    pub fn fits(&self) -> bool {
+        self.refused.is_empty()
     }
 }
 
-/// A dedicated device's own memory domain.
-#[derive(Clone, Copy, Debug)]
-struct DedicatedDomain {
-    id: MemoryPoolId,
-    capacity_bytes: u64,
+
+/// The sole interpretation of stores and grants for engine fit questions.
+pub struct Fit<'a> {
+    topology: &'a DeviceTopology,
+    status: &'a Status,
+    /// The reserves of the volumes this process writes, where it reads them.
+    volumes: Option<&'a super::VolumeReserves>,
 }
 
-/// The pure core of [`observe_domains`]: readings from one host sample and
-/// one device sample. `dedicated` is the device's own pool, or `None` when
-/// the device allocates host RAM.
-fn domain_readings(
-    selector: DeviceSelector,
-    host: &HostMemoryStatus,
-    host_pool: MemoryPoolId,
-    host_capacity_bytes: u64,
-    dedicated: Option<DedicatedDomain>,
-    measurements: &DeviceMeasurements,
-    reserves: &MemoryReserves,
-) -> Result<Vec<DomainReading>, MemoryPolicyError> {
-    let host_headroom = host
-        .limits
-        .iter()
-        .map(|limit| limit.remaining_bytes())
-        .fold(host.headroom.bytes, u64::min);
-    let host_thresholds = reserves.for_domain(host_capacity_bytes);
-    let host_distress = host_distress(host);
-    let mismatched = || MemoryPolicyError::MismatchedObservation {
-        device: selector.to_string(),
-    };
-    let Some(dedicated) = dedicated else {
-        let reading = DomainReading::new(
-            DomainRole::Allocation,
-            host_pool,
-            host_headroom,
-            MemoryConstraint::HostRam,
-            host_thresholds,
-            host_distress,
-        );
-        return Ok(vec![match *measurements {
-            // Metal's working set bounds claims on the same host domain
-            // without a reserve of its own; host headroom decides the band.
-            DeviceMeasurements::Metal {
-                recommended_working_set_bytes,
-                current_allocated_bytes,
-            } => reading.bounded(
-                recommended_working_set_bytes.saturating_sub(current_allocated_bytes),
-                MemoryConstraint::DeviceWorkingSet,
+impl<'a> Fit<'a> {
+    /// Fit over `topology`'s stores and grants as `status` reads them.
+    pub fn new(topology: &'a DeviceTopology, status: &'a Status) -> Self {
+        Self { topology, status, volumes: None }
+    }
+
+    /// This fit, reading volumes against `volumes`' reserves: a volume
+    /// this process does not write keeps nothing free for it.
+    pub fn with_volumes(self, volumes: &'a super::VolumeReserves) -> Self {
+        Self { volumes: Some(volumes), ..self }
+    }
+
+    /// Store `id`'s fit: its capacity, host RAM's within its binding scope,
+    /// and its headroom within what is left of every grant on it: host
+    /// RAM's supply, a volume's space less the margin its writer keeps, a
+    /// device memory's capacity (what the process holds there is its
+    /// ledger's).
+    pub fn store(&self, id: StoreId) -> Result<StoreFit, MemoryPolicyError> {
+        let store = self
+            .topology
+            .store(id)
+            .ok_or(MemoryPolicyError::ForeignIdentifier)?;
+        let (constraint, margin, headroom_bytes) = match store.kind() {
+            StoreKind::HostRam => return Ok(host_ram_fit(store, &self.status.sample.host)),
+            StoreKind::DeviceMemory(_) => (MemoryConstraint::DeviceLocal, 0, store.capacity().value),
+            // A volume keeps the margin its writes need (`super::volume`),
+            // and none where this process writes nothing.
+            StoreKind::Volume(volume) => (
+                MemoryConstraint::Volume,
+                self.volumes.and_then(|volumes| volumes.margin(volume)).unwrap_or(0),
+                self.status.volume_space(id).map_err(MemoryPolicyError::Observation)?,
             ),
-            // An integrated (host-backed) device's driver-reported free bytes
-            // exclude reclaimable page cache, so they are not an allocation
-            // bound; host headroom is.
-            DeviceMeasurements::Host
-            | DeviceMeasurements::Cuda { .. }
-            | DeviceMeasurements::Vulkan { .. } => reading,
-        }]);
-    };
-    let headroom = match *measurements {
-        DeviceMeasurements::Cuda { free_bytes, .. } => free_bytes,
-        // A dedicated Vulkan device may use its memory budget less what this
-        // process already uses of the heap.
-        DeviceMeasurements::Vulkan {
-            heap_budget_bytes,
-            heap_usage_bytes,
-        } => heap_budget_bytes.saturating_sub(heap_usage_bytes),
-        DeviceMeasurements::Host | DeviceMeasurements::Metal { .. } => return Err(mismatched()),
-    };
-    Ok(vec![
-        DomainReading::new(
-            DomainRole::Allocation,
-            dedicated.id,
-            headroom,
-            MemoryConstraint::DeviceLocal,
-            reserves.for_domain(dedicated.capacity_bytes),
-            None,
-        ),
-        DomainReading::new(
-            DomainRole::Staging,
-            host_pool,
-            host_headroom,
-            MemoryConstraint::HostRam,
-            host_thresholds,
-            host_distress,
-        ),
-    ])
-}
+        };
+        // A store's own figure knows only this process; what is left of a
+        // grant on it is the driver's, which other processes' memory lowers.
+        let headroom_bytes = self
+            .topology
+            .access_paths()
+            .iter()
+            .filter(|path| path.store() == id && self.status.sample.executors.contains(&path.executor()))
+            .filter_map(|path| self.status.grant_left(path))
+            .try_fold(headroom_bytes, |least, left| match left {
+                Ok(left) => Ok(least.min(left.value)),
+                Err(error) => Err(MemoryPolicyError::Observation(error.clone())),
+            })?;
+        Ok(store_fit(store, store.capacity().value.saturating_sub(margin), headroom_bytes.saturating_sub(margin), constraint))
+    }
 
-/// Fresh readings of every domain a load on `device` uses: the allocation
-/// domain first, then host RAM for staging when the device is dedicated.
-/// Any failure is the Blind case: missing observations never authorize
-/// allocation.
-pub fn observe_domains(
-    catalog: &DeviceCatalog,
-    device: &seismic::Device,
-    reserves: &MemoryReserves,
-) -> Result<Vec<DomainReading>, MemoryPolicyError> {
-    let info = device.info();
-    let memory = established(info)?;
-    let topology = catalog.topology();
-    let host = catalog
-        .host_memory_status()
-        .map_err(MemoryPolicyError::Observation)?;
-    let status = device
-        .memory_status()
-        .map_err(MemoryPolicyError::Observation)?;
-    let host_pool = topology.host_pool();
-    let dedicated = (!memory.allocates_host_memory()).then(|| {
-        let pool = topology
-            .pool(memory.allocation_pool)
-            .expect("a device's pools belong to its topology");
-        DedicatedDomain {
-            id: pool.id,
-            capacity_bytes: pool.capacity_bytes,
-        }
-    });
-    domain_readings(
-        info.selector,
-        &host,
-        host_pool.id,
-        host_pool.capacity_bytes,
-        dedicated,
-        &status.measurements,
-        reserves,
-    )
-}
+    /// Host RAM's fit from a host sample alone, as [`Fit::store`] gives it
+    /// from a whole status: for a reader that opens no executor, which has
+    /// only `host`.
+    pub fn host_ram(topology: &DeviceTopology, host: &HostSample) -> StoreFit {
+        host_ram_fit(topology.host_ram(), host)
+    }
 
-/// Refresh Seismic's enforced ceiling on `device` from fresh readings: the
-/// current charge plus the allocation domain's ceiling. A failed
-/// observation revokes every unspent grant.
-pub fn refresh_device_ceiling(
-    catalog: &DeviceCatalog,
-    device: &seismic::Device,
-    reserves: &MemoryReserves,
-) -> Result<Vec<DomainReading>, MemoryPolicyError> {
-    let charged = device.memory_usage().charged;
-    match observe_domains(catalog, device, reserves) {
-        Ok(readings) => {
-            let allocation = readings
-                .iter()
-                .find(|reading| reading.role == DomainRole::Allocation)
-                .expect("observe_domains reports the allocation domain");
-            device.set_memory_limit(Some(charged.saturating_add(allocation.ceiling_bytes)));
-            Ok(readings)
-        }
-        Err(error) => {
-            device.set_memory_limit(Some(charged));
-            Err(error)
+    /// What access path `id`'s grant leaves a claim: the reported grant,
+    /// within what a live reading says is left of it. An ungranted path is
+    /// bounded by its store alone.
+    fn grant(&self, id: AccessPathId, mode: FitMode) -> Result<u64, MemoryPolicyError> {
+        let path = self
+            .topology
+            .access_path(id)
+            .ok_or(MemoryPolicyError::ForeignIdentifier)?;
+        let Some(grant) = path.grant() else {
+            return Ok(u64::MAX);
+        };
+        let left = match mode {
+            FitMode::Stable => grant.value,
+            FitMode::Live => match self.status.grant_left(path) {
+                Some(Ok(left)) => grant.value.min(left.value),
+                Some(Err(error)) => return Err(MemoryPolicyError::Observation(error.clone())),
+                // An unopened executor has only its reported stable grant.
+                None => grant.value,
+            },
+        };
+        Ok(left)
+    }
+
+    /// What `executor`'s placement of `kind` storage holds: the sum along
+    /// its paths of each grant within its store's fit.
+    pub fn placement(
+        &self,
+        executor: &Executor,
+        kind: Contract,
+    ) -> Result<PlacementFit, MemoryPolicyError> {
+        self.storage_beside(executor, &[kind], &[])
+    }
+
+    /// What `executor`'s placements of `kinds` hold together beside the
+    /// direct demands `direct`, which take their stores' room first. A
+    /// store or grant several kinds reach is counted once.
+    pub fn storage_beside(
+        &self,
+        executor: &Executor,
+        kinds: &[Contract],
+        direct: &[(StoreId, u64)],
+    ) -> Result<PlacementFit, MemoryPolicyError> {
+        let demands: Vec<_> = kinds
+            .iter()
+            .map(|&kind| StorageDemand {
+                executor: executor.id(),
+                kind,
+                bytes: u64::MAX,
+            })
+            .collect();
+        let available = |mode| -> Result<u64, MemoryPolicyError> {
+            let (_, storage) = self.place(&demands, direct, mode)?;
+            Ok(storage.into_iter().sum())
+        };
+        Ok(PlacementFit {
+            stable_bytes: available(FitMode::Stable)?,
+            ceiling_bytes: available(FitMode::Live)?,
+        })
+    }
+
+    /// The host RAM demand of `staged` bytes that `executor`'s backend
+    /// stages while it fills device storage. Transfer staging is in host
+    /// RAM on every backend (§2.3), and every claim's staged bytes are part
+    /// of its device storage demand. Where host RAM is a store of the
+    /// executor's device placement ([`DomainRole::Allocation`]), that demand
+    /// already holds them in host RAM; only where host RAM is the
+    /// executor's staging store are they a host demand of their own.
+    pub fn host_staging(&self, executor: &Executor, staged: u64) -> u64 {
+        match DomainRole::of(self.topology, executor, self.topology.host_ram().id()) {
+            DomainRole::Allocation => 0,
+            DomainRole::Staging => staged,
         }
     }
+
+    /// Direct demands (host heap, staging, volume downloads) and executor
+    /// storage share one budget per store and one budget per access grant.
+    pub fn demand(
+        &self,
+        storage: &[StorageDemand],
+        direct: &[(StoreId, u64)],
+        mode: FitMode,
+    ) -> Result<DemandFit, MemoryPolicyError> {
+        self.place(storage, direct, mode).map(|(fit, _)| fit)
+    }
+
+    /// [`Self::demand`], with the bytes placed of each storage demand in
+    /// order.
+    fn place(
+        &self,
+        storage: &[StorageDemand],
+        direct: &[(StoreId, u64)],
+        mode: FitMode,
+    ) -> Result<(DemandFit, Vec<u64>), MemoryPolicyError> {
+        let room_of = |fit: &StoreFit| match mode {
+            FitMode::Stable => fit.capacity_bytes,
+            FitMode::Live => fit.headroom_bytes,
+        };
+        let mut stores = BTreeMap::<StoreId, u64>::new();
+        let mut grants = BTreeMap::<AccessPathId, u64>::new();
+        let mut placed = BTreeMap::<StoreId, u64>::new();
+        let mut placed_storage = Vec::with_capacity(storage.len());
+        let mut refused = Vec::new();
+        for &(store, bytes) in direct {
+            let fit = self.store(store)?;
+            let room = stores.entry(store).or_insert(room_of(&fit));
+            let take = bytes.min(*room);
+            *room -= take;
+            *placed.entry(store).or_default() += take;
+            if take < bytes {
+                refused.push(FitRefusal {
+                    store,
+                    required_bytes: bytes,
+                    missing_bytes: bytes - take,
+                    constraint: fit.constraint,
+                });
+            }
+        }
+        for demand in storage {
+            let executor = self
+                .topology
+                .executor(demand.executor)
+                .ok_or(MemoryPolicyError::ForeignIdentifier)?;
+            let mut left = demand.bytes;
+            let mut last = None;
+            for &id in executor.paths(demand.kind) {
+                let path = self
+                    .topology
+                    .access_path(id)
+                    .expect("placement belongs to its topology");
+                let fit = self.store(path.store())?;
+                let room = stores.entry(path.store()).or_insert(room_of(&fit));
+                let grant = grants.entry(id).or_insert(self.grant(id, mode)?);
+                let constraint = if *room <= *grant {
+                    fit.constraint
+                } else {
+                    MemoryConstraint::Grant
+                };
+                let take = left.min(*room).min(*grant);
+                *room -= take;
+                *grant -= take;
+                left -= take;
+                *placed.entry(path.store()).or_default() += take;
+                last = Some((path.store(), constraint));
+                if left == 0 {
+                    break;
+                }
+            }
+            placed_storage.push(demand.bytes - left);
+            if left != 0 {
+                let (store, constraint) = last.ok_or(MemoryPolicyError::Unplaced {
+                    executor: demand.executor,
+                    kind: demand.kind,
+                })?;
+                refused.push(FitRefusal {
+                    store,
+                    required_bytes: demand.bytes,
+                    missing_bytes: left,
+                    constraint,
+                });
+            }
+        }
+        let fit = DemandFit {
+            placed: placed.into_iter().collect(),
+            refused,
+        };
+        Ok((fit, placed_storage))
+    }
+}
+
+/// One fresh observation of a store an opened executor uses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DomainReading {
+    /// What the store holds for the executor.
+    pub role: DomainRole,
+    pub domain: StoreId,
+    /// What a live claim may take: host RAM's supply, a volume's space, a
+    /// device memory's capacity, each within what is left of its grants.
+    pub headroom_bytes: u64,
+    /// The store across revisions, as other processes name it.
+    pub identity: seismic::StoreIdentity,
+    /// What bounds `headroom_bytes`.
+    pub constraint: MemoryConstraint,
+}
+
+impl fmt::Display for DomainReading {
+    /// The reading a claim's room was judged on.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} headroom {} bytes", self.constraint, self.headroom_bytes)
+    }
+}
+
+/// Fresh store readings for the executor's placements and host-side work.
+/// Allocation roles identify stores reached by device storage, not a
+/// promise that device storage occupies only one store.
+pub fn observe_domains(devices: &seismic::Devices, device: &seismic::Device) -> Result<Vec<DomainReading>, MemoryPolicyError> {
+    let status = devices.device_status(device);
+    domain_readings(device, &status)
+}
+
+/// The readings of every store `device` places storage on, and host RAM.
+pub(crate) fn domain_readings(device: &seismic::Device, status: &Status) -> Result<Vec<DomainReading>, MemoryPolicyError> {
+    let topology = device.topology();
+    let fit = Fit::new(topology, status);
+    let stores: std::collections::BTreeSet<_> = crate::memory::CLAIMED
+        .iter()
+        .flat_map(|kind| device.info().paths(*kind))
+        .map(|id| {
+            topology
+                .access_path(*id)
+                .expect("placement belongs to its topology")
+                .store()
+        })
+        .chain(std::iter::once(topology.host_ram().id()))
+        .collect();
+    let readings: Result<Vec<_>, MemoryPolicyError> = stores
+        .into_iter()
+        .map(|store| {
+            let reading = fit.store(store)?;
+            Ok(DomainReading {
+                role: DomainRole::of(topology, device.info(), store),
+                domain: store,
+                headroom_bytes: reading.headroom_bytes,
+                identity: topology
+                    .store_identity(store)
+                    .expect("observed store belongs to topology"),
+                constraint: reading.constraint,
+            })
+        })
+        .collect();
+    // Opt-in investigation trace: the exact sample and readings that decide
+    // the ceiling, rather than a sample taken again after a failed worker
+    // has exited.
+    if std::env::var_os("MAGNITUDE_TRACE_MEMORY_BUDGET").is_some() {
+        eprintln!(
+            "magnitude-engine: memory budget pid={} device={} status={status:?} readings={readings:?}",
+            std::process::id(),
+            device.info().selector(),
+        );
+    }
+    readings
 }
 
 #[cfg(test)]
 mod tests {
+    //! Fit over the recorded machines' topologies
+    //! (`seismic::fixtures::recorded`). Status
+    //! values (headroom, what is left of a grant) are each test's
+    //! input; every structural value is the machine's.
     use super::*;
-    use seismic::{
-        HeadroomBasis, HeadroomEstimate, HostDisplacement, HostMeasurements, LimitVisibility,
-        ProcessLimitKind, ProcessMemoryLimit,
-    };
+    use seismic::fixtures::recorded;
+    use seismic::{BackendName, Reported, ReportedBy, RuntimeStatus, Sample};
     use std::time::SystemTime;
 
-    /// A real pool identity to label synthetic readings with; the values
-    /// under test never come from the device.
-    fn pool() -> MemoryPoolId {
-        DeviceCatalog::discover().unwrap().topology().host_pool().id
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// Host RAM whose binding scope is the whole host, with `supply` bytes
+    /// the OS can give.
+    fn host(supply: u64) -> HostSample {
+        crate::memory::ledger::tests::host_sample(u64::MAX, supply)
     }
 
-    fn host(headroom: u64, limits: Vec<ProcessMemoryLimit>) -> HostMemoryStatus {
-        HostMemoryStatus {
-            sampled_at: SystemTime::now(),
-            measurements: HostMeasurements::Linux {
-                mem_free_bytes: headroom,
-                mem_available_bytes: headroom,
+    /// Host RAM within a limit of `total` bytes that leaves `supply`.
+    fn limited(total: u64, supply: u64) -> HostSample {
+        crate::memory::ledger::tests::host_sample(total, supply)
+    }
+
+    /// Status of an unopened machine: `host` alone, no grant read and no
+    /// charge.
+    fn status(host: HostSample) -> Status {
+        Status {
+            sample: Sample {
+                taken: SystemTime::now(),
+                host,
+                volumes: Vec::new(),
+                executors: Vec::new(),
+                grants: Vec::new(),
             },
-            headroom: HeadroomEstimate {
-                bytes: headroom,
-                basis: HeadroomBasis::LinuxMemAvailable,
-            },
-            limits,
-            limit_visibility: LimitVisibility::Complete,
-            displacement: None,
-            kernel_pressure: None,
+            runtime: RuntimeStatus::default(),
         }
     }
 
-    fn window(millis: u64, compressed: u64, decompressed: u64, swapped_out: u64) -> DisplacementWindow {
-        DisplacementWindow {
-            duration: std::time::Duration::from_millis(millis),
-            compressed_pages: compressed,
-            decompressed_pages: decompressed,
-            swapped_out_pages: swapped_out,
-            swapped_in_pages: 0,
-        }
-    }
-
-    fn displaced(
-        latest: Option<DisplacementWindow>,
-        previous: Option<DisplacementWindow>,
-    ) -> HostMemoryStatus {
-        HostMemoryStatus {
-            displacement: Some(HostDisplacement { latest, previous }),
-            kernel_pressure: Some(KernelPressure::Normal),
-            ..host(32 * GIB, Vec::new())
-        }
-    }
-
-    #[test]
-    fn a_host_without_displacement_counters_is_never_in_distress() {
-        assert_eq!(host_distress(&host(0, Vec::new())), None);
-    }
-
-    #[test]
-    fn compression_alone_is_not_distress() {
-        // Other programs' idle data being compressed is the allowed cost of a load.
-        let compressing = displaced(Some(window(500, 1_000_000, 0, 0)), Some(window(500, 1_000_000, 0, 0)));
-        assert_eq!(host_distress(&compressing), None);
-        // Programs faulting compressed pages back without new compression is recovery.
-        let recovering = displaced(Some(window(500, 0, 1_000_000, 0)), None);
-        assert_eq!(host_distress(&recovering), None);
-    }
-
-    #[test]
-    fn thrashing_needs_both_rates_in_two_consecutive_windows() {
-        // 2,000 compressions/s and 5,000 decompressions/s over 500 ms.
-        let at_rate = window(500, 1_000, 2_500, 0);
-        let thrashing = displaced(Some(at_rate), Some(at_rate));
-        assert_eq!(host_distress(&thrashing), Some(HostDistress::Thrashing));
-        // A load's first compressions beside a burst of faults is one window.
-        assert_eq!(host_distress(&displaced(Some(at_rate), None)), None);
-        let quiet = window(500, 0, 2_500, 0);
-        assert_eq!(host_distress(&displaced(Some(at_rate), Some(quiet))), None);
-        assert_eq!(host_distress(&displaced(Some(quiet), Some(at_rate))), None);
-
-        let below_decompression = displaced(Some(window(500, 1_000, 2_499, 0)), Some(at_rate));
-        assert_eq!(host_distress(&below_decompression), None);
-        let below_compression = displaced(Some(window(500, 999, 2_500, 0)), Some(at_rate));
-        assert_eq!(host_distress(&below_compression), None);
-        // The same page counts over a longer window are a lower rate.
-        let slower = displaced(Some(window(1_000, 1_000, 2_500, 0)), Some(at_rate));
-        assert_eq!(host_distress(&slower), None);
-    }
-
-    #[test]
-    fn swapping_needs_swap_outs_in_two_consecutive_windows() {
-        let one_burst = displaced(Some(window(500, 0, 0, 40)), Some(window(500, 0, 0, 0)));
-        assert_eq!(host_distress(&one_burst), None);
-        let first_window = displaced(Some(window(500, 0, 0, 40)), None);
-        assert_eq!(host_distress(&first_window), None);
-        let ended = displaced(Some(window(500, 0, 0, 0)), Some(window(500, 0, 0, 40)));
-        assert_eq!(host_distress(&ended), None);
-        let sustained = displaced(Some(window(500, 0, 0, 1)), Some(window(500, 0, 0, 1)));
-        assert_eq!(host_distress(&sustained), Some(HostDistress::Swapping));
-    }
-
-    #[test]
-    fn critical_kernel_pressure_is_distress_without_any_window() {
-        let critical = HostMemoryStatus {
-            kernel_pressure: Some(KernelPressure::Critical),
-            ..displaced(None, None)
-        };
-        assert_eq!(host_distress(&critical), Some(HostDistress::KernelCritical));
-        let warning = HostMemoryStatus {
-            kernel_pressure: Some(KernelPressure::Warning),
-            ..displaced(None, None)
-        };
-        assert_eq!(host_distress(&warning), None);
-    }
-
-    #[test]
-    fn host_distress_puts_host_domains_in_reclaim_whatever_their_headroom() {
-        let swapping = displaced(Some(window(500, 0, 0, 1)), Some(window(500, 0, 0, 1)));
-        let host_backed = readings(&swapping, 32 * GIB, None, DeviceMeasurements::Host).unwrap();
-        assert_eq!(host_backed[0].band, MemoryBand::Reclaim);
-        assert_eq!(host_backed[0].distress, Some(HostDistress::Swapping));
-        // Headroom and ceiling are still reported as observed.
-        assert_eq!(host_backed[0].headroom_bytes, 32 * GIB);
-
-        // A dedicated device's own memory has no distress; its staging domain does.
-        let dedicated = readings(
-            &swapping,
-            32 * GIB,
-            Some(24 * GIB),
-            DeviceMeasurements::Cuda {
-                free_bytes: 20 * GIB,
-                total_bytes: 24 * GIB,
-            },
-        )
-        .unwrap();
-        assert_eq!(dedicated[0].band, MemoryBand::Normal);
-        assert_eq!(dedicated[0].distress, None);
-        assert_eq!(dedicated[1].band, MemoryBand::Reclaim);
-        assert_eq!(band_of(&dedicated), MemoryBand::Reclaim);
-    }
-
-    fn readings(
-        host: &HostMemoryStatus,
-        host_capacity: u64,
-        dedicated_capacity: Option<u64>,
-        measurements: DeviceMeasurements,
-    ) -> Result<Vec<DomainReading>, MemoryPolicyError> {
-        let id = pool();
-        domain_readings(
-            DeviceSelector::HostCpu,
-            host,
-            id,
-            host_capacity,
-            dedicated_capacity.map(|capacity_bytes| DedicatedDomain { id, capacity_bytes }),
-            &measurements,
-            &MemoryReserves::standard(),
-        )
-    }
-
-    #[test]
-    fn standard_reserves_use_the_larger_of_fraction_and_floor() {
-        let reserves = MemoryReserves::standard();
-        assert_eq!(
-            reserves.for_domain(16 * GIB),
-            DomainThresholds {
-                planning_bytes: 2 * GIB,
-                emergency_bytes: GIB,
-            }
-        );
-        assert_eq!(
-            reserves.for_domain(64 * GIB),
-            DomainThresholds {
-                planning_bytes: 64 * GIB / 10,
-                emergency_bytes: 64 * GIB / 20,
-            }
-        );
-    }
-
-    #[test]
-    fn host_ram_band_and_ceiling_follow_the_planning_reserve() {
-        let normal = readings(
-            &host(5 * GIB, vec![]),
-            16 * GIB,
-            None,
-            DeviceMeasurements::Host,
-        )
-        .unwrap();
-        assert_eq!(normal.len(), 1);
-        assert_eq!(normal[0].role, DomainRole::Allocation);
-        assert_eq!(normal[0].band, MemoryBand::Normal);
-        assert_eq!(normal[0].ceiling_bytes, 3 * GIB);
-        assert_eq!(normal[0].constraint, MemoryConstraint::HostRam);
-        // Exactly at the planning reserve is already Reclaim.
-        let at_line = readings(
-            &host(2 * GIB, vec![]),
-            16 * GIB,
-            None,
-            DeviceMeasurements::Host,
-        )
-        .unwrap();
-        assert_eq!(at_line[0].band, MemoryBand::Reclaim);
-        assert_eq!(at_line[0].ceiling_bytes, 0);
-        // Below the emergency reserve the engine still reports Reclaim; the
-        // kill belongs to the service.
-        let below = readings(
-            &host(GIB / 2, vec![]),
-            16 * GIB,
-            None,
-            DeviceMeasurements::Host,
-        )
-        .unwrap();
-        assert_eq!(below[0].band, MemoryBand::Reclaim);
-        assert_eq!(below[0].ceiling_bytes, 0);
-    }
-
-    #[test]
-    fn process_limits_bound_host_headroom() {
-        let limited = host(
-            12 * GIB,
-            vec![ProcessMemoryLimit {
-                kind: ProcessLimitKind::CgroupV2 {
-                    cgroup: "/worker".into(),
-                },
-                limit_bytes: 8 * GIB,
-                used_bytes: 4 * GIB,
-            }],
-        );
-        let reading = readings(&limited, 16 * GIB, None, DeviceMeasurements::Host).unwrap();
-        assert_eq!(reading[0].headroom_bytes, 4 * GIB);
-        assert_eq!(reading[0].ceiling_bytes, 2 * GIB);
-        // A container's own limit bounds it though its ancestors are hidden.
-        let mut contained = limited.clone();
-        contained.limit_visibility = LimitVisibility::CgroupAncestorsHidden;
-        assert_eq!(
-            readings(&contained, 16 * GIB, None, DeviceMeasurements::Host).unwrap(),
-            reading
-        );
-    }
-
-    #[test]
-    fn metal_working_set_bounds_the_ceiling_not_the_band() {
-        let metal = |allocated| DeviceMeasurements::Metal {
-            recommended_working_set_bytes: 12 * GIB,
-            current_allocated_bytes: allocated,
-        };
-        // Working-set room (1 GiB) is tighter than host ceiling (4 GiB).
-        let bounded = readings(&host(6 * GIB, vec![]), 16 * GIB, None, metal(11 * GIB)).unwrap();
-        assert_eq!(bounded[0].band, MemoryBand::Normal);
-        assert_eq!(bounded[0].ceiling_bytes, GIB);
-        assert_eq!(bounded[0].constraint, MemoryConstraint::DeviceWorkingSet);
-        // Host headroom (ceiling 4 GiB) is tighter than working-set room.
-        let host_bound = readings(&host(6 * GIB, vec![]), 16 * GIB, None, metal(GIB)).unwrap();
-        assert_eq!(host_bound[0].ceiling_bytes, 4 * GIB);
-        assert_eq!(host_bound[0].constraint, MemoryConstraint::HostRam);
-        // A full working set grants nothing but is not Reclaim by itself.
-        let full = readings(&host(6 * GIB, vec![]), 16 * GIB, None, metal(12 * GIB)).unwrap();
-        assert_eq!(full[0].band, MemoryBand::Normal);
-        assert_eq!(full[0].ceiling_bytes, 0);
-        let reclaim = readings(&host(GIB, vec![]), 16 * GIB, None, metal(GIB)).unwrap();
-        assert_eq!(reclaim[0].band, MemoryBand::Reclaim);
-        assert_eq!(reclaim[0].ceiling_bytes, 0);
-    }
-
-    #[test]
-    fn integrated_cuda_is_bounded_by_host_ram_not_driver_free_bytes() {
-        let reading = readings(
-            &host(10 * GIB, vec![]),
-            32 * GIB,
-            None,
-            DeviceMeasurements::Cuda {
-                free_bytes: GIB,
-                total_bytes: 32 * GIB,
-            },
-        )
-        .unwrap();
-        assert_eq!(reading.len(), 1);
-        // Host planning reserve is 3.2 GiB of 32 GiB.
-        assert_eq!(reading[0].ceiling_bytes, 10 * GIB - 32 * GIB / 10);
-        assert_eq!(reading[0].band, MemoryBand::Normal);
-    }
-
-    #[test]
-    fn dedicated_cuda_reads_its_own_pool_and_host_staging() {
-        let cuda = |free| DeviceMeasurements::Cuda {
-            free_bytes: free,
-            total_bytes: 24 * GIB,
-        };
-        let normal = readings(
-            &host(8 * GIB, vec![]),
-            64 * GIB,
-            Some(24 * GIB),
-            cuda(10 * GIB),
-        )
-        .unwrap();
-        assert_eq!(normal.len(), 2);
-        let (allocation, staging) = (normal[0], normal[1]);
-        assert_eq!(allocation.role, DomainRole::Allocation);
-        assert_eq!(allocation.constraint, MemoryConstraint::DeviceLocal);
-        // 24 GiB card: planning reserve 2.4 GiB.
-        assert_eq!(allocation.thresholds.planning_bytes, 24 * GIB / 10);
-        assert_eq!(allocation.ceiling_bytes, 10 * GIB - 24 * GIB / 10);
-        assert_eq!(allocation.band, MemoryBand::Normal);
-        assert_eq!(staging.role, DomainRole::Staging);
-        assert_eq!(staging.constraint, MemoryConstraint::HostRam);
-        // 64 GiB host: planning reserve 6.4 GiB.
-        assert_eq!(staging.ceiling_bytes, 8 * GIB - 64 * GIB / 10);
-        assert_eq!(staging.band, MemoryBand::Normal);
-        assert_eq!(band_of(&normal), MemoryBand::Normal);
-
-        let card_reclaim = readings(
-            &host(8 * GIB, vec![]),
-            64 * GIB,
-            Some(24 * GIB),
-            cuda(2 * GIB),
-        )
-        .unwrap();
-        assert_eq!(card_reclaim[0].band, MemoryBand::Reclaim);
-        assert_eq!(card_reclaim[0].ceiling_bytes, 0);
-        assert_eq!(band_of(&card_reclaim), MemoryBand::Reclaim);
-    }
-
-    #[test]
-    fn staging_reclaim_holds_a_dedicated_load_in_reclaim() {
-        let staged = readings(
-            &host(6 * GIB, vec![]),
-            64 * GIB,
-            Some(24 * GIB),
-            DeviceMeasurements::Cuda {
-                free_bytes: 20 * GIB,
-                total_bytes: 24 * GIB,
-            },
-        )
-        .unwrap();
-        assert_eq!(staged[0].band, MemoryBand::Normal);
-        assert_eq!(staged[1].role, DomainRole::Staging);
-        assert_eq!(staged[1].band, MemoryBand::Reclaim);
-        assert_eq!(staged[1].ceiling_bytes, 0);
-        assert_eq!(band_of(&staged), MemoryBand::Reclaim);
-    }
-
-    #[test]
-    fn dedicated_vulkan_uses_budget_less_usage() {
-        let vulkan = |usage| DeviceMeasurements::Vulkan {
-            heap_budget_bytes: 14 * GIB,
-            heap_usage_bytes: usage,
-        };
-        let normal = readings(
-            &host(8 * GIB, vec![]),
-            32 * GIB,
-            Some(16 * GIB),
-            vulkan(6 * GIB),
-        )
-        .unwrap();
-        assert_eq!(normal[0].headroom_bytes, 8 * GIB);
-        assert_eq!(normal[0].ceiling_bytes, 6 * GIB);
-        assert_eq!(normal[0].band, MemoryBand::Normal);
-        let reclaim = readings(
-            &host(8 * GIB, vec![]),
-            32 * GIB,
-            Some(16 * GIB),
-            vulkan(13 * GIB),
-        )
-        .unwrap();
-        assert_eq!(reclaim[0].band, MemoryBand::Reclaim);
-        assert_eq!(reclaim[0].ceiling_bytes, 0);
-        // Usage past the budget saturates rather than wrapping.
-        let over = readings(
-            &host(8 * GIB, vec![]),
-            32 * GIB,
-            Some(16 * GIB),
-            vulkan(15 * GIB),
-        )
-        .unwrap();
-        assert_eq!(over[0].headroom_bytes, 0);
-    }
-
-    #[test]
-    fn a_dedicated_device_never_reports_host_measurements() {
-        for measurements in [
-            DeviceMeasurements::Host,
-            DeviceMeasurements::Metal {
-                recommended_working_set_bytes: GIB,
-                current_allocated_bytes: 0,
-            },
-        ] {
-            assert!(matches!(
-                readings(
-                    &host(8 * GIB, vec![]),
-                    32 * GIB,
-                    Some(16 * GIB),
-                    measurements
-                ),
-                Err(MemoryPolicyError::MismatchedObservation { .. })
-            ));
-        }
-    }
-
-    #[test]
-    fn host_backed_fit_subtracts_the_planning_reserve() {
-        let catalog = DeviceCatalog::discover().unwrap();
-        let topology = catalog.topology();
-        let host = catalog.host_memory_status().unwrap();
-        let cpu = topology
-            .devices()
+    /// Status of an unopened machine sampled for every executor of
+    /// `topology`: `host` alone, no grant read and no charge.
+    fn sampled(topology: &DeviceTopology, host: HostSample) -> Status {
+        let mut status = status(host);
+        status.sample.executors = topology
+            .executors()
             .iter()
-            .find(|device| device.selector == DeviceSelector::HostCpu)
+            .map(|executor| executor.id())
+            .collect();
+        status
+    }
+
+    /// The first executor of `backend`.
+    fn executor(topology: &DeviceTopology, backend: BackendName) -> &Executor {
+        topology
+            .executors()
+            .iter()
+            .find(|executor| executor.backend() == backend)
+            .unwrap()
+    }
+
+    /// The machine's one device memory store.
+    fn device_memory(topology: &DeviceTopology) -> StoreId {
+        let stores = topology
+            .stores()
+            .iter()
+            .filter(|store| matches!(store.kind(), StoreKind::DeviceMemory(_)))
+            .map(|store| store.id())
+            .collect::<Vec<_>>();
+        let [store] = stores[..] else {
+            panic!("the machine has one device memory store");
+        };
+        store
+    }
+
+    /// What the reported grant of the `index`th path of `executor`'s
+    /// placement of `kind` lets a claim take.
+    fn grant_room(
+        topology: &DeviceTopology,
+        executor: &Executor,
+        kind: Contract,
+        index: usize,
+    ) -> u64 {
+        let path = topology
+            .access_path(executor.paths(kind)[index])
             .unwrap();
-        let reserves = MemoryReserves::standard();
-        let capacity = topology.host_pool().capacity_bytes;
-        let bounded = host
-            .limits
-            .iter()
-            .map(|limit| limit.limit_bytes)
-            .fold(capacity, u64::min);
-        let fits = fit_capacities(&topology, cpu, &host, &reserves).unwrap();
-        assert_eq!(fits.len(), 1);
-        let (role, fit) = fits[0];
-        assert_eq!(role, DomainRole::Allocation);
-        assert_eq!(fit.capacity_bytes, bounded);
-        assert_eq!(
-            fit.fit_bytes(),
-            bounded - reserves.for_domain(capacity).planning_bytes
-        );
+        path.grant().unwrap().value
     }
 
-    #[cfg(target_os = "macos")]
+    fn demand(executor: &Executor, kind: Contract, bytes: u64) -> StorageDemand {
+        StorageDemand {
+            executor: executor.id(),
+            kind,
+            bytes,
+        }
+    }
+
+    /// The bytes `fit` placed on `store`.
+    fn placed(fit: &DemandFit, store: StoreId) -> u64 {
+        fit.placed
+            .iter()
+            .filter(|(on, _)| *on == store)
+            .map(|(_, bytes)| bytes)
+            .sum()
+    }
+
+    /// Another process's memory on a discrete device reaches its store's
+    /// fit through what the driver says is left of the grant, which the
+    /// process's own charges cannot show.
+    #[test]
+    fn a_stores_headroom_follows_what_is_left_of_its_grants() {
+        let rtx3090 = recorded::rtx3090();
+        let cuda = executor(&rtx3090, BackendName::Cuda);
+        let path = rtx3090.access_path(cuda.paths(Contract::DeviceOnly)[0]).unwrap();
+        let mut opened = sampled(&rtx3090, host(40 * GIB));
+        let store = path.store();
+        let room = |status: &Status| Fit::new(&rtx3090, status).store(store).unwrap().headroom_bytes;
+        let capacity = room(&opened);
+        opened.runtime.grants = vec![(path.id(), Ok(Reported::new(GIB, ReportedBy::CudaFree)))];
+        assert!(capacity > GIB);
+        assert_eq!(room(&opened), GIB);
+    }
+
+    /// Host RAM's stable fit is its capacity and its live fit its headroom:
+    /// stable fit does not follow headroom.
+    #[test]
+    fn host_ram_fit_is_its_capacity_and_headroom() {
+        let topology = recorded::rtx3090();
+        let id = topology.host_ram().id();
+        let capacity = topology.host_ram().capacity().value;
+        let reading = |headroom| Fit::new(&topology, &status(host(headroom))).store(id).unwrap();
+        let above = reading(16 * GIB);
+        assert_eq!(above.capacity_bytes, capacity);
+        assert_eq!(above.headroom_bytes, 16 * GIB);
+        assert_eq!(above.constraint, MemoryConstraint::HostRam);
+        assert_eq!(reading(GIB).capacity_bytes, capacity);
+        assert_eq!(reading(0).headroom_bytes, 0);
+    }
+
+    /// A store an executor's device storage is placed on holds its
+    /// allocations; any other store it charges holds host-side work.
+    #[test]
+    fn domain_roles_follow_the_device_storage_placement() {
+        let rtx3090 = recorded::rtx3090();
+        let (gpu, host_ram) = (device_memory(&rtx3090), rtx3090.host_ram().id());
+        for backend in [BackendName::Cuda, BackendName::Vulkan] {
+            let executor = executor(&rtx3090, backend);
+            assert_eq!(
+                DomainRole::of(&rtx3090, executor, gpu),
+                DomainRole::Allocation
+            );
+            assert_eq!(
+                DomainRole::of(&rtx3090, executor, host_ram),
+                DomainRole::Staging
+            );
+        }
+        let cpu = executor(&rtx3090, BackendName::Cpu);
+        assert_eq!(
+            DomainRole::of(&rtx3090, cpu, host_ram),
+            DomainRole::Allocation
+        );
+        // GB10's CUDA allocates in host RAM.
+        let gb10 = recorded::gb10();
+        let cuda = executor(&gb10, BackendName::Cuda);
+        assert_eq!(
+            DomainRole::of(&gb10, cuda, gb10.host_ram().id()),
+            DomainRole::Allocation
+        );
+        // Device storage over two paths allocates in both stores.
+        let strix = recorded::strix_halo_windows();
+        let vulkan = executor(&strix, BackendName::Vulkan);
+        for store in [device_memory(&strix), strix.host_ram().id()] {
+            assert_eq!(
+                DomainRole::of(&strix, vulkan, store),
+                DomainRole::Allocation
+            );
+        }
+    }
+
+    /// On the M4 Pro, Metal's stable fit is the smaller of its recommended
+    /// working set and host RAM's capacity: the working set's while host RAM
+    /// is larger, host RAM's fit under a process limit below it.
     #[test]
     fn metal_fit_respects_the_recommended_working_set() {
-        let catalog = DeviceCatalog::discover().unwrap();
-        let topology = catalog.topology();
-        let host = catalog.host_memory_status().unwrap();
-        let Some(metal) = topology
-            .devices()
-            .iter()
-            .find(|device| device.backend == seismic::BackendName::Metal)
-        else {
-            return;
-        };
-        let reserves = MemoryReserves::standard();
-        let host_capacity = host
-            .limits
-            .iter()
-            .map(|limit| limit.limit_bytes)
-            .fold(topology.host_pool().capacity_bytes, u64::min);
-        let working_set = metal.recommended_working_set_bytes().unwrap();
-        let fits = fit_capacities(&topology, metal, &host, &reserves).unwrap();
-        assert_eq!(fits.len(), 1);
-        assert_eq!(fits[0].1.capacity_bytes, host_capacity.min(working_set));
+        let topology = recorded::m4_pro();
+        let metal = executor(&topology, BackendName::Metal);
+        let working_set = grant_room(&topology, metal, Contract::DeviceOnly, 0);
+        let unlimited = sampled(&topology, host(16 * GIB));
+        let fit = Fit::new(&topology, &unlimited);
+        let host_fit = fit.store(topology.host_ram().id()).unwrap().capacity_bytes;
+        assert!(working_set < host_fit);
+        for kind in crate::memory::CLAIMED {
+            assert_eq!(
+                fit.placement(metal, kind).unwrap().stable_bytes,
+                working_set
+            );
+        }
+        // The CPU's host RAM is ungranted: host RAM's fit.
+        let cpu = executor(&topology, BackendName::Cpu);
         assert_eq!(
-            fits[0].1.fit_bytes(),
-            host_capacity.min(working_set)
-                - reserves
-                    .for_domain(topology.host_pool().capacity_bytes)
-                    .planning_bytes
+            fit.placement(cpu, Contract::DeviceOnly)
+                .unwrap()
+                .stable_bytes,
+            host_fit
+        );
+
+        let limited = sampled(&topology, limited(32 * GIB, 16 * GIB));
+        let fit = Fit::new(&topology, &limited);
+        let host_fit = fit.store(topology.host_ram().id()).unwrap().capacity_bytes;
+        assert!(host_fit < working_set);
+        assert_eq!(
+            fit.placement(metal, Contract::DeviceOnly)
+                .unwrap()
+                .stable_bytes,
+            host_fit
+        );
+    }
+
+    /// Metal's live ceiling is the smaller of the working set left (the
+    /// sample's grant status) and host RAM's headroom. The working set bounds
+    /// what Metal may claim, never host RAM's own headroom.
+    #[test]
+    fn metal_working_set_bounds_metals_ceiling_not_host_rams() {
+        let topology = recorded::m4_pro();
+        let metal = executor(&topology, BackendName::Metal);
+        let path = metal.paths(Contract::DeviceOnly)[0];
+        let host_ram = topology.host_ram().id();
+        let mut sampled = sampled(&topology, host(20 * GIB));
+        let with_left = |sampled: &mut Status, left| {
+            sampled.sample.grants = vec![(
+                path,
+                Ok(Reported::new(left, ReportedBy::MetalWorkingSetUnallocated)),
+            )];
+        };
+        // Working set left 4 GiB is tighter than host RAM's headroom.
+        with_left(&mut sampled, 4 * GIB);
+        let fit = Fit::new(&topology, &sampled);
+        let host_ceiling = fit.store(host_ram).unwrap().headroom_bytes;
+        assert!(4 * GIB < host_ceiling);
+        let room = fit.placement(metal, Contract::DeviceOnly).unwrap();
+        assert_eq!(room.ceiling_bytes, 4 * GIB);
+        // The sample bounds the ceiling, not stable fit.
+        assert_eq!(
+            room.stable_bytes,
+            grant_room(&topology, metal, Contract::DeviceOnly, 0)
+        );
+        let over = fit
+            .demand(
+                &[demand(metal, Contract::DeviceOnly, 5 * GIB)],
+                &[],
+                FitMode::Live,
+            )
+            .unwrap();
+        assert_eq!(
+            over.refused,
+            [FitRefusal {
+                store: host_ram,
+                required_bytes: 5 * GIB,
+                missing_bytes: GIB,
+                constraint: MemoryConstraint::Grant,
+            }]
+        );
+        // Host RAM's ceiling is tighter than the working set left.
+        with_left(&mut sampled, 30 * GIB);
+        let fit = Fit::new(&topology, &sampled);
+        let room = fit.placement(metal, Contract::DeviceOnly).unwrap();
+        assert_eq!(room.ceiling_bytes, host_ceiling);
+        let over = fit
+            .demand(
+                &[demand(metal, Contract::DeviceOnly, host_ceiling + 1)],
+                &[],
+                FitMode::Live,
+            )
+            .unwrap();
+        assert_eq!(over.refused[0].constraint, MemoryConstraint::HostRam);
+        // A spent working set grants nothing but leaves host RAM's ceiling.
+        with_left(&mut sampled, 0);
+        let fit = Fit::new(&topology, &sampled);
+        assert_eq!(
+            fit.placement(metal, Contract::DeviceOnly)
+                .unwrap()
+                .ceiling_bytes,
+            0
+        );
+        assert_eq!(fit.store(host_ram).unwrap().headroom_bytes, host_ceiling);
+    }
+
+    /// An integrated GPU (GB10's CUDA and Vulkan, Strix Halo's and Lunar
+    /// Lake's Vulkan) fits the smaller of its grant's room and host RAM's
+    /// fit, and a demand beyond it is refused by whichever is smaller.
+    #[test]
+    fn an_integrated_gpu_is_bounded_by_the_smaller_of_its_grant_and_host_ram() {
+        for (topology, backend) in [
+            (recorded::gb10(), BackendName::Cuda),
+            (recorded::gb10(), BackendName::Vulkan),
+            (recorded::strix_halo_linux(), BackendName::Vulkan),
+            (recorded::lunar_lake(), BackendName::Vulkan),
+        ] {
+            let unopened = sampled(&topology, host(8 * GIB));
+            let fit = Fit::new(&topology, &unopened);
+            let host_fit = fit.store(topology.host_ram().id()).unwrap().capacity_bytes;
+            let executor = executor(&topology, backend);
+            let grant = grant_room(&topology, executor, Contract::DeviceOnly, 0);
+            let room = fit.placement(executor, Contract::DeviceOnly).unwrap();
+            let label = format!("{backend:?} on {}", executor.name());
+            assert_eq!(room.stable_bytes, grant.min(host_fit), "{label}");
+            let over = fit
+                .demand(
+                    &[demand(executor, Contract::DeviceOnly, room.stable_bytes + 1)],
+                    &[],
+                    FitMode::Stable,
+                )
+                .unwrap();
+            let bound = if host_fit <= grant {
+                MemoryConstraint::HostRam
+            } else {
+                MemoryConstraint::Grant
+            };
+            assert_eq!(over.refused[0].constraint, bound, "{label}");
+        }
+    }
+
+    /// On GB10 every charge is host RAM's: CUDA's and Vulkan's device
+    /// storage and direct host work spend host RAM's one fit.
+    #[test]
+    fn gb10_executors_and_host_work_share_host_ram() {
+        let topology = recorded::gb10();
+        let unopened = status(host(8 * GIB));
+        let fit = Fit::new(&topology, &unopened);
+        let host_ram = topology.host_ram().id();
+        let host_fit = fit.store(host_ram).unwrap().capacity_bytes;
+        let cuda = executor(&topology, BackendName::Cuda);
+        let vulkan = executor(&topology, BackendName::Vulkan);
+        let (work, half) = (GIB, (host_fit - GIB) / 2);
+        let result = fit
+            .demand(
+                &[
+                    demand(cuda, Contract::DeviceOnly, half),
+                    demand(vulkan, Contract::DeviceOnly, host_fit - work - half + 1),
+                ],
+                &[(host_ram, work)],
+                FitMode::Stable,
+            )
+            .unwrap();
+        assert_eq!(result.placed, [(host_ram, host_fit)]);
+        assert_eq!(
+            result.refused,
+            [FitRefusal {
+                store: host_ram,
+                required_bytes: host_fit - work - half + 1,
+                missing_bytes: 1,
+                constraint: MemoryConstraint::HostRam,
+            }]
+        );
+    }
+
+    /// CUDA's free figure for an integrated device is no bound (§2.5): its
+    /// live grant is its total less what it holds, and host RAM's headroom
+    /// bounds it below that.
+    #[test]
+    fn integrated_cuda_is_bounded_by_host_ram_and_what_it_holds() {
+        let topology = recorded::gb10();
+        let cuda = executor(&topology, BackendName::Cuda);
+        let path = cuda.paths(Contract::DeviceOnly)[0];
+        let total = topology.access_path(path).unwrap().grant().unwrap().value;
+        let mut opened = sampled(&topology, host(40 * GIB));
+        let holding = |opened: &mut Status, held| {
+            opened.runtime.grants = vec![(
+                path,
+                Ok(Reported::new(total - held, ReportedBy::CudaTotalMemory)),
+            )];
+        };
+        holding(&mut opened, 0);
+        let fit = Fit::new(&topology, &opened);
+        let host_ceiling = fit.store(topology.host_ram().id()).unwrap().headroom_bytes;
+        assert_eq!(
+            fit.placement(cuda, Contract::DeviceOnly)
+                .unwrap()
+                .ceiling_bytes,
+            host_ceiling
+        );
+        // Holding all but 8 GiB of its total leaves it 8 GiB, below host
+        // RAM's headroom.
+        holding(&mut opened, total - 8 * GIB);
+        let fit = Fit::new(&topology, &opened);
+        assert!(8 * GIB < host_ceiling);
+        assert_eq!(
+            fit.placement(cuda, Contract::DeviceOnly)
+                .unwrap()
+                .ceiling_bytes,
+            8 * GIB
+        );
+    }
+
+    /// Two executors on one store: each of the RTX 3090's CUDA and Vulkan
+    /// fits the smaller of its grant's room and its memory's fit, and a
+    /// demand split across both cannot exceed that fit once.
+    #[test]
+    fn cuda_and_vulkan_on_one_device_share_its_fit() {
+        let topology = recorded::rtx3090();
+        let gpu = device_memory(&topology);
+        let capacity = topology.store(gpu).unwrap().capacity().value;
+        let sampled = sampled(&topology, host(16 * GIB));
+        let fit = Fit::new(&topology, &sampled);
+        let own = fit.store(gpu).unwrap();
+        assert_eq!(own.constraint, MemoryConstraint::DeviceLocal);
+        assert_eq!(own.capacity_bytes, capacity);
+        let cuda = executor(&topology, BackendName::Cuda);
+        let vulkan = executor(&topology, BackendName::Vulkan);
+        for executor in [cuda, vulkan] {
+            let grant = grant_room(&topology, executor, Contract::DeviceOnly, 0);
+            assert_eq!(
+                fit.placement(executor, Contract::DeviceOnly)
+                    .unwrap()
+                    .stable_bytes,
+                grant.min(own.capacity_bytes)
+            );
+        }
+        let half = own.capacity_bytes / 2;
+        let split = fit
+            .demand(
+                &[
+                    demand(cuda, Contract::DeviceOnly, half),
+                    demand(vulkan, Contract::DeviceOnly, own.capacity_bytes - half + 1),
+                ],
+                &[],
+                FitMode::Stable,
+            )
+            .unwrap();
+        assert_eq!(split.placed, [(gpu, own.capacity_bytes)]);
+        assert_eq!(
+            split.refused,
+            [FitRefusal {
+                store: gpu,
+                required_bytes: own.capacity_bytes - half + 1,
+                missing_bytes: 1,
+                constraint: MemoryConstraint::DeviceLocal,
+            }]
+        );
+    }
+
+    /// The A10-8Q slice's stable fit is its capacity: its driver's own
+    /// reserve is all it keeps.
+    #[test]
+    fn a_small_dedicated_device_fits_its_capacity() {
+        let topology = recorded::a10_8q();
+        let slice = device_memory(&topology);
+        let capacity = topology.store(slice).unwrap().capacity().value;
+        let sampled = sampled(&topology, host(16 * GIB));
+        let fit = Fit::new(&topology, &sampled);
+        let own = fit.store(slice).unwrap();
+        assert_eq!(own.capacity_bytes, capacity);
+        // CUDA's usable memory is below the slice's fit; Vulkan's heap, the
+        // slice's capacity, is above it.
+        let cuda = executor(&topology, BackendName::Cuda);
+        let usable = grant_room(&topology, cuda, Contract::DeviceOnly, 0);
+        assert!(usable < own.capacity_bytes);
+        assert_eq!(
+            fit.placement(cuda, Contract::DeviceOnly)
+                .unwrap()
+                .stable_bytes,
+            usable
+        );
+        let vulkan = executor(&topology, BackendName::Vulkan);
+        assert_eq!(
+            fit.placement(vulkan, Contract::DeviceOnly)
+                .unwrap()
+                .stable_bytes,
+            own.capacity_bytes
+        );
+    }
+
+    /// A shared path's grant is one budget for every storage kind placed on
+    /// it: the RTX 3090's Vulkan places device and upload storage (ReBAR)
+    /// on one path, whose budget left bounds both together.
+    #[test]
+    fn remaining_path_grant_is_shared_by_device_and_upload() {
+        let topology = recorded::rtx3090();
+        let vulkan = executor(&topology, BackendName::Vulkan);
+        let path = vulkan.paths(Contract::DeviceOnly)[0];
+        assert_eq!(vulkan.paths(Contract::Upload), [path]);
+        let mut sampled = sampled(&topology, host(16 * GIB));
+        let gpu = device_memory(&topology);
+        // A budget left 10 GiB.
+        sampled.sample.grants = vec![(
+            path,
+            Ok(Reported::new(10 * GIB, ReportedBy::VulkanHeapBudget)),
+        )];
+        let fit = Fit::new(&topology, &sampled);
+        assert_eq!(fit.store(gpu).unwrap().headroom_bytes, 10 * GIB);
+        let result = fit
+            .demand(
+                &[
+                    demand(vulkan, Contract::DeviceOnly, 7 * GIB),
+                    demand(vulkan, Contract::Upload, 4 * GIB),
+                ],
+                &[],
+                FitMode::Live,
+            )
+            .unwrap();
+        assert_eq!(result.placed, [(gpu, 10 * GIB)]);
+        assert_eq!(
+            result.refused,
+            [FitRefusal {
+                store: gpu,
+                required_bytes: 4 * GIB,
+                missing_bytes: GIB,
+                constraint: MemoryConstraint::DeviceLocal,
+            }]
+        );
+    }
+
+    /// A placement over two paths: Strix Halo on Windows (#207) places
+    /// device storage on its own memory up to that store's fit, then on
+    /// host RAM under the heaps' total beyond it. A demand larger than its
+    /// own memory continues onto host RAM; beyond both, the refusal names
+    /// the path that ran out: its grant, or host RAM when other work has
+    /// taken host RAM's fit.
+    #[test]
+    fn a_placement_over_two_paths_continues_onto_host_ram() {
+        let topology = recorded::strix_halo_windows();
+        let unopened = sampled(&topology, host(16 * GIB));
+        let fit = Fit::new(&topology, &unopened);
+        let (radeon, host_ram) = (device_memory(&topology), topology.host_ram().id());
+        let own_fit = fit.store(radeon).unwrap().capacity_bytes;
+        let host_fit = fit.store(host_ram).unwrap().capacity_bytes;
+        let vulkan = executor(&topology, BackendName::Vulkan);
+        // The own-memory path's grant is its store's capacity, whose room is
+        // its fit; the host path's room is below host RAM's fit.
+        assert_eq!(grant_room(&topology, vulkan, Contract::DeviceOnly, 0), own_fit);
+        let beyond = grant_room(&topology, vulkan, Contract::DeviceOnly, 1);
+        assert!(beyond < host_fit);
+        let room = fit.placement(vulkan, Contract::DeviceOnly).unwrap();
+        assert_eq!(room.stable_bytes, own_fit + beyond);
+
+        let spilled = fit
+            .demand(
+                &[demand(vulkan, Contract::DeviceOnly, own_fit + GIB)],
+                &[],
+                FitMode::Stable,
+            )
+            .unwrap();
+        assert!(spilled.fits());
+        assert_eq!(
+            (placed(&spilled, radeon), placed(&spilled, host_ram)),
+            (own_fit, GIB)
+        );
+
+        let over = fit
+            .demand(
+                &[demand(vulkan, Contract::DeviceOnly, own_fit + beyond + 1)],
+                &[],
+                FitMode::Stable,
+            )
+            .unwrap();
+        assert_eq!(
+            over.refused,
+            [FitRefusal {
+                store: host_ram,
+                required_bytes: own_fit + beyond + 1,
+                missing_bytes: 1,
+                constraint: MemoryConstraint::Grant,
+            }]
+        );
+
+        // Host work leaving 1 GiB of host RAM's fit.
+        let crowded = fit
+            .demand(
+                &[demand(vulkan, Contract::DeviceOnly, own_fit + 2 * GIB)],
+                &[(host_ram, host_fit - GIB)],
+                FitMode::Stable,
+            )
+            .unwrap();
+        assert_eq!(placed(&crowded, radeon), own_fit);
+        assert_eq!(placed(&crowded, host_ram), host_fit);
+        assert_eq!(
+            crowded.refused,
+            [FitRefusal {
+                store: host_ram,
+                required_bytes: own_fit + 2 * GIB,
+                missing_bytes: GIB,
+                constraint: MemoryConstraint::HostRam,
+            }]
+        );
+    }
+
+    /// A binding limit is a grant on host RAM that every path into it
+    /// shares: its total bounds host RAM's stable fit and its supply the
+    /// headroom, for the CPU and for CUDA's pinned upload alike.
+    #[test]
+    fn a_binding_limit_bounds_host_ram_for_every_path() {
+        let topology = recorded::rtx3090();
+        let host_ram = topology.host_ram().id();
+        let limited = status(limited(32 * GIB, 16 * GIB));
+        let fit = Fit::new(&topology, &limited);
+        let reading = fit.store(host_ram).unwrap();
+        assert_eq!(reading.capacity_bytes, 32 * GIB);
+        assert_eq!(reading.headroom_bytes, 16 * GIB);
+        let cpu = executor(&topology, BackendName::Cpu);
+        let cuda = executor(&topology, BackendName::Cuda);
+        for (executor, kind) in [(cpu, Contract::DeviceOnly), (cuda, Contract::Upload)] {
+            let room = fit.placement(executor, kind).unwrap();
+            assert_eq!((room.stable_bytes, room.ceiling_bytes), (reading.capacity_bytes, reading.headroom_bytes));
+        }
+    }
+
+    /// Direct host work and every storage kind of an executor on host RAM
+    /// spend host RAM's one fit.
+    #[test]
+    fn storage_kinds_and_direct_work_spend_one_host_budget() {
+        let topology = recorded::m4_pro();
+        let unopened = status(host(16 * GIB));
+        let fit = Fit::new(&topology, &unopened);
+        let host_ram = topology.host_ram().id();
+        let room = fit.store(host_ram).unwrap().capacity_bytes;
+        let cpu = executor(&topology, BackendName::Cpu);
+        let result = fit
+            .demand(
+                &[
+                    demand(cpu, Contract::DeviceOnly, room - 20),
+                    demand(cpu, Contract::Upload, 20),
+                ],
+                &[(host_ram, 7)],
+                FitMode::Stable,
+            )
+            .unwrap();
+        assert_eq!(result.placed, [(host_ram, room)]);
+        assert_eq!(
+            result.refused,
+            [FitRefusal {
+                store: host_ram,
+                required_bytes: 20,
+                missing_bytes: 7,
+                constraint: MemoryConstraint::HostRam,
+            }]
+        );
+    }
+
+    /// Storage demanded of an executor that places none (Metal on a device
+    /// whose memory is not the host's) is refused as unplaced, never fitted
+    /// as zero.
+    #[test]
+    fn demand_on_an_unavailable_executor_is_unplaced() {
+        let topology = recorded::m4_pro_without_unified_memory();
+        let unopened = status(host(16 * GIB));
+        let fit = Fit::new(&topology, &unopened);
+        let metal = executor(&topology, BackendName::Metal);
+        let unplaced = MemoryPolicyError::Unplaced {
+            executor: metal.id(),
+            kind: Contract::DeviceOnly,
+        };
+        assert_eq!(
+            fit.demand(
+                &[demand(metal, Contract::DeviceOnly, 1)],
+                &[],
+                FitMode::Stable
+            ),
+            Err(unplaced.clone())
+        );
+        assert_eq!(fit.placement(metal, Contract::DeviceOnly), Err(unplaced));
+    }
+
+    /// Fit answers only for nodes of its own topology revision.
+    #[test]
+    fn a_subject_of_another_revision_is_refused() {
+        let (topology, other) = (recorded::m4_pro(), recorded::m4_pro());
+        let unopened = status(host(16 * GIB));
+        let fit = Fit::new(&topology, &unopened);
+        assert_eq!(
+            fit.store(other.host_ram().id()),
+            Err(MemoryPolicyError::ForeignIdentifier)
+        );
+        let cpu = executor(&other, BackendName::Cpu);
+        assert_eq!(
+            fit.demand(&[demand(cpu, Contract::DeviceOnly, 1)], &[], FitMode::Stable),
+            Err(MemoryPolicyError::ForeignIdentifier)
         );
     }
 }

@@ -15,13 +15,14 @@ authorize loading, or replace observed runtime timing.
 
 | Layer | Responsibility |
 |---|---|
-| Engine | Device bandwidth, planned decode demand, fixed decode costs, formula |
+| Seismic topology/runtime | Hardware graph and measured path rates |
+| Engine | Planned decode demand, traffic cost, fixed decode costs, formula |
 | Service | Requested depths, assessment lifecycle, identity, caching |
 | ACN | Local model ranking only |
 
-Estimation is arithmetic: the model's planned decode demand over the selected device's memory
-bandwidth. It opens no device and runs no model, benchmark or tuning. Every fitting model has an
-estimate.
+Estimation is arithmetic over previously measured paths. Establishing the environment explicitly
+measures the requested topology scope, reusing persisted evidence with matching hardware and driver
+keys. Per-model estimation opens no device and runs no model, benchmark or tuning.
 
 ## Scope
 
@@ -29,22 +30,18 @@ Each sample models plain autoregressive decode of one conversation producing one
 requested depth. It excludes prompt processing, speculative acceptance and concurrent scheduling.
 The serving profile owns capacity and fit; performance samples create no serving configurations.
 
-## Device bandwidth
+## Measured traffic
 
-Resolution is total and uses only facts device discovery already holds:
+The engine cost function prices explicitly named path bytes and executor launches using a
+`MeasuredTopology`. Missing scoped evidence is an error; no published table, device-name rule,
+reported peak or class constant supplies a rate.
 
-1. **Reported.** For a discrete GPU whose driver reports memory clock and bus width without opening
-   the device (CUDA), double-data-rate clock × bus width. An integrated device's shared memory has
-   no meaningful board clock, so it is never taken from the driver.
-2. **Published.** A table of published peak bandwidth keyed by the normalized name the driver
-   reports. Chip bins sharing a name are told apart by CPU core count, and boards sharing a name by
-   the memory the device allocates from. Where the device's facts cannot tell configurations apart,
-   the table holds the lowest.
-3. **Assumed.** The low end of the device's class: a GPU with its own memory, a GPU allocating host
-   memory, or a CPU.
-
-An unrecognized device therefore errs slow. Order between models on one device depends only on
-their demand and is exact whatever the bandwidth.
+Decode demand currently aggregates allocations. Its estimate therefore uses the slowest measured
+path in each applicable storage placement. Upload bytes are distinguished from resident bytes;
+history uses device storage. This is conservative with respect to allocation placement within the
+estimator's formula, not a bound on observed model latency. It never invents a proportional split
+between stores or claims that the worst path is the actual allocation. Explicitly attributed
+traffic uses the same cost function directly.
 
 ## Calculation
 
@@ -56,18 +53,128 @@ their demand and is exact whatever the bandwidth.
   is charged once per token.
 - One fixed set of decode costs applies to every device and backend: a per-step cost, a
   per-entry-call cost, the share of bandwidth weight streaming reaches, and the share decode
-  attention reaches over history. Nothing is fitted per device, and no device is measured.
+  attention reaches over history. These fitted estimator terms remain unchanged by the topology
+  migration; replacing them is separate estimation work.
 - The step time is the step cost, plus the entry calls' cost, plus the depth-independent bytes over
   the weight share of bandwidth, plus the history reads over the attention share. The estimate is
   its reciprocal.
 
 Every result has finite positive rates, one per requested depth in ascending order.
 
+## Streamed models
+
+A model whose routed experts stream through an expert bank is estimated as every other model is:
+from its plan's structure and this machine's stored figures. No offline per-model data enters it:
+no model starts or needs a measurement, and nothing a model's own loads record enters its estimate
+or its identity, so a model never loaded has the same estimate as one loaded many times.
+
+- **What is measured is fixed per backend.** The measurement job's standing requests are the
+  executor's cost walk, what its recorded graphs hold, the model store's read line, the device's
+  convert at one reference record form, and, where a bank can have a host tier (a discrete device),
+  the host memory's read line with every CPU reading and a CPU site's lines at one reference form.
+  They are measured once per machine and build, first and in one job: a 10 s budget from the job's
+  start (discovery, probes and kernel forming within it), whatever the machine and whatever time
+  the job is given, which their points divide. Each point samples for its part of the time left
+  beside the fewest passes (making, a lead and a sample) the walk forecasts for the standing points
+  after it, or until its median resolves, passing what it does not take on; none starts that would
+  end past the budget or leave the required figures after it less than their fewest passes. A
+  point the budget cannot hold is recorded unobtainable and priced from those read, as any
+  unobtainable point is, so a slower machine gets less precision, never more time; a required
+  figure, which nothing prices, is never recorded so: the budget ending before it leaves it
+  unrecorded, and the next job resumes from the records stored. Every load, banked or not, plans
+  and serves only on the executor's costs, waiting once per machine for the walk's required figures
+  (the probe, the launch graph's times and the composition chain), every later figure priced from
+  those read until it is. The walk keeps its order: the launch graph's host times wait for every
+  compile to end, so they follow the points measured while the kernels form, and the costs complete
+  as the formation ends either way. The job walks to the last required figure, then measures what a
+  streamed load's bank is priced by (the read line, the convert, a host tier's lines), then the rest
+  of the walk, whose later figures are priced closer without them, so what the budget leaves unread
+  is what is priced closest. Loads' own requests (CPU sites, shrink moves, their forms' converts,
+  tier copies, volume windows) are runtime: the job measures them after the standing requests in
+  what is left of its time, and no estimate reads them; a load's point the job's time ends is
+  measured by the next job, given longer where a job measured nothing.
+- **Storage.** The model store's volume is priced by one read line, `λ + b/D`: the job reads a
+  probe file it keeps in the store (256 MiB, written once) past the file cache, timing full reads
+  (32 readers of 1 MiB at once: `1/D`) and lone 128 KiB reads (`λ`, what one takes past its bytes
+  at `D`). It is keyed by the executor and the volume, of no model.
+- **Expert lines.** Each streamed layer's GPU lines come from the executor's costs at its expert's
+  formats and bytes, over host storage's route and over device memory; a host tier's record read
+  is priced at the host memory's line; a file miss reads its stored bytes along the store's read
+  line. With no host tier a file miss then lands through the device's convert, its stored bytes at
+  the reference form's rate. A miss of a layer the plan gives a CPU site is served at the reference
+  site's lines (the reference convert's record, a decode row's 8 choices): an expert's lines in
+  proportion to the record's bytes, and the site's handshake per request. A form's own CPU lines,
+  convert and observed landing lines are runtime and do not enter the estimate. The step is the
+  resident plan's, so it does not price a bank plan's own launches or its copies, and no read is
+  credited to or charged for a hint.
+- **Misses.** One generic function of a layer's `E` and `k` gives the share `m̄(s)` of a step's
+  distinct routed experts a bank of a share `s` of the layer's experts lacks. Routing is a top-`k`
+  competition: a score is what persists over a text and what changes with the token, so an expert of
+  persistence `g` is chosen with `p(g) = Φ((√c·g − τ)/√(1−c))`, `τ = Φ⁻¹(1 − k/E)`. The ranking holds
+  the highest decayed counts (half-life 64 steps), each a Gamma of mean `p·W₁` and variance
+  `p(1−p)·W₂`, past one threshold the bank's size sets, so `m(s; c) = 1 − E_g[p·P]/E_g[p]`. `c` is in
+  no header and a text moves it, so `m̄` is the mean over `c` uniform on (0, 1): no fitted constant and
+  no model's data. A step of `r` rows reads `D(r) = E·(1 − E_g[(1−p)^r])` distinct experts; the bank
+  misses `m̄(slots/E)·D(r)` of them, spread over its steps as evenly as they fall, of which
+  `m̄(host/E)·D(r)` are read from the file and the rest from the host tier. A layer's misses of a step
+  are one request at its route, a share `q = 1 − (1 − m̄)^k` of a row's steps requesting, and no read
+  is credited to prediction. Each `(E, k)`'s table is built once in a process.
+- **The step** is the one streamed step model's on the resident plan's step, and the estimate is
+  its reciprocal. It is a decode's steady state: it holds no first reads, which a decode's early steps
+  pay and its later ones do not.
+
+**A load's own pricing.** A streamed load prices its bank (growth, shrinks, its move budget and a
+prompt group's decode wait) through the same step model, on `m̄` counted as one
+more step of what its own decode read this session: after `N` counted steps a share prices at
+`(prior + N·live)/(N + 1)`, misses over reads and requests over steps, a decode of several rows
+counting its requests as single rows' (`1 − (1 − q)^r`). The bank grows no further than the depth
+its own reads stop falling at. Nothing a load counts is stored, and nothing it counts enters
+assessment.
+
+## The machine's line
+
+Floors are judged against the hardware's own line, never a reported peak and never our kernels'
+rates: the rate device memory streams at, the arithmetic peak of each operand type the backend's
+forms multiply in (f32 multiply-adds; 16-bit matrix products into f32 on a GPU; int8 products into
+i32 where the forms use them), and an empty dependent launch, which is the costs' launch. Each rate
+is a dedicated probe kernel's, timed by the measurement job at every value of its declared UNROLL
+(loads or multiply chains a lane keeps in flight, each chain seeded apart so no compiler merges two,
+held in registers, a CPU's in its tier's widest vectors on every core, and iterated in rounds so the
+loop's own instructions are a small part of each); the figure is the fastest, and it has reached the
+line where one more step did not raise it: a larger value was timed and ran no faster, or the step
+to the largest rose less than the two timings resolve. That alone shows a plateau, not that the work
+credited was done (work a compiler drops is flat too), so a peak is timed at S, 2S and 4S
+multiply-adds a lane and is the marginal rate between S and 4S (a call's and a launch's fixed cost
+cancel), and it stands only where the 2S-to-4S increment is twice the S-to-2S increment within the
+timings' intervals; the line is the fastest UNROLL that does, and a peak none does is recorded
+unscaled with the timings, never as a line. A point of the line is sampled at least the fewest
+samples that bound its median whatever its call takes (only the job's deadline ends it sooner), so
+no point is left without an interval; a call is milliseconds at most; the stream's calls rotate
+through inputs spanning beyond the largest cache, as a streaming kernel's do. An operand the device
+lacks (a configuration its declaration refuses there, or a device property such as Vulkan's
+cooperative matrices) is recorded unobtainable. Nothing prices a figure of the line, so a point the
+job's time ends is left to the next job, as a required figure's is. No estimate reads the line, and
+nothing in loading, planning or serving does, so the runtime's standing assessment never measures
+it: it is a development measurement, taken only on request, in a job of its own that takes the
+line's requests alone (`magnitude-assess --line`, the evaluation harness), and built only with the
+`machine-line` feature, so no served engine carries its probe kernels or its code. A CPU's stream
+is its own sweeps of host memory by the CPU's pool of readers and one step more, recorded apart
+from the host memory's read line a host tier is priced by.
+
 ## Identity and caching
 
 Estimates are cached with their exact assessment under the assessment environment identity, which
-includes the engine build (covering the decode costs and the bandwidth table) and the resolved
-bandwidth with its source. A warm exact-cache hit performs no estimation.
+includes the engine build, stable graph, and the
+records of every figure an estimate reads (the executor's costs, the store's read line, the
+reference convert and the host memory's line). Measurement timestamps, live usage and what loads record do not enter identity. A warm exact-cache hit performs no
+estimation.
+
+Every record that enters the identity revises the service's assessments as the measurement job
+stores it, with no restart. No record prepares a model again: a preparation reads only the
+structure, and nothing of it a record prices, so the device's graph memory (priced at its
+backend's bound until recorded) enters the environment's identity, not the structure's, and is
+applied when each model is finished. Every record finishes each model again over what it was
+prepared with: arithmetic over its outlined forms and demand.
 
 ## Conformance
 
@@ -77,3 +184,5 @@ bandwidth with its source. A warm exact-cache hit performs no estimation.
 - Recurrent state is charged once per token, never multiplied by depth.
 - Speculative heads do not change the plain-decode estimate.
 - Decode costs are the same on every device; no estimate depends on a per-device fit.
+- No estimate reads a record of one model's loads; every fitting model, streamed or resident, is
+  estimated once the standing figures are stored.

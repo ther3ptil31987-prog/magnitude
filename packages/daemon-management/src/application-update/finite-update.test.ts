@@ -16,17 +16,18 @@ const fixture = Effect.gen(function* () {
   const event = (name: string) => Effect.sync(() => { events.push(name) })
   const store = PreparedUpdateStore.of({
     read: event("read").pipe(Effect.zipRight(Ref.get(pending))),
-    prepare: (_archive, candidate) => event("publish").pipe(Effect.zipRight(Ref.set(pending, Option.some({ release: candidate, installation: { _tag: "Unattempted" } })))),
+    prepare: (_archive, candidate) => event("publish").pipe(Effect.zipRight(Ref.set(pending, Option.some({ release: candidate, from: Option.none(), installation: { _tag: "Unattempted" } })))),
     discard: event("discard").pipe(Effect.zipRight(Ref.set(pending, Option.none()))),
     removeAbandonedTransfers: event("scratch-cleanup"),
-    outcome: Effect.succeed(Option.none()), recordOutcome: () => Effect.void, markOutcomeReported: Effect.void,
+    outcome: Effect.succeed(Option.none()), recordOutcome: () => Effect.void, markOutcomeReported: Effect.void, hold: Effect.succeed(Option.none()), recordHold: () => Effect.void, releaseHold: Effect.void,
     verify: () => Effect.die("Preparation cannot install"), recordAttempt: () => Effect.die("Preparation cannot attempt installation"),
     recordFailure: () => Effect.die("Preparation cannot record installation failure"),
+    complete: () => Effect.die("Preparation cannot complete an installation"),
   })
   const source = ApplicationUpdateSource.of({
     check: () => event("check").pipe(Effect.as(Option.some(release))),
     download: () => Effect.acquireRelease(event("download").pipe(Effect.as("archive")), () => event("retire-transfer")),
-    stage: archive => store.prepare(archive, release).pipe(Effect.mapError(error => new ApplicationUpdateFailed({ message: error.message }))),
+    stage: archive => store.prepare(archive, release, "1.0.0").pipe(Effect.mapError(error => new ApplicationUpdateFailed({ message: error.message }))),
   })
   const provide = <A, E, R>(effect: Effect.Effect<A, E, R>) => effect.pipe(Effect.provideService(PreparedUpdateStore, store),
     Effect.provideService(ApplicationUpdateSource, source), Effect.provideService(UpdatePreferences, {
@@ -44,7 +45,7 @@ describe("finite application update preparation", () => {
   })))
   it("checks without starting an automatic download even when the preference is enabled", () => run(Effect.gen(function* () {
     const { events, provide } = yield* fixture
-    expect((yield* provide(runFiniteUpdatePreparation("check"))).transfer).toEqual({ _tag: "Available", version: "0.1.6", bytes: 1 })
+    expect((yield* provide(runFiniteUpdatePreparation("check"))).transfer).toEqual({ _tag: "Available", version: "0.1.6", bytes: 1, failed: Option.none() })
     expect(events).toEqual(["read", "check"])
   })))
   it("returns Ready only after durable publication and transfer retirement", () => run(Effect.gen(function* () {
@@ -72,13 +73,26 @@ describe("finite application update preparation", () => {
   })))
   it.each(["Unattempted", "Attempted", "Failed"] as const)("preserves an existing %s installer without redownloading", tag => run(Effect.gen(function* () {
     const { pending, events, provide } = yield* fixture
-    yield* Ref.set(pending, Option.some({ release, installation: tag === "Failed" ? { _tag: tag, reason: "Install failed" } : { _tag: tag } }))
+    yield* Ref.set(pending, Option.some({ release, from: Option.none(), installation: tag === "Failed" ? { _tag: tag, kind: "install", reason: "Install failed" } : { _tag: tag } }))
     expect((yield* provide(runFiniteUpdatePreparation("download"))).transfer._tag).toBe(tag === "Unattempted" ? "Ready" : "InstallationFailed")
-    expect(events).toEqual(["read"])
+    expect(events).toEqual(["read", "check"])
+  })))
+  it.each(["check", "download"] as const)("%s offers a newer release over an older prepared update", action => run(Effect.gen(function* () {
+    const { pending, events, provide } = yield* fixture
+    const older = yield* signUpdateRelease({ version: "0.1.5", bytes: 1, sha256: createHash("sha256").update("x").digest("hex") }, { os: "darwin", arch: "arm64", package: "mac-zip" }, key.privateKey)
+    yield* Ref.set(pending, Option.some({ release: older, from: Option.none(), installation: { _tag: "Unattempted" } }))
+    const state = yield* provide(runFiniteUpdatePreparation(action))
+    if (action === "check") {
+      expect(state.transfer).toEqual({ _tag: "Available", version: release.version, bytes: release.bytes, failed: Option.none() })
+      expect(Option.getOrThrow(yield* Ref.get(pending)).release.version).toBe(older.version)
+    } else {
+      expect(state.transfer).toEqual({ _tag: "Ready", version: release.version })
+      expect(events).toContain("publish")
+    }
   })))
   it("keeps retained state when discard fails", () => run(Effect.gen(function* () {
     const { pending, provide, store } = yield* fixture
-    yield* Ref.set(pending, Option.some({ release, installation: { _tag: "Unattempted" } }))
+    yield* Ref.set(pending, Option.some({ release, from: Option.none(), installation: { _tag: "Unattempted" } }))
     expect(yield* provide(runFiniteUpdatePreparation("discard").pipe(Effect.provideService(PreparedUpdateStore, {
       ...store, discard: new PreparedUpdateFailed({ message: "Cleanup failed" }),
     }))).pipe(Effect.isFailure)).toBe(true)

@@ -1,11 +1,15 @@
 // Ordered cache publication before causal target attention.
-use lib::attention::attention::{self, Form};
+use lib::attention::attention::{self, Form, Layout};
 use seismic::cpu::slab::SlabTensor;
-use lib::core::activation;
 
+#[inline(always)]
 fn attention_append_dense<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
-    let form = Form::new(cx.dim_kv(), 0, cx.dim_p(), cx.dim_s(), 0, 0, cx.dim_f(), cx.dim_n(), cx.dim_nv());
+    // The keys' and values' form: no queries, so no query norm or output
+    // rotary.
+    let layout = Layout::new(cx.dim_ra(), cx.dim_rt());
+    let form = Form::new(cx.dim_kv(), 0, cx.dim_p(), cx.dim_s(), 0, 0, cx.dim_f(), 0, cx.dim_n(), cx.dim_nv(), layout, 0, cx.dim_vk())
+        .with_key_rounding(cx.dim_kr(), cx.arg_key_block(), cx.arg_key_element(), cx.arg_key_scale(), cx.arg_key_amax_floor());
     let destination = cx.arg_destinations().get([row]);
     if !form.fresh || destination < 0 { return; }
     let (w, kv) = (form.heads.w, form.heads.kv);
@@ -16,41 +20,31 @@ fn attention_append_dense<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group
         cx.arg_coordinates().row([row, 0]), cx.arg_rotary_components().row([0]),
         cx.arg_rotary_frequencies().row([0]), cx.arg_rotary_amplitudes().row([0]), cosines, sines);
     let (keys, values) = vectors.split_at_mut(kv * w);
-    let queries = &mut [];
     let (key_norm, value_norm) = (cx.arg_key_norm(), cx.arg_value_norm());
-    let norms = (
-        None,
-        form.norm.then(|| key_norm.row([0, 0])),
-        form.value_norm.then(|| value_norm.row([0, 0])),
-    );
+    let norms = (form.key_norm.then(|| key_norm.row([0, 0])), form.value_norm.then(|| value_norm.row([0, 0])));
     let (key, value) = (cx.arg_key(), cx.arg_value());
-    let (key, value) = if form.fresh { (key.row([0, row, 0]), value.row([0, row, 0])) } else { (&[][..], &[][..]) };
+    let value = if form.own_values() { value.row([0, row, 0]) } else { &[][..] };
     attention::prepare_form_row::<E::A>(
         form,
-        |_| &[],
-        key,
+        key.row([0, row, 0]),
         value,
         norms,
         cosines,
         sines,
         cx.arg_epsilon(),
-        queries,
         keys,
         values,
     );
-    if form.fresh && destination >= 0 {
-        let destination = destination as usize;
-        let slab_rows = cx.arg_slab_rows() as usize;
-        let history_key = SlabTensor::from_bound(cx.arg_history_key(), slab_rows);
-        let history_value = SlabTensor::from_bound(cx.arg_history_value(), slab_rows);
-        for head in 0..kv {
-            // SAFETY: every destination is a distinct freshly reserved row.
-            let (key_row, value_row) = unsafe {
-                (history_key.row_mut([destination, head, 0]),
-                 history_value.row_mut([destination, head, 0]))
-            };
-            activation::store::<E::A>(&keys[head * w..][..w], key_row);
-            activation::store::<E::A>(&values[head * w..][..w], value_row);
-        }
+    let slab_rows = cx.arg_slab_rows() as usize;
+    // SAFETY: every destination is a distinct freshly reserved row.
+    unsafe {
+        attention::store_dense_row::<E::A>(
+            form,
+            keys,
+            values,
+            &SlabTensor::from_bound(cx.arg_history_key(), slab_rows),
+            &SlabTensor::from_bound(cx.arg_history_value(), slab_rows),
+            destination as usize,
+        );
     }
 }

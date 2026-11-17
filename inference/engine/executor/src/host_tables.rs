@@ -2,23 +2,25 @@
 //!
 //! A table too large to be a device weight and read only by row gather (the
 //! Gemma per-layer embedding: 1.3–1.6 GB, 5–6 KB per token) stays in its
-//! artifact file and is read through the host page cache. Its bytes are a
-//! claim in the system-RAM domain: the pages a served model reads stay
-//! resident. Each step gathers the source bytes of every batch row's table
+//! artifact file and is read through the host page cache, the one model
+//! read that keeps what it reads there: every step gathers rows from it, so
+//! its pages are kept for the next steps rather than read from the drive
+//! each time. Its bytes are a claim in the system-RAM domain: the pages a
+//! served model reads stay resident. Each step gathers the source bytes of every batch row's table
 //! row (row m = the table row of token m) into the step's upload, in the
 //! table's source representation; the graph converts them into the resident
 //! row layout on the device.
 
 use crate::residency::Stored;
-use magnitude_artifacts::FileSource;
 use seismic::Element;
+use seismic_io::{CachePolicy, Reader, Want};
 use std::fmt;
-use std::sync::Arc;
 
 /// One table: `rows` rows of `row_bytes` source bytes each from `offset`.
 #[derive(Clone)]
 pub struct HostTable {
-    file: Arc<FileSource>,
+    /// Its artifact's reader, through the file cache.
+    reader: Reader,
     offset: u64,
     rows: u64,
     columns: u64,
@@ -32,9 +34,25 @@ pub enum HostTableError {
     Shape(String),
     Read(magnitude_artifacts::Error),
     /// A batch row names a table row outside the table.
-    Row { row: i64, rows: u64 },
+    Row {
+        row: i64,
+        rows: u64,
+    },
     /// The gather buffer does not hold the batch's rows exactly.
-    Buffer { expected: usize, actual: usize },
+    Buffer {
+        expected: usize,
+        actual: usize,
+    },
+    /// The ledger refused a streamed table's row cache.
+    Refused(seismic::memory::Refused),
+    /// The host refused a streamed table's row cache.
+    Unallocated(seismic::memory::AllocationFailure),
+}
+
+impl From<seismic::memory::Refused> for HostTableError {
+    fn from(refused: seismic::memory::Refused) -> Self {
+        Self::Refused(refused)
+    }
 }
 
 impl fmt::Display for HostTableError {
@@ -49,6 +67,8 @@ impl fmt::Display for HostTableError {
                 formatter,
                 "host table gather buffer holds {actual} bytes where {expected} are gathered"
             ),
+            Self::Refused(refused) => write!(formatter, "host table row cache: {refused}"),
+            Self::Unallocated(failure) => write!(formatter, "host table row cache: {failure}"),
         }
     }
 }
@@ -78,8 +98,9 @@ impl HostTable {
         }
         let row_bytes = usize::try_from(row_bytes)
             .map_err(|_| HostTableError::Shape("a table row exceeds the host range".into()))?;
+        let reader = Reader::of(&**file, CachePolicy::Cached).map_err(|error| HostTableError::Read(error.into()))?;
         Ok(Self {
-            file: Arc::clone(file),
+            reader,
             offset,
             rows,
             columns,
@@ -107,8 +128,40 @@ impl HostTable {
         self.row_bytes
     }
 
+    pub fn rows(&self) -> u64 {
+        self.rows
+    }
+
+    /// The index of table row `row`, when the table has it.
+    pub fn row_index(&self, row: i64) -> Result<u64, HostTableError> {
+        u64::try_from(row)
+            .ok()
+            .filter(|index| *index < self.rows)
+            .ok_or(HostTableError::Row {
+                row,
+                rows: self.rows,
+            })
+    }
+
+    /// Copy the source bytes of the rows from `first` into `out`, which
+    /// holds a whole number of them, in one read.
+    pub fn gather_run(&self, first: u64, out: &mut [u8]) -> Result<(), HostTableError> {
+        let rows = (out.len() / self.row_bytes) as u64;
+        if out.len() % self.row_bytes != 0 || first + rows > self.rows {
+            return Err(HostTableError::Row {
+                row: (first + rows) as i64,
+                rows: self.rows,
+            });
+        }
+        // A step waits on the rows: due now.
+        self.reader
+            .read_at([(self.offset + first * self.row_bytes as u64, out)], Want::now())
+            .map_err(|error| HostTableError::Read(error.into()))
+    }
+
     /// Copy the source bytes of `rows` (table row indices, one per batch
-    /// row, in batch order) into `out`, which holds exactly that many rows.
+    /// row, in batch order) into `out`, which holds exactly that many rows,
+    /// as one read of them all.
     pub fn gather(&self, rows: &[i64], out: &mut [u8]) -> Result<(), HostTableError> {
         let expected = rows.len() * self.row_bytes;
         if out.len() != expected {
@@ -117,19 +170,14 @@ impl HostTable {
                 actual: out.len(),
             });
         }
-        for (&row, destination) in rows.iter().zip(out.chunks_exact_mut(self.row_bytes)) {
-            let index = u64::try_from(row)
-                .ok()
-                .filter(|index| *index < self.rows)
-                .ok_or(HostTableError::Row {
-                    row,
-                    rows: self.rows,
-                })?;
-            self.file
-                .read_into(self.offset + index * self.row_bytes as u64, destination)
-                .map_err(HostTableError::Read)?;
-        }
-        Ok(())
+        let offsets = rows
+            .iter()
+            .map(|&row| Ok(self.offset + self.row_index(row)? * self.row_bytes as u64))
+            .collect::<Result<Vec<_>, HostTableError>>()?;
+        // One request of every row, which the link reads at its depth.
+        self.reader
+            .read_at(offsets.into_iter().zip(out.chunks_exact_mut(self.row_bytes)), Want::now())
+            .map_err(|error| HostTableError::Read(error.into()))
     }
 }
 
@@ -137,7 +185,9 @@ impl HostTable {
 mod tests {
     use super::*;
     use crate::residency::StoredTensor;
+    use magnitude_artifacts::FileSource;
     use seismic::DType;
+    use std::sync::Arc;
 
     /// A 5-row, 3-column F32 table after a 16-byte prefix, whose value at
     /// (row, column) is `10·row + column`.
@@ -153,7 +203,7 @@ mod tests {
             }
         }
         std::fs::write(&path, &bytes).unwrap();
-        let stored = Stored::Dense(StoredTensor {
+        let stored = Stored::dense(StoredTensor {
             source: Arc::new(FileSource::open(&path).unwrap()),
             offset: 16,
             nbytes: 5 * 3 * 4,
@@ -198,7 +248,10 @@ mod tests {
         ));
         assert!(matches!(
             table.gather(&[0, 1], &mut out),
-            Err(HostTableError::Buffer { expected: 24, actual: 12 })
+            Err(HostTableError::Buffer {
+                expected: 24,
+                actual: 12
+            })
         ));
         std::fs::remove_file(path).unwrap();
     }

@@ -1,11 +1,8 @@
 import type * as FileSystem from "@effect/platform/FileSystem"
 import type * as Path from "@effect/platform/Path"
 import type * as CommandExecutor from "@effect/platform/CommandExecutor"
-import type {
-  HarnessCompanionConnectionResult,
-  HarnessCompanionDescription,
-  HarnessId,
-} from "@magnitudedev/client-common"
+import type { HarnessCompanionConnectionResult, HarnessCompanionDescription } from "./types"
+import type { HarnessId } from "@magnitudedev/sdk"
 import {
   ProviderModelIdSchema,
   ReasoningEffortSchema,
@@ -124,8 +121,10 @@ export interface HarnessDisconnectionSpec {
 
 export interface HarnessInstallation {
   readonly executable: string
+  readonly version?: string
 }
 
+/** A harness's configuration writer; `selectedModel` reads the Magnitude model it uses by default, if any. */
 export interface HarnessConnector {
   readonly id: HarnessId
   readonly name: string
@@ -136,7 +135,8 @@ export interface HarnessConnector {
   readonly skillInstallationTarget: SkillInstallationTarget
   readonly skillRequired?: boolean
   readonly configurationFiles: ReadonlyArray<string>
-  readonly detect: (searchPath: string) => Effect.Effect<Option.Option<HarnessInstallation>>
+  readonly detect: (searchPath: string) => Effect.Effect<Option.Option<HarnessInstallation>, never, CommandExecutor.CommandExecutor>
+  readonly selectedModel: Effect.Effect<Option.Option<ProviderModelId>, unknown, FileSystem.FileSystem | Path.Path>
   readonly connect: (
     spec: HarnessConnectionSpec,
   ) => Effect.Effect<

@@ -1,0 +1,1599 @@
+//! The native program of a draft head that reads target history
+//! (`operators::SharedHead`). One sealed graph per class runs a head
+//! transaction in a single device submission: one pass per proposal, every
+//! pass one row per slot at the anchor's position.
+//!
+//! A pass gathers the target's embedding rows of its tokens, writes them and
+//! the conditioning hidden rows into the two halves of the joined rows
+//! (`tap_rows`), projects those into the head's width (`project_rows`), runs
+//! the head's decoder blocks (the target's block fragments at the head's
+//! width, each attention bound to the history planes of the target layer it
+//! reads), normalizes the result, projects it onto the whole vocabulary
+//! through the head's own table and selects. A further pass embeds that
+//! selection and conditions on the pass's normalized output projected back to
+//! the target's width, so no proposal returns to the host before the chain
+//! ends. Each pass publishes its selections' probabilities under the logits
+//! it selected them from (`readout::select`). No pass writes history:
+//! the head keeps none.
+
+use super::native_draft::widen;
+use super::{DeviceSubmission, HeadOutput, HeadProgram, HeadSelections};
+use crate::device_table::SelectedRead;
+use crate::operators::block::{
+    BlockLane, BlockState, BlockSublayers, CheckedFeedForwardEntries, CheckedMixerEntries,
+    FeedForwardEntries, HistoryPorts, MixerEntries, SublayerGraph, SublayersNumbers,
+    SublayersTopology,
+};
+use crate::operators::routed::streamed::LayerBank;
+use crate::operators::streams::ResidualCarry;
+use crate::operators::{InputForm, SharedHead, paired_block};
+use crate::{
+    DeviceError, HeadLaunchCore, InvariantError, ModelLoadPlan,
+    NativeGraphOutputLease, NativeGraphWorkspaceLease, ResidentHead, ResidentWeight,
+    ResourceLimits, SharedHeadProgramPlan, StateResourcePlan, SubmitError, ValidatedHeadLaunch,
+    completion::CompletionWaiter,
+    native::{AttestedSharedHead, OutputScales},
+    programs::{
+        graph::readout::{self, SelectionPorts, shapes},
+        graph::facts::{FactIndex, FactSink, Facts, Numbers, RealIndex, TableIndex, constant_reals},
+        graph::{GraphError, draft::{Certified, GraphDraft}},
+        native_constants::RecordedConstant,
+        native_constants::{
+            CheckedGraphFamilyResources, CheckedGraphResources, ConstantTensors, GraphConstant,
+            distinct_storage_bytes,
+        },
+        native_target_graph::{
+            CheckedLandingEntries, GatheredTable, GraphWeights, LandedReadPorts, LandingEntries, RowDirectory,
+            RegisteredPorts, TARGET_TABLE, WeightPort, embedding_transform, packed_weight,
+            scaled_weight_ports, weight,
+        },
+    },
+};
+use magnitude_batching::{TargetBatchUpload, row_class};
+use magnitude_family_contracts::{Decoder, ModelDefinition, WeightKind, WeightRole, WeightScope};
+use magnitude_kernels::{
+    cluster_token_rows, draft_top_k, embedding_rows, place_logits_rows, project_rows,
+    readout_features_rows, readout_project_rows, sample_rows, shape_rows, tap_rows,
+    token_confidence,
+};
+use seismic::{
+    BackendName, BoundNativeGraphPlan, Device, Dim, Element, NativeGraph, NativeGraphClassSlice,
+    NativeGraphFamily, NativeGraphMetadata, NativeGraphPlan, NativeGraphResourceTemplate,
+    NativeGraphTraces, NativePort, Reals, Table, Tensor, WorkflowTensor, Argument,
+};
+use std::{collections::BTreeMap, rc::Rc, sync::Arc};
+
+fn invalid(detail: impl Into<String>) -> SubmitError {
+    SubmitError::Invariant(InvariantError {
+        context: "native shared head program",
+        detail: detail.into(),
+    })
+}
+fn device(error: impl ToString) -> SubmitError {
+    SubmitError::Device(DeviceError::Execution(error.to_string()))
+}
+fn i32_bytes(values: impl IntoIterator<Item = i32>) -> Vec<u8> {
+    values
+        .into_iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
+/// One graph of the head: its slot class (every pass has one row per slot),
+/// its selections per slot and whether selection is shaped first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct SharedHeadGraphClass {
+    pub slots: u64,
+    pub steps: u64,
+    pub shaped: bool,
+}
+
+/// The admitted classes used by both prepared formation and metadata
+/// assessment: every drafting slot class with every proposal count up to the
+/// method's bound.
+pub(crate) fn shared_head_graph_classes(
+    limits: ResourceLimits,
+    proposals: usize,
+) -> Result<Vec<SharedHeadGraphClass>, String> {
+    let slot_bound = limits
+        .max_launch_slots
+        .min(limits.max_launch_rows)
+        .min(limits.max_drafting_slots);
+    let slot_classes = magnitude_batching::row_classes(slot_bound);
+    if slot_classes.is_empty() || proposals == 0 {
+        return Err("a head reading target history has no drafting class".into());
+    }
+    let mut classes = Vec::new();
+    for slots in slot_classes {
+        for steps in 1..=proposals as u64 {
+            for shaped in [false, true] {
+                classes.push(SharedHeadGraphClass {
+                    slots: slots as u64,
+                    steps,
+                    shaped,
+                });
+            }
+        }
+    }
+    Ok(classes)
+}
+
+/// What the head's graphs are built over: the target decoder whose embedding
+/// and history it reads, its own blocks as a decoder of its width, and the
+/// state plan whose target store holds that history.
+pub(crate) struct SharedHeadGeometry<'a> {
+    target: &'a Decoder,
+    /// The head's blocks at its width; its entry and exit are the target's
+    /// and are not read.
+    head: Decoder,
+    /// Per head block, the target block whose history it reads.
+    sources: Vec<u32>,
+    state: &'a StateResourcePlan,
+    plan: &'a SharedHeadProgramPlan,
+    /// The span class of every pass: the target store's span bound.
+    segments: u64,
+    epsilon: f64,
+}
+
+impl<'a> SharedHeadGeometry<'a> {
+    pub(crate) fn new(
+        definition: &'a ModelDefinition,
+        state: &'a StateResourcePlan,
+        plan: &'a SharedHeadProgramPlan,
+    ) -> Result<Self, String> {
+        let head = definition
+            .head
+            .as_ref()
+            .ok_or("a shared head program without a head")?;
+        let crate::operators::HeadForm::Shared(shared) =
+            crate::operators::head_form(head, &definition.decoder)
+                .map_err(|error| error.to_string())?
+        else {
+            return Err("a shared head program for a head with its own history".into());
+        };
+        let SharedHead {
+            width,
+            blocks,
+            output_norm,
+            readout: _,
+        } = shared;
+        if width != plan.width || blocks.len() != plan.blocks.len() {
+            return Err("the shared head program disagrees with its head".into());
+        }
+        let sources = (0..blocks.len())
+            .map(|index| {
+                shared
+                    .source(index)
+                    .map(|source| source.block)
+                    .map_err(|error| error.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let segments = u64::try_from(
+            state
+                .target_state()
+                .span_limit()
+                .checked_next_power_of_two()
+                .ok_or("head segment class overflows")?,
+        )
+        .map_err(|_| "head segment class exceeds u64")?;
+        Ok(Self {
+            target: &definition.decoder,
+            head: Decoder {
+                hidden: width,
+                blocks: blocks.to_vec(),
+                ..definition.decoder.clone()
+            },
+            sources,
+            state,
+            plan,
+            segments,
+            epsilon: output_norm.epsilon,
+        })
+    }
+}
+
+/// The kernel entries of a head graph: prepared kernels or checked bindings.
+/// A block's entries are taken once per pass.
+struct SharedHeadEntries<'a, 'e, G: GraphDraft + 'a> {
+    /// The landing entries of the token table's landed reads, when it has
+    /// landing slots.
+    landing: Option<LandingEntries<'a, G>>,
+    embedding: G::Binding<'a, embedding_rows::Entry>,
+    join: G::Binding<'a, tap_rows::Entry>,
+    /// The projections into the head's width and back, by row range.
+    input: G::Ranged<'a, project_rows::Entry>,
+    mixer: &'e dyn Fn(usize) -> Result<MixerEntries<'a, G>, String>,
+    feed_forward: &'e dyn Fn(usize) -> Result<Option<FeedForwardEntries<'a, G>>, String>,
+    features: G::Binding<'a, readout_features_rows::Entry>,
+    projection: readout::ProjectionEntries<'a, G>,
+    clustered: Option<ClusterEntries<'a, G>>,
+    chain: G::Ranged<'a, project_rows::Entry>,
+    shape: G::Binding<'a, shape_rows::Entry>,
+    sample: G::Binding<'a, sample_rows::Entry>,
+    confidence: G::Binding<'a, token_confidence::Entry>,
+}
+
+struct ClusterEntries<'a, G: GraphDraft + 'a> {
+    centroids: G::Ranged<'a, readout_project_rows::Entry>,
+    selection: G::Binding<'a, draft_top_k::Entry>,
+    rows: G::Binding<'a, cluster_token_rows::Entry>,
+    placement: G::Binding<'a, place_logits_rows::Entry>,
+}
+
+/// One block's per-run ports in one pass.
+struct BlockPorts {
+    coordinates: NativePort,
+    visible: NativePort,
+    fresh: NativePort,
+    destinations: NativePort,
+    /// The source layer's history planes, in plane-descriptor order.
+    planes: Vec<NativePort>,
+}
+
+struct PassPorts {
+    blocks: Vec<BlockPorts>,
+    selection: SelectionPorts,
+    /// A chained pass's landed read of the tokens it embeds, of a table
+    /// with landing slots.
+    landed: Option<LandedReadPorts>,
+}
+
+struct SharedHeadGraphParts<P> {
+    plan: P,
+    /// The first pass's `[slots, 2]` (token, status) rows.
+    tokens: NativePort,
+    /// The first pass's `[slots, hidden]` F32 conditioning rows.
+    conditioning: NativePort,
+    passes: Vec<PassPorts>,
+    constants: Vec<GraphConstant>,
+    weights: Vec<(WeightPort, NativePort)>,
+    /// Selections `[steps · slots, 2]`, step-major.
+    output: WorkflowTensor,
+    /// Each selection's probability under the logits it was selected from,
+    /// `[steps · slots]` in the selections' order.
+    confidence: WorkflowTensor,
+}
+
+type PreparedSharedHeadGraph = SharedHeadGraphParts<NativeGraphPlan>;
+
+/// Everything structural a shared head graph's builder branches on: its
+/// passes, its projection's stored form and its blocks' topologies, with its
+/// reals `R` (its kernels' scalar arguments) and its tables `T` (its
+/// constants' contents). It holds no model number ([`SharedHeadNumbers`]).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SharedHeadForm<R = Argument<f64>, T = Table> {
+    steps: u64,
+    shaped: bool,
+    epsilon: R,
+    /// `embedding_rows`' (`scale`, `normalize`, `epsilon`).
+    embedding: (R, i32, R),
+    /// The head's own table as its scope is stored.
+    projection: readout::StoredHead,
+    /// Whether its passes select through the certified levels.
+    certified: bool,
+    /// A clustered proposal's canonical token order (`i32` tokens): the
+    /// values its graph binds.
+    clustered: Option<T>,
+    blocks: Vec<SublayersTopology<R, T>>,
+}
+
+impl<R, T> Numbers<R> for SharedHeadForm<R, T> {
+    type Of<E> = SharedHeadForm<E, T>;
+    fn map<E>(self, f: &mut impl FnMut(R) -> E) -> SharedHeadForm<E, T> {
+        let (scale, normalize, epsilon) = self.embedding;
+        SharedHeadForm {
+            steps: self.steps,
+            shaped: self.shaped,
+            epsilon: f(self.epsilon),
+            embedding: (f(scale), normalize, f(epsilon)),
+            projection: self.projection,
+            certified: self.certified,
+            clustered: self.clustered,
+            blocks: self.blocks.into_iter().map(|block| block.map(&mut *f)).collect(),
+        }
+    }
+}
+
+impl<R, T> SharedHeadForm<R, T> {
+    /// It with each of its tables `f` of its own.
+    fn tables<U>(self, mut f: impl FnMut(T) -> U) -> SharedHeadForm<R, U> {
+        SharedHeadForm {
+            steps: self.steps,
+            shaped: self.shaped,
+            epsilon: self.epsilon,
+            embedding: self.embedding,
+            projection: self.projection,
+            certified: self.certified,
+            clustered: self.clustered.map(&mut f),
+            blocks: self.blocks.into_iter().map(|block| block.tables(&mut f)).collect(),
+        }
+    }
+}
+
+/// A clustered proposal's clusters and the clusters it selects.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ClusterNumbers<D> {
+    clusters: D,
+    selected: D,
+    /// Its canonical token order's length.
+    tokens: D,
+}
+
+/// Every model number a shared head graph is sized by.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SharedHeadNumbers<D = Dim> {
+    slots: D,
+    /// The target's width, which the head's input joins.
+    hidden: D,
+    /// The head's own width.
+    width: D,
+    vocabulary: D,
+    clusters: Option<ClusterNumbers<D>>,
+    blocks: Vec<SublayersNumbers<D>>,
+    weights: GraphWeights<D>,
+}
+
+impl<D> Numbers<D> for SharedHeadNumbers<D> {
+    type Of<E> = SharedHeadNumbers<E>;
+    fn map<E>(self, f: &mut impl FnMut(D) -> E) -> SharedHeadNumbers<E> {
+        SharedHeadNumbers {
+            slots: f(self.slots),
+            hidden: f(self.hidden),
+            width: f(self.width),
+            vocabulary: f(self.vocabulary),
+            clusters: self.clusters.map(|clusters| ClusterNumbers {
+                clusters: f(clusters.clusters),
+                selected: f(clusters.selected),
+                tokens: f(clusters.tokens),
+            }),
+            blocks: self.blocks.into_iter().map(|block| block.map(&mut *f)).collect(),
+            weights: self.weights.map(&mut *f),
+        }
+    }
+}
+
+/// The weights a shared head graph reads: its own blocks' and tables', and
+/// the target's token table.
+fn shared_head_reads(role: WeightRole) -> bool {
+    match role.scope {
+        WeightScope::HeadBlock(_) | WeightScope::HeadSublayer(_) => true,
+        WeightScope::Target => role.kind == WeightKind::Embedding,
+        _ => false,
+    }
+}
+
+/// `class` of the head as its builder takes it: its topology and its
+/// numbers, its blocks' output scales by `scales`. The only reading of the
+/// model behind a shared head graph.
+fn split_shared_head(
+    load: &ModelLoadPlan,
+    geometry: &SharedHeadGeometry<'_>,
+    class: SharedHeadGraphClass,
+    scales: &dyn Fn(usize) -> Result<OutputScales, String>,
+) -> Result<(SharedHeadForm<f64, Arc<[u8]>>, SharedHeadNumbers<u64>), GraphError> {
+    if class.slots == 0 || class.steps == 0 {
+        return Err(format!("shared head graph class {class:?} is inconsistent").into());
+    }
+    let head = WeightScope::HeadBlock(0);
+    let (scale, normalize, embedding_epsilon) = embedding_transform(geometry.target);
+    let clustered = geometry
+        .plan
+        .clustered
+        .as_ref()
+        .map(|cluster| {
+            cluster
+                .token_order
+                .iter()
+                .map(|token| {
+                    i32::try_from(token.0)
+                        .map(i32::to_le_bytes)
+                        .map_err(|_| GraphError::from("canonical proposal token exceeds i32"))
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(|tokens| tokens.concat().into())
+        })
+        .transpose()?;
+    let (blocks, block_numbers) = geometry
+        .sources
+        .iter()
+        .enumerate()
+        .map(|(index, &source)| {
+            let block = geometry
+                .head
+                .blocks
+                .get(index)
+                .ok_or("head block geometry is absent")?;
+            let paired = paired_block(block).map_err(|error| error.to_string())?;
+            // A draft head's blocks hold their experts whole: no bank.
+            BlockSublayers {
+                lane: BlockLane::Head { source },
+                paired: &paired,
+                load,
+                geometry: &geometry.head,
+                state: geometry.state,
+                block_index: index,
+                rows: class.slots,
+                segments: geometry.segments,
+                slots: class.slots,
+                // The head's classes list no history row tiles and score
+                // no selected read.
+                listed: 0,
+                scored: false,
+                output_scales: scales(index)?,
+            }
+            .split(&LayerBank::<NativeGraphMetadata>::Held, None, None)
+        })
+        .collect::<Result<(Vec<_>, Vec<_>), GraphError>>()?;
+    let form = SharedHeadForm {
+        steps: class.steps,
+        shaped: class.shaped,
+        epsilon: geometry.epsilon,
+        embedding: (f64::from(scale), normalize, f64::from(embedding_epsilon)),
+        projection: readout::HeadPlans::of(load, head)?.selected(),
+        certified: geometry.plan.clustered.is_none()
+            && readout::HeadPlans::for_recipe(load, head, head, true)?.certifies(class.slots),
+        clustered,
+        blocks,
+    };
+    let numbers = SharedHeadNumbers {
+        slots: class.slots,
+        hidden: geometry.target.hidden,
+        width: geometry.head.hidden,
+        vocabulary: geometry.target.vocabulary,
+        clusters: geometry.plan.clustered.as_ref().map(|cluster| ClusterNumbers {
+            clusters: cluster.clusters,
+            selected: cluster.selected_clusters,
+            tokens: cluster.token_order.len() as u64,
+        }),
+        blocks: block_numbers,
+        weights: GraphWeights::of(load, shared_head_reads),
+    };
+    Ok((form, numbers))
+}
+
+fn shared_head_graph<'a, G: GraphDraft + 'a>(
+    mut graph: G,
+    entries: SharedHeadEntries<'a, '_, G>,
+    topology: &SharedHeadForm,
+    numbers: &SharedHeadNumbers,
+) -> Result<SharedHeadGraphParts<G>, GraphError> {
+    let planned = &numbers.weights;
+    let (slots, hidden, width, vocabulary) =
+        (&numbers.slots, &numbers.hidden, &numbers.width, &numbers.vocabulary);
+    let epsilon = topology.epsilon.f32();
+    let head = WeightScope::HeadBlock(0);
+    let mut weights = Vec::new();
+    let mut constants = Vec::new();
+
+    // The first pass embeds the host's tokens, a chained pass the tokens
+    // the device selected.
+    let mut table = GatheredTable::of(
+        &mut graph,
+        planned,
+        WeightScope::Target,
+        WeightKind::Embedding,
+        &mut weights,
+    )?;
+    let input = packed_weight(
+        &mut graph,
+        planned,
+        head,
+        WeightKind::HeadInputProjection,
+        &mut weights,
+        &mut constants,
+    )?;
+    let output_norm = weight(&mut graph, planned, head, WeightKind::OutputNorm, &mut weights)?;
+    let own_table = topology.projection.ports(
+        &mut graph,
+        topology.certified,
+        &mut RegisteredPorts { weights: planned, ports: &mut weights, constants: &mut constants },
+    )?;
+    // A clustered proposal's token order and numbers, which its split gives
+    // together (`split_shared_head`).
+    let clusters = match (&topology.clustered, &numbers.clusters) {
+        (Some(tokens), Some(clusters)) => Some((tokens, clusters)),
+        (None, None) => None,
+        _ => panic!("a shared head's cluster order and cluster numbers disagree"),
+    };
+    let centroids = clusters
+        .map(|_| {
+            let (weight, scale, scale_extent) = scaled_weight_ports(
+                &mut graph,
+                planned,
+                head,
+                WeightKind::OutputCentroids,
+                &mut weights,
+                &mut constants,
+            )?;
+            Ok::<_, GraphError>(readout::ProjectionPorts::Packed {
+                weight,
+                scale,
+                scale_extent,
+            })
+        })
+        .transpose()?;
+    let token_order = clusters
+        .map(|(tokens, clusters)| {
+            GraphConstant::table(&mut graph, Element::i32(), std::slice::from_ref(&clusters.tokens), tokens)
+        })
+        .transpose()?;
+
+    // A one-step graph chains nothing, and a sealed graph reads every port.
+    let chain = (topology.steps > 1)
+        .then(|| {
+            packed_weight(
+                &mut graph,
+                planned,
+                head,
+                WeightKind::HeadChainProjection,
+                &mut weights,
+                &mut constants,
+            )
+        })
+        .transpose()?;
+
+    let embedding_dims = [
+        ("M", slots.clone()),
+        ("V", table.rows.clone()),
+        ("D", hidden.clone()),
+        ("R", Dim::from(0)),
+        ("F", Dim::from(1)),
+    ];
+    let join_dims = [("M", slots.clone()), ("D", hidden.clone()), ("T", Dim::from(2))];
+    let tokens = graph.input_for(entries.embedding, "tokens", &embedding_dims)?;
+    let conditioning = graph.input_for(entries.join, "residual", &join_dims)?;
+    // The embedding half then the hidden half of the joined rows.
+    let halves = [
+        GraphConstant::i32(&mut graph, &[0])?,
+        GraphConstant::i32(&mut graph, &[1])?,
+    ];
+    let out_rows = GraphConstant::identity(&mut graph, slots)?;
+    let (scale, normalize, embedding_epsilon) = topology.embedding;
+    let (scale, embedding_epsilon) = (scale.f32(), embedding_epsilon.f32());
+    let mut selections = graph.local_for(
+        entries.sample,
+        "result",
+        &[("M", slots * topology.steps), ("V", vocabulary.clone())],
+    )?;
+    // Each pass's selections' confidences, beside them step-major; a pass's
+    // selection `s` was drawn from its logits row `s`, as `out_rows` reads.
+    let confidence = graph
+        .local_for(
+            entries.confidence,
+            "confidence",
+            &[("M", slots * topology.steps), ("N", slots.clone()), ("V", vocabulary.clone())],
+        )?
+        .tensor()
+        .clone();
+    let mut passes = Vec::with_capacity(topology.steps as usize);
+    // The hidden rows the next pass conditions on.
+    let mut chained: Option<WorkflowTensor> = None;
+    for step in 0..topology.steps {
+        // The first pass embeds the host's rows, a chained pass the rows
+        // the device selected, a landed read of a table with landing slots.
+        let (gathered, table_rows) = (table.table.clone(), table.rows.clone());
+        let embed = |graph: &mut G,
+                     tokens: seismic::WorkflowTensorRef<'_>,
+                     directory: &RowDirectory| {
+            Ok::<_, GraphError>(
+                graph
+                    .enqueue(
+                        entries.embedding,
+                        &[
+                            ("M", slots.clone()),
+                            ("V", table_rows.clone()),
+                            ("D", hidden.clone()),
+                            ("R", directory.shape[0].clone()),
+                            ("F", directory.shape[1].clone()),
+                        ],
+                        embedding_rows::WorkflowArgs {
+                            table: (&gathered).into(),
+                            tokens,
+                            directory: (&directory.tensor).into(),
+                            scale,
+                            normalize: normalize.into(),
+                            epsilon: embedding_epsilon,
+                        },
+                    )?
+                    .r1,
+            )
+        };
+        let (embedded, landed) = match step {
+            0 => {
+                let directory = table.by_rows(&mut graph, &mut constants)?;
+                (embed(&mut graph, tokens.tensor().into(), &directory)?, None)
+            }
+            _ => {
+                let selected = selections
+                    .tensor()
+                    .slice_leading(slots * (step - 1), slots * step);
+                table.read_selected(
+                    &mut graph,
+                    planned,
+                    &mut weights,
+                    &mut constants,
+                    entries.landing,
+                    (&selected).into(),
+                    slots,
+                    None,
+                    |graph, directory| embed(graph, (&selected).into(), directory),
+                )?
+            }
+        };
+        let mut joined = graph.local_for(entries.join, "taps", &join_dims)?;
+        graph.enqueue(
+            entries.join,
+            &join_dims,
+            tap_rows::WorkflowArgs {
+                residual: (&embedded).into(),
+                index: halves[0].port().tensor().into(),
+                taps: joined.tensor_mut().into(),
+            },
+        )?;
+        graph.enqueue(
+            entries.join,
+            &join_dims,
+            tap_rows::WorkflowArgs {
+                residual: match &chained {
+                    None => conditioning.tensor().into(),
+                    Some(hidden) => hidden.into(),
+                },
+                index: halves[1].port().tensor().into(),
+                taps: joined.tensor_mut().into(),
+            },
+        )?;
+        let mut residual = graph
+            .enqueue(
+                G::pick(entries.input, &slots),
+                &[
+                    ("M", slots.clone()),
+                    ("G", Dim::from(1)),
+                    ("K", hidden * 2),
+                    ("N", width.clone()),
+                    ("WS", input.operands.scale.extent.clone()),
+                    ("WB", input.operands.bound.extent.clone()),
+                ],
+                project_rows::WorkflowArgs {
+                    source: joined.tensor().into(),
+                    weight: (&input.weight).into(),
+                    weight_scale: (&input.operands.scale.tensor).into(),
+                    weight_bound: (&input.operands.bound.tensor).into(),
+                },
+            )?
+            .value;
+        let mut blocks = Vec::with_capacity(topology.blocks.len());
+        for (index, (block_topology, block_numbers)) in topology.blocks.iter().zip(&numbers.blocks).enumerate() {
+            let block = u32::try_from(index).map_err(|_| "head block index exceeds u32")?;
+            let sublayers = SublayerGraph { block, topology: block_topology, numbers: block_numbers, weights: planned };
+            let (mixed, state) = sublayers.mixer(
+                &mut graph,
+                (entries.mixer)(index)?,
+                None,
+                &ResidualCarry::rows(residual),
+                &mut weights,
+                &mut constants,
+            )?;
+            let BlockState {
+                history:
+                    Some(HistoryPorts {
+                        planes,
+                        indexer_planes: None,
+                        coordinates,
+                        visible,
+                        fresh,
+                        destinations,
+                        history_tiles: None,
+                        indexer: None,
+                        picked: None,
+                    }),
+                bank: None,
+            } = state
+            else {
+                return Err("a head block other than unlisted attention".into());
+            };
+            (ResidualCarry { rows: residual, .. }, _) = sublayers.feed_forward(
+                &mut graph,
+                crate::operators::block::FeedForwardGraph {
+                    entries: (entries.feed_forward)(index)?,
+                    bank: crate::operators::routed::streamed::LayerBank::Held,
+                },
+                None,
+                mixed,
+                &mut weights,
+                &mut constants,
+                None,
+                None,
+            )?;
+            blocks.push(BlockPorts {
+                coordinates,
+                visible,
+                fresh,
+                destinations,
+                planes,
+            });
+        }
+        let features = graph
+            .enqueue(
+                entries.features,
+                &[
+                    ("M", slots.clone()),
+                    ("O", slots.clone()),
+                    ("D", width.clone()),
+                    ("PT", Dim::from(1)),
+                    ("NM", width.clone()),
+                ],
+                readout_features_rows::WorkflowArgs {
+                    hidden: (&residual.reshape(&[slots.clone(), Dim::from(1), width.clone()])).into(),
+                    norm: (&output_norm).into(),
+                    out_rows: out_rows.port().tensor().into(),
+                    epsilon,
+                },
+            )?
+            .value;
+        let mut projection_selection = None;
+        let mut logits = if let Some((_, policy)) = clusters {
+            let cluster = entries
+                .clustered
+                .as_ref()
+                .ok_or("clustered proposal entries are absent")?;
+            let centroids = centroids.as_ref().expect("a clustered proposal binds its centroids");
+            let order = token_order.as_ref().expect("a clustered proposal binds its token order");
+            let cluster_scores = readout::project_readout(
+                &mut graph,
+                readout::ProjectionEntries::PreparedPacked(cluster.centroids),
+                centroids,
+                readout::ReadoutInput::PreparedFeatures {
+                    features: &features,
+                    canonical_rows: None,
+                },
+                readout::ProjectionGeometry {
+                    rows: slots.clone(),
+                    projected: slots.clone(),
+                    selected: Dim::from(0),
+                    vocabulary: policy.clusters.clone(),
+                    hidden: width.clone(),
+                    columns: policy.clusters.clone(),
+                },
+                Argument::from(0.0),
+                None,
+                &mut constants,
+            )?
+            .logits;
+            let top_dims = [
+                ("M", slots.clone()),
+                ("V", policy.clusters.clone()),
+                ("K", policy.selected.clone()),
+            ];
+            let candidates_port = graph.local_for(cluster.selection, "candidates", &top_dims)?;
+            let unary_port = graph.local_for(cluster.selection, "unary", &top_dims)?;
+            let mut candidates = candidates_port.tensor().clone();
+            let mut unary = unary_port.tensor().clone();
+            graph.enqueue(
+                cluster.selection,
+                &top_dims,
+                draft_top_k::WorkflowArgs {
+                    logits: (&cluster_scores).into(),
+                    candidates: (&mut candidates).into(),
+                    unary: (&mut unary).into(),
+                },
+            )?;
+            let per_cluster = vocabulary / &policy.clusters;
+            let columns = &policy.selected * &per_cluster;
+            let token_rows = graph
+                .enqueue(
+                    cluster.rows,
+                    &[
+                        ("M", slots.clone()),
+                        ("C", policy.clusters.clone()),
+                        ("B", per_cluster.clone()),
+                        ("K", policy.selected.clone()),
+                    ],
+                    cluster_token_rows::WorkflowArgs {
+                        selected: (&candidates.reshape(&[slots.clone(), policy.selected.clone(), Dim::from(2)]))
+                            .into(),
+                        token_order: (&order
+                            .port()
+                            .tensor()
+                            .reshape(&[policy.clusters.clone(), per_cluster.clone()]))
+                            .into(),
+                    },
+                )?
+                .value;
+            let compact = readout::project_readout(
+                &mut graph,
+                entries.projection.borrowed(),
+                &own_table,
+                readout::ReadoutInput::PreparedFeatures {
+                    features: &features,
+                    canonical_rows: Some(&token_rows),
+                },
+                readout::ProjectionGeometry {
+                    rows: slots.clone(),
+                    projected: slots.clone(),
+                    selected: Dim::from(0),
+                    vocabulary: vocabulary.clone(),
+                    hidden: width.clone(),
+                    columns: columns.clone(),
+                },
+                Argument::from(0.0),
+                None,
+                &mut constants,
+            )?
+            .logits;
+            let placement_dims = [("M", slots.clone()), ("V", vocabulary.clone()), ("S", columns)];
+            let logits_port = graph.local_for(cluster.placement, "logits", &placement_dims)?;
+            let mut logits = logits_port.tensor().clone();
+            graph.enqueue(
+                cluster.placement,
+                &placement_dims,
+                place_logits_rows::WorkflowArgs {
+                    scores: (&compact).into(),
+                    token_rows: (&token_rows).into(),
+                    logits: (&mut logits).into(),
+                },
+            )?;
+            logits
+        } else {
+            let readout::Readout { logits, certified } = readout::project_readout(
+                &mut graph,
+                entries.projection.borrowed(),
+                &own_table,
+                match &own_table {
+                    readout::ProjectionPorts::Packed { .. } => {
+                        readout::ReadoutInput::PreparedFeatures {
+                            features: &features,
+                            canonical_rows: None,
+                        }
+                    }
+                    readout::ProjectionPorts::Progressive { .. } => readout::ReadoutInput::RawRms {
+                        hidden: &residual,
+                        norm: &output_norm,
+                        form: InputForm::SINGLE,
+                        out_rows: out_rows.port().tensor(),
+                        epsilon,
+                    },
+                },
+                readout::ProjectionGeometry {
+                    rows: slots.clone(),
+                    projected: slots.clone(),
+                    selected: slots.clone(),
+                    vocabulary: vocabulary.clone(),
+                    hidden: width.clone(),
+                    columns: vocabulary.clone(),
+                },
+                Argument::from(0.0),
+                Some(entries.sample),
+                &mut constants,
+            )?;
+            projection_selection = certified;
+            logits
+        };
+        let mut result = selections
+            .tensor()
+            .slice_leading(slots * step, slots * (step + 1));
+        let (inputs, view) = match projection_selection {
+            Some(certified) => (certified.selecting, Some(certified.view)),
+            None => (
+                readout::selection_inputs(&mut graph, entries.sample, slots, vocabulary)?,
+                None,
+            ),
+        };
+        let mut step_confidence = confidence.slice_leading(slots * step, slots * (step + 1));
+        let selection = readout::select(
+            &mut graph,
+            readout::SelectionEntries {
+                shape: entries.shape,
+                sample: entries.sample,
+                confidence: entries.confidence,
+            },
+            vocabulary,
+            &mut logits,
+            view.as_ref(),
+            out_rows.port().tensor(),
+            slots,
+            topology.shaped,
+            inputs,
+            &mut result,
+            &mut step_confidence,
+        )?;
+        passes.push(PassPorts {
+            blocks,
+            selection,
+            landed,
+        });
+        chained = if step + 1 < topology.steps {
+            let chain = chain
+                .as_ref()
+                .ok_or("a chaining head graph has no chain projection")?;
+            Some(
+                graph
+                    .enqueue(
+                        G::pick(entries.chain, &slots),
+                        &[
+                            ("M", slots.clone()),
+                            ("G", Dim::from(1)),
+                            ("K", width.clone()),
+                            ("N", hidden.clone()),
+                            ("WS", chain.operands.scale.extent.clone()),
+                            ("WB", chain.operands.bound.extent.clone()),
+                        ],
+                        project_rows::WorkflowArgs {
+                            source: (&features).into(),
+                            weight: (&chain.weight).into(),
+                            weight_scale: (&chain.operands.scale.tensor).into(),
+                            weight_bound: (&chain.operands.bound.tensor).into(),
+                        },
+                    )?
+                    .value,
+            )
+        } else {
+            None
+        };
+    }
+    let output = selections.tensor_mut().clone();
+    graph.export(&output)?;
+    graph.export(&confidence)?;
+    constants.extend(halves);
+    constants.push(out_rows);
+    if let Some(order) = token_order {
+        constants.push(order);
+    }
+    Ok(SharedHeadGraphParts {
+        plan: graph,
+        tokens,
+        conditioning,
+        passes,
+        constants,
+        weights,
+        output,
+        confidence,
+    })
+}
+
+/// The checked bindings of a head's entries, from its program plan.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct CheckedSharedHeadEntries {
+    embedding: [(&'static str, Element); 2],
+    join: [(&'static str, Element); 1],
+    input: [(&'static str, Element); 3],
+    blocks: Vec<(CheckedMixerEntries, Option<CheckedFeedForwardEntries>)>,
+    features: [(&'static str, Element); 2],
+    projection: readout::CheckedProjectionEntries,
+    centroids: Option<[(&'static str, Element); 2]>,
+    chain: [(&'static str, Element); 3],
+    selection: [(&'static str, Element); 0],
+}
+
+impl CheckedSharedHeadEntries {
+    fn new(plan: &SharedHeadProgramPlan, backend: BackendName) -> Result<Self, String> {
+        let activation = plan.activation;
+        let projection =
+            |weight: Element| [("A", activation), ("W", weight), ("Y", Element::f32())];
+        Ok(Self {
+            embedding: [
+                ("EW", plan.embedding.table),
+                ("A", plan.embedding.activation),
+            ],
+            join: [("A", activation)],
+            input: projection(plan.input.element),
+            blocks: plan
+                .blocks
+                .iter()
+                .map(|slot| {
+                    Ok((
+                        CheckedMixerEntries::new(slot.mixer(), backend, false)?,
+                        slot.feed_forward()
+                            .map(|slot| CheckedFeedForwardEntries::new(slot, backend))
+                            .transpose()?,
+                    ))
+                })
+                .collect::<Result<_, String>>()?,
+            features: [("NW", plan.output_norm), ("A", activation)],
+            projection: readout::CheckedProjectionEntries::new(
+                plan.projection,
+                plan.output_norm,
+                activation,
+                true,
+            ),
+            centroids: plan
+                .clustered
+                .as_ref()
+                .map(|cluster| [("OW", cluster.centroids.element), ("A", activation)]),
+            chain: projection(plan.chain.element),
+            selection: [],
+        })
+    }
+}
+
+/// What decides a shared head graph's topology: its checked entries, its
+/// form and its numbers as facts (`split_shared_head`).
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct SharedHeadKey {
+    backend: BackendName,
+    entries: CheckedSharedHeadEntries,
+    landing: Option<CheckedLandingEntries>,
+    form: SharedHeadForm<RealIndex, TableIndex>,
+    numbers: SharedHeadNumbers<FactIndex>,
+}
+
+/// The shared head graphs' traces, one per topology.
+static SHARED_HEAD_TRACES: NativeGraphTraces<SharedHeadKey, Vec<RecordedConstant>> =
+    NativeGraphTraces::new();
+
+/// How many shared head traces this process recorded.
+#[cfg(test)]
+pub(crate) fn shared_head_traces_recorded() -> usize {
+    SHARED_HEAD_TRACES.recorded()
+}
+
+/// The template of a shared head graph of `key` at `facts`, and its binding
+/// constants.
+fn record_shared_head(
+    key: &SharedHeadKey,
+    facts: &[Dim],
+    reals: &Reals,
+) -> Result<(NativeGraphResourceTemplate, Vec<RecordedConstant>), GraphError> {
+    let facts = Facts::new(facts, reals);
+    let numbers = facts.dims(key.numbers.clone());
+    let form = facts.arguments(key.form.clone()).tables(|table| facts.table(table));
+    let checked = &key.entries;
+    let block = |index: usize| {
+        checked
+            .blocks
+            .get(index)
+            .ok_or_else(|| "checked head block is absent".to_owned())
+    };
+    let parts = shared_head_graph(
+        NativeGraphMetadata::new_template(key.backend),
+        SharedHeadEntries {
+            landing: key.landing.as_ref().map(CheckedLandingEntries::entries),
+            embedding: &checked.embedding[..],
+            join: &checked.join[..],
+            input: &checked.input[..],
+            mixer: &|index| block(index)?.0.entries(),
+            feed_forward: &|index| Ok(block(index)?.1.as_ref().map(|checked| checked.entries())),
+            features: &checked.features[..],
+            projection: checked.projection.entries(),
+            clustered: checked.centroids.as_ref().map(|centroids| ClusterEntries {
+                centroids: &centroids[..],
+                selection: &checked.selection[..],
+                rows: &checked.selection[..],
+                placement: &checked.selection[..],
+            }),
+            chain: &checked.chain[..],
+            shape: &checked.selection[..],
+            sample: &checked.selection[..],
+            confidence: &checked.selection[..],
+        },
+        &form,
+        &numbers,
+    )?;
+    let constants = parts.constants.iter().map(GraphConstant::recorded).collect();
+    Ok((parts.plan.seal_template()?, constants))
+}
+
+/// The family of `classes`, each class its own graph: from the shared head
+/// graphs' traces (`Certified::traced_each`).
+pub(crate) fn certify_shared_head_family<L: Certified>(
+    backend: BackendName,
+    load: &ModelLoadPlan,
+    geometry: &SharedHeadGeometry<'_>,
+    classes: impl IntoIterator<Item = SharedHeadGraphClass>,
+) -> Result<(CheckedGraphResources, BTreeMap<SharedHeadGraphClass, L>), GraphError> {
+    let entries = CheckedSharedHeadEntries::new(geometry.plan, backend)?;
+    let landing = CheckedLandingEntries::of(load, TARGET_TABLE)?;
+    let mut family = CheckedGraphFamilyResources::new();
+    let mut layouts = BTreeMap::new();
+    for class in classes {
+        let context = || format!("shared head graph class {class:?}");
+        // Scalar arguments leave the checked shapes and storage alone.
+        let unit = |_| Ok(OutputScales { mixer: 1.0, feed_forward: 1.0, per_layer: 1.0 });
+        let (form, numbers) = split_shared_head(load, geometry, class, &unit)
+            .map_err(|error| error.context(context()))?;
+        let mut facts = FactSink::new();
+        let form = facts.index_reals(form).tables(|bytes| facts.table(bytes));
+        let key = SharedHeadKey {
+            backend,
+            entries: entries.clone(),
+            landing: landing.clone(),
+            form,
+            numbers: facts.index(numbers),
+        };
+        // A class is its own graph: one slice, at the recording's own facts.
+        // Its blocks' row ports follow the class dimension `M`
+        // (`port_with_class_extent`), which is the class's slots.
+        let (layout, constants) = L::traced(
+            &SHARED_HEAD_TRACES,
+            &key,
+            &facts,
+            &[],
+            vec![NativeGraphClassSlice::new().dimension("M", [class.slots])],
+            record_shared_head,
+        )
+        .map_err(|error| error.context(context()))?;
+        family.include_plan(layout.plan_heap())?;
+        family.include(layout.storage_bytes(), constants);
+        // Each class's plan sealed alone, its own graph; a head launch runs
+        // on its own lane, never in a decode step's.
+        family.include_graph(layout.storage_bytes().recorded, false);
+        layouts.insert(class, layout);
+    }
+    Ok((family.finish()?, layouts))
+}
+
+/// The storage and bound constants of the head's graph family over
+/// `classes`, from its traces' outlines ([`certify_shared_head_family`]).
+pub(crate) fn checked_shared_head_family_storage(
+    backend: BackendName,
+    load: &ModelLoadPlan,
+    geometry: &SharedHeadGeometry<'_>,
+    classes: impl IntoIterator<Item = SharedHeadGraphClass>,
+) -> Result<CheckedGraphResources, GraphError> {
+    certify_shared_head_family::<seismic::NativeGraphOutline>(backend, load, geometry, classes)
+        .map(|(resources, _)| resources)
+}
+
+pub struct PreparedSharedHeadGraphs {
+    classes: BTreeMap<SharedHeadGraphClass, PreparedSharedHeadGraph>,
+    family: NativeGraphFamily,
+    segments: u64,
+}
+
+pub(crate) struct BoundSharedHeadGraphs {
+    prepared: Rc<PreparedSharedHeadGraphs>,
+    bound: BTreeMap<SharedHeadGraphClass, BoundNativeGraphPlan>,
+    constants: Vec<Tensor>,
+    /// The token embedding as the passes gather it: the first pass by the
+    /// host's tokens, a chained pass by the device's selections.
+    embedding: crate::device_table::ResidentTable,
+}
+
+impl PreparedSharedHeadGraphs {
+    pub fn binding_constant_bytes(&self) -> Result<u64, String> {
+        distinct_storage_bytes(
+            self.classes
+                .values()
+                .flat_map(|graph| graph.constants.iter()),
+        )
+    }
+
+    /// `landing`: the landing entries of the token table, when it has
+    /// landing slots.
+    pub(crate) fn prepare(
+        target_device: &Device,
+        kernels: &AttestedSharedHead,
+        landing: Option<&crate::native::AttestedLanding>,
+        load: &ModelLoadPlan,
+        geometry: &SharedHeadGeometry<'_>,
+        classes: impl IntoIterator<Item = SharedHeadGraphClass>,
+    ) -> Result<Self, SubmitError> {
+        let classes = classes.into_iter().collect::<Vec<_>>();
+        // What the planner charged for the family, from its own check.
+        let planned = checked_shared_head_family_storage(target_device.backend(), load, geometry, classes.iter().copied())
+            .map_err(|error| invalid(format!("shared head graph family: {error}")))?
+            .graphs;
+        let block = |index: usize| {
+            kernels
+                .blocks
+                .get(index)
+                .ok_or_else(|| "attested head block is absent".to_owned())
+        };
+        let mut prepared = BTreeMap::new();
+        for class in classes {
+            if prepared.contains_key(&class) {
+                return Err(invalid("shared head graph class is duplicated"));
+            }
+            let class_error =
+                |error: GraphError| invalid(format!("shared head graph class {class:?}: {error}"));
+            let scales = |index: usize| Ok(block(index)?.output_scales);
+            let (form, numbers) =
+                split_shared_head(load, geometry, class, &scales).map_err(class_error)?;
+            let parts = shared_head_graph::<NativeGraph>(
+                target_device.native_graph(),
+                SharedHeadEntries {
+                    landing: landing.map(LandingEntries::native),
+                    embedding: &kernels.embedding,
+                    join: &kernels.join,
+                    input: &kernels.input,
+                    mixer: &|index| Ok((&block(index)?.mixer).into()),
+                    feed_forward: &|index| Ok(block(index)?.feed_forward.as_ref().map(Into::into)),
+                    features: &kernels.features,
+                    projection: readout::ProjectionEntries::prepared(&kernels.projection),
+                    clustered: if geometry.plan.clustered.is_some() {
+                        Some(ClusterEntries {
+                            centroids: kernels
+                                .centroids
+                                .as_ref()
+                                .ok_or_else(|| invalid("clustered centroid entry is absent"))?,
+                            selection: kernels
+                                .cluster_selection
+                                .as_ref()
+                                .ok_or_else(|| invalid("cluster selection entry is absent"))?,
+                            rows: kernels
+                                .cluster_rows
+                                .as_ref()
+                                .ok_or_else(|| invalid("cluster row entry is absent"))?,
+                            placement: kernels
+                                .placement
+                                .as_ref()
+                                .ok_or_else(|| invalid("cluster placement entry is absent"))?,
+                        })
+                    } else {
+                        None
+                    },
+                    chain: &kernels.chain,
+                    shape: &kernels.shape,
+                    sample: &kernels.sample,
+                    confidence: &kernels.confidence,
+                },
+                &constant_reals(form).tables(Table::from),
+                &crate::programs::graph::facts::constant(numbers),
+            )
+            .map_err(class_error)?;
+            let plan = GraphDraft::seal(parts.plan).map_err(class_error)?;
+            prepared.insert(
+                class,
+                SharedHeadGraphParts {
+                    plan,
+                    tokens: parts.tokens,
+                    conditioning: parts.conditioning,
+                    passes: parts.passes,
+                    constants: parts.constants,
+                    weights: parts.weights,
+                    output: parts.output,
+                    confidence: parts.confidence,
+                },
+            );
+        }
+        if prepared.is_empty() {
+            return Err(invalid("shared head graph family has no classes"));
+        }
+        let plans = prepared.values().map(|graph| (false, graph.plan.clone()));
+        let family = super::graph::serial_family("shared head", plans, &planned).map_err(device)?;
+        Ok(Self {
+            classes: prepared,
+            family,
+            segments: geometry.segments,
+        })
+    }
+
+    pub fn family(&self) -> &NativeGraphFamily {
+        &self.family
+    }
+
+    pub fn class_count(&self) -> usize {
+        self.classes.len()
+    }
+
+    pub(crate) fn bind_weights(
+        self: &Rc<Self>,
+        resident: &ResidentHead,
+    ) -> Result<BoundSharedHeadGraphs, SubmitError> {
+        let mut uploaded = ConstantTensors::new(resident.embedding.tensor().device());
+        let mut bound = BTreeMap::new();
+        for (class, graph) in &self.classes {
+            let constants = graph
+                .constants
+                .iter()
+                .map(|constant| Ok((constant.port(), uploaded.tensor(constant).map_err(device)?)))
+                .collect::<Result<Vec<_>, SubmitError>>()?;
+            let fixed = graph
+                .weights
+                .iter()
+                .map(|(weight, port)| {
+                    let resident = resident_weight(resident, weight.role)?;
+                    Ok((port, weight.part.of(resident).map_err(invalid)?))
+                })
+                .chain(constants.iter().map(|(port, tensor)| Ok((*port, tensor))))
+                .collect::<Result<Vec<_>, SubmitError>>()?;
+            bound.insert(*class, graph.plan.bind_static(&fixed).map_err(device)?);
+        }
+        Ok(BoundSharedHeadGraphs {
+            prepared: self.clone(),
+            bound,
+            constants: uploaded.into_tensors(),
+            embedding: resident.embedding.table().clone(),
+        })
+    }
+}
+
+impl BoundSharedHeadGraphs {
+    fn constant_bytes(&self) -> Result<u64, &'static str> {
+        self.constants.iter().try_fold(0u64, |bytes, tensor| {
+            bytes
+                .checked_add(tensor.storage_bytes())
+                .ok_or("shared head graph constant charge overflows")
+        })
+    }
+
+    fn class(
+        &self,
+        class: SharedHeadGraphClass,
+    ) -> Result<(&PreparedSharedHeadGraph, &BoundNativeGraphPlan), SubmitError> {
+        let graph = self.prepared.classes.get(&class).ok_or_else(|| {
+            invalid(format!(
+                "shared head graph class {class:?} was not prepared"
+            ))
+        })?;
+        let bound = self
+            .bound
+            .get(&class)
+            .ok_or_else(|| invalid(format!("shared head graph class {class:?} was not bound")))?;
+        Ok((graph, bound))
+    }
+}
+
+/// A head graph's weight: the target's token table, or one of the head's own.
+fn resident_weight(
+    resident: &ResidentHead,
+    role: WeightRole,
+) -> Result<&ResidentWeight, SubmitError> {
+    match (role.scope, role.kind) {
+        (WeightScope::Target, WeightKind::Embedding) => Ok(&resident.embedding),
+        _ => resident.weights.get(role).map_err(invalid),
+    }
+}
+
+/// One pass's attention controls in the target history domain `domain`,
+/// padded to `rows` rows of `segments` spans: padding rows attend to nothing.
+/// No row appends.
+struct PassControls {
+    coordinates: Vec<u8>,
+    visible: Vec<u8>,
+    fresh: Vec<u8>,
+    destinations: Vec<u8>,
+}
+
+impl PassControls {
+    fn new(
+        pass: &TargetBatchUpload<'_>,
+        domain: usize,
+        rows: usize,
+        segments: usize,
+    ) -> Result<Self, SubmitError> {
+        let actual = pass.actual_rows;
+        if actual > rows {
+            return Err(invalid("head pass has more rows than its graph class"));
+        }
+        let history = pass
+            .histories
+            .get(domain)
+            .ok_or_else(|| invalid("head pass lacks the target history domain it reads"))?;
+        let mut visible = vec![0_i32; rows * segments * 2];
+        for (row, ranges) in history.visible[..actual].iter().enumerate() {
+            let used = ranges
+                .iter()
+                .rposition(|range| range[1] > range[0])
+                .map_or(0, |last| last + 1);
+            if used > segments {
+                return Err(invalid(format!(
+                    "head row attends {used} history spans; the head admits {segments}"
+                )));
+            }
+            for (span, [start, end]) in ranges[..used].iter().enumerate() {
+                let at = (row * segments + span) * 2;
+                visible[at] = *start;
+                visible[at + 1] = *end;
+            }
+        }
+        Ok(Self {
+            coordinates: i32_bytes((0..rows).flat_map(|row| {
+                pass.coordinates
+                    .get(row)
+                    .filter(|_| row < actual)
+                    .copied()
+                    .unwrap_or([0; 4])
+            })),
+            visible: i32_bytes(visible),
+            fresh: i32_bytes((0..rows).flat_map(|row| {
+                history
+                    .fresh
+                    .get(row)
+                    .filter(|_| row < actual)
+                    .copied()
+                    .unwrap_or([0, 0])
+            })),
+            destinations: i32_bytes((0..rows).map(|_| -1)),
+        })
+    }
+}
+
+pub struct NativeSharedHeadProgram {
+    geometry: Decoder,
+    graphs: BoundSharedHeadGraphs,
+    waiter: CompletionWaiter,
+}
+
+impl NativeSharedHeadProgram {
+    pub(crate) fn constant_bytes(&self) -> Result<u64, &'static str> {
+        self.graphs.constant_bytes()
+    }
+
+    /// `geometry` is the target decoder.
+    pub(crate) fn new(
+        geometry: Decoder,
+        graphs: BoundSharedHeadGraphs,
+    ) -> Result<Self, SubmitError> {
+        let waiter = CompletionWaiter::spawn().map_err(device)?;
+        Ok(Self {
+            geometry,
+            graphs,
+            waiter,
+        })
+    }
+
+    /// Queue one head transaction. Returns its completion and the
+    /// selections the graph fills.
+    fn queue(
+        &self,
+        core: &HeadLaunchCore,
+        workspace: &mut NativeGraphWorkspaceLease,
+        output: NativeGraphOutputLease,
+    ) -> Result<(seismic::NativeGraphCompletion, HeadOutput), SubmitError> {
+        let reads = core
+            .target_reads()
+            .ok_or_else(|| invalid("a head without a store reads target history"))?;
+        let batch = core.batch();
+        let entry = batch.upload();
+        let chain = batch.chain().collect::<Vec<_>>();
+        let steps = batch.steps();
+        let actual_slots = batch.actual_slots();
+        let slots = row_class(actual_slots).ok_or_else(|| invalid("head slots have no class"))?;
+        let shaped = std::iter::once(&entry)
+            .chain(&chain)
+            .any(|pass| pass.shaping[..pass.select_rows.len()].iter().any(shapes));
+        let class = SharedHeadGraphClass {
+            slots: slots as u64,
+            steps: steps as u64,
+            shaped,
+        };
+        let (graph, bound) = self.graphs.class(class)?;
+        if graph.passes.len() != chain.len() + 1 {
+            return Err(invalid("head graph passes differ from the batch's steps"));
+        }
+        let segments = self.graphs.prepared.segments as usize;
+        let mut bindings = bound.bindings();
+        for pass in &graph.passes {
+            if pass.blocks.len() != reads.history.len() {
+                return Err(invalid("head blocks differ from the target history read"));
+            }
+            for (block, read) in pass.blocks.iter().zip(&reads.history) {
+                if block.planes.len() != read.planes.len() {
+                    return Err(invalid(
+                        "target history planes differ from the attention entry",
+                    ));
+                }
+                for (port, plane) in block.planes.iter().zip(&read.planes) {
+                    bindings.set(port, plane).map_err(device)?;
+                }
+            }
+        }
+        // Conditioning rows in slot order, widened to F32 and padded.
+        let crate::HeadConditioning::Rows(rows) = core.conditioning() else {
+            return Err(invalid(
+                "a head reading target history enters host conditioning rows",
+            ));
+        };
+        let row_bytes = self.geometry.hidden as usize * 4;
+        let mut conditioning = Vec::with_capacity(slots * row_bytes);
+        for rows in rows {
+            conditioning.extend(widen(rows.bytes(), self.geometry.activation_dtype));
+        }
+        if conditioning.len() != actual_slots * row_bytes {
+            return Err(invalid("head conditioning bytes differ from its slots"));
+        }
+        conditioning.resize(slots * row_bytes, 0);
+        let mut active = workspace.slot_mut().activate(&graph.plan).map_err(device)?;
+        active
+            .write_input(&graph.conditioning, &conditioning)
+            .map_err(device)?;
+        // The first pass's tokens gather by table row: of a streamed table,
+        // by the slots their rows are brought to. A chained pass gathers
+        // the device's selections through the table's directory.
+        let tokens = (0..slots)
+            .map(|slot| {
+                entry
+                    .tokens
+                    .get(slot)
+                    .copied()
+                    .filter(|_| slot < actual_slots)
+                    .unwrap_or(0)
+            })
+            .collect::<Vec<_>>();
+        let rows = self.graphs.embedding.indices(&tokens).map_err(invalid)?;
+        // A chained pass embeds the device's selection, a landed read of a
+        // table with landing slots.
+        let landed = graph
+            .passes
+            .iter()
+            .filter_map(|pass| pass.landed.as_ref())
+            .map(|ports| ports.queue(&self.graphs.embedding, &mut bindings))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(invalid)?;
+        active
+            .write_input(
+                &graph.tokens,
+                &i32_bytes(rows.iter().flat_map(|row| [*row, 0])),
+            )
+            .map_err(device)?;
+        let words = self.geometry.vocabulary.div_ceil(32) as usize;
+        for (ports, pass) in graph
+            .passes
+            .iter()
+            .zip(std::iter::once(&entry).chain(&chain))
+        {
+            for (block, read) in ports.blocks.iter().zip(&reads.history) {
+                let controls = PassControls::new(pass, read.domain, slots, segments)?;
+                active
+                    .write_input(&block.coordinates, &controls.coordinates)
+                    .map_err(device)?;
+                active
+                    .write_input(&block.visible, &controls.visible)
+                    .map_err(device)?;
+                active
+                    .write_input(&block.fresh, &controls.fresh)
+                    .map_err(device)?;
+                active
+                    .write_input(&block.destinations, &controls.destinations)
+                    .map_err(device)?;
+            }
+            readout::write_selection(pass, &mut active, &ports.selection, slots, words)?;
+        }
+        let mut output = output;
+        let outputs = output
+            .activate(&graph.plan)
+            .map_err(SubmitError::Invariant)?;
+        let (outputs, completion) = active
+            .attach(bindings, outputs)
+            .and_then(|ready| ready.submit())
+            .map_err(device)?;
+        let landed_reads = landed.into_iter().map(SelectedRead::submitted).collect();
+        let owner = output.publish(outputs);
+        let selections = HeadSelections {
+            tokens: owner
+                .tensor(&graph.output)
+                .ok_or_else(|| invalid("head graph omitted its selections"))?,
+            confidence: Some(
+                owner
+                    .tensor(&graph.confidence)
+                    .ok_or_else(|| invalid("head graph omitted its confidence"))?,
+            ),
+        };
+        Ok((
+            completion,
+            HeadOutput {
+                selections: Some(selections),
+                landed_reads,
+            },
+        ))
+    }
+}
+
+impl HeadProgram for NativeSharedHeadProgram {
+    type Submission =
+        DeviceSubmission<HeadLaunchCore, NativeGraphWorkspaceLease, HeadOutput>;
+
+    fn submit(
+        &mut self,
+        mut launch: ValidatedHeadLaunch,
+    ) -> Result<Self::Submission, (SubmitError, ValidatedHeadLaunch)> {
+        let queued = {
+            let (core, workspace, output) = launch.execution_parts_mut();
+            match output.take() {
+                Some(output) => self.queue(core, workspace, output),
+                None => Err(invalid("head graph output lease is absent")),
+            }
+        };
+        let (completion, output) = match queued {
+            Ok(queued) => queued,
+            Err(error) => return Err((error, launch)),
+        };
+        let (core, workspace, _) = launch.into_submission_parts();
+        Ok(DeviceSubmission::new(
+            self.waiter.completion(vec![completion]),
+            core,
+            workspace,
+            output,
+        ))
+    }
+}

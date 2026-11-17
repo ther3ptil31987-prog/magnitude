@@ -1,3 +1,4 @@
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Weak};
 
 use futures_util::stream::{BoxStream, StreamExt};
@@ -10,25 +11,44 @@ use magnitude_service_contracts::models::{
 use crate::ManagedModelDownloads;
 use crate::catalog_installations::ManagedCatalogInstallations;
 use crate::catalog_models::ManagedCatalogModels;
-use crate::discovered_models::ManagedDiscoveredModels;
+use crate::custom_models::{LocalModelsContext, ManagedLocalModels};
 use crate::inventory::{InstalledPackagesObserver, ManagedModelStore};
+use crate::upstream_updates::UpstreamUpdates;
 
-#[derive(Clone)]
 pub struct ModelDomainResolver {
     pub(crate) inventory: Arc<ManagedModelStore>,
     pub(crate) catalog: RecommendableModelCatalog,
+    pub(crate) local: LocalModelsContext,
+    pub(crate) catalog_changes: CatalogChanges,
+    pub(crate) upstream: UpstreamUpdates,
+}
+
+/// What republishes the catalog list: the inventory, and what it shows that the inventory doesn't
+/// hold (which catalog models serve without their drafter), counted by `generation`.
+pub(crate) struct CatalogChanges {
+    pub(crate) generation: AtomicU64,
+    pub(crate) changes: tokio::sync::broadcast::Sender<ModelDomainInvalidation>,
 }
 
 impl ModelDomainResolver {
     #[must_use]
     pub fn new(inventory: Arc<ManagedModelStore>, catalog: RecommendableModelCatalog) -> Arc<Self> {
-        Arc::new(Self { inventory, catalog })
+        Arc::new(Self {
+            inventory,
+            catalog,
+            local: LocalModelsContext::new(),
+            catalog_changes: CatalogChanges {
+                generation: AtomicU64::new(0),
+                changes: tokio::sync::broadcast::channel(32).0,
+            },
+            upstream: UpstreamUpdates::new(),
+        })
     }
 }
 
 struct ModelInventoryObserver {
     catalog: Weak<ManagedCatalogModels>,
-    discovered: Weak<ManagedDiscoveredModels>,
+    local: Weak<ManagedLocalModels>,
 }
 
 impl InstalledPackagesObserver for ModelInventoryObserver {
@@ -36,15 +56,15 @@ impl InstalledPackagesObserver for ModelInventoryObserver {
         if let Some(catalog) = self.catalog.upgrade() {
             catalog.installed_packages_changed(revision);
         }
-        if let Some(discovered) = self.discovered.upgrade() {
-            discovered.installed_packages_changed(revision);
+        if let Some(local) = self.local.upgrade() {
+            local.installed_packages_changed(revision);
         }
     }
 }
 
 pub struct ManagedModelServices {
     pub catalog: Arc<ManagedCatalogModels>,
-    pub discovered: Arc<ManagedDiscoveredModels>,
+    pub local: Arc<ManagedLocalModels>,
     pub installations: Arc<ManagedCatalogInstallations>,
 }
 
@@ -55,16 +75,12 @@ pub fn managed_model_services(
     optimizer: Arc<dyn CatalogModelOptimizer>,
 ) -> Result<ManagedModelServices, InventoryError> {
     let installations =
-        ManagedCatalogInstallations::new(resolver.clone(), downloads, remover, optimizer);
-    let discovered = ManagedDiscoveredModels::new(resolver.clone());
+        ManagedCatalogInstallations::new(resolver.clone(), downloads, remover.clone(), optimizer);
+    let local = ManagedLocalModels::new(resolver.clone(), remover);
+    crate::upstream_updates::start(&resolver);
     let catalog = ManagedCatalogModels::new(resolver, installations.clone(), {
-        let discovered = Arc::downgrade(&discovered);
-        move |catalog| {
-            Arc::new(ModelInventoryObserver {
-                catalog,
-                discovered,
-            })
-        }
+        let local = Arc::downgrade(&local);
+        move |catalog| Arc::new(ModelInventoryObserver { catalog, local })
     });
     catalog
         .resolver()
@@ -72,7 +88,7 @@ pub fn managed_model_services(
         .set_installed_packages_observer(Arc::downgrade(catalog.inventory_observer()))?;
     Ok(ManagedModelServices {
         catalog,
-        discovered,
+        local,
         installations,
     })
 }

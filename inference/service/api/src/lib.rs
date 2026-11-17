@@ -8,27 +8,33 @@ use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use futures_util::{future::BoxFuture, stream::BoxStream};
 use magnitude_service_contracts::bootstrap_protocol::{
-    IcnBinaryIdentity, IcnInstallationDeclaration, IcnParentCommand, IcnParentCommandType,
-    IcnStartupBackend, IcnStartupProgressRecord, IcnStartupProgressRecordType, IcnStartupRecord,
-    IcnStartupRecordType,
+    API_VERSION, IcnBinaryIdentity, IcnInstallationDeclaration, IcnParentCommand,
+    IcnParentCommandType, IcnStartupRecord, IcnStartupRecordType,
 };
 use magnitude_service_contracts::models::{
+    CandidateInspection, CandidateInspectionEvent, CandidateInspectionProgress,
+    CandidateInspectionProgressSink, CandidateInspectionRequest, CatalogComponent,
     CatalogInstallationAdmission, CatalogInstallationOperation, CatalogInstallationOperationId,
     CatalogInstallationRemoval, CatalogInstallations, CatalogInstallationsResponse, CatalogModel,
-    CatalogModelState, CatalogModels, CatalogModelsResponse, DiscoveredModel, DiscoveredModelState,
-    DiscoveredModels, DiscoveredModelsResponse, EffectiveModel, ModelAssessmentDomainSnapshot,
-    ModelAssessmentEntryState, ModelAssessmentSubject, ModelAssessments,
-    ModelAssessmentsSnapshot, ModelCapabilities, ModelDownloads, ModelId, ModelInstance,
-    ModelInstanceId, ModelInstancesInvalidation, ModelInstancesSnapshot, ModelLoadDevice,
-    ModelLoadPlan, ParsedModelId,
+    CatalogModelState, CatalogModels, CatalogModelsResponse, CustomModel, CustomModelOrigin,
+    CustomModelState, DrafterCandidatesRequest, DrafterCandidatesResponse, DrafterPruning,
+    EffectiveModel, FoundSource, LocalModelRemoval, LocalModels, LocalModelsConfiguration,
+    LocalModelsResponse, ModelAssessment, ModelAssessmentDomainSnapshot, ModelAssessmentEntryState,
+    ModelAssessmentSubject, ModelAssessments, ModelAssessmentsSnapshot, ModelCandidate,
+    ModelCandidates, ModelCapabilities, ModelDownload, ModelDownloadId, ModelDownloads,
+    ModelDownloadsResponse, ModelId, ModelInstance, ModelInstanceId, ModelInstancesInvalidation,
+    ModelInstancesSnapshot, ModelLoadDevice, ModelLoadPlan, ParsedModelId,
+    StartModelDownloadRequest, StartModelDownloadResponse,
 };
 use magnitude_service_contracts::{
-    ExecutionBackend, HardwareProvider, HardwareSnapshot, HuggingFaceModelCatalog,
-    HuggingFaceModelSearchRequest, HuggingFaceModelSearchResults, HuggingFaceRepositoryRequest,
+    ExecutionBackend, HardwareProvider, HardwareSnapshot, HuggingFaceCredential,
+    HuggingFaceModelCatalog,
+    HuggingFaceModelSearchRequest, HuggingFaceModelSearchResults, HuggingFaceRepositoryCheck,
+    HuggingFaceRepositoryCheckRequest, HuggingFaceRepositoryRequest,
     HuggingFaceRepositorySnapshot, InventoryError,
 };
 use serde::{Deserialize, Serialize};
@@ -39,6 +45,13 @@ use utoipa::openapi::{Components, OpenApi as OpenApiDocument, RefOr};
 use utoipa::{OpenApi, PartialSchema, ToSchema};
 
 const CONNECTOR_MAX_OUTPUT_TOKENS: u32 = 32_768;
+
+/// The output a listed model offers harnesses: a quarter of its served context, at most
+/// [`CONNECTOR_MAX_OUTPUT_TOKENS`]. Harnesses keep this much of the window free for the reply, so
+/// a model served at 32K leaves 24K for the conversation rather than none.
+fn connector_max_output_tokens(context_length: u32) -> u32 {
+    (context_length / 4).min(CONNECTOR_MAX_OUTPUT_TOKENS)
+}
 
 use magnitude_serving::chat::{
     AllowedToolRequest, AllowedToolsChoiceRequest, AllowedToolsModeRequest, AllowedToolsRequest,
@@ -64,10 +77,11 @@ static NEXT_HTTP_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone)]
 pub struct AppState {
     catalog_models: Option<Arc<dyn CatalogModels>>,
-    discovered_models: Option<Arc<dyn DiscoveredModels>>,
+    local_models: Option<Arc<dyn LocalModels>>,
     catalog_installations: Option<Arc<dyn CatalogInstallations>>,
     model_assessments: Option<Arc<dyn ModelAssessments>>,
     model_downloads: Option<Arc<dyn ModelDownloads>>,
+    model_candidates: Option<Arc<dyn ModelCandidates>>,
     hardware: Option<Arc<dyn HardwareProvider>>,
     hugging_face_catalog: Option<Arc<dyn HuggingFaceModelCatalog>>,
     model_controller: Option<Arc<dyn ModelInstanceController>>,
@@ -130,9 +144,10 @@ pub struct EnsureModelInstanceRequest {
 pub enum InferenceResourceTopic {
     Hardware,
     Catalog,
-    Discovery,
+    LocalModels,
     ModelAssessments,
     CatalogInstallations,
+    Downloads,
     Instances,
 }
 
@@ -141,9 +156,10 @@ impl InferenceResourceTopic {
         match self {
             Self::Hardware => "hardware",
             Self::Catalog => "catalog",
-            Self::Discovery => "discovery",
+            Self::LocalModels => "local-models",
             Self::ModelAssessments => "model-assessments",
             Self::CatalogInstallations => "catalog-installations",
+            Self::Downloads => "downloads",
             Self::Instances => "instances",
         }
     }
@@ -152,9 +168,10 @@ impl InferenceResourceTopic {
         match value {
             "hardware" => Some(Self::Hardware),
             "catalog" => Some(Self::Catalog),
-            "discovery" => Some(Self::Discovery),
+            "local-models" => Some(Self::LocalModels),
             "model-assessments" => Some(Self::ModelAssessments),
             "catalog-installations" => Some(Self::CatalogInstallations),
+            "downloads" => Some(Self::Downloads),
             "instances" => Some(Self::Instances),
             _ => None,
         }
@@ -183,7 +200,7 @@ impl Default for ServerIdentity {
     fn default() -> Self {
         Self {
             instance_id: "embedded".to_owned(),
-            api_version: 1,
+            api_version: API_VERSION,
             native_build: "unknown".to_owned(),
         }
     }
@@ -195,10 +212,11 @@ impl AppState {
         let (resource_changes, _) = tokio::sync::broadcast::channel(64);
         Self {
             catalog_models: None,
-            discovered_models: None,
+            local_models: None,
             catalog_installations: None,
             model_assessments: None,
             model_downloads: None,
+            model_candidates: None,
             hardware: None,
             hugging_face_catalog: None,
             model_controller: None,
@@ -212,11 +230,11 @@ impl AppState {
     pub fn with_model_domains(
         mut self,
         catalog_models: Arc<dyn CatalogModels>,
-        discovered_models: Arc<dyn DiscoveredModels>,
+        local_models: Arc<dyn LocalModels>,
         catalog_installations: Arc<dyn CatalogInstallations>,
     ) -> Self {
         self.catalog_models = Some(catalog_models);
-        self.discovered_models = Some(discovered_models);
+        self.local_models = Some(local_models);
         self.catalog_installations = Some(catalog_installations);
         self
     }
@@ -228,6 +246,11 @@ impl AppState {
 
     pub fn with_model_downloads(mut self, model_downloads: Arc<dyn ModelDownloads>) -> Self {
         self.model_downloads = Some(model_downloads);
+        self
+    }
+
+    pub fn with_model_candidates(mut self, model_candidates: Arc<dyn ModelCandidates>) -> Self {
+        self.model_candidates = Some(model_candidates);
         self
     }
 
@@ -281,6 +304,10 @@ pub fn app(state: AppState, serving: magnitude_serving::Serving) -> Router {
             post(install_catalog_model),
         )
         .route(
+            "/api/v1/catalog/models/{model_id}/components/{component}/install",
+            post(install_catalog_component),
+        )
+        .route(
             "/api/v1/catalog/models/{model_id}/installation",
             axum::routing::delete(remove_catalog_model_installation),
         )
@@ -297,9 +324,43 @@ pub fn app(state: AppState, serving: magnitude_serving::Serving) -> Router {
             "/api/v1/catalog/installations/{operation_id}/acknowledge-failure",
             post(acknowledge_catalog_installation_failure),
         )
-        .route("/api/v1/discovery/models", get(discovered_models))
-        .route("/api/v1/discovery/refresh", post(refresh_discovery))
+        .route(
+            "/api/v1/local-models/configuration",
+            get(local_models_configuration).put(configure_local_models),
+        )
+        .route("/api/v1/local-models", get(local_models))
+        .route("/api/v1/local-models/refresh", post(refresh_local_models))
+        .route(
+            "/api/v1/local-models/{model_id}/files",
+            axum::routing::delete(remove_local_model_files),
+        )
+        .route(
+            "/api/v1/local-models/drafters/prune",
+            post(prune_local_drafters),
+        )
+        .route("/api/v1/candidates/inspect", post(inspect_model_candidate))
+        .route(
+            "/api/v1/candidates/inspect/stream",
+            post(stream_model_candidate_inspection),
+        )
+        .route("/api/v1/candidates/drafters", post(drafter_candidates))
         .route("/api/v1/model-assessments", get(model_assessments))
+        .route(
+            "/api/v1/model-assessments/candidates",
+            post(assess_model_candidate),
+        )
+        .route(
+            "/api/v1/downloads",
+            get(model_downloads).post(start_model_download),
+        )
+        .route(
+            "/api/v1/downloads/{download_id}/cancel",
+            post(cancel_model_download),
+        )
+        .route(
+            "/api/v1/downloads/{download_id}/acknowledge-failure",
+            post(acknowledge_model_download_failure),
+        )
         .route(
             "/api/v1/models/{model_id}/load-plan",
             post(preview_model_load),
@@ -319,8 +380,16 @@ pub fn app(state: AppState, serving: magnitude_serving::Serving) -> Router {
             post(search_hugging_face_models),
         )
         .route(
+            "/api/v1/sources/hugging-face/check",
+            post(check_hugging_face_repository),
+        )
+        .route(
             "/api/v1/sources/hugging-face/resolve",
             post(resolve_hugging_face_repository),
+        )
+        .route(
+            "/api/v1/sources/hugging-face/credential",
+            put(configure_hugging_face_credential),
         )
         .route("/v1/models", get(standard_models))
         .route("/openapi.json", get(serve_openapi))
@@ -333,7 +402,9 @@ pub fn app(state: AppState, serving: magnitude_serving::Serving) -> Router {
         .route("/health", get(health))
         .with_state(state)
         .merge(protected)
-        .layer(DefaultBodyLimit::max(magnitude_serving::MAX_HTTP_BODY_BYTES))
+        .layer(DefaultBodyLimit::max(
+            magnitude_serving::MAX_HTTP_BODY_BYTES,
+        ))
 }
 
 async fn authorize(State(capability): State<Arc<str>>, request: Request, next: Next) -> Response {
@@ -479,6 +550,18 @@ impl ApiError {
                 "integrity_failed",
                 false,
             ),
+            InventoryError::DoesNotFit(_) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_request_error",
+                "model_does_not_fit",
+                false,
+            ),
+            InventoryError::ModelUnsupported { .. } => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_request_error",
+                "model_unsupported",
+                false,
+            ),
             InventoryError::ModelOperation {
                 code, retryable, ..
             } => (
@@ -547,7 +630,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         (status = 400, description = "Invalid model identity or request", body = ErrorResponse),
         (status = 404, description = "Model is not installed", body = ErrorResponse),
         (status = 409, description = "Model cannot currently be admitted", body = ErrorResponse),
-        (status = 422, description = "Installed model failed integrity validation", body = ErrorResponse),
+        (status = 422, description = "Installed model failed integrity validation, does not fit, or the engine cannot run it (`model_unsupported`)", body = ErrorResponse),
         (status = 500, description = "Runtime control unavailable", body = ErrorResponse)
     )
 )]
@@ -716,10 +799,14 @@ async fn watch_inference_events(
         .catalog_models
         .as_ref()
         .ok_or_else(|| ApiError::server("catalog models are not configured"))?;
-    let discovery = state
-        .discovered_models
+    let local = state
+        .local_models
         .as_ref()
-        .ok_or_else(|| ApiError::server("discovered models are not configured"))?;
+        .ok_or_else(|| ApiError::server("local models are not configured"))?;
+    let downloads = state
+        .model_downloads
+        .as_ref()
+        .ok_or_else(|| ApiError::server("model downloads are not configured"))?;
     let assessments = state
         .model_assessments
         .as_ref()
@@ -737,25 +824,29 @@ async fn watch_inference_events(
                 }),
             )
         });
-    let installation_events = futures_util::StreamExt::map(
-        installations.watch_catalog_installations(),
-        |event| InferenceResourceInvalidation {
-            topic: InferenceResourceTopic::CatalogInstallations,
-            revision: event.revision,
-        },
-    );
+    let installation_events =
+        futures_util::StreamExt::map(installations.watch_catalog_installations(), |event| {
+            InferenceResourceInvalidation {
+                topic: InferenceResourceTopic::CatalogInstallations,
+                revision: event.revision,
+            }
+        });
     let catalog_events = futures_util::StreamExt::map(catalog.watch_catalog(), |event| {
         InferenceResourceInvalidation {
             topic: InferenceResourceTopic::Catalog,
             revision: event.revision,
         }
     });
-    let discovery_events = futures_util::StreamExt::map(discovery.watch_discovery(), |event| {
-        InferenceResourceInvalidation {
-            topic: InferenceResourceTopic::Discovery,
+    let local_events =
+        futures_util::StreamExt::map(local.watch_local(), |event| InferenceResourceInvalidation {
+            topic: InferenceResourceTopic::LocalModels,
             revision: event.revision,
-        }
-    });
+        });
+    let download_events =
+        futures_util::StreamExt::map(downloads.watch(), |event| InferenceResourceInvalidation {
+            topic: InferenceResourceTopic::Downloads,
+            revision: event.revision,
+        });
     let assessment_events =
         futures_util::StreamExt::map(assessments.watch(), |event| InferenceResourceInvalidation {
             topic: InferenceResourceTopic::ModelAssessments,
@@ -779,7 +870,7 @@ async fn watch_inference_events(
                 futures_util::stream::select(instance_events, installation_events),
                 catalog_events,
             ),
-            discovery_events,
+            futures_util::stream::select(local_events, download_events),
         ),
         futures_util::stream::select(assessment_events, direct_events),
     );
@@ -820,6 +911,9 @@ async fn hardware(State(state): State<AppState>) -> Result<Json<HardwareSnapshot
     responses(
         (status = 200, description = "Live Hugging Face GGUF model search", body = HuggingFaceModelSearchResults),
         (status = 400, description = "Invalid search request", body = ErrorResponse),
+        (status = 404, description = "Repository or revision not found", body = ErrorResponse),
+        (status = 409, description = "The operation conflicts with the model's current state", body = ErrorResponse),
+        (status = 422, description = "The repository's metadata or a file's header is invalid", body = ErrorResponse),
         (status = 500, description = "Hugging Face search failed", body = ErrorResponse)
     )
 )]
@@ -839,11 +933,41 @@ async fn search_hugging_face_models(
         .map_err(ApiError::from_inventory)
 }
 
+#[utoipa::path(post, path = "/api/v1/sources/hugging-face/check", operation_id = "checkHuggingFaceRepository", tag = "hugging-face",
+    request_body(content = HuggingFaceRepositoryCheckRequest, content_type = "application/json"),
+    responses(
+        (status = 200, description = "What a listed repository holds on this machine", body = HuggingFaceRepositoryCheck),
+        (status = 400, description = "Invalid check request", body = ErrorResponse),
+        (status = 404, description = "Repository or revision not found", body = ErrorResponse),
+        (status = 409, description = "The operation conflicts with the model's current state", body = ErrorResponse),
+        (status = 422, description = "The repository's metadata or a file's header is invalid", body = ErrorResponse),
+        (status = 500, description = "The check failed", body = ErrorResponse)
+    )
+)]
+#[tracing::instrument(name = "icn.hugging_face.check", skip_all, err(Debug))]
+async fn check_hugging_face_repository(
+    State(state): State<AppState>,
+    Json(request): Json<HuggingFaceRepositoryCheckRequest>,
+) -> Result<Json<HuggingFaceRepositoryCheck>, ApiError> {
+    let catalog = state
+        .hugging_face_catalog
+        .as_ref()
+        .ok_or_else(|| ApiError::server("Hugging Face discovery is not configured"))?;
+    catalog
+        .check(request)
+        .await
+        .map(Json)
+        .map_err(ApiError::from_inventory)
+}
+
 #[utoipa::path(post, path = "/api/v1/sources/hugging-face/resolve", operation_id = "resolveHuggingFaceRepository", tag = "hugging-face",
     request_body(content = HuggingFaceRepositoryRequest, content_type = "application/json"),
     responses(
         (status = 200, description = "Immutable snapshot of the requested live Hugging Face repository", body = HuggingFaceRepositorySnapshot),
         (status = 400, description = "Invalid repository request", body = ErrorResponse),
+        (status = 404, description = "Repository or revision not found", body = ErrorResponse),
+        (status = 409, description = "The operation conflicts with the model's current state", body = ErrorResponse),
+        (status = 422, description = "The repository's metadata or a file's header is invalid", body = ErrorResponse),
         (status = 500, description = "Hugging Face resolution failed", body = ErrorResponse)
     )
 )]
@@ -860,6 +984,37 @@ async fn resolve_hugging_face_repository(
         .resolve(request)
         .await
         .map(Json)
+        .map_err(ApiError::from_inventory)
+}
+
+#[utoipa::path(put, path = "/api/v1/sources/hugging-face/credential", operation_id = "configureHuggingFaceCredential", tag = "hugging-face",
+    request_body(content = HuggingFaceCredential, content_type = "application/json"),
+    responses(
+        (status = 204, description = "Later Hub requests present this token, or none when it is absent. The token is write-only: no response returns it"),
+        (status = 400, description = "Empty token", body = ErrorResponse),
+        (status = 500, description = "The credential could not be applied", body = ErrorResponse)
+    )
+)]
+#[tracing::instrument(name = "icn.hugging_face.configure_credential", skip_all, err(Debug))]
+async fn configure_hugging_face_credential(
+    State(state): State<AppState>,
+    Json(credential): Json<HuggingFaceCredential>,
+) -> Result<StatusCode, ApiError> {
+    let catalog = state
+        .hugging_face_catalog
+        .as_ref()
+        .ok_or_else(|| ApiError::server("Hugging Face discovery is not configured"))?;
+    if credential
+        .token
+        .as_deref()
+        .is_some_and(|token| token.trim().is_empty())
+    {
+        return Err(ApiError::invalid("a Hugging Face token must not be empty"));
+    }
+    catalog
+        .configure_credential(credential)
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
         .map_err(ApiError::from_inventory)
 }
 
@@ -937,6 +1092,44 @@ async fn install_catalog_model(
         .as_ref()
         .ok_or_else(|| ApiError::server("catalog models are not configured"))?
         .install_catalog_model(&parsed_id)
+        .await
+        .map_err(ApiError::from_inventory)?;
+    state.invalidate_resources([
+        InferenceResourceTopic::Catalog,
+        InferenceResourceTopic::CatalogInstallations,
+    ]);
+    Ok(Json(result))
+}
+
+#[utoipa::path(post, path = "/api/v1/catalog/models/{model_id}/components/{component}/install", operation_id = "installCatalogComponent", tag = "catalog",
+    params(
+        ("model_id" = String, Path, description = "Canonical catalog model ID"),
+        ("component" = CatalogComponent, Path, description = "The one component to fetch")
+    ),
+    responses(
+        (status = 200, description = "Catalog installation admission", body = CatalogInstallationAdmission),
+        (status = 404, description = "Catalog model not found", body = ErrorResponse),
+        (status = 409, description = "Installation cannot be admitted", body = ErrorResponse),
+        (status = 500, description = "Installation failed", body = ErrorResponse)
+    )
+)]
+async fn install_catalog_component(
+    State(state): State<AppState>,
+    Path((model_id, component)): Path<(String, CatalogComponent)>,
+) -> Result<Json<CatalogInstallationAdmission>, ApiError> {
+    let parsed_id = model_id
+        .parse::<ModelId>()
+        .map_err(|error| ApiError::invalid(error.to_string()))?;
+    if !matches!(parsed_id.parsed(), ParsedModelId::Catalog { .. }) {
+        return Err(ApiError::invalid(
+            "catalog installation requires a catalog model ID",
+        ));
+    }
+    let result = state
+        .catalog_models
+        .as_ref()
+        .ok_or_else(|| ApiError::server("catalog models are not configured"))?
+        .install_catalog_component(&parsed_id, component)
         .await
         .map_err(ApiError::from_inventory)?;
     state.invalidate_resources([
@@ -1051,36 +1244,425 @@ async fn acknowledge_catalog_installation_failure(
     Ok(Json(result))
 }
 
-#[utoipa::path(get, path = "/api/v1/discovery/models", operation_id = "listDiscoveredModels", tag = "discovery",
-    responses((status = 200, description = "Current non-catalog discoveries", body = DiscoveredModelsResponse))
-)]
-async fn discovered_models(
-    State(state): State<AppState>,
-) -> Result<Json<DiscoveredModelsResponse>, ApiError> {
+fn local_models_domain(state: &AppState) -> Result<&Arc<dyn LocalModels>, ApiError> {
     state
-        .discovered_models
+        .local_models
         .as_ref()
-        .ok_or_else(|| ApiError::server("model discovery is not configured"))?
-        .list_discovered()
+        .ok_or_else(|| ApiError::server("local models are not configured"))
+}
+
+fn model_candidates_domain(state: &AppState) -> Result<&Arc<dyn ModelCandidates>, ApiError> {
+    state
+        .model_candidates
+        .as_ref()
+        .ok_or_else(|| ApiError::server("model candidates are not configured"))
+}
+
+fn model_downloads_domain(state: &AppState) -> Result<&Arc<dyn ModelDownloads>, ApiError> {
+    state
+        .model_downloads
+        .as_ref()
+        .ok_or_else(|| ApiError::server("model downloads are not configured"))
+}
+
+#[utoipa::path(get, path = "/api/v1/local-models/configuration", operation_id = "getLocalModelsConfiguration", tag = "local-models",
+    responses(
+        (status = 200, description = "The active local-models configuration", body = LocalModelsConfiguration),
+        (status = 500, description = "Local models unavailable", body = ErrorResponse)
+    )
+)]
+async fn local_models_configuration(
+    State(state): State<AppState>,
+) -> Result<Json<LocalModelsConfiguration>, ApiError> {
+    local_models_domain(&state)?
+        .configuration()
         .await
         .map(Json)
         .map_err(ApiError::from_inventory)
 }
 
-#[utoipa::path(post, path = "/api/v1/discovery/refresh", operation_id = "refreshDiscoveredModels", tag = "discovery",
-    responses((status = 200, description = "Refreshed discovery snapshot", body = DiscoveredModelsResponse))
+#[utoipa::path(put, path = "/api/v1/local-models/configuration", operation_id = "configureLocalModels", tag = "local-models",
+    request_body(content = LocalModelsConfiguration, content_type = "application/json"),
+    responses(
+        (status = 200, description = "The applied local-models configuration; applying the same snapshot again changes nothing", body = LocalModelsConfiguration),
+        (status = 400, description = "Invalid configuration", body = ErrorResponse),
+        (status = 500, description = "Configuration could not be applied", body = ErrorResponse)
+    )
 )]
-async fn refresh_discovery(
+#[tracing::instrument(name = "icn.local_models.configure", skip_all, err(Debug))]
+async fn configure_local_models(
     State(state): State<AppState>,
-) -> Result<Json<DiscoveredModelsResponse>, ApiError> {
-    let result = state
-        .discovered_models
-        .as_ref()
-        .ok_or_else(|| ApiError::server("model discovery is not configured"))?
-        .refresh_discovery()
+    Json(configuration): Json<LocalModelsConfiguration>,
+) -> Result<Json<LocalModelsConfiguration>, ApiError> {
+    let result = local_models_domain(&state)?
+        .configure(configuration)
         .await
         .map_err(ApiError::from_inventory)?;
-    state.invalidate_resources([InferenceResourceTopic::Discovery]);
+    state.invalidate_resources([InferenceResourceTopic::LocalModels]);
+    Ok(Json(result))
+}
+
+#[utoipa::path(get, path = "/api/v1/local-models", operation_id = "listLocalModels", tag = "local-models",
+    responses(
+        (status = 200, description = "Custom models on this computer, and the ones the engine cannot run", body = LocalModelsResponse),
+        (status = 500, description = "Local models unavailable", body = ErrorResponse)
+    )
+)]
+async fn local_models(
+    State(state): State<AppState>,
+) -> Result<Json<LocalModelsResponse>, ApiError> {
+    local_models_domain(&state)?
+        .list_local()
+        .await
+        .map(Json)
+        .map_err(ApiError::from_inventory)
+}
+
+#[utoipa::path(post, path = "/api/v1/local-models/refresh", operation_id = "refreshLocalModels", tag = "local-models",
+    responses(
+        (status = 200, description = "Local models after a rescan of every enabled root", body = LocalModelsResponse),
+        (status = 500, description = "Rescan failed", body = ErrorResponse)
+    )
+)]
+async fn refresh_local_models(
+    State(state): State<AppState>,
+) -> Result<Json<LocalModelsResponse>, ApiError> {
+    let result = local_models_domain(&state)?
+        .refresh_local()
+        .await
+        .map_err(ApiError::from_inventory)?;
+    state.invalidate_resources([InferenceResourceTopic::LocalModels]);
+    Ok(Json(result))
+}
+
+#[utoipa::path(delete, path = "/api/v1/local-models/{model_id}/files", operation_id = "removeLocalModelFiles", tag = "local-models",
+    params(("model_id" = String, Path, description = "Canonical custom model ID of an added model")),
+    responses(
+        (status = 200, description = "Magnitude's copy of the added model was removed; files in other locations are never touched", body = LocalModelRemoval),
+        (status = 400, description = "Not a custom model ID", body = ErrorResponse),
+        (status = 404, description = "Custom model not found", body = ErrorResponse),
+        (status = 409, description = "The model is not an added model, so its files are never removed", body = ErrorResponse),
+        (status = 500, description = "Removal failed", body = ErrorResponse)
+    )
+)]
+async fn remove_local_model_files(
+    State(state): State<AppState>,
+    Path(model_id): Path<String>,
+) -> Result<Json<LocalModelRemoval>, ApiError> {
+    let model_id = model_id
+        .parse::<ModelId>()
+        .map_err(|error| ApiError::invalid(error.to_string()))?;
+    if matches!(model_id.parsed(), ParsedModelId::Catalog { .. }) {
+        return Err(ApiError::invalid(
+            "local-model removal requires a custom model ID",
+        ));
+    }
+    let result = local_models_domain(&state)?
+        .remove_local(&model_id)
+        .await
+        .map_err(ApiError::from_inventory)?;
+    state.invalidate_resources([InferenceResourceTopic::LocalModels]);
+    Ok(Json(result))
+}
+
+#[utoipa::path(post, path = "/api/v1/local-models/drafters/prune", operation_id = "pruneLocalDrafters", tag = "local-models",
+    responses(
+        (status = 200, description = "Magnitude-owned drafter packages no model uses were removed; drafters in other locations are never touched", body = DrafterPruning),
+        (status = 500, description = "Removal failed", body = ErrorResponse)
+    )
+)]
+#[tracing::instrument(name = "icn.local_models.prune_drafters", skip_all, err(Debug))]
+async fn prune_local_drafters(
+    State(state): State<AppState>,
+) -> Result<Json<DrafterPruning>, ApiError> {
+    let result = local_models_domain(&state)?
+        .prune_drafters()
+        .await
+        .map_err(ApiError::from_inventory)?;
+    if !result.removed.is_empty() {
+        state.invalidate_resources([InferenceResourceTopic::LocalModels]);
+    }
+    Ok(Json(result))
+}
+
+#[utoipa::path(post, path = "/api/v1/candidates/inspect", operation_id = "inspectModelCandidate", tag = "candidates",
+    request_body(content = CandidateInspectionRequest, content_type = "application/json"),
+    responses(
+        (status = 200, description = "Every version of the candidate with the engine's verdict", body = CandidateInspection),
+        (status = 400, description = "Invalid candidate", body = ErrorResponse),
+        (status = 404, description = "Repository, revision or file not found", body = ErrorResponse),
+        (status = 409, description = "The operation conflicts with the model's current state", body = ErrorResponse),
+        (status = 422, description = "The repository's metadata or a file's header is invalid", body = ErrorResponse),
+        (status = 500, description = "Inspection failed", body = ErrorResponse)
+    )
+)]
+#[tracing::instrument(name = "icn.candidates.inspect", skip_all, err(Debug))]
+async fn inspect_model_candidate(
+    State(state): State<AppState>,
+    Json(request): Json<CandidateInspectionRequest>,
+) -> Result<Json<CandidateInspection>, ApiError> {
+    model_candidates_domain(&state)?
+        .inspect(request)
+        .await
+        .map(Json)
+        .map_err(ApiError::from_inventory)
+}
+
+#[utoipa::path(post, path = "/api/v1/candidates/inspect/stream", operation_id = "streamModelCandidateInspection", tag = "candidates",
+    request_body(content = CandidateInspectionRequest, content_type = "application/json"),
+    responses(
+        (status = 200, description = "The inspection's progress in order, then the inspection; a failure after the first event is an `error` event", body = String, content_type = "text/event-stream"),
+        (status = 400, description = "Invalid candidate", body = ErrorResponse),
+        (status = 404, description = "Repository, revision or file not found", body = ErrorResponse),
+        (status = 409, description = "The operation conflicts with the model's current state", body = ErrorResponse),
+        (status = 422, description = "The repository's metadata or a file's header is invalid", body = ErrorResponse),
+        (status = 500, description = "Inspection failed", body = ErrorResponse)
+    )
+)]
+#[tracing::instrument(name = "icn.candidates.inspect_stream", skip_all, err(Debug))]
+async fn stream_model_candidate_inspection(
+    State(state): State<AppState>,
+    Json(request): Json<CandidateInspectionRequest>,
+) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    let candidates = Arc::clone(model_candidates_domain(&state)?);
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let progress = CandidateInspectionProgressSink::new(move |progress| {
+        let _ = sender.send(progress);
+    });
+    let mut inspection: BoxFuture<'static, Result<CandidateInspection, InventoryError>> =
+        Box::pin(async move { candidates.inspect_with_progress(request, progress).await });
+    // A failure before the first progress (a repository or revision that can't be resolved) is
+    // the response's own status, as the request/response inspection reports it.
+    let stage = tokio::select! {
+        biased;
+        Some(progress) = receiver.recv() => InspectionStage::Running { first: Some(progress), receiver, inspection },
+        result = &mut inspection => match receiver.try_recv() {
+            Ok(progress) => InspectionStage::Draining { first: Some(progress), receiver, result },
+            Err(_) => match result {
+                Ok(inspection) => InspectionStage::Draining { first: None, receiver, result: Ok(inspection) },
+                Err(error) => return Err(ApiError::from_inventory(error)),
+            },
+        },
+    };
+    let events = futures_util::stream::unfold(stage, |stage| async move {
+        match stage {
+            InspectionStage::Running {
+                first: Some(progress),
+                receiver,
+                inspection,
+            } => Some((
+                progress_event(progress),
+                InspectionStage::Running {
+                    first: None,
+                    receiver,
+                    inspection,
+                },
+            )),
+            InspectionStage::Running {
+                first: None,
+                mut receiver,
+                mut inspection,
+            } => tokio::select! {
+                biased;
+                Some(progress) = receiver.recv() => Some((
+                    progress_event(progress),
+                    InspectionStage::Running { first: None, receiver, inspection },
+                )),
+                result = &mut inspection => {
+                    // Progress reported in the same poll that finished the inspection comes first.
+                    let first = receiver.try_recv().ok();
+                    match first {
+                        Some(progress) => Some((
+                            progress_event(progress),
+                            InspectionStage::Draining { first: None, receiver, result },
+                        )),
+                        None => Some((inspection_outcome_event(result), InspectionStage::Done)),
+                    }
+                },
+            },
+            InspectionStage::Draining {
+                first,
+                mut receiver,
+                result,
+            } => match first.or_else(|| receiver.try_recv().ok()) {
+                Some(progress) => Some((
+                    progress_event(progress),
+                    InspectionStage::Draining {
+                        first: None,
+                        receiver,
+                        result,
+                    },
+                )),
+                None => Some((inspection_outcome_event(result), InspectionStage::Done)),
+            },
+            InspectionStage::Done => None,
+        }
+    });
+    Ok(Sse::new(events).keep_alive(KeepAlive::default()))
+}
+
+/// The stream's progress through an inspection: running, then any progress still buffered once
+/// it finished, then its outcome.
+enum InspectionStage {
+    Running {
+        first: Option<CandidateInspectionProgress>,
+        receiver: tokio::sync::mpsc::UnboundedReceiver<CandidateInspectionProgress>,
+        inspection: BoxFuture<'static, Result<CandidateInspection, InventoryError>>,
+    },
+    Draining {
+        first: Option<CandidateInspectionProgress>,
+        receiver: tokio::sync::mpsc::UnboundedReceiver<CandidateInspectionProgress>,
+        result: Result<CandidateInspection, InventoryError>,
+    },
+    Done,
+}
+
+fn progress_event(progress: CandidateInspectionProgress) -> Result<Event, Infallible> {
+    Ok(Event::default().data(
+        serde_json::to_string(&CandidateInspectionEvent::Progress { progress })
+            .expect("inspection progress is serializable"),
+    ))
+}
+
+/// The inspection, or its failure as an `error` event carrying the error the request/response
+/// inspection would have returned.
+fn inspection_outcome_event(
+    result: Result<CandidateInspection, InventoryError>,
+) -> Result<Event, Infallible> {
+    Ok(match result {
+        Ok(inspection) => Event::default().data(
+            serde_json::to_string(&CandidateInspectionEvent::Inspected { inspection })
+                .expect("inspection is serializable"),
+        ),
+        Err(error) => Event::default().event("error").data(
+            serde_json::to_string(&ApiError::from_inventory(error).body)
+                .expect("error response is serializable"),
+        ),
+    })
+}
+
+#[utoipa::path(post, path = "/api/v1/candidates/drafters", operation_id = "listDrafterCandidates", tag = "candidates",
+    request_body(content = DrafterCandidatesRequest, content_type = "application/json"),
+    responses(
+        (status = 200, description = "Drafter candidates for the target, in category order", body = DrafterCandidatesResponse),
+        (status = 400, description = "Invalid target", body = ErrorResponse),
+        (status = 404, description = "Target not found", body = ErrorResponse),
+        (status = 409, description = "The operation conflicts with the model's current state", body = ErrorResponse),
+        (status = 422, description = "The repository's metadata or a file's header is invalid", body = ErrorResponse),
+        (status = 500, description = "Enumeration failed", body = ErrorResponse)
+    )
+)]
+#[tracing::instrument(name = "icn.candidates.drafters", skip_all, err(Debug))]
+async fn drafter_candidates(
+    State(state): State<AppState>,
+    Json(request): Json<DrafterCandidatesRequest>,
+) -> Result<Json<DrafterCandidatesResponse>, ApiError> {
+    model_candidates_domain(&state)?
+        .drafters(request)
+        .await
+        .map(Json)
+        .map_err(ApiError::from_inventory)
+}
+
+#[utoipa::path(post, path = "/api/v1/model-assessments/candidates", operation_id = "assessModelCandidate", tag = "models",
+    request_body(content = ModelCandidate, content_type = "application/json"),
+    responses(
+        (status = 200, description = "The engine's header-only verdict for the candidate", body = ModelAssessment),
+        (status = 400, description = "Invalid candidate", body = ErrorResponse),
+        (status = 404, description = "Candidate file not found", body = ErrorResponse),
+        (status = 409, description = "The operation conflicts with the model's current state", body = ErrorResponse),
+        (status = 422, description = "The repository's metadata or a file's header is invalid", body = ErrorResponse),
+        (status = 500, description = "Assessment failed", body = ErrorResponse)
+    )
+)]
+#[tracing::instrument(name = "icn.candidates.assess", skip_all, err(Debug))]
+async fn assess_model_candidate(
+    State(state): State<AppState>,
+    Json(candidate): Json<ModelCandidate>,
+) -> Result<Json<ModelAssessment>, ApiError> {
+    model_candidates_domain(&state)?
+        .assess_candidate(candidate)
+        .await
+        .map(Json)
+        .map_err(ApiError::from_inventory)
+}
+
+#[utoipa::path(get, path = "/api/v1/downloads", operation_id = "listModelDownloads", tag = "downloads",
+    responses(
+        (status = 200, description = "Model bundle downloads", body = ModelDownloadsResponse),
+        (status = 500, description = "Downloads unavailable", body = ErrorResponse)
+    )
+)]
+async fn model_downloads(
+    State(state): State<AppState>,
+) -> Result<Json<ModelDownloadsResponse>, ApiError> {
+    model_downloads_domain(&state)?
+        .list()
+        .await
+        .map(Json)
+        .map_err(ApiError::from_inventory)
+}
+
+#[utoipa::path(post, path = "/api/v1/downloads", operation_id = "startModelDownload", tag = "downloads",
+    request_body(content = StartModelDownloadRequest, content_type = "application/json"),
+    responses(
+        (status = 200, description = "The admitted download, absent when the bundle is already installed", body = StartModelDownloadResponse),
+        (status = 400, description = "Invalid bundle", body = ErrorResponse),
+        (status = 409, description = "Download cannot be admitted", body = ErrorResponse),
+        (status = 500, description = "Download failed to start", body = ErrorResponse)
+    )
+)]
+#[tracing::instrument(name = "icn.downloads.start", skip_all, err(Debug))]
+async fn start_model_download(
+    State(state): State<AppState>,
+    Json(request): Json<StartModelDownloadRequest>,
+) -> Result<Json<StartModelDownloadResponse>, ApiError> {
+    let result = model_downloads_domain(&state)?
+        .start(request)
+        .await
+        .map_err(ApiError::from_inventory)?;
+    state.invalidate_resources([InferenceResourceTopic::Downloads]);
+    Ok(Json(result))
+}
+
+#[utoipa::path(post, path = "/api/v1/downloads/{download_id}/cancel", operation_id = "cancelModelDownload", tag = "downloads",
+    params(("download_id" = String, Path, description = "Model download ID")),
+    responses(
+        (status = 200, description = "The cancelled download", body = ModelDownload),
+        (status = 404, description = "Download not found", body = ErrorResponse),
+        (status = 500, description = "Cancellation failed", body = ErrorResponse)
+    )
+)]
+async fn cancel_model_download(
+    State(state): State<AppState>,
+    Path(download_id): Path<String>,
+) -> Result<Json<ModelDownload>, ApiError> {
+    let result = model_downloads_domain(&state)?
+        .cancel(&ModelDownloadId(download_id))
+        .await
+        .map_err(ApiError::from_inventory)?;
+    state.invalidate_resources([InferenceResourceTopic::Downloads]);
+    Ok(Json(result))
+}
+
+#[utoipa::path(post, path = "/api/v1/downloads/{download_id}/acknowledge-failure", operation_id = "acknowledgeModelDownloadFailure", tag = "downloads",
+    params(("download_id" = String, Path, description = "Model download ID")),
+    responses(
+        (status = 200, description = "The download with its failure acknowledged", body = ModelDownload),
+        (status = 404, description = "Download not found", body = ErrorResponse),
+        (status = 409, description = "Download has not failed", body = ErrorResponse),
+        (status = 500, description = "Acknowledgement failed", body = ErrorResponse)
+    )
+)]
+async fn acknowledge_model_download_failure(
+    State(state): State<AppState>,
+    Path(download_id): Path<String>,
+) -> Result<Json<ModelDownload>, ApiError> {
+    let result = model_downloads_domain(&state)?
+        .acknowledge_failure(&ModelDownloadId(download_id))
+        .await
+        .map_err(ApiError::from_inventory)?;
+    state.invalidate_resources([InferenceResourceTopic::Downloads]);
     Ok(Json(result))
 }
 
@@ -1117,11 +1699,8 @@ async fn standard_models(
         .list_catalog()
         .await
         .map_err(ApiError::from_inventory)?;
-    let discovered = state
-        .discovered_models
-        .as_ref()
-        .ok_or_else(|| ApiError::server("model discovery is not configured"))?
-        .list_discovered()
+    let local = local_models_domain(&state)?
+        .list_local()
         .await
         .map_err(ApiError::from_inventory)?;
     let assessment_snapshot = state
@@ -1131,71 +1710,90 @@ async fn standard_models(
         .snapshot()
         .await
         .map_err(ApiError::from_inventory)?;
-    let assessed_capabilities = assessed_capabilities(&assessment_snapshot);
+    let offered = offered_models(&assessment_snapshot);
     let catalog_models = catalog.models.into_iter().filter_map(|model| {
         let CatalogModelState::Installed { effective, .. } = model.local_state else {
             return None;
         };
-        let EffectiveModel::Ready { model: target } = effective else {
+        let EffectiveModel::Ready { .. } = effective else {
             return None;
         };
-        let capabilities = assessed_capabilities.get(&ModelAssessmentSubject::Catalog {
+        let offered = offered.get(&ModelAssessmentSubject::Catalog {
             model_id: model.id.clone(),
             selection: magnitude_service_contracts::models::CatalogModelSelection::Effective,
         })?;
         let name = format!("{} ({})", model.display_name, model.variant_label);
         let id = model.id.to_string();
-        Some(open_ai_model(
+        open_ai_model(
             id,
             "magnitude",
             name,
             model.description,
-            target.profile.context_length,
-            capabilities.clone(),
-        ))
+            offered.served.context_length,
+            offered.capabilities.clone(),
+        )
     });
-    let discovered_models = discovered.models.into_iter().filter_map(|model| {
-        let DiscoveredModel { id, state } = model;
-        let DiscoveredModelState::Ready { model: target, .. } = state else {
+    let custom_models = local.models.into_iter().filter_map(|model| {
+        let CustomModelState::Ready { .. } = &model.state else {
             return None;
         };
-        let capabilities = assessed_capabilities.get(&ModelAssessmentSubject::Discovery {
-            model_id: id.clone(),
+        let offered = offered.get(&ModelAssessmentSubject::Custom {
+            model_id: model.model_id.clone(),
         })?;
-        let ParsedModelId::HuggingFace {
-            repository_id,
-            artifact_selector,
-        } = id.parsed()
-        else {
-            return None;
-        };
-        let display_name = std::path::Path::new(artifact_selector.as_str())
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or(artifact_selector.as_str())
-            .to_owned();
-        let repository = repository_id.as_str().to_owned();
-        let id = id.to_string();
-        Some(open_ai_model(
-            id,
-            "huggingface-cache",
-            display_name,
-            format!("Discovered in Hugging Face cache from {repository}"),
-            target.profile.context_length,
-            capabilities.clone(),
-        ))
+        let (owned_by, description) = custom_model_source(&model);
+        open_ai_model(
+            model.model_id.to_string(),
+            owned_by,
+            model.display_name,
+            description,
+            offered.served.context_length,
+            offered.capabilities.clone(),
+        )
     });
-    let data = catalog_models.chain(discovered_models).collect();
+    let data = catalog_models.chain(custom_models).collect();
     Ok(Json(OpenAiModelsResponse {
         object: "list",
         data,
     }))
 }
 
-fn assessed_capabilities(
-    snapshot: &ModelAssessmentsSnapshot,
-) -> BTreeMap<ModelAssessmentSubject, ModelCapabilities> {
-    [&snapshot.catalog, &snapshot.discovered]
+/// The `owned_by` label and description of a custom model, which name where its files came from.
+fn custom_model_source(model: &CustomModel) -> (&'static str, String) {
+    let repository = match model.model_id.parsed() {
+        ParsedModelId::HuggingFace { repository_id, .. } => Some(repository_id),
+        ParsedModelId::Catalog { .. } | ParsedModelId::Local { .. } => None,
+    };
+    let from = |label: &str| match &repository {
+        Some(repository) => format!("{label} ({repository})", repository = repository.as_str()),
+        None => label.to_owned(),
+    };
+    match &model.origin {
+        CustomModelOrigin::Added { repository, .. } => (
+            "huggingface",
+            format!("Added from Hugging Face ({})", repository.as_str()),
+        ),
+        CustomModelOrigin::Found { source } => match source {
+            FoundSource::HuggingFaceCache => {
+                ("huggingface-cache", from("Found in the Hugging Face cache"))
+            }
+            FoundSource::LmStudio => ("lm-studio", from("Found in LM Studio")),
+            FoundSource::LlamaCpp => ("llama-cpp", from("Found in the llama.cpp cache")),
+            FoundSource::Ollama => ("ollama", from("Found in Ollama")),
+            FoundSource::Folder { path } => ("folder", format!("Found in {}", path.display())),
+        },
+    }
+}
+
+/// What an offered model serves: its capabilities, at the context it is served at.
+struct OfferedModel {
+    capabilities: ModelCapabilities,
+    served: magnitude_service_contracts::models::ServingProfile,
+}
+
+/// Every offered model: one whose assessment is `Fits`. A model that does not fit or that the
+/// engine cannot run is never offered for inference.
+fn offered_models(snapshot: &ModelAssessmentsSnapshot) -> BTreeMap<ModelAssessmentSubject, OfferedModel> {
+    [&snapshot.catalog, &snapshot.custom]
         .into_iter()
         .filter_map(|domain| match domain {
             ModelAssessmentDomainSnapshot::Available { entries, .. } => Some(entries),
@@ -1203,14 +1801,30 @@ fn assessed_capabilities(
         })
         .flatten()
         .filter_map(|entry| match &entry.state {
-            ModelAssessmentEntryState::Assessed { capabilities, .. } => {
-                Some((entry.subject.clone(), capabilities.clone()))
-            }
-            ModelAssessmentEntryState::Assessing | ModelAssessmentEntryState::Dropped => None,
+            ModelAssessmentEntryState::Assessed {
+                capabilities,
+                profiles,
+                ..
+            } => match profiles.first() {
+                Some(ModelAssessment::Fits { served, .. }) => Some((
+                    entry.subject.clone(),
+                    OfferedModel {
+                        capabilities: capabilities.clone(),
+                        served: served.clone(),
+                    },
+                )),
+                _ => None,
+            },
+            ModelAssessmentEntryState::Assessed { .. }
+            | ModelAssessmentEntryState::Assessing
+            | ModelAssessmentEntryState::Dropped => None,
         })
         .collect()
 }
 
+/// An offered model's OpenAI listing entry. A model that supports reasoning but has no default
+/// effort is an incomplete assessment: it is left out of the listing rather than taking down every
+/// other model's entry.
 fn open_ai_model(
     id: String,
     owned_by: &'static str,
@@ -1218,7 +1832,7 @@ fn open_ai_model(
     description: String,
     context_length: u32,
     capabilities: magnitude_service_contracts::models::ModelCapabilities,
-) -> OpenAiModel {
+) -> Option<OpenAiModel> {
     let mut supported_parameters = vec!["max_tokens"];
     if capabilities.tools {
         supported_parameters.extend(["tools", "tool_choice"]);
@@ -1226,29 +1840,31 @@ fn open_ai_model(
     if capabilities.structured_output {
         supported_parameters.extend(["structured_outputs", "response_format"]);
     }
-    let reasoning = capabilities.reasoning.supported.then(|| {
-        supported_parameters.push("reasoning");
-        let default_effort = capabilities
-            .reasoning
-            .default_effort
-            .clone()
-            .expect("assessed reasoning capabilities must include a default effort");
-        OpenAiModelReasoning {
-            default_enabled: default_effort != "none",
-            mandatory: !capabilities
-                .reasoning
-                .efforts
-                .iter()
-                .any(|effort| effort == "none"),
-            supported_efforts: capabilities.reasoning.efforts,
-            default_effort,
+    let reasoning = match (
+        capabilities.reasoning.supported,
+        capabilities.reasoning.default_effort,
+    ) {
+        (false, _) => None,
+        (true, Some(default_effort)) => {
+            supported_parameters.push("reasoning");
+            Some(OpenAiModelReasoning {
+                default_enabled: default_effort != "none",
+                mandatory: !capabilities
+                    .reasoning
+                    .efforts
+                    .iter()
+                    .any(|effort| effort == "none"),
+                supported_efforts: capabilities.reasoning.efforts,
+                default_effort,
+            })
         }
-    });
+        (true, None) => return None,
+    };
     let mut input_modalities = vec!["text"];
     if capabilities.vision {
         input_modalities.push("image");
     }
-    OpenAiModel {
+    Some(OpenAiModel {
         id,
         object: "model",
         created: 0,
@@ -1264,9 +1880,9 @@ fn open_ai_model(
         reasoning,
         top_provider: OpenAiTopProvider {
             context_length,
-            max_completion_tokens: context_length.min(CONNECTOR_MAX_OUTPUT_TOKENS),
+            max_completion_tokens: connector_max_output_tokens(context_length),
         },
-    }
+    })
 }
 
 #[derive(OpenApi)]
@@ -1278,17 +1894,32 @@ fn open_ai_model(
         catalog_models,
         catalog_model,
         install_catalog_model,
+        install_catalog_component,
         remove_catalog_model_installation,
         catalog_installations,
         catalog_installation,
         cancel_catalog_installation,
         acknowledge_catalog_installation_failure,
-        discovered_models,
-        refresh_discovery,
+        local_models_configuration,
+        configure_local_models,
+        local_models,
+        refresh_local_models,
+        remove_local_model_files,
+        prune_local_drafters,
+        inspect_model_candidate,
+        stream_model_candidate_inspection,
+        drafter_candidates,
         model_assessments,
+        assess_model_candidate,
+        model_downloads,
+        start_model_download,
+        cancel_model_download,
+        acknowledge_model_download_failure,
         standard_models,
         search_hugging_face_models,
+        check_hugging_face_repository,
         resolve_hugging_face_repository,
+        configure_hugging_face_credential,
         preview_model_load,
         ensure_model_instance,
         model_instances,
@@ -1306,11 +1937,25 @@ fn open_ai_model(
         HealthResponse,
         HardwareSnapshot,
         CatalogModelsResponse,
-        DiscoveredModelsResponse,
+        LocalModelsConfiguration,
+        LocalModelsResponse,
+        LocalModelRemoval,
+        DrafterPruning,
+        CandidateInspectionRequest,
+        CandidateInspection,
+        DrafterCandidatesRequest,
+        DrafterCandidatesResponse,
+        ModelCandidate,
+        ModelAssessment,
+        ModelDownloadsResponse,
+        StartModelDownloadRequest,
+        StartModelDownloadResponse,
+        ModelDownload,
         ModelAssessmentsSnapshot,
         CatalogInstallationsResponse,
         CatalogInstallationAdmission,
         CatalogInstallationRemoval,
+        CatalogComponent,
         EnsureModelInstanceRequest,
         OpenAiModel,
         OpenAiModelArchitecture,
@@ -1319,8 +1964,11 @@ fn open_ai_model(
         OpenAiModelsResponse,
         HuggingFaceModelSearchRequest,
         HuggingFaceModelSearchResults,
+        HuggingFaceRepositoryCheckRequest,
+        HuggingFaceRepositoryCheck,
         HuggingFaceRepositoryRequest,
         HuggingFaceRepositorySnapshot,
+        HuggingFaceCredential,
         ModelLoadPlan,
         ModelInstancesSnapshot,
         ModelInstancesInvalidation,
@@ -1375,11 +2023,8 @@ fn open_ai_model(
         IcnBinaryIdentity,
         IcnStartupRecord,
         IcnStartupRecordType,
-        IcnStartupProgressRecord,
         IcnParentCommand,
         IcnParentCommandType,
-        IcnStartupProgressRecordType,
-        IcnStartupBackend,
         IcnInstallationDeclaration,
         ExecutionBackend,
         ModelLoadDevice
@@ -1486,6 +2131,29 @@ impl StreamContract for ResponsesStream {
     }
 }
 
+struct CandidateInspectionStream;
+
+impl StreamContract for CandidateInspectionStream {
+    type Event = CandidateInspectionEvent;
+    const RESPONSE_STATUS: u16 = 200;
+
+    fn metadata() -> StreamMetadata {
+        StreamMetadata {
+            version: 1,
+            response_status: Self::RESPONSE_STATUS,
+            framing: StreamFraming::Sse,
+            data: StreamData {
+                encoding: "json",
+                schema: StreamSchemaRef {
+                    reference: format!("#/components/schemas/{}", Self::Event::name()),
+                },
+            },
+            termination: StreamTermination::Eof,
+            reconnect: StreamReconnect::None,
+        }
+    }
+}
+
 struct InferenceEventsStream;
 
 impl StreamContract for InferenceEventsStream {
@@ -1544,6 +2212,11 @@ pub fn openapi() -> Result<OpenApiDocument, OpenApiExportError> {
     attach_stream_contract::<InferenceEventsStream>(
         &mut document,
         "watchInferenceEvents",
+        "text/event-stream",
+    )?;
+    attach_stream_contract::<CandidateInspectionStream>(
+        &mut document,
+        "streamModelCandidateInspection",
         "text/event-stream",
     )?;
     Ok(document)
@@ -1716,11 +2389,12 @@ mod tests {
                     default_effort: Some("high".to_owned()),
                 },
             },
-        );
+        )
+        .expect("listed model");
 
         let value = serde_json::to_value(model).expect("serializable model");
         assert_eq!(value["context_length"], 65_536);
-        assert_eq!(value["top_provider"]["max_completion_tokens"], 32_768);
+        assert_eq!(value["top_provider"]["max_completion_tokens"], 16_384);
         assert_eq!(
             value["architecture"]["input_modalities"],
             json!(["text", "image"])
@@ -1781,16 +2455,27 @@ mod tests {
         }
     }
 
-    struct StubHuggingFaceCatalog;
+    #[derive(Default)]
+    struct StubHuggingFaceCatalog {
+        credentials: std::sync::Mutex<Vec<Option<String>>>,
+    }
 
     impl HuggingFaceModelCatalog for StubHuggingFaceCatalog {
+        fn configure_credential(
+            &self,
+            credential: HuggingFaceCredential,
+        ) -> BoxFuture<'_, Result<(), InventoryError>> {
+            self.credentials.lock().unwrap().push(credential.token);
+            Box::pin(async { Ok(()) })
+        }
+
         fn search(
             &self,
             request: HuggingFaceModelSearchRequest,
         ) -> BoxFuture<'_, Result<HuggingFaceModelSearchResults, InventoryError>> {
             Box::pin(async move {
                 Ok(HuggingFaceModelSearchResults {
-                    models: vec![magnitude_service_contracts::HuggingFaceModelSearchResult {
+                    results: vec![magnitude_service_contracts::HuggingFaceModelSearchResult {
                         repository: format!("owner/{}", request.query),
                         commit: "a".repeat(40),
                         last_modified: None,
@@ -1799,7 +2484,31 @@ mod tests {
                         gated: false,
                         private: false,
                         tags: vec!["gguf".to_owned()],
+                        architecture: Some("qwen35moe".to_owned()),
+                        developer: None,
+                        version_count: Some(3),
+                        base: Some(magnitude_service_contracts::HuggingFaceModelBase {
+                            repository: "Qwen/Qwen3.6-35B-A3B".to_owned(),
+                            relation: magnitude_service_contracts::HuggingFaceBaseRelation::Quantized,
+                        }),
                     }],
+                    next_cursor: None,
+                })
+            })
+        }
+
+        fn check(
+            &self,
+            request: HuggingFaceRepositoryCheckRequest,
+        ) -> BoxFuture<'_, Result<HuggingFaceRepositoryCheck, InventoryError>> {
+            Box::pin(async move {
+                Ok(HuggingFaceRepositoryCheck::Model {
+                    architecture: request.architecture,
+                    variant_of: Some("qwen3.6-35b-a3b:gguf:q4".parse().unwrap()),
+                    developer: None,
+                    base: None,
+                    unsupported: Vec::new(),
+                    recommended: None,
                 })
             })
         }
@@ -1850,31 +2559,33 @@ mod tests {
                     "architecture": "test64",
                     "cpu_model": "Test CPU",
                     "logical_cores": 8,
-                    "system_memory": {
-                        "physical_capacity_bytes": 1024,
-                        "physical_available_bytes": 512,
-                        "allocation_capacity_bytes": 1024,
-                        "allocation_headroom_bytes": 512,
-                        "assess_reserve_bytes": 128,
-                        "abort_reserve_bytes": 64
-                    },
                     "native_build": "test-build",
-                    "enabled_backends": ["cpu"],
                     "topology_fingerprint": "topology",
-                    "memory_domains": [{
-                        "id": "system",
-                        "kind": "system",
-                        "total_capacity_bytes": 1024,
-                        "stable_capacity_bytes": 768,
-                        "current_free_bytes": 512,
-                        "shares_system_memory": true,
-                        "devices": [{
+                    "host_ram": {
+                        "store": {
+                            "id": "system",
+                            "total_capacity_bytes": 1024,
+                            "allocation_capacity_bytes": 1024,
+                            "capacity_basis": "linux_mem_total"
+                        },
+                        "current_free_bytes": 512
+                    },
+                    "device_memory": [],
+                    "volumes": [],
+                    "access_paths": [{
+                        "id": 0, "executor": "cpu", "store": "system", "grant": null
+                    }],
+                    "transfer_paths": [],
+                    "selected_executor": "cpu",
+                    "physical_devices": [{
+                        "id": "host", "kind": "cpu",
+                        "executors": [{
                             "id": "cpu",
                             "backend": "cpu",
                             "name": "CPU",
                             "description": "Test CPU",
-                            "kind": "cpu",
-                            "memory_limit": null
+                            "device_placement": [0], "upload_placement": [0],
+                            "availability": { "type": "available", "stable_capacity_bytes": 768 }
                         }]
                     }]
                 }))
@@ -1898,12 +2609,12 @@ mod tests {
             serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
                 .unwrap();
         assert_eq!(body["topology_fingerprint"], "topology");
-        assert_eq!(body["memory_domains"][0]["stable_capacity_bytes"], 768);
+        assert_eq!(body["host_ram"]["store"]["allocation_capacity_bytes"], 1024);
     }
 
     #[tokio::test]
     async fn hugging_face_endpoints_expose_live_search_and_immutable_resolution() {
-        let state = AppState::new().with_hugging_face_catalog(Arc::new(StubHuggingFaceCatalog));
+        let state = AppState::new().with_hugging_face_catalog(Arc::new(StubHuggingFaceCatalog::default()));
         let search = test_app(state.clone())
             .oneshot(
                 Request::post("/api/v1/sources/hugging-face/search")
@@ -1919,7 +2630,32 @@ mod tests {
         let search_body: Value =
             serde_json::from_slice(&search.into_body().collect().await.unwrap().to_bytes())
                 .unwrap();
-        assert_eq!(search_body["models"][0]["repository"], "owner/model");
+        assert_eq!(search_body["results"][0]["repository"], "owner/model");
+        assert!(search_body["results"][0].get("lastModified").is_none());
+        assert_eq!(
+            search_body["results"][0]["base"],
+            serde_json::json!({ "repository": "Qwen/Qwen3.6-35B-A3B", "relation": "quantized" })
+        );
+
+        let check = test_app(state.clone())
+            .oneshot(
+                Request::post("/api/v1/sources/hugging-face/check")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "repository": "owner/model", "commit": "a".repeat(40), "architecture": "qwen35moe", "restricted": false }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(check.status(), StatusCode::OK);
+        let check_body: Value =
+            serde_json::from_slice(&check.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(check_body["_tag"], "Model");
+        assert_eq!(check_body["variantOf"], "qwen3.6-35b-a3b:gguf:q4");
+        assert_eq!(check_body["unsupported"], json!([]));
+        assert!(check_body.get("recommended").is_none());
 
         let resolve = test_app(state)
             .oneshot(
@@ -1937,7 +2673,61 @@ mod tests {
             serde_json::from_slice(&resolve.into_body().collect().await.unwrap().to_bytes())
                 .unwrap();
         assert_eq!(resolve_body["commit"], "b".repeat(40));
-        assert_eq!(resolve_body["gguf_files"][0]["size_bytes"], 123);
+        assert_eq!(resolve_body["ggufFiles"][0]["sizeBytes"], 123);
+    }
+
+    #[tokio::test]
+    async fn the_hugging_face_credential_is_write_only_and_absent_means_anonymous() {
+        let catalog = Arc::new(StubHuggingFaceCatalog::default());
+        let state = AppState::new().with_hugging_face_catalog(catalog.clone());
+        for body in [json!({ "token": "hf_secret" }), json!({})] {
+            let response = test_app(state.clone())
+                .oneshot(json_request(
+                    "PUT",
+                    "/api/v1/sources/hugging-face/credential",
+                    body,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            assert!(bytes.is_empty());
+        }
+        assert_eq!(
+            *catalog.credentials.lock().unwrap(),
+            vec![Some("hf_secret".to_owned()), None]
+        );
+        let document = serde_json::to_string(&openapi().unwrap()).unwrap();
+        assert!(!document.contains("hf_secret"));
+        let value: Value = serde_json::from_str(&document).unwrap();
+        let operation = &value["paths"]["/api/v1/sources/hugging-face/credential"]["put"];
+        assert_eq!(operation["operationId"], "configureHuggingFaceCredential");
+        assert!(operation["responses"]["204"]["content"].is_null());
+        let schema = &value["components"]["schemas"]["HuggingFaceCredential"];
+        assert_eq!(schema["properties"]["token"]["type"], "string");
+        assert!(schema.get("required").is_none_or(|required| required
+            .as_array()
+            .is_some_and(Vec::is_empty)));
+    }
+
+    #[tokio::test]
+    async fn an_empty_hugging_face_token_is_rejected() {
+        let catalog = Arc::new(StubHuggingFaceCatalog::default());
+        let state = AppState::new().with_hugging_face_catalog(catalog.clone());
+        for token in ["", "   "] {
+            let (status, body) = send(
+                test_app(state.clone()),
+                json_request(
+                    "PUT",
+                    "/api/v1/sources/hugging-face/credential",
+                    json!({ "token": token }),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{token:?}");
+            assert_eq!(body["error"]["code"], "invalid_request");
+        }
+        assert!(catalog.credentials.lock().unwrap().is_empty());
     }
 
     struct StubModelInstanceController;
@@ -1958,13 +2748,7 @@ mod tests {
             &self,
             _model_id: String,
         ) -> BoxFuture<'_, Result<ModelInstance, InventoryError>> {
-            Box::pin(async move {
-                Ok(self
-                    .instances()
-                    .await?
-                    .instances
-                    .remove(0))
-            })
+            Box::pin(async move { Ok(self.instances().await?.instances.remove(0)) })
         }
 
         fn stop_instance(
@@ -1985,6 +2769,19 @@ mod tests {
                             allocation: ModelInstanceAllocation {
                                 context_window_tokens: 1,
                                 memory_domains: Vec::new(),
+                                prompt_group_places: magnitude_service_contracts::models::PromptGroupPlacesParts {
+                                    held: std::num::NonZeroU64::MIN,
+                                    capacity: std::num::NonZeroU64::MIN,
+                                }
+                                .try_into()
+                                .unwrap(),
+                                streaming: None,
+                            },
+                            device: ModelLoadDevice {
+                                id: magnitude_service_contracts::HardwareDeviceId::new(
+                                    "host-cpu",
+                                ),
+                                backend: ExecutionBackend::Cpu,
                             },
                         },
                     }],
@@ -1999,16 +2796,15 @@ mod tests {
 
     #[tokio::test]
     async fn exposes_the_authoritative_model_instances_snapshot() {
-        let response = test_app(
-            AppState::new().with_model_controller(Arc::new(StubModelInstanceController)),
-        )
-            .oneshot(
-                Request::get("/api/v1/instances")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let response =
+            test_app(AppState::new().with_model_controller(Arc::new(StubModelInstanceController)))
+                .oneshot(
+                    Request::get("/api/v1/instances")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
         let body: Value =
@@ -2027,7 +2823,8 @@ mod tests {
                 "environment".to_owned(),
             ),
             catalog: ModelAssessmentDomainSnapshot::Pending { source_revision: 0 },
-            discovered: ModelAssessmentDomainSnapshot::Pending { source_revision: 0 },
+            custom: ModelAssessmentDomainSnapshot::Pending { source_revision: 0 },
+            measurement: magnitude_service_contracts::models::MeasurementState::Measuring,
         }));
         let response = test_app(AppState::new().with_model_assessments(assessments))
             .oneshot(
@@ -2045,6 +2842,7 @@ mod tests {
         assert_eq!(body["revision"], 7);
         assert_eq!(body["environmentId"], "environment");
         assert_eq!(body["catalog"]["_tag"], "Pending");
+        assert_eq!(body["measurement"]["_tag"], "Measuring");
     }
 
     #[test]
@@ -2103,6 +2901,27 @@ mod tests {
         let contract = &value["paths"]["/api/v1/events"]["get"][STREAM_EXTENSION];
         assert_eq!(contract["termination"]["type"], "long-lived");
         assert_eq!(contract["reconnect"]["type"], "none");
+    }
+
+    #[test]
+    fn exported_candidate_operations_declare_every_inventory_error_status() {
+        let value = serde_json::to_value(openapi().unwrap()).unwrap();
+        for path in [
+            "/api/v1/sources/hugging-face/search",
+            "/api/v1/sources/hugging-face/check",
+            "/api/v1/sources/hugging-face/resolve",
+            "/api/v1/candidates/inspect",
+            "/api/v1/candidates/drafters",
+            "/api/v1/model-assessments/candidates",
+        ] {
+            let responses = &value["paths"][path]["post"]["responses"];
+            for status in ["400", "404", "409", "422", "500"] {
+                assert!(
+                    responses[status].is_object(),
+                    "post {path} must declare inventory error status {status}: an undeclared one reaches clients as an invalid response, not the service's message",
+                );
+            }
+        }
     }
 
     #[test]
@@ -2193,4 +3012,1218 @@ mod tests {
         assert_eq!(protocol.status(), StatusCode::NOT_FOUND);
     }
 
+    use magnitude_service_contracts::models::{
+        CandidateFile, CandidateSource, CatalogInstallationAdmission, CatalogInstallationRemoval,
+        CustomModelCatalogAttribution, CustomModelFile, DrafterCandidate, DrafterCategory,
+        DrafterLineage, DrafterReference, DrafterVerdict, KnownUnsupportedReason,
+        ModelDomainInvalidation, ModelDownloadState, ModelDownloadsInvalidation, ModelMetadata,
+        ModelPackage, ModelPackageId, ModelPackageProperties, ModelPackageSource, ReadyModel,
+        ResolvedModelInstallation, ServableModelBundle, ServingProfile, SpeculativeMethod,
+        UnsupportedLocalModel, UnsupportedReason,
+    };
+
+    fn local_model_id() -> ModelId {
+        "local:model-q4_k_m:abababababab".parse().unwrap()
+    }
+
+    fn custom_model(model_id: ModelId, origin: CustomModelOrigin) -> CustomModel {
+        CustomModel {
+            model_id,
+            origin,
+            display_name: "Fine Tune".to_owned(),
+            variant_label: Some("Q4_K_M".to_owned()),
+            variant_of: Some("qwen3.6-35b-a3b:gguf:q4".parse().unwrap()),
+            developer: None,
+            files: vec![CustomModelFile {
+                path: "/models/fine-tune.gguf".into(),
+                size_bytes: 100,
+            }],
+            size_bytes: 100,
+            projector: None,
+            drafter: None,
+            drafter_pending: false,
+            recommended_drafter: None,
+            license: None,
+            profile: ServingProfile {
+                context_length: 8192,
+            },
+            update_commit: None,
+            state: CustomModelState::Ready {
+                installation: ResolvedModelInstallation::Resolved {
+                    installed_bytes: 100,
+                    primary_path: "/models/fine-tune.gguf".into(),
+                    ownership:
+                        magnitude_service_contracts::models::ModelInstallationOwnership::External,
+                },
+                model: ReadyModel {
+                    metadata: ModelMetadata {
+                        format: "gguf".to_owned(),
+                        architecture: "qwen35moe".to_owned(),
+                        quantization: "Q4_K_M".to_owned(),
+                        quantization_name: "4-bit".to_owned(),
+                        storage_bytes: 100,
+                        maximum_context_length: Some(8192),
+                    },
+                    profile: ServingProfile {
+                        context_length: 8192,
+                    },
+                    speculative_method: None,
+                },
+                catalog_attribution: CustomModelCatalogAttribution::NotInCatalog,
+            },
+        }
+    }
+
+    struct StubLocalModels {
+        configuration: std::sync::Mutex<LocalModelsConfiguration>,
+    }
+
+    impl StubLocalModels {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                configuration: std::sync::Mutex::new(LocalModelsConfiguration::default()),
+            })
+        }
+
+        fn response(&self) -> LocalModelsResponse {
+            LocalModelsResponse {
+                revision: 4,
+                reconciliation_complete: true,
+                models: vec![custom_model(
+                    local_model_id(),
+                    CustomModelOrigin::Found {
+                        source: FoundSource::Ollama,
+                    },
+                )],
+                hidden: Vec::new(),
+                unsupported: vec![UnsupportedLocalModel {
+                    display_name: "DeepSeek V4 Flash".to_owned(),
+                    origin: CustomModelOrigin::Found {
+                        source: FoundSource::LmStudio,
+                    },
+                    path: "/lmstudio/deepseek.gguf".into(),
+                    reasons: vec![UnsupportedReason::Known(
+                        KnownUnsupportedReason::Architecture {
+                            architecture: "deepseek4".to_owned(),
+                        },
+                    )],
+                    detail: "unsupported model family".to_owned(),
+                }],
+            }
+        }
+    }
+
+    impl LocalModels for StubLocalModels {
+        fn configuration(&self) -> BoxFuture<'_, Result<LocalModelsConfiguration, InventoryError>> {
+            Box::pin(async { Ok(self.configuration.lock().unwrap().clone()) })
+        }
+
+        fn configure(
+            &self,
+            configuration: LocalModelsConfiguration,
+        ) -> BoxFuture<'_, Result<LocalModelsConfiguration, InventoryError>> {
+            Box::pin(async move {
+                *self.configuration.lock().unwrap() = configuration.clone();
+                Ok(configuration)
+            })
+        }
+
+        fn list_local(&self) -> BoxFuture<'_, Result<LocalModelsResponse, InventoryError>> {
+            Box::pin(async { Ok(self.response()) })
+        }
+
+        fn refresh_local(&self) -> BoxFuture<'_, Result<LocalModelsResponse, InventoryError>> {
+            Box::pin(async { Ok(self.response()) })
+        }
+
+        fn remove_local(
+            &self,
+            model_id: &ModelId,
+        ) -> BoxFuture<'_, Result<LocalModelRemoval, InventoryError>> {
+            let model_id = model_id.clone();
+            Box::pin(async move {
+                if model_id == local_model_id() {
+                    return Err(InventoryError::Unsupported(format!(
+                        "{model_id} is not an added model"
+                    )));
+                }
+                Ok(LocalModelRemoval {
+                    model_id,
+                    removed: true,
+                    freed_bytes: 7,
+                })
+            })
+        }
+
+        fn prune_drafters(&self) -> BoxFuture<'_, Result<DrafterPruning, InventoryError>> {
+            Box::pin(async {
+                Ok(DrafterPruning {
+                    removed: Vec::new(),
+                    freed_bytes: 0,
+                })
+            })
+        }
+
+        fn watch_local(&self) -> BoxStream<'static, ModelDomainInvalidation> {
+            Box::pin(futures_util::stream::empty())
+        }
+    }
+
+    fn hugging_face_source() -> CandidateSource {
+        CandidateSource::HuggingFace {
+            repository: magnitude_service_contracts::models::HuggingFaceRepositoryId::new(
+                "owner/repo",
+            )
+            .unwrap(),
+            commit: "c".repeat(40),
+        }
+    }
+
+    fn fits_assessment() -> ModelAssessment {
+        ModelAssessment::Fits {
+            profile: ServingProfile {
+                context_length: 8192,
+            },
+            served: ServingProfile {
+                context_length: 8192,
+            },
+            assessment_id: magnitude_service_contracts::models::ModelAssessmentId(
+                "assessment".to_owned(),
+            ),
+            memory: Vec::new(),
+            memory_breakdown: magnitude_service_contracts::models::MemoryBreakdown {
+                weights_bytes: 0,
+                context_bytes: 0,
+                overhead_bytes: 0,
+            },
+            placement: magnitude_service_contracts::models::ModelPlacement {
+                device_bytes: 0,
+                host_bytes: 0,
+                disk_bytes: 0,
+                lookup_disk_bytes: 0,
+            },
+            residency: magnitude_service_contracts::models::ModelResidency::Resident {
+                performance: magnitude_service_contracts::models::ModelPerformance::Pending,
+            },
+            projector: magnitude_service_contracts::models::ProjectorVerdict::None,
+            drafter: DrafterVerdict::Bound {
+                method: SpeculativeMethod::DFlash,
+                memory_bytes: 900,
+            },
+        }
+    }
+
+    struct StubModelCandidates;
+
+    impl ModelCandidates for StubModelCandidates {
+        fn inspect_with_progress(
+            &self,
+            request: CandidateInspectionRequest,
+            progress: CandidateInspectionProgressSink,
+        ) -> BoxFuture<'_, Result<CandidateInspection, InventoryError>> {
+            Box::pin(async move {
+                let CandidateInspectionRequest::HuggingFace { revision, .. } = request else {
+                    return Err(InventoryError::NotFound("local candidate".to_owned()));
+                };
+                let row = |assessment| magnitude_service_contracts::models::CandidateVersionProgress {
+                    label: "Q4_K_M".to_owned(),
+                    size_bytes: 100,
+                    assessment,
+                };
+                progress.report(CandidateInspectionProgress {
+                    phase: magnitude_service_contracts::models::CandidateInspectionPhase::ReadingHeaders {
+                        completed: 1,
+                        total: 1,
+                    },
+                    versions: vec![row(None)],
+                });
+                if revision == "fails-late" {
+                    return Err(InventoryError::Internal("header reads failed".to_owned()));
+                }
+                progress.report(CandidateInspectionProgress {
+                    phase: magnitude_service_contracts::models::CandidateInspectionPhase::CheckingVersions {
+                        completed: 1,
+                        total: 1,
+                    },
+                    versions: vec![row(Some(fits_assessment()))],
+                });
+                Ok(CandidateInspection {
+                    source: hugging_face_source(),
+                    display_name: "Repo".to_owned(),
+                    license: Some("apache-2.0".to_owned()),
+                    variant_of: None,
+                    developer: None,
+                    versions: vec![magnitude_service_contracts::models::CandidateVersion {
+                        label: "Q4_K_M".to_owned(),
+                        model_id: "hf:owner/repo/repo-Q4_K_M.gguf".parse().unwrap(),
+                        files: vec![CandidateFile {
+                            path: "repo-Q4_K_M.gguf".to_owned(),
+                            size_bytes: 100,
+                        }],
+                        size_bytes: 100,
+                        download_bytes: 100,
+                        assessment: Some(fits_assessment()),
+                        recommended: true,
+                        catalog_model: None,
+                        on_this_computer: None,
+                        drafter: None,
+                    }],
+                    projector: None,
+                    unsupported_architecture: None,
+                })
+            })
+        }
+
+        fn drafters(
+            &self,
+            _request: DrafterCandidatesRequest,
+        ) -> BoxFuture<'_, Result<DrafterCandidatesResponse, InventoryError>> {
+            Box::pin(async {
+                Ok(DrafterCandidatesResponse {
+                    candidates: vec![DrafterCandidate {
+                        category: DrafterCategory::CatalogDrafter,
+                        reference: DrafterReference::Catalog {
+                            model_id: "qwen3.6-35b-a3b:gguf:q4".parse().unwrap(),
+                        },
+                        name: "Magnitude DFlash for Qwen3.6 35B-A3B".to_owned(),
+                        label: "Trained for Qwen3.6 35B-A3B".to_owned(),
+                        size_bytes: 900,
+                        lineage: DrafterLineage::Lineage,
+                        verdict: DrafterVerdict::Bound {
+                            method: SpeculativeMethod::DFlash,
+                            memory_bytes: 900,
+                        },
+                        automatic: true,
+                        on_this_computer: false,
+                        method: Some(SpeculativeMethod::DFlash),
+                    }],
+                    entered: None,
+                })
+            })
+        }
+
+        fn assess_candidate(
+            &self,
+            _candidate: ModelCandidate,
+        ) -> BoxFuture<'_, Result<ModelAssessment, InventoryError>> {
+            Box::pin(async { Ok(fits_assessment()) })
+        }
+    }
+
+    fn test_bundle() -> ServableModelBundle {
+        ServableModelBundle::Standalone {
+            package: ModelPackage {
+                id: ModelPackageId("package".to_owned()),
+                source: ModelPackageSource::HuggingFace {
+                    repository: "owner/repo".to_owned(),
+                    revision: "c".repeat(40),
+                },
+                files: Vec::new(),
+                relationships: Vec::new(),
+                properties: ModelPackageProperties {
+                    format: "gguf".to_owned(),
+                    quantization: "Q4_K_M".to_owned(),
+                    quantization_name: "4-bit".to_owned(),
+                    architecture: "qwen35moe".to_owned(),
+                    maximum_context_length: None,
+                    intrinsic_model_id: None,
+                    intrinsic_quality_id: None,
+                },
+            },
+        }
+    }
+
+    struct StubModelDownloads;
+
+    impl StubModelDownloads {
+        fn download(id: &ModelDownloadId, state: ModelDownloadState) -> ModelDownload {
+            ModelDownload {
+                id: id.clone(),
+                bundle: test_bundle(),
+                for_model: "hf:owner/repo/model.gguf".parse().unwrap(),
+                state,
+            }
+        }
+    }
+
+    impl ModelDownloads for StubModelDownloads {
+        fn start(
+            &self,
+            request: StartModelDownloadRequest,
+        ) -> BoxFuture<'_, Result<StartModelDownloadResponse, InventoryError>> {
+            Box::pin(async move {
+                Ok(StartModelDownloadResponse {
+                    download: Some(ModelDownload {
+                        id: ModelDownloadId("download-1".to_owned()),
+                        bundle: test_bundle(),
+                        for_model: request.model_id,
+                        state: ModelDownloadState::Pending {
+                            completed_bytes: 0,
+                            total_bytes: 100,
+                        },
+                    }),
+                })
+            })
+        }
+
+        fn list(&self) -> BoxFuture<'_, Result<ModelDownloadsResponse, InventoryError>> {
+            Box::pin(async {
+                Ok(ModelDownloadsResponse {
+                    downloads: vec![Self::download(
+                        &ModelDownloadId("download-1".to_owned()),
+                        ModelDownloadState::Completed,
+                    )],
+                })
+            })
+        }
+
+        fn cancel(
+            &self,
+            id: &ModelDownloadId,
+        ) -> BoxFuture<'_, Result<ModelDownload, InventoryError>> {
+            let id = id.clone();
+            Box::pin(async move {
+                if id.0 != "download-1" {
+                    return Err(InventoryError::NotFound(id.0));
+                }
+                Ok(Self::download(
+                    &id,
+                    ModelDownloadState::Cancelled {
+                        completed_bytes: 10,
+                        total_bytes: 100,
+                    },
+                ))
+            })
+        }
+
+        fn acknowledge_failure(
+            &self,
+            id: &ModelDownloadId,
+        ) -> BoxFuture<'_, Result<ModelDownload, InventoryError>> {
+            let id = id.clone();
+            Box::pin(async move {
+                Ok(Self::download(
+                    &id,
+                    ModelDownloadState::Failed {
+                        completed_bytes: 10,
+                        total_bytes: 100,
+                        failure: magnitude_service_contracts::DownloadFailure::Interrupted,
+                        acknowledged: true,
+                    },
+                ))
+            })
+        }
+
+        fn watch(&self) -> BoxStream<'static, ModelDownloadsInvalidation> {
+            Box::pin(futures_util::stream::empty())
+        }
+    }
+
+    struct EmptyCatalog;
+
+    impl CatalogModels for EmptyCatalog {
+        fn list_catalog(&self) -> BoxFuture<'_, Result<CatalogModelsResponse, InventoryError>> {
+            Box::pin(async {
+                Ok(CatalogModelsResponse {
+                    revision: 0,
+                    reconciliation_complete: true,
+                    models: Vec::new(),
+                    families: Vec::new(),
+                })
+            })
+        }
+
+        fn install_catalog_model(
+            &self,
+            model_id: &ModelId,
+        ) -> BoxFuture<'_, Result<CatalogInstallationAdmission, InventoryError>> {
+            let model_id = model_id.to_string();
+            Box::pin(async move { Err(InventoryError::NotFound(model_id)) })
+        }
+
+        fn install_catalog_component(
+            &self,
+            model_id: &ModelId,
+            _component: CatalogComponent,
+        ) -> BoxFuture<'_, Result<CatalogInstallationAdmission, InventoryError>> {
+            let model_id = model_id.to_string();
+            Box::pin(async move { Err(InventoryError::NotFound(model_id)) })
+        }
+
+        fn remove_catalog_model_installation(
+            &self,
+            model_id: &ModelId,
+        ) -> BoxFuture<'_, Result<CatalogInstallationRemoval, InventoryError>> {
+            let model_id = model_id.to_string();
+            Box::pin(async move { Err(InventoryError::NotFound(model_id)) })
+        }
+
+        fn watch_catalog(&self) -> BoxStream<'static, ModelDomainInvalidation> {
+            Box::pin(futures_util::stream::empty())
+        }
+    }
+
+    struct NoInstallations;
+
+    impl CatalogInstallations for NoInstallations {
+        fn watch_catalog_installations(
+            &self,
+        ) -> BoxStream<'static, magnitude_service_contracts::models::CatalogInstallationsInvalidation>
+        {
+            Box::pin(futures_util::stream::empty())
+        }
+
+        fn list_catalog_installations(
+            &self,
+        ) -> BoxFuture<'_, Result<CatalogInstallationsResponse, InventoryError>> {
+            Box::pin(async {
+                Ok(CatalogInstallationsResponse {
+                    operations: Vec::new(),
+                })
+            })
+        }
+
+        fn cancel_catalog_installation(
+            &self,
+            id: &CatalogInstallationOperationId,
+        ) -> BoxFuture<'_, Result<CatalogInstallationOperation, InventoryError>> {
+            let id = id.0.clone();
+            Box::pin(async move { Err(InventoryError::NotFound(id)) })
+        }
+
+        fn acknowledge_catalog_installation_failure(
+            &self,
+            id: &CatalogInstallationOperationId,
+        ) -> BoxFuture<'_, Result<CatalogInstallationOperation, InventoryError>> {
+            let id = id.0.clone();
+            Box::pin(async move { Err(InventoryError::NotFound(id)) })
+        }
+    }
+
+    fn local_models_state(local: Arc<StubLocalModels>) -> AppState {
+        AppState::new().with_model_domains(Arc::new(EmptyCatalog), local, Arc::new(NoInstallations))
+    }
+
+    async fn send(app: Router, request: Request<Body>) -> (StatusCode, Value) {
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
+        (status, body)
+    }
+
+    fn json_request(method: &str, uri: &str, body: Value) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn local_models_configuration_is_replaced_whole_and_read_back() {
+        let state = local_models_state(StubLocalModels::new());
+        let mut changes = state.resource_changes.subscribe();
+        let configuration = json!({
+            "roots": [{ "kind": "Ollama", "path": "/home/u/.ollama/models", "enabled": true }],
+            "added": [{
+                "repository": "owner/Model-GGUF",
+                "path": "Model-Q4_K_M.gguf",
+                "revision": "c".repeat(40),
+                "projector": "mmproj-F16.gguf"
+            }],
+            "hidden": [local_model_id()],
+            "drafters": [{ "modelId": local_model_id(), "drafter": { "_tag": "None" } }]
+        });
+        let (status, body) = send(
+            test_app(state.clone()),
+            json_request(
+                "PUT",
+                "/api/v1/local-models/configuration",
+                configuration.clone(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, configuration);
+        assert_eq!(
+            changes.recv().await.unwrap().topic,
+            InferenceResourceTopic::LocalModels
+        );
+
+        let (status, body) = send(
+            test_app(state),
+            Request::get("/api/v1/local-models/configuration")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, configuration);
+    }
+
+    #[tokio::test]
+    async fn local_models_configuration_rejects_an_invalid_snapshot() {
+        let (status, _) = send(
+            test_app(local_models_state(StubLocalModels::new())),
+            json_request(
+                "PUT",
+                "/api/v1/local-models/configuration",
+                json!({ "roots": [], "added": [], "hidden": ["local:short"], "drafters": [] }),
+            ),
+        )
+        .await;
+        assert!(status.is_client_error());
+    }
+
+    #[tokio::test]
+    async fn local_models_list_and_refresh_return_custom_and_unsupported_models() {
+        let state = local_models_state(StubLocalModels::new());
+        let (status, body) = send(
+            test_app(state.clone()),
+            Request::get("/api/v1/local-models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["models"][0]["modelId"], local_model_id().to_string());
+        assert_eq!(body["models"][0]["origin"]["source"]["_tag"], "Ollama");
+        assert_eq!(
+            body["unsupported"][0]["reasons"][0],
+            json!({ "_tag": "Architecture", "architecture": "deepseek4" })
+        );
+
+        let mut changes = state.resource_changes.subscribe();
+        let (status, body) = send(
+            test_app(state),
+            Request::post("/api/v1/local-models/refresh")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["revision"], 4);
+        assert_eq!(
+            changes.recv().await.unwrap().topic,
+            InferenceResourceTopic::LocalModels
+        );
+    }
+
+    #[tokio::test]
+    async fn local_model_file_removal_reaches_only_added_models() {
+        let state = local_models_state(StubLocalModels::new());
+        let added = "hf:owner/repo/model-Q4_K_M.gguf";
+        let (status, body) = send(
+            test_app(state.clone()),
+            Request::delete(format!(
+                "/api/v1/local-models/{}/files",
+                added.replace('/', "%2F")
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({ "modelId": added, "removed": true, "freedBytes": 7 })
+        );
+
+        let (status, _) = send(
+            test_app(state.clone()),
+            Request::delete(format!(
+                "/api/v1/local-models/{}/files",
+                local_model_id().to_string().replace('/', "%2F")
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        let (status, _) = send(
+            test_app(state),
+            Request::delete("/api/v1/local-models/qwen3.6-35b-a3b:gguf:q4/files")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn local_model_routes_report_an_unconfigured_domain() {
+        let (status, body) = send(
+            test_app(AppState::new()),
+            Request::get("/api/v1/local-models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"]["message"], "local models are not configured");
+    }
+
+    async fn inspection_stream(
+        state: AppState,
+        request: serde_json::Value,
+    ) -> (StatusCode, Vec<(Option<String>, serde_json::Value)>) {
+        let response = test_app(state)
+            .oneshot(json_request("POST", "/api/v1/candidates/inspect/stream", request))
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        if status != StatusCode::OK {
+            return (status, vec![(None, serde_json::from_str(&text).unwrap())]);
+        }
+        let events = text
+            .split("\n\n")
+            .filter(|frame| frame.contains("data:"))
+            .map(|frame| {
+                let name = frame
+                    .lines()
+                    .find_map(|line| line.strip_prefix("event:"))
+                    .map(|name| name.trim().to_owned());
+                let data = frame
+                    .lines()
+                    .find_map(|line| line.strip_prefix("data:"))
+                    .unwrap()
+                    .trim();
+                (name, serde_json::from_str(data).unwrap())
+            })
+            .collect();
+        (status, events)
+    }
+
+    #[tokio::test]
+    async fn inspection_stream_reports_progress_in_order_then_the_inspection() {
+        let state = AppState::new().with_model_candidates(Arc::new(StubModelCandidates));
+        let (status, events) = inspection_stream(
+            state.clone(),
+            json!({ "_tag": "HuggingFace", "repository": "owner/repo", "revision": "main" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let tags = events
+            .iter()
+            .map(|(_, event)| event["_tag"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(tags, ["Progress", "Progress", "Inspected"]);
+        assert_eq!(events[0].1["progress"]["phase"]["_tag"], "ReadingHeaders");
+        assert!(events[0].1["progress"]["versions"][0].get("assessment").is_none());
+        assert_eq!(events[1].1["progress"]["phase"]["_tag"], "CheckingVersions");
+        assert_eq!(events[1].1["progress"]["phase"]["completed"], 1);
+        assert_eq!(events[1].1["progress"]["versions"][0]["assessment"]["_tag"], "Fits");
+        assert_eq!(events[2].1["inspection"]["versions"][0]["label"], "Q4_K_M");
+
+        // A failure before any progress is the response's status; one after it, an error event.
+        let (status, events) =
+            inspection_stream(state.clone(), json!({ "_tag": "Local", "path": "/missing.gguf" }))
+                .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(events[0].1["error"]["message"].is_string());
+        let (status, events) = inspection_stream(
+            state,
+            json!({ "_tag": "HuggingFace", "repository": "owner/repo", "revision": "fails-late" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].0.as_deref(), Some("error"));
+        assert_eq!(events[1].1["error"]["type"], "server_error");
+    }
+
+    #[tokio::test]
+    async fn candidate_routes_inspect_list_drafters_and_assess() {
+        let state = AppState::new().with_model_candidates(Arc::new(StubModelCandidates));
+        let (status, body) = send(
+            test_app(state.clone()),
+            json_request(
+                "POST",
+                "/api/v1/candidates/inspect",
+                json!({ "_tag": "HuggingFace", "repository": "owner/repo", "revision": "main" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["versions"][0]["label"], "Q4_K_M");
+        assert_eq!(body["versions"][0]["recommended"], true);
+        assert_eq!(
+            body["versions"][0]["assessment"]["drafter"]["_tag"],
+            "Bound"
+        );
+        assert!(body.get("unsupportedArchitecture").is_none());
+
+        let (status, _) = send(
+            test_app(state.clone()),
+            json_request(
+                "POST",
+                "/api/v1/candidates/inspect",
+                json!({ "_tag": "Local", "path": "/missing.gguf" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let candidate = json!({
+            "source": { "_tag": "HuggingFace", "repository": "owner/repo", "commit": "c".repeat(40) },
+            "target": ["repo-Q4_K_M.gguf"]
+        });
+        let (status, body) = send(
+            test_app(state.clone()),
+            json_request(
+                "POST",
+                "/api/v1/candidates/drafters",
+                json!({ "_tag": "Candidate", "candidate": candidate.clone() }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["candidates"][0]["category"], "CatalogDrafter");
+        assert_eq!(body["candidates"][0]["lineage"], "Lineage");
+        assert_eq!(body["candidates"][0]["onThisComputer"], false);
+
+        let (status, body) = send(
+            test_app(state.clone()),
+            json_request(
+                "POST",
+                "/api/v1/candidates/drafters",
+                json!({ "_tag": "Model", "modelId": local_model_id() }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["candidates"].as_array().unwrap().len(), 1);
+
+        let (status, body) = send(
+            test_app(state),
+            json_request("POST", "/api/v1/model-assessments/candidates", candidate),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["_tag"], "Fits");
+        assert_eq!(body["drafter"]["memoryBytes"], 900);
+    }
+
+    #[tokio::test]
+    async fn candidate_routes_report_an_unconfigured_domain() {
+        let (status, body) = send(
+            test_app(AppState::new()),
+            json_request(
+                "POST",
+                "/api/v1/candidates/inspect",
+                json!({ "_tag": "Local", "path": "/model.gguf" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            body["error"]["message"],
+            "model candidates are not configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_routes_list_start_cancel_and_acknowledge() {
+        let state = AppState::new().with_model_downloads(Arc::new(StubModelDownloads));
+        let mut changes = state.resource_changes.subscribe();
+
+        let (status, body) = send(
+            test_app(state.clone()),
+            Request::get("/api/v1/downloads")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["downloads"][0]["state"]["_tag"], "Completed");
+
+        let (status, body) = send(
+            test_app(state.clone()),
+            json_request(
+                "POST",
+                "/api/v1/downloads",
+                json!({ "modelId": "hf:owner/repo/model.gguf", "part": "Drafter" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["download"]["id"], "download-1");
+        assert_eq!(body["download"]["forModel"], "hf:owner/repo/model.gguf");
+        assert_eq!(body["download"]["state"]["totalBytes"], 100);
+        assert_eq!(
+            changes.recv().await.unwrap().topic,
+            InferenceResourceTopic::Downloads
+        );
+
+        let (status, body) = send(
+            test_app(state.clone()),
+            Request::post("/api/v1/downloads/download-1/cancel")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["state"]["_tag"], "Cancelled");
+
+        let (status, _) = send(
+            test_app(state.clone()),
+            Request::post("/api/v1/downloads/unknown/cancel")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, body) = send(
+            test_app(state),
+            Request::post("/api/v1/downloads/download-1/acknowledge-failure")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["state"]["acknowledged"], true);
+    }
+
+    fn does_not_fit_assessment() -> ModelAssessment {
+        ModelAssessment::DoesNotFit {
+            profile: ServingProfile {
+                context_length: 8192,
+            },
+            shortfall: ServingProfile {
+                context_length: 8192,
+            },
+            assessment_id: magnitude_service_contracts::models::ModelAssessmentId(
+                "assessment".to_owned(),
+            ),
+            memory: Vec::new(),
+            limiting_resource: "gpu".to_owned(),
+            deficit_bytes: 1,
+            projector: magnitude_service_contracts::models::ProjectorVerdict::None,
+            drafter: DrafterVerdict::None,
+        }
+    }
+
+    fn unsupported_assessment() -> ModelAssessment {
+        ModelAssessment::Unsupported {
+            profile: Some(ServingProfile {
+                context_length: 8192,
+            }),
+            reasons: Vec::new(),
+            detail: "unknown GGUF tensor type 31".to_owned(),
+        }
+    }
+
+    fn assessed_entry(
+        subject: ModelAssessmentSubject,
+        assessment: ModelAssessment,
+    ) -> magnitude_service_contracts::models::ModelAssessmentEntry {
+        magnitude_service_contracts::models::ModelAssessmentEntry {
+            subject,
+            state: ModelAssessmentEntryState::Assessed {
+                capabilities: ModelCapabilities {
+                    vision: false,
+                    tools: true,
+                    structured_output: false,
+                    reasoning: magnitude_service_contracts::models::ModelReasoningCapabilities {
+                        supported: false,
+                        efforts: Vec::new(),
+                        default_effort: None,
+                    },
+                },
+                template_fingerprint: "template".to_owned(),
+                fingerprint: None,
+                profiles: vec![assessment],
+            },
+        }
+    }
+
+    fn assessments_snapshot(
+        catalog: Vec<magnitude_service_contracts::models::ModelAssessmentEntry>,
+        custom: Vec<magnitude_service_contracts::models::ModelAssessmentEntry>,
+    ) -> ModelAssessmentsSnapshot {
+        ModelAssessmentsSnapshot {
+            revision: 1,
+            environment_id: magnitude_service_contracts::models::AssessmentEnvironmentId(
+                "environment".to_owned(),
+            ),
+            catalog: ModelAssessmentDomainSnapshot::Available {
+                source_revision: 3,
+                entries: catalog,
+            },
+            custom: ModelAssessmentDomainSnapshot::Available {
+                source_revision: 4,
+                entries: custom,
+            },
+            measurement: magnitude_service_contracts::models::MeasurementState::Measured,
+        }
+    }
+
+    async fn standard_models_with_custom_assessment(assessment: ModelAssessment) -> Value {
+        let custom = ModelAssessmentSubject::Custom {
+            model_id: local_model_id(),
+        };
+        let assessments = Arc::new(StubModelAssessments(assessments_snapshot(
+            Vec::new(),
+            vec![assessed_entry(custom, assessment)],
+        )));
+        let state = local_models_state(StubLocalModels::new()).with_model_assessments(assessments);
+        let (status, body) = send(
+            test_app(state),
+            Request::get("/v1/models").body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        body
+    }
+
+    #[tokio::test]
+    async fn standard_models_list_fitting_custom_models_with_their_source() {
+        let body = standard_models_with_custom_assessment(fits_assessment()).await;
+        assert_eq!(body["data"][0]["id"], local_model_id().to_string());
+        assert_eq!(body["data"][0]["owned_by"], "ollama");
+        assert_eq!(body["data"][0]["name"], "Fine Tune");
+        assert_eq!(body["data"][0]["description"], "Found in Ollama");
+        assert_eq!(body["data"][0]["context_length"], 8192);
+    }
+
+    #[test]
+    fn listed_output_leaves_three_quarters_of_the_served_context_for_the_conversation() {
+        assert_eq!(connector_max_output_tokens(32_768), 8_192);
+        assert_eq!(connector_max_output_tokens(65_536), 16_384);
+        assert_eq!(connector_max_output_tokens(131_072), 32_768);
+        assert_eq!(connector_max_output_tokens(1_048_576), 32_768);
+        assert_eq!(connector_max_output_tokens(8_192), 2_048);
+    }
+
+    /// A model served at a smaller context than its own lists the context it is served at, which
+    /// is what harnesses size their conversations to.
+    #[tokio::test]
+    async fn standard_models_list_the_served_context() {
+        let ModelAssessment::Fits {
+            profile, served: _, assessment_id, memory, memory_breakdown, placement, residency,
+            projector, drafter,
+        } = fits_assessment()
+        else {
+            unreachable!()
+        };
+        let body = standard_models_with_custom_assessment(ModelAssessment::Fits {
+            profile,
+            served: ServingProfile {
+                context_length: 4096,
+            },
+            assessment_id,
+            memory,
+            memory_breakdown,
+            placement,
+            residency,
+            projector,
+            drafter,
+        })
+        .await;
+        assert_eq!(body["data"][0]["context_length"], 4096);
+    }
+
+    #[tokio::test]
+    async fn standard_models_omit_a_reasoning_model_without_a_default_effort() {
+        let mut entry = assessed_entry(
+            ModelAssessmentSubject::Custom {
+                model_id: local_model_id(),
+            },
+            fits_assessment(),
+        );
+        let ModelAssessmentEntryState::Assessed { capabilities, .. } = &mut entry.state else {
+            unreachable!("assessed entry");
+        };
+        capabilities.reasoning = magnitude_service_contracts::models::ModelReasoningCapabilities {
+            supported: true,
+            efforts: vec!["none".to_owned(), "high".to_owned()],
+            default_effort: None,
+        };
+        let assessments = Arc::new(StubModelAssessments(assessments_snapshot(
+            Vec::new(),
+            vec![entry],
+        )));
+        let state = local_models_state(StubLocalModels::new()).with_model_assessments(assessments);
+        let (status, body) = send(
+            test_app(state),
+            Request::get("/v1/models").body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn standard_models_omit_custom_models_that_are_not_offered() {
+        for assessment in [unsupported_assessment(), does_not_fit_assessment()] {
+            let body = standard_models_with_custom_assessment(assessment).await;
+            assert_eq!(body["data"], json!([]));
+        }
+    }
+
+    #[test]
+    fn only_fitting_models_are_offered() {
+        let catalog_fits = ModelAssessmentSubject::Catalog {
+            model_id: "qwen3.6-35b-a3b:gguf:q4".parse().unwrap(),
+            selection: magnitude_service_contracts::models::CatalogModelSelection::Effective,
+        };
+        let catalog_too_large = ModelAssessmentSubject::Catalog {
+            model_id: "qwen3.6-27b:gguf:q4".parse().unwrap(),
+            selection: magnitude_service_contracts::models::CatalogModelSelection::Effective,
+        };
+        let custom_fits = ModelAssessmentSubject::Custom {
+            model_id: "hf:owner/repo/fits.gguf".parse().unwrap(),
+        };
+        let custom_unsupported = ModelAssessmentSubject::Custom {
+            model_id: "hf:owner/repo/unsupported.gguf".parse().unwrap(),
+        };
+        let snapshot = assessments_snapshot(
+            vec![
+                assessed_entry(catalog_fits.clone(), fits_assessment()),
+                assessed_entry(catalog_too_large, does_not_fit_assessment()),
+            ],
+            vec![
+                assessed_entry(custom_fits.clone(), fits_assessment()),
+                assessed_entry(custom_unsupported, unsupported_assessment()),
+            ],
+        );
+        assert_eq!(
+            offered_models(&snapshot)
+                .into_keys()
+                .collect::<Vec<_>>(),
+            {
+                let mut expected = vec![catalog_fits, custom_fits];
+                expected.sort();
+                expected
+            }
+        );
+    }
+
+    #[test]
+    fn custom_model_sources_name_where_the_files_came_from() {
+        let hf_id: ModelId = "hf:owner/repo/model.gguf".parse().unwrap();
+        let repository =
+            magnitude_service_contracts::models::HuggingFaceRepositoryId::new("owner/repo")
+                .unwrap();
+        let cases = [
+            (
+                custom_model(
+                    hf_id.clone(),
+                    CustomModelOrigin::Added {
+                        repository,
+                        commit: "c".repeat(40),
+                    },
+                ),
+                ("huggingface", "Added from Hugging Face (owner/repo)"),
+            ),
+            (
+                custom_model(
+                    hf_id.clone(),
+                    CustomModelOrigin::Found {
+                        source: FoundSource::HuggingFaceCache,
+                    },
+                ),
+                (
+                    "huggingface-cache",
+                    "Found in the Hugging Face cache (owner/repo)",
+                ),
+            ),
+            (
+                custom_model(
+                    hf_id,
+                    CustomModelOrigin::Found {
+                        source: FoundSource::LmStudio,
+                    },
+                ),
+                ("lm-studio", "Found in LM Studio (owner/repo)"),
+            ),
+            (
+                custom_model(
+                    local_model_id(),
+                    CustomModelOrigin::Found {
+                        source: FoundSource::Folder {
+                            path: "/models".into(),
+                        },
+                    },
+                ),
+                ("folder", "Found in /models"),
+            ),
+        ];
+        for (model, (owned_by, description)) in cases {
+            assert_eq!(
+                custom_model_source(&model),
+                (owned_by, description.to_owned())
+            );
+        }
+    }
+
+    #[test]
+    fn resource_topics_name_local_models_and_downloads() {
+        assert_eq!(
+            InferenceResourceTopic::parse("local-models"),
+            Some(InferenceResourceTopic::LocalModels)
+        );
+        assert_eq!(
+            InferenceResourceTopic::parse("downloads"),
+            Some(InferenceResourceTopic::Downloads)
+        );
+        assert_eq!(InferenceResourceTopic::parse("discovery"), None);
+        assert_eq!(
+            serde_json::to_value(InferenceResourceTopic::LocalModels).unwrap(),
+            "local-models"
+        );
+    }
+
+    #[test]
+    fn exported_document_declares_every_custom_model_operation() {
+        let value = serde_json::to_value(openapi().unwrap()).unwrap();
+        for (path, method) in [
+            ("/api/v1/local-models/configuration", "get"),
+            ("/api/v1/local-models/configuration", "put"),
+            ("/api/v1/local-models", "get"),
+            ("/api/v1/local-models/refresh", "post"),
+            ("/api/v1/sources/hugging-face/credential", "put"),
+            ("/api/v1/candidates/inspect", "post"),
+            ("/api/v1/candidates/drafters", "post"),
+            ("/api/v1/model-assessments/candidates", "post"),
+            ("/api/v1/downloads", "get"),
+            ("/api/v1/downloads", "post"),
+            ("/api/v1/downloads/{download_id}/cancel", "post"),
+            (
+                "/api/v1/downloads/{download_id}/acknowledge-failure",
+                "post",
+            ),
+        ] {
+            assert!(
+                value["paths"][path][method].is_object(),
+                "{method} {path} is not exported"
+            );
+        }
+        assert!(value["paths"]["/api/v1/discovery/models"].is_null());
+        let schemas = &value["components"]["schemas"];
+        for schema in [
+            "UnsupportedReason",
+            "DrafterVerdict",
+            "ProjectorVerdict",
+            "ModelFingerprint",
+            "CustomModel",
+            "LocalModelsConfiguration",
+            "HuggingFaceCredential",
+            "HuggingFaceAccess",
+            "CandidateInspection",
+            "DrafterCandidate",
+        ] {
+            assert!(
+                schemas[schema].is_object(),
+                "schema {schema} is not exported"
+            );
+        }
+    }
 }

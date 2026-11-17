@@ -1,0 +1,155 @@
+name: Docker image
+
+# Builds the image of a release from its own .deb and engine, natively per architecture, pushes
+# each by digest (untagged, so unpublished) and smoke-tests exactly that digest. The release build
+# calls it with the candidate's artifacts before anything is published, and the release tags the
+# tested digests after publication with docker-tags.yml. Dispatch it to rebuild and tag a published
+# version or to push to another repository, such as magnitudedev/magnitude-qa.
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+      ref:
+        description: Commit whose Dockerfile and scripts build the image
+        required: true
+        type: string
+      repository:
+        required: true
+        type: string
+      candidate:
+        description: Build from this run's release candidate instead of a published release
+        required: true
+        type: boolean
+    secrets:
+      DOCKERHUB_TOKEN:
+        required: true
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact published release version
+        required: true
+        type: string
+      ref:
+        description: Commit whose Dockerfile and scripts build the image; empty for the dispatched one
+        required: false
+        type: string
+      repository:
+        description: Docker Hub repository
+        required: false
+        type: string
+        default: magnitudedev/magnitude
+      channel_tag:
+        description: Also move latest, beta or alpha; leave off when rebuilding an older release
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  BUN_VERSION: "1.4.2"
+  REPOSITORY: ${{ inputs.repository || 'magnitudedev/magnitude' }}
+  DOCKERHUB_USERNAME: magnitudedev
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            host: linux-x64-gnu
+            runner: blacksmith-8vcpu-ubuntu-2404
+          - arch: arm64
+            host: linux-arm64-gnu
+            runner: blacksmith-8vcpu-ubuntu-2404-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 0
+      - name: Only main publishes the official repository
+        if: env.REPOSITORY == 'magnitudedev/magnitude'
+        run: |
+          test "$GITHUB_REF" = refs/heads/main
+          git merge-base --is-ancestor HEAD origin/main
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: bun install --frozen-lockfile
+      - name: Download the candidate's Linux artifacts
+        if: inputs.candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: host-${{ matrix.host }}
+          path: ${{ runner.temp }}/artifacts
+      - name: Assemble the candidate for this architecture
+        if: inputs.candidate
+        run: |
+          sudo apt-get update && sudo apt-get install -y binutils rpm libarchive-tools
+          bun run packages/release/scripts/assemble.ts "$RUNNER_TEMP/artifacts" "$RUNNER_TEMP/candidate" --host "${{ matrix.host }}"
+          echo "CANDIDATE=$RUNNER_TEMP/candidate" >> "$GITHUB_ENV"
+        env:
+          MAGNITUDE_RELEASE_VERSION: ${{ inputs.version }}
+          MAGNITUDE_SOURCE_COMMIT: ${{ inputs.ref }}
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - name: Prepare the build context from the release
+        run: >-
+          bun packages/release/scripts/docker/prepare-context.ts
+          --version "$VERSION" --arch "${{ matrix.arch }}" --output "$RUNNER_TEMP/context" ${CANDIDATE:+--candidate "$CANDIDATE"}
+        env:
+          VERSION: ${{ inputs.version }}
+      # Docker media types without attestations: Podman reads HEALTHCHECK only from a Docker image config.
+      - name: Build and push by digest
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          revision=$(jq -r .sourceCommit "$RUNNER_TEMP/context/magnitude-release.json")
+          docker buildx build \
+            --platform "linux/${{ matrix.arch }}" \
+            --file packaging/docker/Dockerfile \
+            --build-arg "VERSION=$VERSION" \
+            --build-arg "REVISION=$revision" \
+            --provenance=false --sbom=false \
+            --output "type=image,name=docker.io/$REPOSITORY,push-by-digest=true,name-canonical=true,push=true,oci-mediatypes=false" \
+            --metadata-file "$RUNNER_TEMP/metadata.json" \
+            "$RUNNER_TEMP/context"
+          digest=$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/metadata.json")
+          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${digest#sha256:}"
+          echo "IMAGE=docker.io/$REPOSITORY@$digest" >> "$GITHUB_ENV"
+          echo "Pushed linux/${{ matrix.arch }} as docker.io/$REPOSITORY@$digest"
+      # The digest stays untagged, and so unpublished, unless this passes.
+      - name: Smoke test the pushed digest
+        timeout-minutes: 45
+        env:
+          VERSION: ${{ inputs.version }}
+        run: bash packages/release/scripts/acceptance/test-docker.sh "$IMAGE" "$VERSION"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docker-digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 7
+
+  tags:
+    needs: build
+    if: ${{ !inputs.candidate }}
+    uses: ./.github/workflows/docker-tags.yml
+    with:
+      version: ${{ inputs.version }}
+      ref: ${{ inputs.ref || github.sha }}
+      repository: ${{ inputs.repository }}
+      channel_tag: ${{ inputs.channel_tag }}
+    secrets:
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}

@@ -18,6 +18,20 @@
 //! reported: it is dead code, or reachable only through more than one change
 //! from every kept configuration.
 //!
+//! Planning gives a weight any representation of its backend's resident row
+//! layout, and gives each weight its own. So a weight slot (an element
+//! parameter the entry reads, other than a conversion target, which its
+//! source chooses) that takes one of them must take every one: the base
+//! configuration with that slot changed to it, and the slots the entry's
+//! element predicates tie to its operand recipe, must be implemented. A
+//! representation it is not implemented at is reported as untaken. Every
+//! change of a binding the search makes carries those tied slots with it.
+//!
+//! The configurations a row may hold are its implementation's at its
+//! bindings, whose `where` may read them (`form(W, NAME)`). A change of a
+//! binding keeps the row's configuration where the new bindings admit it,
+//! and otherwise takes their first at its statics.
+//!
 //! A `form` tuning parameter selects a structurally different algorithm,
 //! which a kernel may take without a preprocessor group (a template chosen
 //! by a constant, say) and which its declaration may admit only at some
@@ -29,23 +43,34 @@
 //!
 //! Vulkan skeletons are preprocessed by glslang, the toolchain itself; CUDA
 //! and Metal skeletons by `clang -E`. Their conditions may read no
-//! toolchain-predefined macro except `__CUDA_ARCH__`, which the CUDA skeleton
-//! defines for the configuration's architecture.
+//! toolchain-predefined macro except the architecture macros, which the CUDA
+//! skeleton defines as the configuration's formation target does
+//! (`seismic_cuda::nvrtc::architecture_macros`).
+//!
+//! The search decides what to form; the caller's [`Forming`] forms it, each
+//! [`Formation`] identified by everything it reads.
 
-use super::abi::{self, render_source, Dialect};
+mod forming;
+
+pub use forming::{form, Formation, Forming, InProcess, Progress, Target, Verdict};
+pub use seismic_native_target::{ProgramEntry, ProgramSource};
+
+use super::abi::{self, Dialect, render_source};
 use super::plan::{self, LaunchVariant};
-use seismic_lang::checked::{CheckedModule, EntryInfo, NativeImplementation, NativeSpecialization};
+use seismic_lang::checked::{
+    CheckedModule, ElementDomain, ElementTarget, ElementTerm, EntryInfo, NativeImplementation,
+    NativeParameter, NativeSpecialization,
+};
 use seismic_lang::entry::ElementBindings;
 use seismic_lang::ids::{EntryId, RepresentationId};
 use seismic_lang::registry::{self, BackendName};
-use seismic_native_target::{NativeCompilationError, ProgramEntry, ProgramSource};
 use std::collections::BTreeSet;
 use std::fmt;
 
 /// The device facts one formation reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Configuration {
-    Vulkan(seismic_vulkan::FormationFacts),
+    Vulkan(seismic_vulkan::FormationTarget),
     Cuda { architecture: u32 },
     Metal { tensor_ops: bool },
 }
@@ -54,7 +79,7 @@ impl Configuration {
     fn dialect(self) -> Dialect {
         match self {
             Self::Vulkan(facts) => Dialect::Vulkan(abi::vulkan::VulkanFeatures::of(&facts)),
-            Self::Cuda { .. } => Dialect::Cuda,
+            Self::Cuda { .. } => Dialect::Cuda(abi::CudaFeatures::UNOPENED),
             Self::Metal { tensor_ops } => Dialect::Metal(abi::MetalFeatures { tensor_ops }),
         }
     }
@@ -62,10 +87,11 @@ impl Configuration {
 
 /// An authored preprocessor group: the file (relative to its asset's
 /// directory; Seismic library files as `seismic/<name>`) and the line of the
-/// directive that opens it.
+/// directive that opens it. Searches hold sites by the million, so the file
+/// name is shared.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GroupSite {
-    pub file: String,
+    pub file: std::sync::Arc<str>,
     pub line: usize,
 }
 
@@ -95,6 +121,26 @@ impl fmt::Display for FormationFailure {
     }
 }
 
+/// A resident representation a weight slot of an entry does not take,
+/// though the slot takes other representations of the backend's resident
+/// layout.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Untaken {
+    pub entry: String,
+    pub parameter: String,
+    pub representation: &'static str,
+}
+
+impl fmt::Display for Untaken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "`{}` {}={}",
+            self.entry, self.parameter, self.representation
+        )
+    }
+}
+
 /// What forming one backend's implementations established.
 #[derive(Debug, Default)]
 pub struct Coverage {
@@ -115,6 +161,9 @@ pub struct Coverage {
     pub unformed: Vec<String>,
     /// Entries with no implemented configuration at all.
     pub unimplemented: Vec<String>,
+    /// Resident representations a weight slot does not take, though it
+    /// takes others ([`untaken`]).
+    pub untaken: Vec<Untaken>,
     /// Configurations this host's toolchain cannot form (Metal tensor
     /// operations on a compiler without Metal 4), with the entries whose
     /// kept configurations needed them.
@@ -129,6 +178,7 @@ impl Coverage {
             && self.unreached.is_empty()
             && self.unformed.is_empty()
             && self.unimplemented.is_empty()
+            && self.untaken.is_empty()
     }
 }
 
@@ -148,6 +198,9 @@ impl fmt::Display for Coverage {
         for site in &self.unreached {
             writeln!(f, "unreached group: {site}")?;
         }
+        for untaken in &self.untaken {
+            writeln!(f, "untaken representation: {untaken}")?;
+        }
         for form in &self.unformed {
             writeln!(f, "unformed form: {form}")?;
         }
@@ -166,6 +219,9 @@ pub enum CoverageError {
     /// A skeleton could not be preprocessed: the coverage machinery, not a
     /// kernel, is at fault.
     Skeleton(String),
+    /// Entry `0`'s declaration reads a device property, so it has no
+    /// defaults offline: coverage forms on no device.
+    DeviceDependent(String),
 }
 
 impl fmt::Display for CoverageError {
@@ -173,32 +229,66 @@ impl fmt::Display for CoverageError {
         match self {
             Self::ToolchainUnavailable(reason) => write!(f, "toolchain unavailable: {reason}"),
             Self::Skeleton(reason) => write!(f, "skeleton preprocessing failed: {reason}"),
+            Self::DeviceDependent(entry) => write!(
+                f,
+                "`{entry}` reads a device property, so offline coverage, on no device, cannot form it"
+            ),
         }
     }
 }
 
 impl std::error::Error for CoverageError {}
 
-/// One backend's toolchain, as preparation forms with it.
+/// One backend's formation toolchain on this host.
+pub struct Toolchain {
+    former: Former,
+}
+
+impl Toolchain {
+    /// The toolchain for `backend`, or why this host cannot form for it.
+    pub fn open(backend: BackendName) -> Result<Self, CoverageError> {
+        Ok(Self {
+            former: Former::open(backend)?,
+        })
+    }
+
+    pub fn backend(&self) -> BackendName {
+        self.former.backend()
+    }
+
+    /// What identifies this toolchain across every configuration it forms,
+    /// with the preprocessor that chooses the configurations.
+    pub fn identity(&self) -> String {
+        self.former.identity()
+    }
+}
+
+/// One backend's toolchain as preparation forms with it: the configurations
+/// it forms, and what identifies and forms each formation.
 enum Former {
     Vulkan,
     Cuda {
         architectures: Vec<u32>,
+        release: (u32, u32),
+        /// `clang --version`, which preprocesses the skeletons.
+        preprocessor: String,
     },
     #[cfg(target_os = "macos")]
     Metal {
-        device: seismic_metal::DeviceHandle,
         language: seismic_metal::facts::LanguageVersion,
         tensor_ops: bool,
+        operating_system: String,
+        preprocessor: String,
     },
 }
 
 /// The preparation baseline of the Vulkan floor: a 32-lane fp16 device
 /// without cooperative matrix, declaring every seal mode.
-const VULKAN_BASE: seismic_vulkan::FormationFacts = seismic_vulkan::FormationFacts {
+const VULKAN_BASE: seismic_vulkan::FormationTarget = seismic_vulkan::FormationTarget {
     subgroup_lanes: seismic_vulkan::SUBGROUP_WIDTH,
     float16: true,
     matrix: false,
+    matrix_hardware: false,
     wide_accumulators: true,
     mixed_dot: true,
     f32_atomic_add: false,
@@ -214,21 +304,40 @@ impl Former {
             BackendName::Cuda => {
                 let floor = u32::from(seismic_cuda::ComputeCapability::SM80.major) * 10
                     + u32::from(seismic_cuda::ComputeCapability::SM80.minor);
+                let unavailable = |error| CoverageError::ToolchainUnavailable(format!("{error:?}"));
                 let architectures = seismic_cuda::nvrtc::supported_architectures()
-                    .map_err(|error| CoverageError::ToolchainUnavailable(format!("{error:?}")))?
+                    .map_err(unavailable)?
                     .into_iter()
                     .filter(|architecture| *architecture >= floor)
                     .collect();
-                Ok(Self::Cuda { architectures })
+                Ok(Self::Cuda {
+                    architectures,
+                    release: seismic_cuda::nvrtc::release().map_err(unavailable)?,
+                    preprocessor: clang_identity()?,
+                })
             }
             #[cfg(target_os = "macos")]
             BackendName::Metal => {
                 let device = seismic_metal::DeviceHandle::system_default()
                     .map_err(|error| CoverageError::ToolchainUnavailable(format!("{error:?}")))?;
-                let language = seismic_metal::profile::probe_language_version(&device)
-                    .ok_or_else(|| CoverageError::ToolchainUnavailable("no supported Metal language version".into()))?;
-                let tensor_ops = seismic_metal::toolchain::forms_tensor_operations(&device, language);
-                Ok(Self::Metal { device, language, tensor_ops })
+                // The device's probe answers, as its discovery and open
+                // read them: from the process's one store.
+                let answers = seismic_metal::profile::probe_answers(
+                    &device,
+                    &*crate::artifacts::ProgramStore::user(),
+                );
+                let language = answers.language().map_err(|error| {
+                    CoverageError::ToolchainUnavailable(format!(
+                        "no supported Metal language version: {error}"
+                    ))
+                })?;
+                let tensor_ops = answers.forms_tensor_headers();
+                Ok(Self::Metal {
+                    language,
+                    tensor_ops,
+                    operating_system: seismic_metal::profile::operating_system(),
+                    preprocessor: clang_identity()?,
+                })
             }
             #[cfg(not(target_os = "macos"))]
             BackendName::Metal => Err(CoverageError::ToolchainUnavailable(
@@ -243,7 +352,7 @@ impl Former {
     fn base(&self) -> Configuration {
         match self {
             Self::Vulkan => Configuration::Vulkan(VULKAN_BASE),
-            Self::Cuda { architectures } => Configuration::Cuda {
+            Self::Cuda { architectures, .. } => Configuration::Cuda {
                 architecture: architectures[0],
             },
             #[cfg(target_os = "macos")]
@@ -259,13 +368,15 @@ impl Former {
                 .into_iter()
                 .map(Configuration::Vulkan)
                 .collect(),
-            (Self::Cuda { architectures }, Configuration::Cuda { architecture }) => architectures
-                .iter()
-                .filter(|candidate| **candidate != architecture)
-                .map(|architecture| Configuration::Cuda {
-                    architecture: *architecture,
-                })
-                .collect(),
+            (Self::Cuda { architectures, .. }, Configuration::Cuda { architecture }) => {
+                architectures
+                    .iter()
+                    .filter(|candidate| **candidate != architecture)
+                    .map(|architecture| Configuration::Cuda {
+                        architecture: *architecture,
+                    })
+                    .collect()
+            }
             #[cfg(target_os = "macos")]
             (Self::Metal { .. }, Configuration::Metal { tensor_ops }) => {
                 vec![Configuration::Metal {
@@ -287,41 +398,121 @@ impl Former {
         }
     }
 
-    /// Form `programs` as preparation forms them, short of loading them on a
-    /// device.
-    fn form(
-        &self,
-        programs: &[ProgramSource],
-        configuration: Configuration,
-    ) -> Result<(), NativeCompilationError> {
+    /// The row layout weights are resident in on this backend.
+    fn resident_layout(&self) -> registry::Layout {
+        self.backend().resident_layout()
+    }
+
+    fn backend(&self) -> BackendName {
+        match self {
+            Self::Vulkan => BackendName::Vulkan,
+            Self::Cuda { .. } => BackendName::Cuda,
+            #[cfg(target_os = "macos")]
+            Self::Metal { .. } => BackendName::Metal,
+        }
+    }
+
+    /// What identifies this toolchain across every configuration it forms,
+    /// with the preprocessor that chooses the configurations.
+    fn identity(&self) -> String {
+        match self {
+            Self::Vulkan => seismic_vulkan::formation::compiler(),
+            Self::Cuda {
+                architectures,
+                release,
+                preprocessor,
+            } => format!(
+                "cuda;nvrtc {}.{};{};sm {architectures:?};{preprocessor}",
+                release.0,
+                release.1,
+                seismic_cuda::nvrtc::COMPILE_OPTIONS.join(" ")
+            ),
+            #[cfg(target_os = "macos")]
+            Self::Metal {
+                language,
+                tensor_ops,
+                operating_system,
+                preprocessor,
+            } => format!(
+                "{};tensor_ops {tensor_ops};{preprocessor}",
+                seismic_metal::toolchain::material(operating_system, *language)
+            ),
+        }
+    }
+
+    /// The toolchain namespace and the identity material of a formation
+    /// under `configuration`: with the program, everything it reads.
+    fn material(&self, configuration: Configuration) -> (&'static str, String) {
         match (self, configuration) {
-            (Self::Vulkan, Configuration::Vulkan(facts)) => {
-                for program in programs {
-                    for entry in &program.entries {
-                        seismic_vulkan::formation::compile(
-                            &program.text,
-                            &entry.symbol,
-                            facts.environment(),
-                        )?;
-                    }
-                }
-                Ok(())
-            }
+            (Self::Vulkan, Configuration::Vulkan(facts)) => (
+                "vulkan",
+                format!("{};{facts:?}", seismic_vulkan::formation::compiler()),
+            ),
+            (Self::Cuda { release, .. }, Configuration::Cuda { architecture }) => (
+                "cuda",
+                seismic_cuda::toolchain::material(&seismic_cuda::nvrtc::Formation {
+                    release: *release,
+                    architecture,
+                    options: seismic_cuda::nvrtc::COMPILE_OPTIONS,
+                }),
+            ),
+            #[cfg(target_os = "macos")]
+            (
+                Self::Metal {
+                    language,
+                    operating_system,
+                    ..
+                },
+                Configuration::Metal { tensor_ops },
+            ) => (
+                "metal",
+                format!(
+                    "{};tensor_ops {tensor_ops}",
+                    seismic_metal::toolchain::material(operating_system, *language)
+                ),
+            ),
+            _ => unreachable!("a former identifies only its own configurations"),
+        }
+    }
+
+    /// Forming `program` under `configuration`, with what identifies it.
+    fn formation<'a>(
+        &self,
+        configuration: Configuration,
+        program: &'a ProgramSource,
+    ) -> Formation<'a> {
+        let (namespace, material) = self.material(configuration);
+        let target = match (self, configuration) {
+            (Self::Vulkan, Configuration::Vulkan(facts)) => Target::Vulkan(facts),
             (Self::Cuda { .. }, Configuration::Cuda { architecture }) => {
-                for program in programs {
-                    seismic_cuda::toolchain::form_cubin(program, architecture)?;
-                }
-                Ok(())
+                Target::Cuda { architecture }
             }
             #[cfg(target_os = "macos")]
-            (Self::Metal { device, language, .. }, Configuration::Metal { .. }) => {
-                for program in programs {
-                    seismic_metal::toolchain::form_functions(device, program, *language)?;
-                }
-                Ok(())
-            }
-            _ => unreachable!("a former forms only its own configurations"),
+            (Self::Metal { language, .. }, Configuration::Metal { .. }) => Target::Metal {
+                language: *language,
+            },
+            _ => unreachable!("a former targets only its own configurations"),
+        };
+        Formation {
+            namespace,
+            material,
+            target,
+            program,
         }
+    }
+}
+
+/// A search's toolchain and how its formations run.
+#[derive(Clone, Copy)]
+struct Forms<'a> {
+    former: &'a Former,
+    forming: &'a dyn Forming,
+}
+
+impl Forms<'_> {
+    fn form(&self, configuration: Configuration, program: &ProgramSource) -> Verdict {
+        self.forming
+            .form(self.former.formation(configuration, program))
     }
 }
 
@@ -370,8 +561,12 @@ fn kept(directive: &str, dialect: Dialect) -> bool {
 /// Build the skeleton of `text`, whose authored part is `asset` (labelled
 /// `label`) at its end, possibly followed by a generated suffix.
 fn skeleton(text: &str, asset: &str, label: &str, dialect: Dialect, preamble: &str) -> Skeleton {
-    let asset_start = text
-        .rfind(asset)
+    // The last occurrence, sought from the end: at most a generated suffix
+    // follows the asset, so few starts are compared and no searcher is built
+    // over the (long) asset.
+    let asset_start = (0..=text.len().saturating_sub(asset.len()))
+        .rev()
+        .find(|start| text.as_bytes()[*start..].starts_with(asset.as_bytes()))
         .expect("a rendered source contains its asset");
     let asset_end = asset_start + asset.len();
     let mut out = String::new();
@@ -379,7 +574,7 @@ fn skeleton(text: &str, asset: &str, label: &str, dialect: Dialect, preamble: &s
     let mut rejecting = BTreeSet::new();
     // Open authored groups, innermost last, by marker index.
     let mut open: Vec<Option<usize>> = Vec::new();
-    let mut file = label.to_owned();
+    let mut file: std::sync::Arc<str> = label.into();
     let mut line = 0usize;
     let mut offset = 0usize;
     let mut lines = text.split_inclusive('\n').peekable();
@@ -407,7 +602,7 @@ fn skeleton(text: &str, asset: &str, label: &str, dialect: Dialect, preamble: &s
             if let Some(number) = words.next().and_then(|word| word.parse::<usize>().ok()) {
                 line = number - 1;
                 if let Some(name) = words.next() {
-                    file = name.trim_matches('"').to_owned();
+                    file = name.trim_matches('"').into();
                 }
             }
             continue;
@@ -551,9 +746,10 @@ fn reached_markers(preprocessed: &str) -> BTreeSet<usize> {
 fn preprocess_vulkan(skeleton: &Skeleton, kernels: &[&str]) -> Result<Outcome, CoverageError> {
     let mut reached = BTreeSet::new();
     for kernel in kernels {
-        let text = seismic_vulkan::formation::preprocess(&skeleton.text, kernel).map_err(|error| {
-            CoverageError::Skeleton(format!("{error:?}\n--- skeleton ---\n{}", skeleton.text))
-        })?;
+        let text =
+            seismic_vulkan::formation::preprocess(&skeleton.text, kernel).map_err(|error| {
+                CoverageError::Skeleton(format!("{error:?}\n--- skeleton ---\n{}", skeleton.text))
+            })?;
         match outcome(&text) {
             Outcome::Rejected => return Ok(Outcome::Rejected),
             Outcome::Reached(markers) => reached.extend(markers),
@@ -587,7 +783,9 @@ fn preprocess_clang(skeletons: &[&str]) -> Result<Vec<Outcome>, CoverageError> {
         .args(&paths)
         .output()
         .map_err(|error| match error.kind() {
-            std::io::ErrorKind::NotFound => CoverageError::ToolchainUnavailable(format!("clang: {error}")),
+            std::io::ErrorKind::NotFound => {
+                CoverageError::ToolchainUnavailable(format!("clang: {error}"))
+            }
             _ => CoverageError::Skeleton(format!("clang: {error}")),
         })?;
     std::fs::remove_dir_all(&directory).ok();
@@ -614,6 +812,22 @@ fn preprocess_clang(skeletons: &[&str]) -> Result<Vec<Outcome>, CoverageError> {
 /// Ends each skeleton in a batched `clang -E`.
 const END: &str = "seismic_skeleton_end_";
 
+/// `clang --version`: the preprocessor that decides which CUDA and Metal
+/// configurations a search keeps.
+fn clang_identity() -> Result<String, CoverageError> {
+    let output = std::process::Command::new("clang")
+        .arg("--version")
+        .output()
+        .map_err(|error| CoverageError::ToolchainUnavailable(format!("clang: {error}")))?;
+    if !output.status.success() {
+        return Err(CoverageError::ToolchainUnavailable(format!(
+            "clang --version: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
 /// Every representation of the registry, bf16 and f16 first. Which of them
 /// an entry admits is what monomorphizing it accepts, as preparation decides
 /// it; which the kernel implements, its `#error` and `static_assert`
@@ -629,21 +843,38 @@ fn representations() -> Vec<RepresentationId> {
     found.into_iter().map(|info| info.id).collect()
 }
 
+/// Why a subject's implementations bind as every device offers them:
+/// [`Subject::new`] admits only declarations that read no device property,
+/// and substituting element reads reads none.
+const INDEPENDENT: &str = "a subject's declaration reads no device property (Subject::new)";
+
 /// The checked inputs of one entry's implementation on one backend.
+///
+/// Which configurations are admissible is the implementation's at a row's
+/// bindings ([`Subject::implementation`]), whose `where` may read them; the
+/// declaration holds what every binding shares (its source, statics,
+/// parameters and launches).
 struct Subject<'m> {
     module: &'m CheckedModule,
     info: &'m EntryInfo,
-    implementation: &'m NativeImplementation,
-    asset: &'m str,
+    backend: BackendName,
+    declaration: &'m NativeImplementation,
+    asset: seismic_lang::checked::NativeAsset<'m>,
     label: String,
     /// Each element parameter's candidate representations.
     candidates: Vec<(String, Vec<RepresentationId>)>,
     /// Whether the entry monomorphizes at a binding, by binding.
     admitted: std::sync::Mutex<std::collections::HashMap<String, bool>>,
-    /// Searched statics, by the statics fixed.
-    searched: std::sync::Mutex<std::collections::HashMap<Vec<(String, u64)>, Option<NativeSpecialization>>>,
-    /// Admissible specializations, by statics.
-    specializations: std::sync::Mutex<std::collections::HashMap<NativeSpecialization, std::sync::Arc<Vec<NativeSpecialization>>>>,
+    /// Searched statics, by implementation ([`Bound`]) and the statics fixed.
+    searched: std::sync::Mutex<
+        std::collections::HashMap<(Bound, Vec<(String, u64)>), Option<NativeSpecialization>>,
+    >,
+    /// Admissible specializations, by implementation and statics.
+    specializations: std::sync::Mutex<
+        std::collections::HashMap<(Bound, NativeSpecialization), std::sync::Arc<Admissible<'m>>>,
+    >,
+    /// Whether programs are formed per code variant (CUDA and Metal).
+    variant_programs: bool,
 }
 
 impl<'m> Subject<'m> {
@@ -652,60 +883,184 @@ impl<'m> Subject<'m> {
         info: &'m EntryInfo,
         backend: BackendName,
         candidates: Vec<(String, Vec<RepresentationId>)>,
-    ) -> Option<Self> {
-        let implementation = module.native_implementation(info.id, backend)?;
+    ) -> Result<Option<Self>, CoverageError> {
+        let Some(declaration) = module.native_implementation(info.id, backend) else {
+            return Ok(None);
+        };
+        // Coverage forms offline, on no device: a declaration whose
+        // defaults read the device has none here.
+        if declaration.device_independent().is_none() {
+            return Err(CoverageError::DeviceDependent(info.name.clone()));
+        }
         let asset = module
             .native_asset(info.id, backend)
             .expect("a checked module captures every native asset");
-        let label = std::path::Path::new(&implementation.source_path)
+        let label = std::path::Path::new(&declaration.source_path)
             .file_name()
             .expect("a native asset path names a file")
             .to_string_lossy()
             .into_owned();
-        Some(Self {
+        Ok(Some(Self {
             module,
             info,
-            implementation,
+            backend,
+            declaration,
             asset,
             label,
             candidates,
             admitted: Default::default(),
             searched: Default::default(),
             specializations: Default::default(),
-        })
+            variant_programs: backend != BackendName::Vulkan,
+        }))
     }
 
-    /// [`NativeImplementation::search_statics`], once per `fixed`.
-    fn statics(&self, fixed: &[(&str, u64)]) -> Option<NativeSpecialization> {
+    /// The implementation at `bindings`, every element read substituted
+    /// ([`CheckedModule::native_implementation_at`]): the one value of the
+    /// module's that every binding of the same reads shares.
+    fn implementation(&self, bindings: &ElementBindings) -> &'m NativeImplementation {
+        self.module
+            .native_implementation_at(self.info.id, self.backend, bindings)
+            .expect("a subject's entry has a native implementation")
+    }
+
+    /// [`NativeImplementation::search_statics`] of `implementation`, once per
+    /// `fixed`.
+    fn statics(
+        &self,
+        implementation: &'m NativeImplementation,
+        fixed: &[(&str, u64)],
+    ) -> Option<NativeSpecialization> {
         let key = fixed
             .iter()
             .map(|(name, value)| ((*name).to_owned(), *value))
             .collect::<Vec<_>>();
-        let mut searched = self.searched.lock().expect("no thread panics holding the cache");
+        let mut searched = self
+            .searched
+            .lock()
+            .expect("no thread panics holding the cache");
         searched
-            .entry(key)
-            .or_insert_with(|| self.implementation.search_statics(fixed))
+            .entry((Bound::of(implementation), key))
+            .or_insert_with(|| {
+                implementation
+                    .search_statics(fixed)
+                    .expect("an implementation at bindings reads no element")
+            })
             .clone()
     }
 
-    /// The admissible specializations at `statics`, walked once.
-    fn admissible(&self, statics: &NativeSpecialization) -> std::sync::Arc<Vec<NativeSpecialization>> {
+    /// The admissible specializations of `implementation` at `statics`,
+    /// walked once.
+    fn admissible(
+        &self,
+        implementation: &'m NativeImplementation,
+        statics: &NativeSpecialization,
+    ) -> std::sync::Arc<Admissible<'m>> {
         let mut walked = self
             .specializations
             .lock()
             .expect("no thread panics holding the cache");
         walked
-            .entry(statics.clone())
+            .entry((Bound::of(implementation), statics.clone()))
             .or_insert_with(|| {
-                std::sync::Arc::new(
-                    self.implementation
-                        .admissible(statics)
-                        .expect("a row's statics admit its specialization"),
-                )
+                std::sync::Arc::new(Admissible::walk(
+                    implementation,
+                    statics,
+                    self.variant_programs,
+                ))
             })
             .clone()
     }
 
+    /// The row at `bindings` (searched statics' defaults), when the
+    /// implementation there admits some statics.
+    fn based(&self, bindings: ElementBindings, configuration: Configuration) -> Option<Row> {
+        let implementation = self.implementation(&bindings);
+        let statics = self.statics(implementation, &[])?;
+        Some(Row {
+            specialization: implementation
+                .device_independent()
+                .expect(INDEPENDENT)
+                .default_specialization(&statics)
+                .expect("searched statics admit a configuration"),
+            bindings,
+            configuration,
+        })
+    }
+
+    /// `row` at `bindings`: its specialization where the implementation at
+    /// them admits it, else theirs first at its statics; `None` when those
+    /// bindings admit no configuration at its statics.
+    fn rebound(&self, row: &Row, bindings: ElementBindings) -> Option<Row> {
+        let implementation = self.implementation(&bindings);
+        let specialization = match implementation.validate(&row.specialization) {
+            Ok(()) => row.specialization.clone(),
+            Err(seismic_lang::checked::NativeSpecializationError::Inadmissible) => {
+                match implementation
+                    .device_independent()
+                    .expect(INDEPENDENT)
+                    .default_specialization(&statics_of(&row.specialization))
+                {
+                    Ok(specialization) => specialization,
+                    Err(seismic_lang::checked::NativeSpecializationError::Inadmissible) => {
+                        return None;
+                    }
+                    Err(error) => panic!("a row's statics are the declaration's: {error}"),
+                }
+            }
+            Err(error) => panic!("a row's specialization is the declaration's: {error}"),
+        };
+        Some(Row {
+            bindings,
+            specialization,
+            configuration: row.configuration,
+        })
+    }
+
+    /// `bindings` with `parameter` bound to `representation`, and every
+    /// parameter the entry's element predicates declare shares its operand
+    /// recipe (`operands(P) == operands(Q)`) and holds another bound to it
+    /// too: one choice of the search, the smallest change that keeps those
+    /// predicates.
+    fn rebind(
+        &self,
+        bindings: &ElementBindings,
+        parameter: &str,
+        representation: RepresentationId,
+    ) -> ElementBindings {
+        let recipe = |representation| registry::representation_info(representation).operands;
+        let mut tied = vec![parameter.to_owned()];
+        let mut index = 0;
+        while let Some(current) = tied.get(index).cloned() {
+            for predicate in self.info.element_domain.predicates() {
+                let (ElementTerm::Operands(left), ElementTerm::Operands(right)) =
+                    (&predicate.left, &predicate.right)
+                else {
+                    continue;
+                };
+                if !predicate.equal {
+                    continue;
+                }
+                for (from, to) in [(left, right), (right, left)] {
+                    if *from == current && !tied.contains(to) {
+                        tied.push(to.clone());
+                    }
+                }
+            }
+            index += 1;
+        }
+        tied.iter().fold(bindings.clone(), |bindings, name| {
+            let held = bindings.get(name);
+            if name == parameter || held.is_some_and(|held| recipe(held) != recipe(representation)) {
+                bindings.bind(name, representation)
+            } else {
+                bindings
+            }
+        })
+    }
+
+    /// Whether the entry forms at `bindings` and so does its native
+    /// implementation on the subject's backend.
     fn admits(&self, bindings: &ElementBindings) -> bool {
         let key = format!("{bindings:?}");
         if let Some(admitted) = self
@@ -716,7 +1071,11 @@ impl<'m> Subject<'m> {
         {
             return *admitted;
         }
-        let admitted = self.module.entry(self.info.id, bindings).is_ok();
+        let admitted = self.module.entry(self.info.id, bindings).is_ok()
+            && self
+                .module
+                .native_implementation_at(self.info.id, self.backend, bindings)
+                .is_some();
         self.admitted
             .lock()
             .expect("no thread panics holding the cache")
@@ -724,80 +1083,86 @@ impl<'m> Subject<'m> {
         admitted
     }
 
-    /// The code variants of each launch at `specialization`'s statics: every
-    /// template instance an admissible configuration names.
-    fn variants(&self, specialization: &NativeSpecialization) -> Vec<Vec<LaunchVariant>> {
-        let admissible = self.admissible(&statics_of(specialization));
-        (0..self.implementation.launches.len())
-            .map(|ordinal| {
-                let mut variants = Vec::<LaunchVariant>::new();
-                for candidate in admissible.iter() {
-                    let variant = LaunchVariant {
-                        code: plan::code_values(self.implementation, candidate, ordinal),
-                        group_size: self.implementation.static_group_size(candidate, ordinal),
-                    };
-                    if !variants.contains(&variant) {
-                        variants.push(variant);
-                    }
-                }
-                variants
-            })
-            .collect()
+    /// The code variants of each launch at `row`'s bindings and statics:
+    /// every template instance an admissible configuration reaching the
+    /// launch names ([`NativeImplementation::reachable`]); none for a launch
+    /// no admissible configuration reaches, which preparation never forms.
+    fn variants(&self, row: &Row) -> Vec<Vec<LaunchVariant>> {
+        self.admissible(self.implementation(&row.bindings), &statics_of(&row.specialization))
+            .variants
+            .clone()
     }
 
     /// The programs preparation forms for `row`, every code variant of a
-    /// launch-scoped implementation among their entries.
+    /// launch-scoped implementation among their entries: none of a launch no
+    /// admissible configuration reaches.
     fn programs(&self, row: &Row) -> Vec<ProgramSource> {
         let logical = self
             .module
             .entry(self.info.id, &row.bindings)
             .expect("a row's bindings are admitted");
         let dialect = row.configuration.dialect();
+        let implementation = self.implementation(&row.bindings);
         match dialect {
             Dialect::Vulkan(_) => vec![ProgramSource {
                 text: render_source(
                     dialect,
                     &logical,
                     &row.bindings,
-                    self.implementation,
+                    implementation,
                     &row.specialization,
                     self.asset,
                 ),
-                entries: self
-                    .implementation
+                entries: implementation
                     .launches
                     .iter()
                     .map(|launch| ProgramEntry::named(launch.kernel.as_str()))
                     .collect(),
             }],
-            Dialect::Cuda | Dialect::Metal(_) => super::implementation_programs(
+            Dialect::Cuda(_) | Dialect::Metal(_) => super::implementation_programs(
                 dialect,
                 &logical,
                 &row.bindings,
-                self.implementation,
+                implementation,
                 &row.specialization,
                 self.asset,
-                &self.variants(&row.specialization),
-            ),
+                &self.variants(row),
+            )
+            .into_iter()
+            .filter(|program| !program.entries.is_empty())
+            .collect(),
+        }
+    }
+
+    /// How many programs [`Self::programs`] renders for a row: one per
+    /// launch for a launch-scoped CUDA or Metal implementation, else one.
+    fn programs_per_row(&self) -> usize {
+        if self.variant_programs && self.declaration.launch_scoped() {
+            self.declaration.launches.len().max(1)
+        } else {
+            1
         }
     }
 
     fn skeletons(&self, row: &Row) -> Vec<Skeleton> {
         let preamble = match row.configuration {
             Configuration::Cuda { architecture } => {
-                format!("#define __CUDA_ARCH__ {}\n", architecture * 10)
+                seismic_cuda::nvrtc::architecture_macros(architecture)
+                    .into_iter()
+                    .map(|(name, value)| format!("#define {name} {value}\n"))
+                    .collect()
             }
             Configuration::Vulkan(_) | Configuration::Metal { .. } => String::new(),
         };
         let dialect = row.configuration.dialect();
         self.programs(row)
             .iter()
-            .map(|program| skeleton(&program.text, self.asset, &self.label, dialect, &preamble))
+            .map(|program| skeleton(&program.text, self.asset.text, &self.label, dialect, &preamble))
             .collect()
     }
 
     fn kernels(&self) -> Vec<&str> {
-        self.implementation
+        self.declaration
             .launches
             .iter()
             .map(|launch| launch.kernel.as_str())
@@ -811,7 +1176,10 @@ impl<'m> Subject<'m> {
                 .bindings
                 .iter()
                 .map(|(name, representation)| {
-                    format!("{name}={}", registry::representation_info(representation).name)
+                    format!(
+                        "{name}={}",
+                        registry::representation_info(representation).name
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join(", "),
@@ -819,6 +1187,19 @@ impl<'m> Subject<'m> {
             configuration: row.configuration,
             error,
         }
+    }
+}
+
+/// An implementation at bindings by identity: each is one value of the
+/// module's ([`CheckedModule::native_implementation_at`]), shared by every
+/// binding of the same element reads, so its address names it while the
+/// module lives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct Bound(usize);
+
+impl Bound {
+    fn of(implementation: &NativeImplementation) -> Self {
+        Self(std::ptr::from_ref(implementation) as usize)
     }
 }
 
@@ -831,82 +1212,470 @@ fn statics_of(specialization: &NativeSpecialization) -> NativeSpecialization {
         })
 }
 
-/// The changes of one choice from `row` the search considers.
-fn variations(subject: &Subject<'_>, former: &Former, row: &Row) -> Vec<Row> {
+/// The admissible specializations at one set of statics. Where the `where`
+/// condition cannot fail to evaluate at them, a walk visits exactly the
+/// configurations of its parameter product the condition admits, in order,
+/// so each question is answered by walks over a part of the product, and the
+/// first configuration such a walk visits is the first of the whole walk's
+/// within that part. Otherwise each question is answered by one walk over
+/// every admissible configuration, holding only its answers: a declaration
+/// can admit hundreds of millions, so they are never held.
+struct Admissible<'m> {
+    implementation: &'m NativeImplementation,
+    statics: NativeSpecialization,
+    axes: Vec<(Option<usize>, &'m NativeParameter)>,
+    first: NativeSpecialization,
+    /// Whether the condition can fail to evaluate at `statics`, so questions
+    /// are answered by whole walks rather than walks over parts.
+    fallible: bool,
+    variants: Vec<Vec<LaunchVariant>>,
+}
+
+/// A parameter a configuration leaves unset.
+const UNSET: u16 = u16::MAX;
+
+impl<'m> Admissible<'m> {
+    fn walk(implementation: &'m NativeImplementation, statics: &NativeSpecialization, variant_programs: bool) -> Self {
+        if implementation.infallible(statics) {
+            Self::declared(implementation, statics, variant_programs)
+        } else {
+            Self::walked(implementation, statics, variant_programs)
+        }
+    }
+
+    fn new(implementation: &'m NativeImplementation, statics: &NativeSpecialization) -> Self {
+        Self {
+            implementation,
+            statics: statics.clone(),
+            axes: implementation
+                .params
+                .iter()
+                .map(|parameter| (None, parameter))
+                .chain(implementation.launches.iter().enumerate().flat_map(
+                    |(launch, declaration)| {
+                        declaration
+                            .params
+                            .iter()
+                            .map(move |parameter| (Some(launch), parameter))
+                    },
+                ))
+                .collect(),
+            first: NativeSpecialization::new(),
+            fallible: false,
+            variants: Vec::new(),
+        }
+    }
+
+    /// Answered by walks over parts of the product: only where the condition
+    /// cannot fail to evaluate at `statics`.
+    fn declared(
+        implementation: &'m NativeImplementation,
+        statics: &NativeSpecialization,
+        variant_programs: bool,
+    ) -> Self {
+        let mut admissible = Self::new(implementation, statics);
+        admissible.first = implementation
+            .device_independent()
+            .expect(INDEPENDENT)
+            .default_specialization(statics)
+            .expect("a row's statics admit its specialization");
+        if variant_programs {
+            admissible.variants = (0..implementation.launches.len())
+                .map(|launch| admissible.launch_variants(launch))
+                .collect();
+        }
+        admissible
+    }
+
+    fn walked(
+        implementation: &'m NativeImplementation,
+        statics: &NativeSpecialization,
+        variant_programs: bool,
+    ) -> Self {
+        let mut admissible = Self::new(implementation, statics);
+        admissible.fallible = true;
+        admissible.variants = vec![
+            Vec::new();
+            if variant_programs {
+                implementation.launches.len()
+            } else {
+                0
+            }
+        ];
+        let mut first = None;
+        implementation
+            .walk_admissible(statics, |candidate| {
+                if first.is_none() {
+                    first = Some(candidate.clone());
+                }
+                for (ordinal, variants) in admissible.variants.iter_mut().enumerate() {
+                    if !implementation.reachable(candidate, ordinal) {
+                        continue;
+                    }
+                    let variant = variant_of(implementation, candidate, ordinal);
+                    if !variants.contains(&variant) {
+                        variants.push(variant);
+                    }
+                }
+                true
+            })
+            .expect("a row's statics admit its specialization");
+        admissible.first = first.expect("a row's statics admit its specialization");
+        admissible
+    }
+
+    /// `specialization`'s code on every axis.
+    fn codes_of(&self, specialization: &NativeSpecialization) -> Vec<u16> {
+        self.axes
+            .iter()
+            .map(|(launch, parameter)| {
+                let value = match launch {
+                    None => specialization.param(&parameter.name),
+                    Some(launch) => specialization.launch_param(*launch, &parameter.name),
+                };
+                value
+                    .and_then(|value| parameter.values.iter().position(|declared| *declared == value))
+                    .map_or(UNSET, |code| code as u16)
+            })
+            .collect()
+    }
+
+    /// The first admissible configuration in walk order whose every
+    /// parameter takes one of `values` (one list per axis, in declaration
+    /// order). Only for statics at which the condition cannot fail.
+    fn first_within(&self, values: &[Vec<u64>]) -> Option<NativeSpecialization> {
+        let mut within = self.implementation.clone();
+        let mut lists = values.iter();
+        for parameter in within.params.iter_mut().chain(
+            within
+                .launches
+                .iter_mut()
+                .flat_map(|launch| launch.params.iter_mut()),
+        ) {
+            parameter.values = lists.next().expect("one list per axis").clone();
+        }
+        let within = within.narrowed(&self.statics)?;
+        let mut first = None;
+        within
+            .walk_admissible(&self.statics, |configuration| {
+                first = Some(configuration.clone());
+                false
+            })
+            .expect("a walk at statics where the condition cannot fail succeeds");
+        first
+    }
+
+    /// The code variants of launch `launch` in the order of their first
+    /// configurations: each from the first configuration holding one
+    /// combination of the parameters a variant reads and the launch's
+    /// condition reads, of the combinations at which it reaches the launch.
+    fn launch_variants(&self, launch: usize) -> Vec<LaunchVariant> {
+        let declaration = &self.implementation.launches[launch];
+        let mut extent = Vec::new();
+        for expression in &declaration.group_extent {
+            expression.parameters(&mut extent);
+        }
+        let mut reached = Vec::new();
+        if let Some(when) = &declaration.when {
+            when.parameters(&mut reached);
+        }
+        let reads = self
+            .axes
+            .iter()
+            .enumerate()
+            .filter(|(_, (scope, parameter))| {
+                scope.is_none_or(|scope| scope == launch)
+                    && (parameter.code || extent.contains(&parameter.name) || reached.contains(&parameter.name))
+            })
+            .map(|(axis, _)| axis)
+            .collect::<Vec<_>>();
+        let mut firsts = Vec::new();
+        let mut choice = vec![0usize; reads.len()];
+        loop {
+            let values = self
+                .axes
+                .iter()
+                .enumerate()
+                .map(
+                    |(axis, (_, parameter))| match reads.iter().position(|read| *read == axis) {
+                        Some(at) => vec![parameter.values[choice[at]]],
+                        None => parameter.values.clone(),
+                    },
+                )
+                .collect::<Vec<_>>();
+            if let Some(first) = self
+                .first_within(&values)
+                .filter(|first| self.implementation.reachable(first, launch))
+            {
+                firsts.push((
+                    self.codes_of(&first),
+                    variant_of(self.implementation, &first, launch),
+                ));
+            }
+            let Some(at) = (0..reads.len())
+                .rev()
+                .find(|at| choice[*at] + 1 < self.axes[reads[*at]].1.values.len())
+            else {
+                break;
+            };
+            choice[at] += 1;
+            for later in &mut choice[at + 1..] {
+                *later = 0;
+            }
+        }
+        firsts.sort();
+        let mut variants = Vec::new();
+        for (_, variant) in firsts {
+            if !variants.contains(&variant) {
+                variants.push(variant);
+            }
+        }
+        variants
+    }
+
+    /// For each of `helds`: for every axis and every code of it the held
+    /// codes do not hold, in axis then code order, the first configuration in
+    /// walk order holding that code with the fewest set parameters differing
+    /// from them; codes no configuration holds are skipped.
+    fn nearest_each(&self, helds: &[Vec<u16>]) -> Vec<Vec<NativeSpecialization>> {
+        if !self.fallible {
+            return helds
+                .iter()
+                .map(|held| {
+                    self.axes
+                        .iter()
+                        .enumerate()
+                        .flat_map(|(axis, (_, parameter))| {
+                            (0..parameter.values.len() as u16)
+                                .filter(move |code| held[axis] != *code)
+                                .filter_map(move |code| self.nearest(held, axis, code))
+                        })
+                        .collect()
+                })
+                .collect();
+        }
+        // One walk for every held: each configuration is a candidate for the
+        // code it holds on each axis, at its distance from each held. A
+        // strictly nearer candidate replaces an answer, so ties keep the first
+        // in walk order.
+        let empty = self
+            .axes
+            .iter()
+            .map(|(_, parameter)| vec![None; parameter.values.len()])
+            .collect::<Vec<Vec<Option<(usize, NativeSpecialization)>>>>();
+        let mut nearest = vec![empty; helds.len()];
+        self.implementation
+            .walk_admissible(&self.statics, |candidate| {
+                let codes = self.codes_of(candidate);
+                debug_assert_eq!(
+                    codes.iter().filter(|code| **code != UNSET).count(),
+                    candidate.params().len() + candidate.launch_params().len(),
+                    "every parameter a configuration sets is declared"
+                );
+                for (held, nearest) in helds.iter().zip(&mut nearest) {
+                    let distance = codes
+                        .iter()
+                        .zip(held)
+                        .filter(|(code, held)| **code != UNSET && code != held)
+                        .count();
+                    for (axis, code) in codes.iter().enumerate() {
+                        if *code == UNSET || *code == held[axis] {
+                            continue;
+                        }
+                        let answer = &mut nearest[axis][*code as usize];
+                        if answer.as_ref().is_none_or(|(least, _)| distance < *least) {
+                            *answer = Some((distance, candidate.clone()));
+                        }
+                    }
+                }
+                true
+            })
+            .expect("a row's statics admit its specialization");
+        nearest
+            .into_iter()
+            .map(|answers| {
+                answers
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .map(|(_, specialization)| specialization)
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The first configuration in walk order holding `code` on `axis` with
+    /// the fewest set parameters differing from `held`, answered by walks
+    /// over parts of the product. Only for statics at which the condition
+    /// cannot fail.
+    fn nearest(&self, held: &[u16], axis: usize, code: u16) -> Option<NativeSpecialization> {
+        // Every configuration differs from `held` on the axes it leaves
+        // unset; on each other axis a configuration holds its value or one
+        // of the rest. So the configurations differing in exactly the axes
+        // of a set are a product, and the nearest is the first in walk order
+        // of the first products, by the size of the set, that admit one.
+        let open = (0..self.axes.len())
+            .filter(|other| {
+                *other != axis && held[*other] != UNSET && self.axes[*other].1.values.len() > 1
+            })
+            .collect::<Vec<_>>();
+        // The first configuration holding `code` bounds the sets to try.
+        let holding = self
+            .axes
+            .iter()
+            .enumerate()
+            .map(|(other, (_, parameter))| {
+                if other == axis {
+                    vec![parameter.values[code as usize]]
+                } else {
+                    parameter.values.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        let first = self.first_within(&holding)?;
+        let codes = self.codes_of(&first);
+        let bound = open
+            .iter()
+            .filter(|other| codes[**other] != held[**other])
+            .count();
+        for size in 0..bound {
+            let mut nearest: Option<(Vec<u16>, NativeSpecialization)> = None;
+            let mut set = (0..size).collect::<Vec<_>>();
+            loop {
+                let values = self
+                    .axes
+                    .iter()
+                    .enumerate()
+                    .map(|(other, (_, parameter))| {
+                        if other == axis {
+                            vec![parameter.values[code as usize]]
+                        } else if held[other] == UNSET {
+                            parameter.values.clone()
+                        } else if set.iter().any(|at| open[*at] == other) {
+                            parameter
+                                .values
+                                .iter()
+                                .enumerate()
+                                .filter(|(index, _)| *index != held[other] as usize)
+                                .map(|(_, value)| *value)
+                                .collect()
+                        } else {
+                            vec![parameter.values[held[other] as usize]]
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(first) = self.first_within(&values) {
+                    let codes = self.codes_of(&first);
+                    if nearest.as_ref().is_none_or(|(least, _)| codes < *least) {
+                        nearest = Some((codes, first));
+                    }
+                }
+                // The next set of `size` open axes, in lexicographic order.
+                let Some(at) = (0..size).rev().find(|at| set[*at] < open.len() - size + at) else {
+                    break;
+                };
+                set[at] += 1;
+                for later in at + 1..size {
+                    set[later] = set[later - 1] + 1;
+                }
+            }
+            if let Some((_, nearest)) = nearest {
+                return Some(nearest);
+            }
+        }
+        // No nearer one: the nearest differ in `bound` open axes, and the
+        // first in walk order of all holding `code` is one of them.
+        Some(first)
+    }
+}
+
+/// The code variant of launch `launch` a configuration names.
+fn variant_of(
+    implementation: &NativeImplementation,
+    configuration: &NativeSpecialization,
+    launch: usize,
+) -> LaunchVariant {
+    LaunchVariant {
+        code: plan::code_values(implementation, configuration, launch),
+        group_size: implementation.static_group_size(configuration, launch),
+    }
+}
+
+/// The changes of one choice from each of `rows` the search considers, in
+/// row order. The nearest configurations of rows sharing statics come from
+/// one set of walks.
+fn variations(subject: &Subject<'_>, former: &Former, rows: &[Row]) -> Vec<Row> {
+    let mut groups: Vec<((Bound, NativeSpecialization), Vec<usize>)> = Vec::new();
+    let mut implementations = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        let implementation = subject.implementation(&row.bindings);
+        let key = (Bound::of(implementation), statics_of(&row.specialization));
+        match groups.iter_mut().find(|(held, _)| *held == key) {
+            Some((_, indices)) => indices.push(index),
+            None => {
+                groups.push((key, vec![index]));
+                implementations.push(implementation);
+            }
+        }
+    }
+    let mut nearest = vec![Vec::new(); rows.len()];
+    for (((_, statics), indices), implementation) in groups.into_iter().zip(implementations) {
+        let admissible = subject.admissible(implementation, &statics);
+        let helds = indices
+            .iter()
+            .map(|index| admissible.codes_of(&rows[*index].specialization))
+            .collect::<Vec<_>>();
+        for (index, answers) in indices.into_iter().zip(admissible.nearest_each(&helds)) {
+            nearest[index] = answers;
+        }
+    }
+    rows.iter()
+        .zip(nearest)
+        .flat_map(|(row, nearest)| row_variations(subject, former, row, nearest))
+        .collect()
+}
+
+/// The changes of one choice from `row`: its bindings, its statics, the
+/// `nearest` configuration holding each parameter value it does not hold
+/// (ties to the first in walk order), and its device configuration.
+fn row_variations(
+    subject: &Subject<'_>,
+    former: &Former,
+    row: &Row,
+    nearest: Vec<NativeSpecialization>,
+) -> Vec<Row> {
     let mut rows = Vec::new();
     for (parameter, candidates) in &subject.candidates {
         for representation in candidates {
             if row.bindings.get(parameter) == Some(*representation) {
                 continue;
             }
-            let bindings = row.bindings.clone().bind(parameter, *representation);
+            let bindings = subject.rebind(&row.bindings, parameter, *representation);
             if subject.admits(&bindings) {
-                rows.push(Row {
-                    bindings,
-                    ..row.clone()
-                });
+                rows.extend(subject.rebound(row, bindings));
             }
         }
     }
-    let implementation = subject.implementation;
+    let implementation = subject.implementation(&row.bindings);
     let statics = statics_of(&row.specialization);
     for name in &implementation.statics {
         for value in [0, 1] {
             if statics.static_value(name) == Some(value) {
                 continue;
             }
-            if let Some(found) = subject.statics(&[(name.as_str(), value)]) {
+            if let Some(found) = subject.statics(implementation, &[(name.as_str(), value)]) {
                 rows.push(Row {
-                    specialization: subject.admissible(&found)[0].clone(),
+                    specialization: subject.admissible(implementation, &found).first.clone(),
                     ..row.clone()
                 });
             }
         }
     }
-    let admissible = subject.admissible(&statics);
-    let distance = |candidate: &NativeSpecialization| {
-        candidate
-            .params()
-            .iter()
-            .filter(|(name, value)| row.specialization.param(name) != Some(**value))
-            .count()
-            + candidate
-                .launch_params()
-                .iter()
-                .filter(|((launch, name), value)| {
-                    row.specialization.launch_param(*launch, name) != Some(**value)
-                })
-                .count()
-    };
-    let mut nearest = |matches: &dyn Fn(&NativeSpecialization) -> bool| {
-        if let Some(candidate) = admissible
-            .iter()
-            .filter(|candidate| matches(candidate))
-            .min_by_key(|candidate| distance(candidate))
-        {
-            rows.push(Row {
-                specialization: candidate.clone(),
-                ..row.clone()
-            });
-        }
-    };
-    for parameter in &implementation.params {
-        for value in &parameter.values {
-            if row.specialization.param(&parameter.name) != Some(*value) {
-                nearest(&|candidate| candidate.param(&parameter.name) == Some(*value));
-            }
-        }
-    }
-    for (launch, declaration) in implementation.launches.iter().enumerate() {
-        for parameter in &declaration.params {
-            for value in &parameter.values {
-                if row.specialization.launch_param(launch, &parameter.name) != Some(*value) {
-                    nearest(&|candidate| {
-                        candidate.launch_param(launch, &parameter.name) == Some(*value)
-                    });
-                }
-            }
-        }
+    for specialization in nearest {
+        rows.push(Row {
+            specialization,
+            ..row.clone()
+        });
     }
     for configuration in former.variations(row.configuration) {
         rows.push(Row {
@@ -917,36 +1686,59 @@ fn variations(subject: &Subject<'_>, former: &Former, row: &Row) -> Vec<Row> {
     rows
 }
 
-/// What preprocessing one row's skeletons established: the authored groups
-/// its programs contain (`universe`, apart from `rejecting` ones that hold an
-/// `#error`) and, when no `#error` rejects it, the groups it compiles.
-struct Evaluated {
-    reached: Option<BTreeSet<GroupSite>>,
+/// What preprocessing rows' skeletons established: for each row, when no
+/// `#error` rejects it, the groups it compiles; and over all the rows, the
+/// authored groups their programs contain (`universe`, apart from
+/// `rejecting` ones that hold an `#error`).
+struct Evaluation {
+    reached: Vec<Option<BTreeSet<GroupSite>>>,
     universe: BTreeSet<GroupSite>,
     rejecting: BTreeSet<GroupSite>,
 }
 
-/// Preprocess every row's skeletons, in parallel.
-fn evaluate(subject: &Subject<'_>, rows: &[Row]) -> Result<Vec<Evaluated>, CoverageError> {
-    let skeletons = in_parallel(rows, |row| gated(|| subject.skeletons(row)));
+/// Preprocess every row's skeletons. A round can hold tens of thousands of
+/// rows, each rendering several programs, so rows are evaluated a chunk at a
+/// time under one permit (a chunk is one clang batch of programs): a chunk's
+/// skeletons live only while it is preprocessed, and at most one chunk per
+/// core is held, whatever the round's size.
+fn evaluate(subject: &Subject<'_>, rows: &[Row]) -> Result<Evaluation, CoverageError> {
+    let rows_per_chunk = (CLANG_BATCH / subject.programs_per_row()).max(1);
+    let chunks = rows.chunks(rows_per_chunk).collect::<Vec<_>>();
+    let mut evaluation = Evaluation {
+        reached: Vec::with_capacity(rows.len()),
+        universe: BTreeSet::new(),
+        rejecting: BTreeSet::new(),
+    };
+    for chunk in in_parallel(&chunks, |chunk| gated(|| evaluate_chunk(subject, chunk))) {
+        let chunk = chunk?;
+        evaluation.reached.extend(chunk.reached);
+        evaluation.universe.extend(chunk.universe);
+        evaluation.rejecting.extend(chunk.rejecting);
+    }
+    Ok(evaluation)
+}
+
+fn evaluate_chunk(subject: &Subject<'_>, rows: &[Row]) -> Result<Evaluation, CoverageError> {
+    let skeletons = rows
+        .iter()
+        .map(|row| subject.skeletons(row))
+        .collect::<Vec<_>>();
     let vulkan = rows
         .first()
         .is_some_and(|row| matches!(row.configuration, Configuration::Vulkan(_)));
     let outcomes: Vec<Vec<Outcome>> = if vulkan {
         let kernels = subject.kernels();
-        in_parallel(&skeletons, |programs| {
-            gated(|| {
+        skeletons
+            .iter()
+            .map(|programs| {
                 programs
                     .iter()
                     .map(|skeleton| preprocess_vulkan(skeleton, &kernels))
                     .collect::<Result<Vec<_>, _>>()
             })
-        })
-        .into_iter()
-        .collect::<Result<_, _>>()?
+            .collect::<Result<_, _>>()?
     } else {
-        // CUDA and Metal: clang over every program of every row, in
-        // parallel batches.
+        // CUDA and Metal: clang over every program of every row, in batches.
         let texts = skeletons
             .iter()
             .flat_map(|programs| programs.iter().map(|skeleton| skeleton.text.as_str()))
@@ -954,7 +1746,7 @@ fn evaluate(subject: &Subject<'_>, rows: &[Row]) -> Result<Vec<Evaluated>, Cover
         for text in &texts {
             let unknown = predefined(text)
                 .into_iter()
-                .filter(|name| name != "__CUDA_ARCH__")
+                .filter(|name| !seismic_cuda::nvrtc::ARCHITECTURE_MACROS.contains(&name.as_str()))
                 .collect::<Vec<_>>();
             if !unknown.is_empty() {
                 return Err(CoverageError::Skeleton(format!(
@@ -962,54 +1754,57 @@ fn evaluate(subject: &Subject<'_>, rows: &[Row]) -> Result<Vec<Evaluated>, Cover
                 )));
             }
         }
-        let batches = texts.chunks(CLANG_BATCH).collect::<Vec<_>>();
-        let mut flat = in_parallel(&batches, |batch| gated(|| preprocess_clang(batch)))
-            .into_iter()
+        let mut flat = texts
+            .chunks(CLANG_BATCH)
+            .map(preprocess_clang)
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .flatten();
         skeletons
             .iter()
-            .map(|programs| programs.iter().map(|_| flat.next().expect("one outcome per skeleton")).collect())
+            .map(|programs| {
+                programs
+                    .iter()
+                    .map(|_| flat.next().expect("one outcome per skeleton"))
+                    .collect()
+            })
             .collect()
     };
-    Ok(skeletons
-        .iter()
-        .zip(outcomes)
-        .map(|(programs, outcomes)| {
-            let mut evaluated = Evaluated {
-                reached: Some(BTreeSet::new()),
-                universe: BTreeSet::new(),
-                rejecting: BTreeSet::new(),
+    let mut evaluation = Evaluation {
+        reached: Vec::with_capacity(rows.len()),
+        universe: BTreeSet::new(),
+        rejecting: BTreeSet::new(),
+    };
+    for (programs, outcomes) in skeletons.iter().zip(outcomes) {
+        let mut reached = Some(BTreeSet::new());
+        for (skeleton, outcome) in programs.iter().zip(outcomes) {
+            let markers = match outcome {
+                Outcome::Rejected => {
+                    reached = None;
+                    BTreeSet::new()
+                }
+                Outcome::Reached(markers) => markers,
             };
-            for (skeleton, outcome) in programs.iter().zip(outcomes) {
-                let markers = match outcome {
-                    Outcome::Rejected => {
-                        evaluated.reached = None;
-                        BTreeSet::new()
-                    }
-                    Outcome::Reached(markers) => markers,
-                };
-                for (marker, site) in skeleton.sites.iter().enumerate() {
-                    if skeleton.rejecting.contains(&marker) {
-                        evaluated.rejecting.insert(site.clone());
-                        continue;
-                    }
-                    evaluated.universe.insert(site.clone());
-                    if markers.contains(&marker) {
-                        if let Some(reached) = &mut evaluated.reached {
-                            reached.insert(site.clone());
-                        }
+            for (marker, site) in skeleton.sites.iter().enumerate() {
+                if skeleton.rejecting.contains(&marker) {
+                    evaluation.rejecting.insert(site.clone());
+                    continue;
+                }
+                evaluation.universe.insert(site.clone());
+                if markers.contains(&marker) {
+                    if let Some(reached) = &mut reached {
+                        reached.insert(site.clone());
                     }
                 }
             }
-            evaluated
-        })
-        .collect())
+        }
+        evaluation.reached.push(reached);
+    }
+    Ok(evaluation)
 }
 
 /// What forming one row established.
-enum Formation {
+enum RowOutcome {
     /// The toolchain formed these programs.
     Formed(usize),
     /// The kernel rejects the configuration: a `static_assert` fired, which
@@ -1020,22 +1815,22 @@ enum Formation {
     Unformable,
 }
 
-fn form_row(subject: &Subject<'_>, former: &Former, row: &Row) -> Formation {
-    if !former.formable(row.configuration) {
-        return Formation::Unformable;
+/// Form `row`'s programs in order: the first that does not form decides.
+fn form_row(subject: &Subject<'_>, forms: Forms<'_>, row: &Row) -> RowOutcome {
+    if !forms.former.formable(row.configuration) {
+        return RowOutcome::Unformable;
     }
     let programs = subject.programs(row);
-    match gated(|| former.form(&programs, row.configuration)) {
-        Ok(()) => Formation::Formed(programs.len()),
-        Err(error) if asserted(&error) => Formation::Rejected,
-        Err(error) => Formation::Failed(compilation_message(&error)),
-    }
-}
-
-/// Whether a compilation failed because a `static_assert` fired.
-fn asserted(error: &NativeCompilationError) -> bool {
-    let text = format!("{error:?}");
-    text.contains("static assertion failed") || text.contains("static_assert failed")
+    gated(|| {
+        for program in &programs {
+            match forms.form(row.configuration, program) {
+                Verdict::Formed => {}
+                Verdict::Rejected => return RowOutcome::Rejected,
+                Verdict::Failed(error) => return RowOutcome::Failed(error),
+            }
+        }
+        RowOutcome::Formed(programs.len())
+    })
 }
 
 /// One entry's search: its kept rows, what forming them established, and
@@ -1054,19 +1849,20 @@ struct Search {
     reached: BTreeSet<GroupSite>,
     universe: BTreeSet<GroupSite>,
     rejecting: BTreeSet<GroupSite>,
+    untaken: Vec<Untaken>,
 }
 
 impl Search {
     /// Record a kept row's formation; `false` when the kernel rejects it.
-    fn record(&mut self, subject: &Subject<'_>, row: &Row, formation: Formation) -> bool {
+    fn record(&mut self, subject: &Subject<'_>, row: &Row, formation: RowOutcome) -> bool {
         match formation {
-            Formation::Formed(programs) => {
+            RowOutcome::Formed(programs) => {
                 self.formed += programs;
                 self.kept.push(row.clone());
             }
-            Formation::Rejected => return false,
-            Formation::Failed(error) => self.failures.push(subject.describe(row, error)),
-            Formation::Unformable => self.unformable.push(row.configuration),
+            RowOutcome::Rejected => return false,
+            RowOutcome::Failed(error) => self.failures.push(subject.describe(row, error)),
+            RowOutcome::Unformable => self.unformable.push(row.configuration),
         }
         true
     }
@@ -1078,82 +1874,53 @@ impl Search {
     }
 }
 
-fn search(subject: &Subject<'_>, former: &Former) -> Result<Option<Search>, CoverageError> {
-    let implementation = subject.implementation;
-    let Some(statics) = subject.statics(&[]) else {
-        return Ok(None);
-    };
-    let specialization = implementation
-        .default_specialization(&statics)
-        .expect("searched statics admit a configuration");
-    let configuration = former.base();
+/// The base of `subject`'s search, formed and recorded in `search`: the first
+/// binding in candidate order that is admitted, implemented and not rejected
+/// by the toolchain.
+fn search_base(
+    subject: &Subject<'_>,
+    forms: Forms<'_>,
+    search: &mut Search,
+) -> Result<Option<Row>, CoverageError> {
+    base_row(
+        subject,
+        forms.former.base(),
+        |row, mut evaluated| {
+            search
+                .universe
+                .extend(std::mem::take(&mut evaluated.universe));
+            search
+                .rejecting
+                .extend(std::mem::take(&mut evaluated.rejecting));
+            match evaluated.reached.pop().expect("one row evaluated") {
+                Some(reached) if search.record(subject, row, form_row(subject, forms, row)) => {
+                    search.reached.extend(reached);
+                    true
+                }
+                _ => false,
+            }
+        },
+    )
+}
+
+fn search(subject: &Subject<'_>, forms: Forms<'_>) -> Result<Option<Search>, CoverageError> {
     let mut search = Search::default();
-    // The base: the first binding in candidate order that is admitted,
-    // implemented and not rejected by the toolchain.
-    let mut base = None;
-    let mut choice = vec![0usize; subject.candidates.len()];
-    if subject.candidates.iter().all(|(_, candidates)| !candidates.is_empty()) {
-        loop {
-            let bindings = subject.candidates.iter().zip(&choice).fold(
-                ElementBindings::new(),
-                |bindings, ((parameter, candidates), index)| {
-                    bindings.bind(parameter, candidates[*index])
-                },
-            );
-            if subject.admits(&bindings) {
-                let row = Row {
-                    bindings,
-                    specialization: specialization.clone(),
-                    configuration,
-                };
-                let evaluated = evaluate(subject, std::slice::from_ref(&row))?
-                    .pop()
-                    .expect("one row evaluated");
-                search.universe.extend(evaluated.universe);
-                search.rejecting.extend(evaluated.rejecting);
-                if let Some(reached) = evaluated.reached {
-                    if search.record(subject, &row, form_row(subject, former, &row)) {
-                        search.reached.extend(reached);
-                        base = Some(row);
-                        break;
-                    }
-                }
-            }
-            let mut position = choice.len();
-            let advanced = loop {
-                if position == 0 {
-                    break false;
-                }
-                position -= 1;
-                choice[position] += 1;
-                if choice[position] < subject.candidates[position].1.len() {
-                    break true;
-                }
-                choice[position] = 0;
-            };
-            if !advanced {
-                break;
-            }
-        }
-    }
+    let base = search_base(subject, forms, &mut search)?;
     let Some(base) = base else {
         return Ok(None);
     };
+    search.untaken = untaken_at(subject, forms.former.resident_layout(), &base)?;
     let mut seen = BTreeSet::from([base.key()]);
     let mut frontier = vec![base.clone()];
     let mut paired = false;
     loop {
         // Change one choice at a time from every newly kept configuration.
         while !frontier.is_empty() {
-            let mut candidates = Vec::new();
-            for row in &frontier {
-                for candidate in variations(subject, former, row) {
-                    if seen.insert(candidate.key()) {
-                        candidates.push(candidate);
-                    }
-                }
-            }
-            frontier = keep(subject, former, candidates, &mut search)?;
+            let candidates = variations(subject, forms.former, &frontier)
+                .into_iter()
+                .filter(|candidate| seen.insert(candidate.key()))
+                .collect();
+            frontier = keep(subject, forms, candidates, &mut search)?;
         }
         if search.complete() || paired {
             break;
@@ -1164,12 +1931,154 @@ fn search(subject: &Subject<'_>, former: &Former) -> Result<Option<Search>, Cove
         // from whatever the pairs reach.
         paired = true;
         let candidates = binding_pairs(subject, &base, &mut seen);
-        frontier = keep(subject, former, candidates, &mut search)?;
+        frontier = keep(subject, forms, candidates, &mut search)?;
     }
-    form_values(subject, former, &base, &mut search)?;
+    form_values(subject, forms, &base, &mut search)?;
     let rejecting = std::mem::take(&mut search.rejecting);
     search.universe.retain(|site| !rejecting.contains(site));
     Ok(Some(search))
+}
+
+/// The first binding in candidate order that is admitted, whose
+/// implementation admits some statics, and that `accept` takes, given its
+/// evaluation, as a row of `configuration` at the searched statics' defaults
+/// ([`Subject::based`]).
+fn base_row(
+    subject: &Subject<'_>,
+    configuration: Configuration,
+    mut accept: impl FnMut(&Row, Evaluation) -> bool,
+) -> Result<Option<Row>, CoverageError> {
+    if subject
+        .candidates
+        .iter()
+        .any(|(_, candidates)| candidates.is_empty())
+    {
+        return Ok(None);
+    }
+    let mut choice = vec![0usize; subject.candidates.len()];
+    loop {
+        let bindings = subject.candidates.iter().zip(&choice).fold(
+            ElementBindings::new(),
+            |bindings, ((parameter, candidates), index)| {
+                bindings.bind(parameter, candidates[*index])
+            },
+        );
+        if let Some(row) = subject
+            .admits(&bindings)
+            .then(|| subject.based(bindings, configuration))
+            .flatten()
+        {
+            let evaluated = evaluate(subject, std::slice::from_ref(&row))?;
+            if accept(&row, evaluated) {
+                return Ok(Some(row));
+            }
+        }
+        let mut position = choice.len();
+        let advanced = loop {
+            if position == 0 {
+                break false;
+            }
+            position -= 1;
+            choice[position] += 1;
+            if choice[position] < subject.candidates[position].1.len() {
+                break true;
+            }
+            choice[position] = 0;
+        };
+        if !advanced {
+            return Ok(None);
+        }
+    }
+}
+
+/// The representations of `layout` that a weight slot of `base`'s entry is
+/// not implemented at while it is at another of them, each with only that
+/// slot of `base` changed. Only preprocessing decides; nothing is formed.
+fn untaken_at(
+    subject: &Subject<'_>,
+    layout: registry::Layout,
+    base: &Row,
+) -> Result<Vec<Untaken>, CoverageError> {
+    let domain = &subject.info.element_domain;
+    let mut untaken = Vec::new();
+    for (parameter, candidates) in &subject.candidates {
+        if !weight_slot(domain, parameter) {
+            continue;
+        }
+        let rows = candidates
+            .iter()
+            .filter(|representation| {
+                registry::representation_info(**representation).layout == layout
+            })
+            .map(|representation| subject.rebind(&base.bindings, parameter, *representation))
+            .filter(|bindings| subject.admits(bindings))
+            .filter_map(|bindings| subject.rebound(base, bindings))
+            .collect::<Vec<_>>();
+        let reached = evaluate(subject, &rows)?.reached;
+        if reached.iter().all(Option::is_none) {
+            continue;
+        }
+        for (row, _) in rows
+            .iter()
+            .zip(reached)
+            .filter(|(_, reached)| reached.is_none())
+        {
+            let representation = row.bindings.get(parameter).expect("the slot is bound");
+            untaken.push(Untaken {
+                entry: subject.info.name.clone(),
+                parameter: parameter.clone(),
+                representation: registry::representation_info(representation).name,
+            });
+        }
+    }
+    Ok(untaken)
+}
+
+/// Whether `parameter` is a weight slot: the entry reads its elements, and no
+/// conversion's source chooses it (`repack[U = U]`).
+fn weight_slot(domain: &ElementDomain, parameter: &str) -> bool {
+    let read = domain.parameters().iter().any(|element| {
+        element.name == parameter && (element.uses.decoded_read || element.uses.component_read)
+    });
+    let converted = domain.conversions().iter().any(|conversion| {
+        matches!(&conversion.target, ElementTarget::Parameter(target) if target == parameter)
+    });
+    read && !converted
+}
+
+/// Every resident representation a weight slot of a native implementation
+/// of `module` does not take while it takes another, on `toolchain`'s
+/// backend: the check [`cover`] makes, by preprocessing alone. Each entry's
+/// base is its first binding in candidate order that is admitted and
+/// implemented.
+pub fn untaken(
+    module: &CheckedModule,
+    toolchain: &Toolchain,
+) -> Result<Vec<Untaken>, CoverageError> {
+    let former = &toolchain.former;
+    let subjects = subjects(module, former.backend())?;
+    let found = in_parallel(&subjects, |subject| {
+        let base = base_row(
+            subject,
+            former.base(),
+            |_, mut evaluated| {
+                evaluated
+                    .reached
+                    .pop()
+                    .expect("one row evaluated")
+                    .is_some()
+            },
+        )?;
+        match base {
+            Some(base) => untaken_at(subject, former.resident_layout(), &base),
+            None => Ok(Vec::new()),
+        }
+    });
+    let mut untaken = Vec::new();
+    for found in found {
+        untaken.extend(found?);
+    }
+    Ok(untaken)
 }
 
 /// One value of a `form` tuning parameter: the launch that declares it (none
@@ -1191,41 +2100,57 @@ fn holds(specialization: &NativeSpecialization, (launch, name, value): Form<'_>)
 /// device configuration, never the product with the other parameters.
 fn form_values(
     subject: &Subject<'_>,
-    former: &Former,
+    forms: Forms<'_>,
     base: &Row,
     search: &mut Search,
 ) -> Result<(), CoverageError> {
-    let implementation = subject.implementation;
-    let forms: Vec<Form<'_>> = implementation
+    let implementation = subject.implementation(&base.bindings);
+    let values: Vec<Form<'_>> = implementation
         .params
         .iter()
         .map(|parameter| (None, parameter))
-        .chain(implementation.launches.iter().enumerate().flat_map(
-            |(launch, declaration)| {
-                declaration.params.iter().map(move |parameter| (Some(launch), parameter))
-            },
-        ))
+        .chain(
+            implementation
+                .launches
+                .iter()
+                .enumerate()
+                .flat_map(|(launch, declaration)| {
+                    declaration
+                        .params
+                        .iter()
+                        .map(move |parameter| (Some(launch), parameter))
+                }),
+        )
         .filter(|(_, parameter)| parameter.form)
         .flat_map(|(launch, parameter)| {
-            parameter.values.iter().map(move |value| (launch, parameter.name.as_str(), *value))
+            parameter
+                .values
+                .iter()
+                .map(move |value| (launch, parameter.name.as_str(), *value))
         })
         .collect();
     let mut configurations = vec![base.configuration];
-    configurations.extend(former.variations(base.configuration));
+    configurations.extend(forms.former.variations(base.configuration));
     // Whether each form is settled (formed, or beyond this host's toolchain)
     // and whether a row of it failed, which is reported as that failure.
-    let mut settled = vec![false; forms.len()];
-    let mut failed = vec![false; forms.len()];
+    let mut settled = vec![false; values.len()];
+    let mut failed = vec![false; values.len()];
     let mut rows: Vec<(usize, Row)> = Vec::new();
-    for (index, form) in forms.iter().enumerate() {
+    for (index, form) in values.iter().enumerate() {
         let specialization = search
             .kept
             .iter()
             .chain(rows.iter().map(|(_, row)| row))
             .map(|row| &row.specialization)
-            .find(|specialization| holds(specialization, *form))
+            .find(|specialization| {
+                holds(specialization, *form) && implementation.validate(specialization).is_ok()
+            })
             .cloned()
-            .or_else(|| implementation.search_form(form.0, form.1, form.2));
+            .or_else(|| {
+                implementation
+                    .search_form(form.0, form.1, form.2)
+                    .expect("an implementation at bindings reads no element")
+            });
         let Some(specialization) = specialization else {
             continue;
         };
@@ -1249,27 +2174,28 @@ fn form_values(
     }
     let candidates = rows.iter().map(|(_, row)| row.clone()).collect::<Vec<_>>();
     let mut implemented = Vec::new();
-    for ((index, row), evaluated) in rows.into_iter().zip(evaluate(subject, &candidates)?) {
-        search.universe.extend(evaluated.universe);
-        search.rejecting.extend(evaluated.rejecting);
-        if let Some(reached) = evaluated.reached {
+    let evaluated = evaluate(subject, &candidates)?;
+    search.universe.extend(evaluated.universe);
+    search.rejecting.extend(evaluated.rejecting);
+    for ((index, row), reached) in rows.into_iter().zip(evaluated.reached) {
+        if let Some(reached) = reached {
             implemented.push((index, row, reached));
         }
     }
-    let formations = in_parallel(&implemented, |(_, row, _)| form_row(subject, former, row));
+    let formations = in_parallel(&implemented, |(_, row, _)| form_row(subject, forms, row));
     for ((index, row, reached), formation) in implemented.into_iter().zip(formations) {
         match formation {
-            Formation::Failed(_) => failed[index] = true,
-            Formation::Formed(_) | Formation::Unformable => settled[index] = true,
-            Formation::Rejected => {}
+            RowOutcome::Failed(_) => failed[index] = true,
+            RowOutcome::Formed(_) | RowOutcome::Unformable => settled[index] = true,
+            RowOutcome::Rejected => {}
         }
         if search.record(subject, &row, formation) {
             search.reached.extend(reached);
         }
     }
-    search.forms = forms.len();
+    search.forms = values.len();
     search.forms_formed = settled.iter().filter(|settled| **settled).count();
-    search.unformed = forms
+    search.unformed = values
         .iter()
         .zip(settled.iter().zip(&failed))
         .filter(|(_, (settled, failed))| !**settled && !**failed)
@@ -1290,16 +2216,16 @@ fn form_values(
 /// again among the rest. The kept candidates are returned.
 fn keep(
     subject: &Subject<'_>,
-    former: &Former,
+    forms: Forms<'_>,
     candidates: Vec<Row>,
     search: &mut Search,
 ) -> Result<Vec<Row>, CoverageError> {
     let evaluated = evaluate(subject, &candidates)?;
+    search.universe.extend(evaluated.universe);
+    search.rejecting.extend(evaluated.rejecting);
     let mut open = Vec::new();
-    for (candidate, evaluated) in candidates.into_iter().zip(evaluated) {
-        search.universe.extend(evaluated.universe);
-        search.rejecting.extend(evaluated.rejecting);
-        if let Some(reached) = evaluated.reached {
+    for (candidate, reached) in candidates.into_iter().zip(evaluated.reached) {
+        if let Some(reached) = reached {
             open.push((candidate, reached));
         }
     }
@@ -1319,7 +2245,9 @@ fn keep(
         if chosen.is_empty() {
             return Ok(kept);
         }
-        let formations = in_parallel(&chosen, |(candidate, _)| form_row(subject, former, candidate));
+        let formations = in_parallel(&chosen, |(candidate, _)| {
+            form_row(subject, forms, candidate)
+        });
         let mut rejected = false;
         for ((candidate, reached), formation) in chosen.into_iter().zip(formations) {
             if search.record(subject, &candidate, formation) {
@@ -1350,16 +2278,18 @@ fn binding_pairs(subject: &Subject<'_>, row: &Row, seen: &mut BTreeSet<String>) 
                     if row.bindings.get(other) == Some(*other_representation) {
                         continue;
                     }
-                    let candidate = Row {
-                        bindings: row
-                            .bindings
-                            .clone()
-                            .bind(parameter, *representation)
-                            .bind(other, *other_representation),
-                        ..row.clone()
-                    };
-                    if seen.insert(candidate.key()) && subject.admits(&candidate.bindings) {
-                        rows.push(candidate);
+                    let bindings = subject.rebind(
+                        &subject.rebind(&row.bindings, parameter, *representation),
+                        other,
+                        *other_representation,
+                    );
+                    if !subject.admits(&bindings) {
+                        continue;
+                    }
+                    if let Some(candidate) = subject.rebound(row, bindings) {
+                        if seen.insert(candidate.key()) {
+                            rows.push(candidate);
+                        }
                     }
                 }
             }
@@ -1368,25 +2298,27 @@ fn binding_pairs(subject: &Subject<'_>, row: &Row, seen: &mut BTreeSet<String>) 
     rows
 }
 
-/// Form every native implementation of `module` for `backend`. Entries are
-/// searched in parallel, each search preprocessing and forming its
-/// candidates in parallel; the toolchain work itself runs at most one job
-/// per core.
-pub fn cover(module: &CheckedModule, backend: BackendName) -> Result<Coverage, CoverageError> {
-    let former = Former::open(backend)?;
-    let subjects = module
-        .entries()
-        .iter()
-        .filter_map(|info| {
-            let candidates = info
-                .element_parameters
-                .iter()
-                .map(|parameter| (parameter.clone(), representations()))
-                .collect();
-            Subject::new(module, info, backend, candidates)
-        })
-        .collect::<Vec<_>>();
-    let searches = in_parallel(&subjects, |subject| search(subject, &former));
+/// Form every native implementation of `module` with `toolchain`, through
+/// `forming`. Entries are searched in parallel, each search preprocessing
+/// and forming its candidates in parallel; the toolchain work itself runs at
+/// most one job per core. `progress` counts the entries searched.
+pub fn cover(
+    module: &CheckedModule,
+    toolchain: &Toolchain,
+    forming: &dyn Forming,
+    progress: &Progress,
+) -> Result<Coverage, CoverageError> {
+    let forms = Forms {
+        former: &toolchain.former,
+        forming,
+    };
+    let subjects = subjects(module, toolchain.backend())?;
+    progress.begin(subjects.len());
+    let searches = in_parallel(&subjects, |subject| {
+        let searched = search(subject, forms);
+        progress.advance();
+        searched
+    });
     let mut coverage = Coverage::default();
     let mut reached = BTreeSet::new();
     let mut universe = BTreeSet::new();
@@ -1400,6 +2332,7 @@ pub fn cover(module: &CheckedModule, backend: BackendName) -> Result<Coverage, C
         coverage.forms_formed += searched.forms_formed;
         coverage.forms += searched.forms;
         coverage.unformed.extend(searched.unformed);
+        coverage.untaken.extend(searched.untaken);
         coverage.failures.extend(searched.failures);
         coverage.unformable.extend(
             searched
@@ -1416,6 +2349,62 @@ pub fn cover(module: &CheckedModule, backend: BackendName) -> Result<Coverage, C
     Ok(coverage)
 }
 
+/// Form the base configuration of every native implementation of `module`
+/// with `toolchain`, through `forming`, in parallel across entries: each
+/// entry's first binding in candidate order that is admitted and
+/// implemented, without [`cover`]'s search of the others. What a caller that
+/// must run on every change bounds by entry, one formation of each.
+/// `progress` counts the entries formed.
+pub fn form_bases(
+    module: &CheckedModule,
+    toolchain: &Toolchain,
+    forming: &dyn Forming,
+    progress: &Progress,
+) -> Result<Coverage, CoverageError> {
+    let forms = Forms {
+        former: &toolchain.former,
+        forming,
+    };
+    let subjects = subjects(module, toolchain.backend())?;
+    progress.begin(subjects.len());
+    let bases = in_parallel(&subjects, |subject| {
+        let mut search = Search::default();
+        let base = search_base(subject, forms, &mut search);
+        progress.advance();
+        base.map(|base| (base.is_some(), search))
+    });
+    let mut coverage = Coverage::default();
+    for (subject, base) in subjects.iter().zip(bases) {
+        let (implemented, search) = base?;
+        if !implemented {
+            coverage.unimplemented.push(subject.info.name.clone());
+        }
+        coverage.formed += search.formed;
+        coverage.failures.extend(search.failures);
+    }
+    Ok(coverage)
+}
+
+/// Every entry of `module` with a native implementation on `backend`, each
+/// element parameter's candidates every registry representation.
+fn subjects(
+    module: &CheckedModule,
+    backend: BackendName,
+) -> Result<Vec<Subject<'_>>, CoverageError> {
+    module
+        .entries()
+        .iter()
+        .filter_map(|info| {
+            let candidates = info
+                .element_parameters
+                .iter()
+                .map(|parameter| (parameter.clone(), representations()))
+                .collect();
+            Subject::new(module, info, backend, candidates).transpose()
+        })
+        .collect()
+}
+
 /// `work` over every item on every core, results in item order.
 fn in_parallel<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + Sync) -> Vec<R> {
     let next = std::sync::atomic::AtomicUsize::new(0);
@@ -1424,18 +2413,26 @@ fn in_parallel<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + Sync) -> 
         .map_or(1, usize::from)
         .min(items.len());
     std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
         for _ in 0..workers {
-            scope.spawn(|| loop {
-                let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let Some(item) = items.get(index) else {
-                    return;
-                };
-                let result = work(item);
-                results
-                    .lock()
-                    .expect("no worker panics holding the lock")
-                    .push((index, result));
-            });
+            handles.push(scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(item) = items.get(index) else {
+                        return;
+                    };
+                    let result = work(item);
+                    results
+                        .lock()
+                        .expect("no worker panics holding the lock")
+                        .push((index, result));
+                }
+            }));
+        }
+        for handle in handles {
+            if let Err(payload) = handle.join() {
+                std::panic::resume_unwind(payload);
+            }
         }
     });
     let mut results = results.into_inner().expect("the lock is not poisoned");
@@ -1456,7 +2453,10 @@ fn gated<R>(work: impl FnOnce() -> R) -> R {
     });
     {
         let mut free = released
-            .wait_while(free.lock().expect("no thread panics holding the permits"), |free| *free == 0)
+            .wait_while(
+                free.lock().expect("no thread panics holding the permits"),
+                |free| *free == 0,
+            )
             .expect("no thread panics holding the permits");
         *free -= 1;
     }
@@ -1470,15 +2470,6 @@ fn gated<R>(work: impl FnOnce() -> R) -> R {
     }
     let _permit = Permit(free, released);
     work()
-}
-
-fn compilation_message(error: &NativeCompilationError) -> String {
-    let text = format!("{error:?}");
-    text.lines()
-        .filter(|line| line.contains("ERROR") || line.contains("error"))
-        .take(4)
-        .collect::<Vec<_>>()
-        .join(" | ")
 }
 
 /// A kernel request a program makes: an entry at element bindings and
@@ -1504,70 +2495,74 @@ pub enum RequestFailure {
 impl fmt::Display for RequestFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Inadmissible(reason) => write!(f, "statics outside the kernel's domain: {reason}"),
+            Self::Inadmissible(reason) => {
+                write!(f, "statics outside the kernel's domain: {reason}")
+            }
             Self::Unimplemented => f.write_str("the kernel rejects the binding"),
             Self::Formation(error) => write!(f, "formation failed: {error}"),
         }
     }
 }
 
-/// Forms requests as preparation forms them on one backend's base
-/// configuration, at each request's default specialization.
-pub struct RequestFormer {
-    former: Former,
-    backend: BackendName,
+/// Form every request as preparation forms it on `toolchain`'s base
+/// configuration, at its default specialization, in parallel through
+/// `forming`; results in request order. `progress` counts the requests
+/// formed.
+pub fn form_requests(
+    module: &CheckedModule,
+    toolchain: &Toolchain,
+    forming: &dyn Forming,
+    requests: &[Request],
+    progress: &Progress,
+) -> Vec<Result<(), RequestFailure>> {
+    let forms = Forms {
+        former: &toolchain.former,
+        forming,
+    };
+    progress.begin(requests.len());
+    in_parallel(requests, |request| {
+        let formed = form_request(module, forms, request);
+        progress.advance();
+        formed
+    })
 }
 
-impl RequestFormer {
-    pub fn open(backend: BackendName) -> Result<Self, CoverageError> {
-        Ok(Self {
-            former: Former::open(backend)?,
-            backend,
-        })
+fn form_request(
+    module: &CheckedModule,
+    forms: Forms<'_>,
+    request: &Request,
+) -> Result<(), RequestFailure> {
+    let info = module
+        .entries()
+        .iter()
+        .find(|info| info.id == request.entry)
+        .expect("a request names an entry of the module");
+    let subject = Subject::new(module, info, forms.former.backend(), Vec::new())
+        .map_err(|error| RequestFailure::Formation(error.to_string()))?
+        .expect("a request names an entry with a native implementation");
+    let specialization = subject
+        .implementation(&request.bindings)
+        .device_independent()
+        .expect(INDEPENDENT)
+        .default_specialization(&request.statics)
+        .map_err(|error| RequestFailure::Inadmissible(error.to_string()))?;
+    let row = Row {
+        bindings: request.bindings.clone(),
+        specialization,
+        configuration: forms.former.base(),
+    };
+    let reached = evaluate(&subject, std::slice::from_ref(&row))
+        .map_err(|error| RequestFailure::Formation(error.to_string()))?
+        .reached
+        .pop()
+        .expect("one row evaluated");
+    if reached.is_none() {
+        return Err(RequestFailure::Unimplemented);
     }
-
-    pub fn backend(&self) -> BackendName {
-        self.backend
-    }
-
-    pub fn form(&self, module: &CheckedModule, request: &Request) -> Result<(), RequestFailure> {
-        let info = module
-            .entries()
-            .iter()
-            .find(|info| info.id == request.entry)
-            .expect("a request names an entry of the module");
-        let subject = Subject::new(module, info, self.backend, Vec::new())
-            .expect("a request names an entry with a native implementation");
-        let specialization = subject
-            .implementation
-            .default_specialization(&request.statics)
-            .map_err(|error| RequestFailure::Inadmissible(error.to_string()))?;
-        let row = Row {
-            bindings: request.bindings.clone(),
-            specialization,
-            configuration: self.former.base(),
-        };
-        let evaluated = evaluate(&subject, std::slice::from_ref(&row))
-            .map_err(|error| RequestFailure::Formation(error.to_string()))?
-            .pop()
-            .expect("one row evaluated");
-        if evaluated.reached.is_none() {
-            return Err(RequestFailure::Unimplemented);
-        }
-        match form_row(&subject, &self.former, &row) {
-            Formation::Formed(_) | Formation::Unformable => Ok(()),
-            Formation::Rejected => Err(RequestFailure::Unimplemented),
-            Formation::Failed(error) => Err(RequestFailure::Formation(error)),
-        }
-    }
-
-    /// [`Self::form`] over every request, in parallel, results in order.
-    pub fn form_all(
-        &self,
-        module: &CheckedModule,
-        requests: &[Request],
-    ) -> Vec<Result<(), RequestFailure>> {
-        in_parallel(requests, |request| self.form(module, request))
+    match form_row(&subject, forms, &row) {
+        RowOutcome::Formed(_) | RowOutcome::Unformable => Ok(()),
+        RowOutcome::Rejected => Err(RequestFailure::Unimplemented),
+        RowOutcome::Failed(error) => Err(RequestFailure::Formation(error)),
     }
 }
 
@@ -1589,13 +2584,26 @@ mod tests {
         assert_eq!(
             skeleton.sites,
             vec![
-                GroupSite { file: "k.comp".into(), line: 1 },
-                GroupSite { file: "lib/x.glsl".into(), line: 1 },
-                GroupSite { file: "k.comp".into(), line: 3 },
+                GroupSite {
+                    file: "k.comp".into(),
+                    line: 1
+                },
+                GroupSite {
+                    file: "lib/x.glsl".into(),
+                    line: 1
+                },
+                GroupSite {
+                    file: "k.comp".into(),
+                    line: 3
+                },
             ]
         );
         assert_eq!(skeleton.rejecting, BTreeSet::from([1]));
-        assert!(skeleton.text.starts_with("#version 460\n#define A 1\n#if Q\n#endif\n#if A\n"));
+        assert!(
+            skeleton
+                .text
+                .starts_with("#version 460\n#define A 1\n#if Q\n#endif\n#if A\n")
+        );
         assert!(skeleton.text.ends_with("void main() {}\n"));
     }
 

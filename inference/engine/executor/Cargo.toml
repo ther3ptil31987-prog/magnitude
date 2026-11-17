@@ -12,38 +12,58 @@ magnitude-family-contracts = { path = "../families/contracts" }
 magnitude-kernels = { path = "../kernels" }
 magnitude-state = { path = "../state" }
 seismic.workspace = true
+seismic-io.workspace = true
 serde.workspace = true
 # Persisted precision policies and objective weights retain their exact f64 identity.
 serde_json = { version = "=1.0.151", features = ["float_roundtrip"] }
 sha2 = "=0.11.0"
+tracing.workspace = true
 
 [features]
-# Development-only bounded precision calibration; production uses fixed limits.
-tuning-precision-experiment = []
-# Development-only tuning pin for bit-exact measurement runs
-# (`native::tuning::pinned`). Enabled only through `magnitude-engine`'s
-# `pinned-tuning` feature by the `forward_bench` example; never by a served
-# engine.
-pinned-tuning = []
 # Development-only tuning survey (`native::tuning::survey`): every admissible
 # configuration of every tuned entry is measured and recorded for replaying
 # the search. Enabled only through `magnitude-engine`'s `tuning-survey`
-# feature by `forward_bench`; never by a served engine.
+# feature by `magnitude-harness`; never by a served engine.
 tuning-survey = []
+# Development-only routing replay (`experts::directory::replay`): eviction
+# over a run's recorded routing. Enabled only through `magnitude-engine`'s
+# `expert-routing` feature by `magnitude-harness`; never by a served engine.
+expert-routing = []
+# Development-only machine line (`assessment::line`): what the hardware
+# itself reaches, measured on request by a tool's measurement job. Enabled
+# only through `magnitude-engine`'s `machine-line` feature by
+# `magnitude-harness` and `magnitude-assess`; never by a served engine.
+machine-line = ["magnitude-kernels/machine-line"]
+# Test-only: the controlled execution domain (`fixtures`), its family and its
+# fake expert bank, for the tests of the owners above the domain, and the
+# expert watchers' stall (`starve`). Enabled only as a
+# dev-dependency; never by a served engine.
+fixtures = ["seismic/fixtures"]
 
-# The catalog's families and headers, for the assessment terms of every
-# catalog target (`assessment::catalog`).
+# The report's stacks on x86-64 Linux, unwound through the images' tables
+# without allocating (`diagnostics::stacks::cfi`).
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+gimli = { version = "0.32", default-features = false, features = ["read-core"] }
+
 [dev-dependencies]
+# The registered families and the catalog's headers, for the assessment terms
+# of every catalog target, and the families its drafts name
+# (`assessment::catalog`).
 magnitude-family-common = { path = "../families/common", features = ["catalog-headers"] }
+magnitude-family-registry = { path = "../families/registry" }
 magnitude-family-dflash = { path = "../families/dflash" }
 magnitude-family-gemma4 = { path = "../families/gemma4" }
 magnitude-family-lfm2 = { path = "../families/lfm2" }
-magnitude-family-llama = { path = "../families/llama" }
-magnitude-family-muse-glimmer = { path = "../families/muse_glimmer" }
 magnitude-family-nemotron-h = { path = "../families/nemotron_h" }
 magnitude-family-qwen35 = { path = "../families/qwen35" }
+magnitude-family-qwen4exp = { path = "../families/qwen4exp" }
+# The recorded machines' topologies, for fit and assessment over the spec's
+# situations (`platform::policy`, `planning::assessment`).
+seismic = { workspace = true, features = ["fixtures"] }
+# The kernels' reference bodies, which the cost function's host test runs
+# (`assessment::cost`).
+seismic-lang.workspace = true
+seismic-std.workspace = true
 
-# Development-only: replays the tuning search against survey records.
-[[example]]
-name = "tuning_replay"
-required-features = ["tuning-survey"]
+[build-dependencies]
+magnitude-source-identity = { path = "../source-identity" }

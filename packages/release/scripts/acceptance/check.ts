@@ -21,7 +21,7 @@ const run = Effect.gen(function* () {
     }
   }
   const metadata = yield* Schema.decodeUnknown(UpdateClientMetadata)({ version: "0.0.14", os, os_version: release(), arch: process.arch,
-    package: os === "darwin" ? "mac-zip" : os === "windows" ? "windows-exe" : (yield* fs.exists("/usr/bin/dpkg")) ? "deb" : "rpm",
+    package: os === "darwin" ? "mac-zip" : os === "windows" ? "windows-exe" : (yield* fs.exists("/usr/bin/dpkg")) ? "deb" : (yield* fs.exists("/usr/bin/pacman")) ? "pacman" : "rpm",
     ...(os === "linux" ? { distro: distro.ID, distro_version: distro.VERSION_ID } : {}),
   })
   const identity = yield* Effect.try({ try: () => generateKeyPairSync("ed25519"), catch: () => new AcceptanceCheckFailed() })
@@ -29,7 +29,7 @@ const run = Effect.gen(function* () {
   const update = yield* checkHostedUpdate({ origin: "https://magnitude-update-acceptance.vercel.app", metadata,
     sign: url => signUpdateRequest(identity.privateKey, url), trustedPublishers: new Map([["acceptance", publisher]]),
     userAgent: `Magnitude-acceptance/0.0.14 ${process.arch} Bun/${Bun.version} ${os}/${release()}`,
-  }, { reason: "manual", outcome: Option.none() })
+  }, { reason: "manual", outcome: Option.none(), hardware: Option.none() })
   const evidence = { at: yield* Clock.currentTimeMillis, installation: yield* installationId(identity.publicKey), metadata, updateAvailable: Option.isSome(update) }
   yield* fs.writeFileString(yield* Config.string("MAGNITUDE_ACCEPTANCE_OUTPUT"), yield* Schema.encode(Schema.parseJson(Evidence))(evidence))
   yield* Effect.logInfo("Native signed check accepted", { os, arch: process.arch })

@@ -1,10 +1,11 @@
 use super::cases::DenseOutputTuning;
 use super::*;
 use crate::native::import::ImportKernels;
-use crate::planning::tests::{fixture_definition, fixture_manifest};
+use crate::planning::fixtures::{fixture_definition, fixture_manifest};
 use crate::{ComponentSelection, ModelLoadPlan};
 use magnitude_kernels::{dense_output, shape_rows};
-use seismic::{BackendName, ConfigurationRecord, DeviceCatalog, Exclusion, Outcome};
+use seismic::TuningMethod;
+use seismic::{BackendName, ConfigurationRecord, Outcome};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -14,6 +15,284 @@ const LIMITS: TuningLimits = TuningLimits {
     max_projected_rows: 8,
     context_tokens: 16384,
 };
+
+/// What a demand walk collects for `case` alone, decoding without drafting:
+/// the target's launches as the case represents them, and the objective
+/// with the case's estimate of each term's time.
+fn fixture_invocations<T: EntryTuning>(
+    case: &T,
+    statics: &NativeSpecialization,
+    limits: TuningLimits,
+) -> super::super::specialization::InvocationDemand {
+    let terms = workload::terms(limits, &[]);
+    let mut demand = super::super::specialization::InvocationDemand {
+        units: HashMap::new(),
+        objective: Objective::new(terms),
+    };
+    fixture_add(&mut demand, case, statics, limits);
+    demand
+}
+
+/// Add what a demand walk collects for `case` to `demand`.
+fn fixture_add<T: EntryTuning>(
+    demand: &mut super::super::specialization::InvocationDemand,
+    case: &T,
+    statics: &NativeSpecialization,
+    limits: TuningLimits,
+) {
+    let graph = crate::programs::invocation_demand::GraphInvocationDemand::new(
+        crate::PlannedMethod::Plain,
+        demand.objective.terms.clone(),
+        None,
+        limits.max_rows,
+    );
+    let mut representatives = case
+        .points(limits)
+        .into_iter()
+        .map(|point| point.rows)
+        .collect::<Vec<_>>();
+    representatives.sort_unstable();
+    representatives.dedup();
+    let calls = graph
+        .target
+        .represented(|launch| case.invocation_rows(launch, &representatives))
+        .scaled(case.launches());
+    let mut points = case.points(limits);
+    apply_invocation_counts(&mut points, &calls, &demand.objective);
+    // The fixtures weigh each term by its points' relative cost: a load
+    // estimates them from its entries' declarations ([`point_bytes`]).
+    for point in &points {
+        let time = point.cost();
+        for (term, launches) in &point.terms {
+            demand.objective.measured[*term] += launches * time;
+        }
+    }
+    demand
+        .units
+        .entry((
+            <T::Entry as seismic::Entry>::NAME,
+            case.bindings(),
+            statics.statics().clone(),
+        ))
+        .or_default()
+        .add(&calls);
+}
+
+/// A unit's share is the mean over the objective's terms of its fraction
+/// of each term's time: a unit that is a small part of the longest term and
+/// most of a short one is worth as much as that short term.
+#[test]
+fn a_units_share_is_its_mean_fraction_of_every_terms_time() {
+    // Two equal terms: a long prefill and a short decode. The projection
+    // takes 90 of the prefill's 100 and 2 of the decode's 4; attention the
+    // rest.
+    let weights = [0.5, 0.5];
+    let measured = [vec![90., 2.], vec![10., 2.]];
+    let shares = shares(&measured, &weights);
+    assert!(
+        (shares[0] - (0.5 * 0.9 + 0.5 * 0.5)).abs() < 1e-12,
+        "{shares:?}"
+    );
+    assert!(
+        (shares[1] - (0.5 * 0.1 + 0.5 * 0.5)).abs() < 1e-12,
+        "{shares:?}"
+    );
+}
+
+/// The load's launches reach a unit's points: by rows and the sequences
+/// declared at or below theirs, a launch's history divided between the two
+/// declared histories around it and held to the longest (a window), each
+/// point weighing its terms' launches by the term's weight over its time.
+#[test]
+fn launches_reach_the_points_at_their_rows_sequences_and_histories() {
+    use crate::programs::invocation_demand::{InvocationCounts, Launch};
+    let mut objective = Objective::new(workload::terms(LIMITS, &[]));
+    objective.measured = vec![1.; objective.terms.len()];
+    let mut counts = InvocationCounts::default();
+    let launch = |term, rows, sequences, history| Launch {
+        term,
+        rows,
+        sequences,
+        history,
+        projected: rows,
+    };
+    counts.launch(launch(0, 8, 8, 1024), 2.);
+    counts.launch(launch(1, 8, 1, 4096), 1.);
+    counts.launch(launch(2, 1, 1, 100_000), 1.);
+    let windowed = |points: Vec<PointShape>| with_contexts(LIMITS, Some(4096), points);
+    let mut points = windowed(vec![
+        row_point(1, 1.),
+        row_point(8, 1.),
+        across_sequences(&row_point(8, 1.), 8),
+    ]);
+    apply_invocation_counts(&mut points, &counts, &objective);
+    let at = |label: &str| {
+        points
+            .iter()
+            .find(|point| point.label == label)
+            .unwrap_or_else(|| panic!("{label}"))
+            .terms
+            .clone()
+    };
+    // 1024 lies between the empty history and 4096: a quarter of the way.
+    let quarter = 1024. / 4096.;
+    assert!(
+        at("m8s8-c256").is_empty(),
+        "numerical-only history has no timing demand"
+    );
+    assert_eq!(at("m8s8-c0"), [(0, 2. * (1. - quarter))]);
+    assert_eq!(at("m8s8-c4096"), [(0, 2. * quarter)]);
+    assert_eq!(at("m8-c4096"), [(1, 1.)]);
+    // A history past the window is read at the window.
+    assert_eq!(at("m1-c4096"), [(2, 1.)]);
+    let weight = objective.terms[1].weight;
+    let point = points
+        .iter()
+        .find(|point| point.label == "m8-c4096")
+        .unwrap();
+    assert!((point.weight - weight).abs() < 1e-12);
+    // The census discovers the weighed points and the empty history of
+    // their rows.
+    let census = points
+        .iter()
+        .zip(census_points(&points))
+        .filter(|(_, census)| *census)
+        .map(|(point, _)| point.label.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        census,
+        [
+            "m1-c0",
+            "m1-c4096",
+            "m8-c0",
+            "m8-c4096",
+            "m8s8-c0",
+            "m8s8-c4096"
+        ]
+    );
+}
+
+/// The requirement of the test units: `alpha` rounding steps of `bf16`.
+fn steps(alpha: f64) -> seismic::NumericalRequirement {
+    seismic::NumericalRequirement::RoundingSteps {
+        alpha,
+        activation: Some(DType::BF16),
+    }
+}
+
+/// A candidate's measurement at `point`, made under the key `variant`: its
+/// one `bf16` result is `ratio` rounding steps from the default's.
+fn observation(point: &str, variant: u64, ratio: f64) -> seismic::NumericalObservation {
+    seismic::NumericalObservation {
+        point: point.into(),
+        key: seismic::LaunchKey {
+            launches: vec![0],
+            values: BTreeMap::from([("ROWS".into(), variant)]),
+        },
+        rotations: vec![vec![seismic::SubjectMeasurement {
+            subject: "r0".into(),
+            comparison: seismic::SubjectComparison::Differs(seismic::Difference {
+                stored: Some(DType::BF16),
+                elements: 64,
+                differing: 64,
+                exact_mismatches: 0,
+                non_finite_mismatches: 0,
+                error_power: ratio * ratio,
+                reference_power: 64.,
+                maximum_absolute_error: ratio,
+                step_power: vec![seismic::StepPower {
+                    dtype: DType::BF16,
+                    power: 1.,
+                }],
+            }),
+        }]],
+    }
+}
+
+#[test]
+fn demanded_cache_requires_selected_native_default_evidence_for_every_case() {
+    let shapes = [row_point(1, 1.), row_point(4, 0.)];
+    let default = Configuration {
+        statics: BTreeMap::new(),
+        params: BTreeMap::from([("ROWS".into(), 1)]),
+        launches: Vec::new(),
+    };
+    let overall = Configuration {
+        params: BTreeMap::from([("ROWS".into(), 4)]),
+        ..default.clone()
+    };
+    let mut result = TuningResult {
+        disposition: seismic::TuningDisposition::QualifiedCandidate,
+        tuning_identity: "fixture-device".into(),
+        entry: "fixture".into(),
+        backend: "fixture".into(),
+        points: Vec::new(),
+        requirement: steps(8.),
+        observations: Vec::new(),
+        served: vec![default, overall.clone()],
+        reselection: None,
+        implementation_identity: "fixture-implementation".into(),
+        parameters: Vec::new(),
+        configurations: vec![ConfigurationRecord {
+            launches: Vec::new(),
+            formation: None,
+            configuration: overall.clone(),
+            artifact: Some("selected".into()),
+            observations: Vec::new(),
+            outcome: Outcome::Measured {
+                points: Vec::new(),
+                confirmed: Vec::new(),
+            },
+        }],
+        overall,
+        method: TuningMethod::Census,
+        time: TuningTime::default(),
+        coverage: None,
+        default_launches: Vec::new(),
+    };
+    assert!(ChosenEvidence::of(&result).qualified_at(&shapes).is_err());
+    result
+        .observations
+        .push(observation(&shapes[0].label, 4, 2.));
+    result.configurations[0].observations.push(0);
+    assert!(
+        ChosenEvidence::of(&result).qualified_at(&shapes).is_err(),
+        "untimed cases remain required"
+    );
+    // Another candidate's measurement at the untimed case is not the
+    // selected one's.
+    result
+        .observations
+        .push(observation(&shapes[1].label, 8, 2.));
+    assert!(ChosenEvidence::of(&result).qualified_at(&shapes).is_err());
+    result.configurations[0].observations.push(1);
+    assert!(ChosenEvidence::of(&result).qualified_at(&shapes).is_ok());
+    // Evidence at every case is not admission: one measurement beyond α
+    // disqualifies the choice.
+    result.observations[1] = observation(&shapes[1].label, 4, 8.5);
+    assert!(
+        ChosenEvidence::of(&result)
+            .qualified_at(&shapes)
+            .unwrap_err()
+            .contains("error ratio 8.5 exceeds alpha 8")
+    );
+    result.observations[1] = observation(&shapes[1].label, 4, 2.);
+    // A choice its search never promoted has no confirmation or coverage.
+    let promoted = result.served.pop().unwrap();
+    assert!(ChosenEvidence::of(&result).qualified_at(&shapes).is_err());
+    result.served.push(promoted);
+    assert!(ChosenEvidence::of(&result).qualified_at(&shapes).is_ok());
+
+    // A recorded canonical fallback is usable without that evidence, unless
+    // the canonical artifact itself was rejected.
+    result.disposition = seismic::TuningDisposition::CanonicalFallback {
+        artifact: "canonical".into(),
+    };
+    assert!(ChosenEvidence::of(&result).usable_fallback().is_ok());
+    result.configurations[0].outcome =
+        Outcome::Excluded(seismic::Exclusion::Execution("known defect".into()));
+    assert!(ChosenEvidence::of(&result).usable_fallback().is_err());
+}
 
 #[test]
 fn draft_readout_tuning_preserves_the_complete_artifact_vocabulary() {
@@ -31,6 +310,8 @@ fn draft_readout_tuning_preserves_the_complete_artifact_vocabulary() {
             vision: false,
         },
         crate::resident_layout(crate::ExecutionPath::Native, BackendName::Metal),
+        crate::PlannedMethod::Plain,
+        crate::planning::fixtures::LIMITS,
     )
     .unwrap();
     let inputs = ModelInputs {
@@ -38,11 +319,18 @@ fn draft_readout_tuning_preserves_the_complete_artifact_vocabulary() {
         limits: LIMITS,
         load: &load,
     };
-    let mtp = readout::HeadLogitsTuning {
+    let mtp = readout::PreparedProjectionTuning {
+        scope: magnitude_family_contracts::WeightScope::Target,
+        kind: magnitude_family_contracts::WeightKind::Output,
+        columns: None,
+        indexed: false,
+        softcap: 0.0,
         weight: Element::f16(),
         activation: Element::bf16(),
     };
     let separate = readout::HeadRowsTuning {
+        projection_scope: magnitude_family_contracts::WeightScope::Target,
+        norm_scope: magnitude_family_contracts::WeightScope::Target,
         norm: Element::f16(),
         weight: Element::f16(),
         activation: Element::bf16(),
@@ -83,9 +371,7 @@ fn persisted_point_weights_preserve_cache_identity() {
 
 #[test]
 fn stored_cpu_choice_accepts_device_owned_parameters() {
-    let device = DeviceCatalog::discover()
-        .unwrap()
-        .open_backend(BackendName::Cpu)
+    let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), BackendName::Cpu)
         .unwrap();
     let implementation = seismic::generated::native_implementation::<shape_rows::Entry>(&device)
         .unwrap()
@@ -96,92 +382,86 @@ fn stored_cpu_choice_accepts_device_owned_parameters() {
         .with_param("cpu.tier", 0)
         .with_param("cpu.workers.0", 0)
         .with_param("cpu.workers.1", 0);
-    assert!(implementation.validate(&choice).is_err());
+    let declared = seismic::generated::native_implementation_for_backend::<shape_rows::Entry>(BackendName::Cpu)
+        .unwrap()
+        .unwrap();
     assert!(
-        seismic::generated::native_specialization_valid::<shape_rows::Entry>(&device, &choice)
+        matches!(declared.validate(&choice), Err(seismic::NativeSpecializationError::UnknownParameter(_))),
+        "the declaration names no Seismic-owned parameter"
+    );
+    implementation.validate(&choice).unwrap();
+    assert!(
+        seismic::generated::native_specialization_valid::<shape_rows::Entry>(&device, &choice, &[])
             .unwrap()
     );
 }
 
+/// A search's count collects each entry without tuning parameters once, and
+/// its mandatory phase forms them beside the units' canonical programs and
+/// reports them, so the load after the search forms none of them itself.
 #[test]
-fn row_points_follow_the_shape_ladder_and_normalize_weights() {
-    let points = row_points(LIMITS);
-    assert_eq!(
-        points.iter().map(|point| point.rows).collect::<Vec<_>>(),
-        TUNING_ROWS
-    );
-    let total = points.iter().map(|point| point.weight).sum::<f64>();
-    assert!((total - 1.0).abs() < 1e-12);
-    // Each served row class retains its own share of step time. The prefill
-    // chunks divide theirs by the octaves of prompt length each serves: one
-    // each, and the largest every octave from 512 rows to the 16384-token
-    // context besides, five of them.
-    let weights = points.iter().map(|point| point.weight).collect::<Vec<_>>();
-    for (weight, expected) in weights.iter().zip([
-        0.40,
-        0.20 / 3.0,
-        0.20 / 3.0,
-        0.20 / 3.0,
-        0.05,
-        0.05,
-        0.30 / 9.0,
-        0.30 / 9.0,
-        0.30 / 9.0,
-        0.30 * 6.0 / 9.0,
-    ]) {
-        assert!((weight - expected).abs() < 1e-12, "{weights:?}");
+fn the_mandatory_phase_forms_the_untuned_entries_the_count_met() {
+    let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), BackendName::Cpu)
+        .unwrap();
+    let mut spec =
+        crate::native::specialization::Specializer::count_untuned(&device, Default::default());
+    for (element, bindings) in [
+        (seismic::Element::bf16(), "A=bf16"),
+        (seismic::Element::u32(), "A=u32"),
+        (seismic::Element::bf16(), "A=bf16"),
+    ] {
+        let entry = magnitude_kernels::copy_rows::native_entry_with(
+            magnitude_kernels::copy_rows::Elements { A: element },
+        );
+        assert!(spec.fixed(bindings, &[], entry).unwrap().is_none());
     }
-    // A context no longer than the largest launch holds no longer prompt:
-    // the chunks weigh alike.
-    let short = row_points(TuningLimits {
-        context_tokens: 512,
-        ..LIMITS
-    });
-    assert!(short[6..]
-        .iter()
-        .all(|point| (point.weight - 0.075).abs() < 1e-12));
-    // The largest launch of an engine bounded below 512 rows takes the
-    // longer prompts: 256 rows serve seven octaves of the nine.
-    let narrow = row_points(TuningLimits {
-        max_rows: 256,
-        ..LIMITS
-    });
-    assert!((narrow[8].weight / narrow[7].weight - 7.0).abs() < 1e-9);
-    let bounded = row_points(TuningLimits {
-        max_rows: 32,
-        ..LIMITS
-    });
-    assert_eq!(
-        bounded.iter().map(|point| point.rows).collect::<Vec<_>>(),
-        [1, 2, 4, 8, 16, 32]
+    let untuned = spec.into_untuned();
+    assert_eq!(untuned.len(), 2);
+    let (definition, load) = fixture_load();
+    let import = ImportKernels {
+        import_dense: HashMap::new(),
+        repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
+    };
+    let recorder = Recorder::default();
+    let tuner = Tuner::count(
+        &device,
+        TuningContext {
+            definition: &definition,
+            weights: &ZeroTuningWeights,
+            observer: &recorder,
+            cache: None,
+            numerical_profile: super::precision::ResolvedNumericalProfile::standard(),
+            settings: TuningSettings::STANDARD,
+        },
+        LIMITS,
+        TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
+        Default::default(),
     );
-    assert!((bounded.iter().map(|point| point.weight).sum::<f64>() - 1.0).abs() < 1e-12);
+    let tuner = tuner.census(untuned).unwrap();
+    assert!(matches!(
+        recorder.0.borrow().as_slice(),
+        [TuningEvent::Untuned { programs: 2, .. }]
+    ));
+    assert!(tuner.search().unwrap().conclude().is_empty());
 }
 
 #[test]
 fn the_tuning_cache_key_is_what_a_result_is_valid_for() {
-    let device = DeviceCatalog::discover()
-        .unwrap()
-        .open_backend(BackendName::Cpu)
+    let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), BackendName::Cpu)
         .unwrap();
-    let policy = seismic::PrecisionPolicy::bounded(seismic::precision::Tolerance {
-        absolute: seismic::precision::Limit::new(0.01).unwrap(),
-        relative: seismic::precision::Limit::new(0.01).unwrap(),
-        relative_floor: seismic::precision::Limit::ZERO,
-        ulps: None,
-    });
-    let key = |shapes: &[PointShape]| {
+    let measured = |shapes: &[PointShape], activation| {
         tuning_key_material(
             &device,
             "dense_output",
             "A=bf16",
             &NativeSpecialization::new(),
             "same-implementation",
-            &policy,
-            &BTreeMap::new(),
+            activation,
             shapes,
         )
     };
+    let key = |shapes: &[PointShape]| measured(shapes, Some(DType::BF16));
     let shapes = row_points(LIMITS);
     // Weights and order steer how a search spends its time, not what its
     // result is valid for.
@@ -197,74 +477,22 @@ fn the_tuning_cache_key_is_what_a_result_is_valid_for() {
     reweighted.pop();
     assert_ne!(key(&shapes), key(&reweighted));
     assert!(key(&shapes).contains(&format!("tuning {SEARCH_VERSION}\n")));
-    // An admitted error class the entry declares, and its envelope, are
-    // what a choice was searched and validated under.
-    let admitting = |limit: f64| {
-        let limit = seismic::precision::Limit::new(limit).unwrap();
-        tuning_key_material(
-            &device,
-            "dense_output",
-            "A=bf16",
-            &NativeSpecialization::new(),
-            "same-implementation",
-            &policy,
-            &[(
-                "int8_activations".to_owned(),
-                seismic::ErrorEnvelope {
-                    relative_rms: limit,
-                    peak: limit,
-                },
-            )]
-            .into_iter()
-            .collect(),
-            &shapes,
-        )
-    };
-    assert_ne!(admitting(1e-2), key(&shapes));
-    assert_ne!(admitting(1e-2), admitting(2e-2));
-    assert!(admitting(1e-2).starts_with(&key(&shapes)));
-    assert!(admitting(1e-2).contains(seismic::ErrorEnvelope::COMPARISON_VERSION));
-    assert!(!key(&shapes).contains(seismic::ErrorEnvelope::COMPARISON_VERSION));
-}
-
-#[test]
-fn the_census_times_the_costliest_point_of_each_chunk_class() {
-    let labels = |shapes: &[PointShape]| {
-        shapes
-            .iter()
-            .zip(census_points(shapes))
-            .filter(|(_, census)| *census)
-            .map(|(shape, _)| shape.label.clone())
-            .collect::<Vec<_>>()
-    };
-    // Every streaming row count, then the most rows of the short chunks and
-    // of the prefill chunks.
-    assert_eq!(
-        labels(&row_points(LIMITS)),
-        ["m1", "m2", "m4", "m8", "m32", "m512"]
-    );
-    // An entry bounded below the largest chunk is timed at its own largest.
-    assert_eq!(
-        labels(&served_row_points(TuningLimits { max_rows: 256, ..LIMITS }, |rows| rows >= 32)),
-        ["m32", "m256"]
-    );
-    // Attention: the most rows at the longest history.
-    let chunks = served_row_points(LIMITS, |rows| rows >= 16);
-    assert_eq!(
-        labels(&with_contexts(LIMITS, None, chunks.clone())),
-        ["m32-c16384", "m512-c16384"]
-    );
-    // Window layers: the most rows at the window.
-    assert_eq!(
-        labels(&with_contexts(LIMITS, Some(1024), chunks)),
-        ["m32-c1024", "m512-c1024"]
-    );
+    // What is measured is result identity: the comparison's version and
+    // the activation type subjects are measured against. The caller's α is
+    // not: no part of the key is derived from a profile.
+    assert!(key(&shapes).contains(&format!(
+        "comparison {} steps Some(BF16)\n",
+        seismic::COMPARISON_VERSION
+    )));
+    assert_ne!(key(&shapes), measured(&shapes, Some(DType::F16)));
+    assert!(!key(&shapes).contains("profile") && !key(&shapes).contains("alpha"));
 }
 
 #[test]
 fn a_units_window_is_the_longest_history_its_layers_keep() {
     use magnitude_family_contracts::{
-        Attention, HistoryDomain, KeyValue, ModelDefinition, Operator, SublayerIndex, WeightScope,
+        Attention, HistoryRows, ModelDefinition, Operator, RowProducer, SublayerIndex,
+        TokenDomain, WeightScope,
     };
     fn mixer(definition: &mut ModelDefinition, block: usize) -> &mut Attention {
         match &mut definition.decoder.blocks[block].sublayers[0].op {
@@ -279,13 +507,17 @@ fn a_units_window_is_the_longest_history_its_layers_keep() {
     let block = definition.decoder.blocks[0].clone();
     definition.decoder.blocks = vec![block; 4];
     for (block, tokens) in [(1, 1024), (2, 2048)] {
-        let KeyValue::Owned { domain, .. } = &mut mixer(&mut definition, block).key_value
+        let HistoryRows::Own(RowProducer::Projected(rows)) =
+            &mut mixer(&mut definition, block).history[0].rows
         else {
             panic!("the fixture's attention owns its history");
         };
-        *domain = HistoryDomain::Window { tokens };
+        rows.domain = TokenDomain::Window { tokens };
     }
-    mixer(&mut definition, 3).key_value = KeyValue::Shared { source: layer(1) };
+    mixer(&mut definition, 3).history[0].rows = HistoryRows::Shared {
+        source: layer(1),
+        part: 0,
+    };
     let inputs = ModelInputs {
         definition: &definition,
         limits: LIMITS,
@@ -309,10 +541,75 @@ fn a_units_window_is_the_longest_history_its_layers_keep() {
     assert_eq!(kept(&[0]), Ok(None));
     assert_eq!(kept(&[1, 0, 2]), Ok(None));
     assert!(kept(&[]).is_err());
+    // One request's listed history holds what the layers keep: the whole
+    // context, or the window, each in whole pages.
+    let codec = magnitude_state::KvCodec::AffineK8V4;
+    for window in [None, Some(1024), Some(2048)] {
+        let rows = request_history_rows(&inputs, codec, window).unwrap();
+        assert!(
+            rows >= window.unwrap_or(LIMITS.context_tokens),
+            "{window:?}: {rows}"
+        );
+    }
+}
+
+/// A model whose every attention layer keeps a window has no Token history
+/// domain: points of several sequences lie where its Window store places
+/// requests that arrive together, and every such point is valid.
+#[test]
+fn several_sequences_lie_in_a_window_only_models_store() {
+    use magnitude_family_contracts::{HistoryRows, Operator, RowProducer, TokenDomain};
+    let (mut definition, load) = fixture_load();
+    for block in &mut definition.decoder.blocks {
+        for sublayer in &mut block.sublayers {
+            if let Operator::Attention(attention) = &mut sublayer.op {
+                for source in &mut attention.history {
+                    if let HistoryRows::Own(RowProducer::Projected(rows)) = &mut source.rows {
+                        rows.domain = TokenDomain::Window { tokens: 1024 };
+                    }
+                }
+            }
+        }
+    }
+    let inputs = ModelInputs {
+        definition: &definition,
+        limits: LIMITS,
+        load: &load,
+    };
+    let codec = magnitude_state::KvCodec::AffineK8V4;
+    let point = across_sequences(
+        &PointShape {
+            context: Some(600),
+            ..row_point(2, 1.)
+        },
+        2,
+    );
+    let placement = history_placement(&inputs, codec, Some(1024), &point).unwrap();
+    assert_eq!(placement.sequences.len(), 2);
+    for history in &placement.sequences {
+        assert_eq!(
+            history.iter().map(|range| range[1] - range[0]).sum::<i32>(),
+            600,
+            "{history:?}"
+        );
+    }
+    let rows = |history: &Vec<[i32; 2]>| {
+        history
+            .iter()
+            .flat_map(|range| range[0]..range[1])
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    assert!(
+        rows(&placement.sequences[0]).is_disjoint(&rows(&placement.sequences[1])),
+        "{:?}",
+        placement.sequences
+    );
+    // The model has no whole-context domain to place them in.
+    assert!(history_placement(&inputs, codec, None, &point).is_err());
 }
 
 #[test]
-fn window_layers_are_timed_at_the_histories_their_window_keeps() {
+fn numerical_histories_include_witnesses_and_the_window_limit() {
     let decode = || served_row_points(LIMITS, |rows| rows == 1);
     let labels = |window: Option<u64>| {
         with_contexts(LIMITS, window, decode())
@@ -320,8 +617,7 @@ fn window_layers_are_timed_at_the_histories_their_window_keeps() {
             .map(|point| point.label)
             .collect::<Vec<_>>()
     };
-    // Layers keeping the whole context see every served length of the
-    // ladder: the points, and with them the key, of every stored result.
+    // Numerical witnesses remain present even when they carry no timing demand.
     let whole = ["m1-c0", "m1-c256", "m1-c4096", "m1-c16384"];
     assert_eq!(labels(None), whole);
     // A window shorter than the context is the longest history its layers
@@ -337,7 +633,7 @@ fn window_layers_are_timed_at_the_histories_their_window_keeps() {
     assert!((windowed.iter().map(|point| point.weight).sum::<f64>() - 1.0).abs() < 1e-12);
     // The window's lengths of one row point are its class, each row class
     // keeping the share it has at any history.
-    assert_eq!(windowed[2].class.as_deref(), Some("m1"));
+    assert_eq!(windowed[1].class.as_deref(), Some("m1"));
     let share = |points: &[PointShape], rows: u64| {
         points
             .iter()
@@ -352,101 +648,13 @@ fn window_layers_are_timed_at_the_histories_their_window_keeps() {
 }
 
 #[test]
-fn a_conclusion_is_estimated_from_what_the_start_leaves_to_confirm() {
-    let settings = search_settings(BackendName::Cuda);
-    let samples = (settings.confirmation_samples + 1) as u32;
-    // One-row decode attention of one key/value head and sixteen query heads
-    // of 512 columns at up to 65536 rows of history, on a GB10: the defaults'
-    // sample over the census's points takes 1.21 s and their pass 5.81 s; the
-    // other form's start measures in a fiftieth of that.
-    let sample = Duration::from_millis(1210);
-    let pass = Duration::from_millis(5810);
-    // The defaults and the one form start.
-    let conclusion = started_conclusion(sample, 1, false, &settings);
-    assert_eq!(conclusion, sample * 2 * samples);
-    // The start with its form start and that conclusion fit the tuning
-    // time with room for the units after it.
-    assert!(pass * 2 + conclusion < TUNING_TIME.mul_f64(0.6));
-    // Without form starts the first refinement finds the first rival.
-    assert_eq!(started_conclusion(sample, 0, false, &settings), conclusion);
-    // No more rivals are confirmed than the settings' finalists.
-    assert_eq!(
-        started_conclusion(sample, 9, false, &settings),
-        sample * (settings.confirmed as u32 + 1) * samples
-    );
-    // A launch-scoped search reserves them all from its start.
-    assert_eq!(
-        started_conclusion(sample, 1, true, &settings),
-        sample * (settings.confirmed as u32 + 1) * samples
-    );
-}
-
-#[test]
-fn a_unit_serving_only_chunks_holds_its_part_of_the_prefill_classes() {
-    // One unit serves every row count, one only chunks. The census timed
-    // each at its census points: the first takes a second everywhere, the
-    // second three.
-    let every = row_points(LIMITS);
-    let chunks = served_row_points(LIMITS, |rows| rows >= 16);
-    let timed = |shapes: &[PointShape]| {
-        shapes
-            .iter()
-            .zip(census_points(shapes))
-            .filter(|(_, census)| *census)
-            .map(|(shape, _)| shape.clone())
-            .collect::<Vec<_>>()
-    };
-    let (every_timed, chunks_timed) = (timed(&every), timed(&chunks));
-    let shares = step_shares(
-        &[
-            UnitTime {
-                launches: 1,
-                served: &every,
-                shapes: &every_timed,
-                seconds: &vec![1.; every_timed.len()],
-            },
-            UnitTime {
-                launches: 1,
-                served: &chunks,
-                shapes: &chunks_timed,
-                seconds: &vec![3.; chunks_timed.len()],
-            },
-        ],
-        LIMITS,
-    );
-    // The streaming classes (0.6 of the step) are the first unit's alone;
-    // the chunk classes (0.4) split one to three.
-    assert!((shares[0] - 0.7).abs() < 1e-9, "{shares:?}");
-    assert!((shares[1] - 0.3).abs() < 1e-9, "{shares:?}");
-    // Timed at its cheapest point alone, as a census of required points
-    // left it, the second unit held only its part of that one class.
-    let cheapest = [chunks[0].clone()];
-    let shares = step_shares(
-        &[
-            UnitTime {
-                launches: 1,
-                served: &every,
-                shapes: &every_timed,
-                seconds: &vec![1.; every_timed.len()],
-            },
-            UnitTime {
-                launches: 1,
-                served: &chunks,
-                shapes: &cheapest,
-                seconds: &[3.],
-            },
-        ],
-        LIMITS,
-    );
-    assert!(shares[1] < 0.3, "{shares:?}");
-}
-
-#[test]
 fn point_cost_grows_with_rows_and_history() {
     let point = |rows: u64, context: Option<u64>| PointShape {
+        terms: Vec::new(),
         label: String::new(),
         weight: 1.0,
         rows,
+        sequences: 1,
         context,
         class: None,
     };
@@ -463,7 +671,7 @@ fn attention_points_cross_rows_with_served_contexts() {
     assert_eq!(
         points.len(),
         TUNING_ROWS.len() * 4,
-        "64k exceeds the served context"
+        "all numerical histories through the served context"
     );
     assert!(points.iter().all(|point| point.context.unwrap() <= 16384));
     assert_eq!(points[0].label, "m1-c0");
@@ -479,7 +687,7 @@ fn attention_points_cross_rows_with_served_contexts() {
     });
     assert_eq!(
         short.iter().map(|p| p.context.unwrap()).collect::<Vec<_>>(),
-        [0]
+        [0, 128]
     );
 }
 
@@ -496,13 +704,25 @@ fn served_points_keep_an_entry_whose_rows_exceed_the_bound() {
         [1, 2, 4, 8]
     );
     // A bound admits only the served rows at or below it.
-    let short = served_row_points(TuningLimits { max_rows: 16, ..LIMITS }, |rows| rows >= 16);
+    let short = served_row_points(
+        TuningLimits {
+            max_rows: 16,
+            ..LIMITS
+        },
+        |rows| rows >= 16,
+    );
     assert_eq!(
         short.iter().map(|point| point.rows).collect::<Vec<_>>(),
         [16]
     );
     assert!((chunked.iter().map(|point| point.weight).sum::<f64>() - 1.0).abs() < 1e-12);
-    let stand_in = served_row_points(TuningLimits { max_rows: 8, ..LIMITS }, |rows| rows >= 16);
+    let stand_in = served_row_points(
+        TuningLimits {
+            max_rows: 8,
+            ..LIMITS
+        },
+        |rows| rows >= 16,
+    );
     assert_eq!(stand_in.len(), 1);
     assert_eq!(stand_in[0].rows, 16);
     assert_eq!(stand_in[0].weight, 1.0);
@@ -530,11 +750,96 @@ fn rotations_take_distinct_layers_spread_over_depth() {
     assert_eq!(TuningInputs::rotation_scopes(&few, &rows(1)), few);
 }
 
+/// The host's Metal device, where it has one: an available Metal executor
+/// opens, or the test fails.
 fn metal() -> Option<Device> {
-    DeviceCatalog::discover()
-        .ok()?
-        .open_backend(BackendName::Metal)
-        .ok()
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+    crate::test_support::available(&catalog, BackendName::Metal)
+        .then(|| crate::test_support::open_backend(&catalog, BackendName::Metal).expect("an available Metal executor opens"))
+}
+
+/// A dependant (a streamed layer's route of its resident route) is a unit
+/// of the search's own count, fixed at its prerequisite's arithmetic as the
+/// choice stands and free in the rest, so the mandatory phase forms it and
+/// no load forms it alone. A search that promotes other arithmetic leaves
+/// it stale; the next round counts it at the promoted values and forms it
+/// there, and forms nothing an earlier round decided.
+#[test]
+fn a_search_forms_each_dependant_at_its_prerequisites_final_arithmetic() {
+    let Some(device) = metal() else {
+        return;
+    };
+    let (definition, load) = fixture_load();
+    let import = ImportKernels {
+        import_dense: HashMap::new(),
+        repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
+    };
+    let context = TuningContext {
+        definition: &definition,
+        weights: &ZeroTuningWeights,
+        observer: &UnreportedTuning,
+        cache: None,
+        numerical_profile: super::precision::ResolvedNumericalProfile::standard(),
+        settings: TuningSettings::STANDARD,
+    };
+    let limits = TuningLimits {
+        max_rows: 64,
+        max_projected_rows: 8,
+        context_tokens: 256,
+    };
+    let implementation = dense_output_implementation(&device);
+    let statics = [("H", 8), ("F", 16), ("DS", 0), ("DB", 0)]
+        .into_iter()
+        .fold(NativeSpecialization::new(), |spec, (name, value)| {
+            spec.with_static(name, value)
+        });
+    // The prerequisite's search promotes another LANES (arithmetic);
+    // TALL (not arithmetic) is the dependant's own to search.
+    let mut prerequisite = FakeCase::new(&implementation, &statics, "prerequisite");
+    prerequisite.chosen.params.insert("LANES".into(), 32);
+    let mut dependant = FakeCase::new(&implementation, &statics, "dependant");
+    dependant.bindings = "dependant".into();
+    let mut invocations = fixture_invocations(&prerequisite, &statics, limits);
+    fixture_add(&mut invocations, &dependant, &statics, limits);
+    let key = unit_key("dense_output", prerequisite.bindings(), &statics);
+    let mut tuner = Tuner::count(
+        &device,
+        context,
+        limits,
+        TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
+        invocations,
+    );
+    let walk = |tuner: &mut Tuner<'_>| {
+        tuner.tune(&prerequisite, &implementation, &statics).unwrap();
+        let fixed = tuner
+            .following(&key, &implementation, statics.clone())
+            .unwrap();
+        tuner.tune(&dependant, &implementation, &fixed).unwrap();
+        fixed
+    };
+    let counted = walk(&mut tuner);
+    assert_eq!(counted.param("LANES"), Some(16));
+    assert_eq!(counted.param("TALL"), None);
+    let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
+    assert_eq!(
+        (prerequisite.formations.get(), dependant.formations.get()),
+        (1, 1)
+    );
+    walk(&mut tuner);
+    let tuner = tuner.search().unwrap();
+    assert!(tuner.stale());
+    let mut tuner = tuner.recount();
+    let recounted = walk(&mut tuner);
+    assert_eq!(recounted.param("LANES"), Some(32));
+    let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
+    assert_eq!(
+        (prerequisite.formations.get(), dependant.formations.get()),
+        (1, 2)
+    );
+    walk(&mut tuner);
+    let tuner = tuner.search().unwrap();
+    assert!(!tuner.stale());
 }
 
 fn fixture_load() -> (magnitude_family_contracts::ModelDefinition, ModelLoadPlan) {
@@ -548,6 +853,8 @@ fn fixture_load() -> (magnitude_family_contracts::ModelDefinition, ModelLoadPlan
             vision: false,
         },
         crate::resident_layout(crate::ExecutionPath::Native, seismic::BackendName::Metal),
+        crate::PlannedMethod::Plain,
+        crate::planning::fixtures::LIMITS,
     )
     .unwrap();
     (definition, load)
@@ -563,64 +870,83 @@ impl TuningObserver for Recorder {
 }
 
 /// A fake entry: its rotation uses case-owned scratch tensors, and its
-/// "search" builds every point it is given at its census and at its start
-/// and reports a fixed table choosing `chosen`.
+/// "search" discovers every point it is given, one a piece, measures one
+/// challenger from a fixed table and promotes it: `chosen`.
 #[derive(Clone)]
 struct FakeCase {
+    /// Canonical preparation is complete before any unit builds its inputs.
+    formations: Rc<Cell<usize>>,
     /// Every point built: its label, weight and rotation length.
     seen: Rc<RefCell<Vec<(String, f64, usize)>>>,
-    /// The unit's share of the tuning time, as every search the case
-    /// started was given it to admit points with.
-    allowances: Rc<RefCell<Vec<Duration>>>,
+    /// Every piece of optional work performed, in order.
+    stages: Rc<RefCell<Vec<seismic::Stage>>>,
     /// The implementation digest the case reports.
     digest: String,
     bindings: String,
     launches: usize,
     /// What the census reports the defaults take at every point.
     defaults_seconds: f64,
+    defaults: Configuration,
     chosen: Configuration,
+    /// When set, no candidate qualifies: the unit concludes on its
+    /// canonical default, unqualified.
+    unqualified: bool,
+}
+
+/// `dense_output`'s implementation on `device` over dense BF16 rows: its
+/// CPU `where` reads the weight's form (`form(DW, INT8)`).
+fn dense_output_implementation(device: &seismic::Device) -> seismic::OnDevice {
+    dense_output::native_entry_with(dense_output::Elements {
+        DW: Element::bf16(),
+        A: Element::bf16(),
+    })
+    .offered(device)
+    .unwrap()
+    .unwrap()
 }
 
 impl FakeCase {
     /// A case choosing the defaults with `ROWS` 2 (admissible, not the
     /// default).
     fn new(
-        implementation: &NativeImplementation,
+        implementation: &seismic::OnDevice,
         statics: &NativeSpecialization,
         digest: &str,
     ) -> Self {
-        let chosen = implementation
-            .default_specialization(statics)
-            .unwrap()
-            .with_launch_param(0, "ROWS", 2);
+        let defaults = implementation.default_specialization(statics).unwrap();
+        let chosen = defaults.clone().with_launch_param(0, "ROWS", 2);
+        let configuration = |spec: &NativeSpecialization| Configuration {
+            statics: spec.statics().clone(),
+            params: spec.params().clone(),
+            launches: implementation
+                .launches
+                .iter()
+                .enumerate()
+                .map(|(ordinal, launch)| {
+                    launch
+                        .params
+                        .iter()
+                        .map(|parameter| {
+                            (
+                                parameter.name.clone(),
+                                spec.launch_param(ordinal, &parameter.name).unwrap(),
+                            )
+                        })
+                        .collect()
+                })
+                .collect(),
+        };
         Self {
+            formations: Rc::new(Cell::new(0)),
             seen: Rc::new(RefCell::new(Vec::new())),
-            allowances: Rc::new(RefCell::new(Vec::new())),
+            stages: Rc::new(RefCell::new(Vec::new())),
             digest: digest.into(),
             bindings: "fake".into(),
             launches: 1,
             defaults_seconds: 1e-3,
-            chosen: Configuration {
-                statics: chosen.statics().clone(),
-                params: chosen.params().clone(),
-                launches: implementation
-                    .launches
-                    .iter()
-                    .enumerate()
-                    .map(|(ordinal, launch)| {
-                        launch
-                            .params
-                            .iter()
-                            .map(|parameter| {
-                                (
-                                    parameter.name.clone(),
-                                    chosen.launch_param(ordinal, &parameter.name).unwrap(),
-                                )
-                            })
-                            .collect()
-                    })
-                    .collect(),
-            },
+            defaults: configuration(&defaults),
+            chosen: configuration(&chosen),
+            unqualified: false,
         }
     }
 }
@@ -634,9 +960,6 @@ struct FakeArgs {
 }
 
 impl EntryTuning for FakeCase {
-    fn precision(&self) -> Result<PrecisionPolicy, TuneError> {
-        Ok(PrecisionPolicy::Exact)
-    }
     type Entry = dense_output::Entry;
     type Case = FakeArgs;
 
@@ -648,7 +971,7 @@ impl EntryTuning for FakeCase {
         self.bindings.clone()
     }
     fn statics(&self, _inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
-        Ok(vec![("H", 8), ("F", 16), ("DS", 0)])
+        Ok(vec![("H", 8), ("F", 16), ("DS", 0), ("DB", 0)])
     }
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
         row_points(limits)
@@ -657,7 +980,7 @@ impl EntryTuning for FakeCase {
         &self,
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
-    ) -> Result<Vec<FakeArgs>, String> {
+    ) -> Result<Vec<FakeArgs>, BuildError> {
         (0..ROTATION_LAYERS)
             .map(|layer| {
                 Ok(FakeArgs {
@@ -677,6 +1000,7 @@ impl EntryTuning for FakeCase {
             down_weight: &case.down,
             out_rows: &case.out_rows,
             down_scale: &case.absent_scale,
+            down_bound: &case.absent_scale,
         }
     }
 
@@ -686,7 +1010,7 @@ impl EntryTuning for FakeCase {
         _device: &Device,
         _statics: &NativeSpecialization,
         _points: &mut dyn seismic::PointSource<'_, Self::Entry>,
-        _validation: seismic::TuningPrecision,
+        _validation: seismic::NumericalRequirement,
         strategy: Strategy,
     ) -> Result<TuningResult, TuneError> {
         panic!("the fake case is searched, not tuned by {strategy:?}")
@@ -696,12 +1020,23 @@ impl EntryTuning for FakeCase {
         &self,
         _device: &Device,
         statics: &NativeSpecialization,
-        validation: seismic::TuningPrecision,
+        validation: seismic::NumericalRequirement,
     ) -> Result<Box<dyn EntrySearch<Self::Entry>>, TuneError> {
         assert_eq!(&self.chosen.statics, statics.statics());
+        // The unit's activation type is the entry's `A` binding.
+        let seismic::NumericalRequirement::RoundingSteps { alpha, activation } = validation else {
+            panic!("the engine holds candidates to rounding steps, not {validation:?}")
+        };
+        assert_eq!(activation, Some(DType::BF16));
         Ok(Box::new(FakeSearch {
             case: self.clone(),
-            policy: validation.policy,
+            alpha,
+            specs: Vec::new(),
+            formed: false,
+            discovered: 0,
+            measured: false,
+            promoted: false,
+            resident: false,
         }))
     }
     fn digest(
@@ -719,179 +1054,914 @@ impl EntryTuning for FakeCase {
     }
 }
 
-/// The search of a [`FakeCase`]: finished by its start.
+/// The tuning of a [`FakeCase`]: every point discovered one a piece, then
+/// one challenger measured at half the defaults' time, then promoted
+/// (unless the case is `unqualified`: then nothing leads). It serves a
+/// legal choice with a complete record throughout, like a real search. Its
+/// challenger measures a quarter of the α it was opened under from the
+/// defaults at every point; a second candidate measures half as much again
+/// as α at its first point and is rejected there.
 struct FakeSearch {
     case: FakeCase,
-    policy: PrecisionPolicy,
+    alpha: f64,
+    specs: Vec<seismic::PointSpec>,
+    formed: bool,
+    discovered: usize,
+    measured: bool,
+    promoted: bool,
+    /// Whether the inputs built for its points are held.
+    resident: bool,
 }
 
 impl FakeSearch {
-    /// Build every point and record it.
-    fn build(
-        &self,
-        points: &mut dyn seismic::PointSource<'static, dense_output::Entry>,
-    ) -> Vec<seismic::PointSpec> {
-        let specs = points.points();
-        for (index, spec) in specs.iter().enumerate() {
-            let built = points
-                .build(index, Duration::MAX)
-                .unwrap_or_else(|unavailable| panic!("{unavailable:?}"));
-            self.case
-                .seen
-                .borrow_mut()
-                .push((spec.label.clone(), spec.weight, built.rotation.len()));
-        }
-        specs
+    fn measurements(&self, count: usize, seconds: f64) -> Vec<seismic::PointMeasurement> {
+        self.specs
+            .iter()
+            .take(count)
+            .map(|spec| seismic::PointMeasurement {
+                point: spec.label.clone(),
+                key: seismic::LaunchKey {
+                    launches: vec![0],
+                    values: Default::default(),
+                },
+                median_seconds: seconds,
+                deviation_seconds: 0.0,
+                samples: vec![seconds],
+                repetitions: 1,
+                rotation_bytes: 0,
+            })
+            .collect()
     }
 
-    fn result(
-        &self,
-        points: Vec<seismic::PointRecord>,
-        configurations: Vec<ConfigurationRecord>,
-        overall: Configuration,
-        method: TuningMethod,
-    ) -> TuningResult {
-        TuningResult {
-            tuning_identity: "fake-device".into(),
-            entry: "dense_output".into(),
-            backend: "metal".into(),
-            points,
-            validation: self.policy.clone(),
-            numerical_evidence: Vec::new(),
-            implementation_identity: String::new(),
-            parameters: Vec::new(),
-            configurations,
-            overall,
-            method,
-            time: TuningTime::default(),
-        }
+    fn piece(&self) -> Duration {
+        Duration::from_secs_f64(self.case.defaults_seconds)
     }
 }
 
 impl EntrySearch<dense_output::Entry> for FakeSearch {
-    /// The defaults measured at every point, at the case's time each.
-    fn census(
+    fn grounding(
         &mut self,
         points: &mut dyn seismic::PointSource<'static, dense_output::Entry>,
-        _plan: CensusPlan,
-    ) -> Result<TuningResult, TuneError> {
-        let specs = self.build(points);
-        let defaults = Configuration {
-            launches: vec![[("ROWS".to_owned(), 8)].into_iter().collect()],
-            ..self.case.chosen.clone()
-        };
-        Ok(self.result(
-            specs
+    ) -> Result<Option<seismic::Grounding>, TuneError> {
+        self.specs = points.points();
+        Ok(None)
+    }
+
+    fn grounded(&mut self, grounded: Option<seismic::Grounded>) -> Result<(), TuneError> {
+        assert!(grounded.is_none(), "the fake compiles nothing on a thread");
+        self.case.formations.set(self.case.formations.get() + 1);
+        self.formed = true;
+        Ok(())
+    }
+
+    fn forming(&self) -> Option<seismic::Forming> {
+        None
+    }
+
+    fn formed(&mut self, _: seismic::Formed) -> Result<Duration, TuneError> {
+        unreachable!("the fake compiles nothing ahead")
+    }
+
+    fn plan(&mut self, _: seismic::UnitPlan) {}
+
+    fn terminal(&self) -> Result<TuningResult, TuneError> {
+        if !self.formed {
+            return Err(TuneError::Declaration(
+                "the defaults were not formed".into(),
+            ));
+        }
+        let mut configurations = Vec::new();
+        // This deterministic fixture supplies explicit synthetic
+        // measurements of its candidates; it executes no arithmetic.
+        let mut observations = Vec::new();
+        if self.discovered > 0 {
+            configurations.push(ConfigurationRecord {
+                launches: Vec::new(),
+                formation: None,
+                configuration: self.case.defaults.clone(),
+                artifact: Some("a".into()),
+                // The default is the reference: it carries no evidence
+                // against itself.
+                observations: Vec::new(),
+                outcome: Outcome::Measured {
+                    points: self.measurements(self.discovered, self.case.defaults_seconds),
+                    confirmed: Vec::new(),
+                },
+            });
+        }
+        if self.measured {
+            let mut rejected = self.case.chosen.clone();
+            rejected.launches[0].insert("ROWS".into(), 4);
+            observations.extend(
+                self.specs
+                    .iter()
+                    .map(|spec| observation(&spec.label, 2, self.alpha / 4.)),
+            );
+            configurations.push(ConfigurationRecord {
+                launches: Vec::new(),
+                formation: None,
+                configuration: self.case.chosen.clone(),
+                artifact: Some("b".into()),
+                observations: (0..self.specs.len()).collect(),
+                outcome: Outcome::Measured {
+                    points: self.measurements(self.specs.len(), self.case.defaults_seconds / 2.0),
+                    confirmed: Vec::new(),
+                },
+            });
+            let beyond = observation(&self.specs[0].label, 4, self.alpha * 1.5);
+            configurations.push(ConfigurationRecord {
+                launches: Vec::new(),
+                formation: None,
+                configuration: rejected,
+                artifact: Some("c".into()),
+                observations: vec![observations.len()],
+                outcome: Outcome::Excluded(
+                    seismic::admit(&beyond, &steps(self.alpha))
+                        .unwrap_err()
+                        .exclusion(),
+                ),
+            });
+            observations.push(beyond);
+        }
+        let candidates = configurations.len().saturating_sub(1);
+        Ok(TuningResult {
+            disposition: if self.promoted {
+                seismic::TuningDisposition::QualifiedCandidate
+            } else {
+                seismic::TuningDisposition::CanonicalFallback {
+                    artifact: "a".into(),
+                }
+            },
+            tuning_identity: "fake-device".into(),
+            entry: "dense_output".into(),
+            backend: "metal".into(),
+            points: self
+                .specs
                 .iter()
                 .map(|spec| seismic::PointRecord {
                     label: spec.label.clone(),
-                    weight: 1.0,
-                    class: None,
+                    weight: spec.weight,
+                    class: spec.class.clone(),
                 })
                 .collect(),
-            vec![ConfigurationRecord {
-                configuration: defaults.clone(),
-                outcome: Outcome::Measured {
-                    artifact: "a".into(),
-                    points: specs
-                        .iter()
-                        .map(|spec| seismic::PointMeasurement {
-                            point: spec.label.clone(),
-                            key: seismic::PointKey {
-                                launches: vec![0],
-                                values: Default::default(),
-                            },
-                            median_seconds: self.case.defaults_seconds,
-                            deviation_seconds: 0.0,
-                            samples: vec![self.case.defaults_seconds],
-                            repetitions: 1,
-                            rotation_bytes: 0,
-                        })
-                        .collect(),
-                    confirmed: Vec::new(),
-                    validated: true,
-                },
-            }],
-            defaults,
-            TuningMethod::Census,
-        ))
-    }
-
-    fn start(
-        &mut self,
-        points: &mut dyn seismic::PointSource<'static, dense_output::Entry>,
-        plan: StartPlan,
-        _until: Instant,
-    ) -> Result<Standing, TuneError> {
-        self.build(points);
-        self.case
-            .allowances
-            .borrow_mut()
-            .push(plan.admission * ADMISSION_SHARE);
-        Ok(Standing {
-            finished: true,
-            cost: 1.,
-            measured: 2,
-            admissible: 2,
-            programs: 0,
-            declared_programs: 0,
-            forming_seconds: 0.,
-            cut: false,
+            requirement: steps(self.alpha),
+            observations,
+            served: std::iter::once(self.case.defaults.clone())
+                .chain(self.promoted.then(|| self.case.chosen.clone()))
+                .collect(),
+            reselection: None,
+            implementation_identity: String::new(),
+            parameters: Vec::new(),
+            configurations,
+            overall: if self.promoted {
+                self.case.chosen.clone()
+            } else {
+                self.case.defaults.clone()
+            },
+            method: if self.discovered < self.specs.len() {
+                TuningMethod::Census
+            } else {
+                TuningMethod::Search {
+                    groups: 1,
+                    candidates,
+                    complete: self.next().is_none(),
+                }
+            },
+            time: TuningTime::default(),
+            coverage: None,
+            default_launches: Vec::new(),
         })
     }
 
-    fn refine(&mut self, _slice: Instant, _until: Instant) -> Result<Standing, TuneError> {
-        panic!("the fake search is finished by its start")
+    fn next(&self) -> Option<seismic::Work> {
+        let priced = seismic::Quote {
+            priced: self.piece(),
+            unpriced: 0,
+        };
+        if self.discovered < self.specs.len() {
+            // A point's classes are first observed by its own discovery.
+            Some(seismic::Work {
+                stage: seismic::Stage::Discovery,
+                quote: seismic::Quote {
+                    priced: Duration::ZERO,
+                    unpriced: 1,
+                },
+                forming: seismic::Quote::default(),
+                // As a real unit's discovery is worth: each point one
+                // operation of what remains.
+                opportunity: 0.,
+                footprint: seismic::Footprint::default(),
+            })
+        } else if !self.measured {
+            Some(seismic::Work {
+                stage: seismic::Stage::Measure,
+                quote: priced,
+                forming: seismic::Quote::default(),
+                opportunity: 0.5,
+                footprint: seismic::Footprint::default(),
+            })
+        } else if !self.promoted && !self.case.unqualified {
+            Some(seismic::Work {
+                stage: seismic::Stage::Promote,
+                quote: priced,
+                forming: seismic::Quote::default(),
+                opportunity: 0.5,
+                footprint: seismic::Footprint::default(),
+            })
+        } else {
+            None
+        }
     }
 
-    fn reserve(&self) -> Duration {
-        Duration::ZERO
-    }
-
-    fn conclude(
-        self: Box<Self>,
+    fn perform(
+        &mut self,
         points: &mut dyn seismic::PointSource<'static, dense_output::Entry>,
-        _until: Instant,
-        allowance: Duration,
-    ) -> Result<TuningResult, TuneError> {
-        let mut rejected = self.case.chosen.clone();
-        rejected.launches[0].insert("ROWS".into(), 4);
-        Ok(self.result(
-            points
-                .points()
-                .iter()
-                .map(|point| seismic::PointRecord {
-                    label: point.label.clone(),
-                    weight: point.weight,
-                    class: point.class.clone(),
-                })
-                .collect(),
-            vec![
-                ConfigurationRecord {
-                    configuration: self.case.chosen.clone(),
-                    outcome: Outcome::Measured {
-                        artifact: "a".into(),
-                        points: Vec::new(),
-                        confirmed: Vec::new(),
-                        validated: true,
-                    },
-                },
-                ConfigurationRecord {
-                    configuration: rejected,
-                    outcome: Outcome::Excluded(Exclusion::Validation {
-                        point: "m1".into(),
-                        detail: "differs".into(),
-                    }),
-                },
-            ],
-            self.case.chosen.clone(),
-            TuningMethod::Search {
-                allowance_seconds: allowance.as_secs_f64(),
-                settings: SEARCH_SETTINGS,
-                stop: SearchStop::Exhausted,
-            },
-        ))
+        _before: Option<Instant>,
+    ) -> Result<seismic::Performed, TuneError> {
+        let work = self.next().expect("a unit performs the work it named");
+        let began = Instant::now();
+        match work.stage {
+            seismic::Stage::Discovery => {
+                let spec = &self.specs[self.discovered];
+                let built = points
+                    .build(self.discovered)
+                    .unwrap_or_else(|unavailable| panic!("{unavailable:?}"));
+                self.resident = true;
+                self.case.seen.borrow_mut().push((
+                    spec.label.clone(),
+                    spec.weight,
+                    built.rotation.len(),
+                ));
+                self.discovered += 1;
+            }
+            seismic::Stage::Form | seismic::Stage::Measure => self.measured = true,
+            seismic::Stage::Promote => self.promoted = true,
+            seismic::Stage::Confirm => unreachable!("the fake's lead is resolved"),
+        }
+        self.case.stages.borrow_mut().push(work.stage);
+        Ok(seismic::Performed {
+            stage: work.stage,
+            quote: work.quote,
+            actual: began.elapsed(),
+            interrupted: false,
+            spent: seismic::Spent::default(),
+            raises: Vec::new(),
+            promoted: work.stage == seismic::Stage::Promote,
+            footprint: work.footprint,
+            memory: seismic::PieceMemory::default(),
+        })
     }
+
+    fn release(&mut self, points: &mut dyn seismic::PointSource<'static, dense_output::Entry>) {
+        if std::mem::take(&mut self.resident) {
+            for point in 0..self.discovered {
+                points.release(point);
+            }
+        }
+    }
+
+    fn narrow(&mut self) -> bool {
+        false
+    }
+
+    fn bound(&self) -> Option<Vec<(u64, u64)>> {
+        self.resident.then(Vec::new)
+    }
+
+    fn programs(&self) -> u64 {
+        0
+    }
+
+    fn give_up_programs(&mut self) {}
+
+    fn largest_footprint(&self) -> Option<u64> {
+        None
+    }
+
+    fn longest_operation(&self) -> Duration {
+        self.piece()
+    }
+
+    fn inputs_built(&self) -> seismic::Quote {
+        seismic::Quote::default()
+    }
+
+    fn service_measurements(&self) -> Vec<seismic::PointMeasurement> {
+        self.measurements(self.discovered, self.case.defaults_seconds)
+    }
+
+    fn reweigh(&mut self, _: &[f64]) -> bool {
+        !self.measured
+    }
+
+    fn discovered(&self) -> bool {
+        self.discovered == self.specs.len()
+    }
+
+    fn standing(&self) -> Standing {
+        Standing {
+            cost: if self.promoted { 0.5 } else { 1. },
+            measured: usize::from(self.discovered > 0) + usize::from(self.measured),
+            generated: 2,
+            requests: 2,
+            declared: Some(2),
+            exhausted: self.measured,
+            programs: usize::from(self.measured),
+            forming_seconds: 0.,
+        }
+    }
+}
+
+/// A Prepare abandoned at any instant after its mandatory phase (a load
+/// preempting a post-install optimization, a killed process) leaves only
+/// provisional records: the next Prepare, the preempting load's, searches
+/// the unit again to its end and settles it, and a load after that consumes
+/// the settled record with nothing searched. A deterministic search and
+/// real typed point factories; no model inference or claimed numerical
+/// qualification.
+#[test]
+fn a_prepare_abandoned_mid_search_is_searched_again_by_the_next_prepare() {
+    let Some(device) = metal() else {
+        return;
+    };
+    let (definition, load) = fixture_load();
+    let import = ImportKernels {
+        import_dense: HashMap::new(),
+        repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
+    };
+    let recorder = Recorder::default();
+    let context = TuningContext {
+        definition: &definition,
+        weights: &ZeroTuningWeights,
+        observer: &recorder,
+        cache: None,
+        numerical_profile: super::precision::ResolvedNumericalProfile::standard(),
+        settings: TuningSettings::STANDARD,
+    };
+    let limits = TuningLimits {
+        max_rows: 64,
+        max_projected_rows: 8,
+        context_tokens: 256,
+    };
+    let implementation = dense_output_implementation(&device);
+    let statics = implementation
+        .statics
+        .iter()
+        .fold(NativeSpecialization::new(), |spec, name| {
+            spec.with_static(
+                name.clone(),
+                if name == "DS" || name == "DB" {
+                    0
+                } else if name == "H" {
+                    8
+                } else {
+                    16
+                },
+            )
+        });
+    // The first load is abandoned after `performed` pieces of its optional
+    // work: none at all, some of its discovery, its measurement, its
+    // promotion. Whenever that is, the cache holds the unit's record only
+    // provisional.
+    struct Abandoning {
+        after: usize,
+        stages: Cell<usize>,
+    }
+    impl TuningObserver for Abandoning {
+        fn event(&self, event: &TuningEvent) {
+            if matches!(event, TuningEvent::Stage(_)) {
+                self.stages.set(self.stages.get() + 1);
+                if self.stages.get() == self.after {
+                    panic!("the tuner is abandoned here");
+                }
+            }
+        }
+    }
+    let points = row_points(limits).len();
+    for performed in 0..=points + 2 {
+        let root = std::env::temp_dir().join(format!(
+            "magnitude-tuning-abandoned-{}-{performed}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let cache = KernelCache::open(root.clone(), crate::DEFAULT_KERNEL_CACHE_BYTES).unwrap();
+        let case = FakeCase::new(&implementation, &statics, "abandoned");
+        let abandoning = Abandoning {
+            after: performed,
+            stages: Cell::new(0),
+        };
+        let mut tuner = Tuner::count(
+            &device,
+            TuningContext {
+                observer: &abandoning,
+                cache: Some(&cache),
+                ..context
+            },
+            limits,
+            TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
+            fixture_invocations(&case, &statics, limits),
+        );
+        tuner.tune(&case, &implementation, &statics).unwrap();
+        // The mandatory phase forms the canonical artifact and publishes
+        // the unit's record before any input is built.
+        let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
+        assert_eq!(case.formations.get(), 1);
+        assert!(case.seen.borrow().is_empty());
+        tuner.tune(&case, &implementation, &statics).unwrap();
+        if performed == 0 {
+            drop(tuner);
+        } else {
+            let abandoned =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tuner.search().is_ok()));
+            assert!(abandoned.is_err(), "the load was abandoned mid-search");
+        }
+        assert_eq!(case.stages.borrow().len(), performed);
+        // The next Prepare finds no settled record: it forms the canonical
+        // artifact again and searches the unit to its end, the challenger
+        // promoted.
+        let prepare = |case: &FakeCase| {
+            let mut tuner = Tuner::count(
+                &device,
+                TuningContext {
+                    cache: Some(&cache),
+                    ..context
+                },
+                limits,
+                TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
+                fixture_invocations(case, &statics, limits),
+            );
+            tuner.tune(case, &implementation, &statics).unwrap();
+            let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
+            tuner.tune(case, &implementation, &statics).unwrap();
+            let mut tuner = tuner.search().unwrap();
+            let chosen = tuner.tune(case, &implementation, &statics).unwrap();
+            (chosen, tuner.conclude())
+        };
+        let resumed = FakeCase::new(&implementation, &statics, "abandoned");
+        let (chosen, tuned) = prepare(&resumed);
+        assert_eq!(resumed.formations.get(), 1, "after {performed} pieces");
+        assert_eq!(resumed.stages.borrow().len(), points + 2);
+        assert_eq!(chosen.launch_param(0, "ROWS"), Some(2));
+        assert_eq!(tuned.len(), 1);
+        assert_eq!(tuned[0].origin, TuningOrigin::Searched);
+        assert!(tuned[0].qualified);
+        // A load after it consumes the settled record: nothing is formed,
+        // built, measured or searched.
+        let again = FakeCase::new(&implementation, &statics, "abandoned");
+        let (chosen, tuned) = prepare(&again);
+        assert_eq!(again.formations.get(), 0);
+        assert!(again.seen.borrow().is_empty() && again.stages.borrow().is_empty());
+        assert_eq!(chosen.launch_param(0, "ROWS"), Some(2));
+        assert_eq!(tuned[0].origin, TuningOrigin::Stored);
+        assert!(tuned[0].qualified);
+        assert_eq!(tuned[0].measured, 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+/// MEASUREMENT: what compiling the engine's dense output projection costs
+/// the process while it runs on worker threads, as a load's challenger
+/// compiles do (`cargo test --release -p magnitude-executor --lib --
+/// --ignored compiles_on_workers --nocapture`). Each distinct value of a
+/// launch's code parameters is a compile the toolchain has not seen. The
+/// process's physical footprint is sampled every millisecond: before,
+/// its most while four compiles run at once, with every kernel held, and
+/// with all of them released.
+#[test]
+#[ignore]
+fn profile_what_compiles_on_workers_add_to_the_process_footprint() {
+    let Some(device) = metal() else {
+        return;
+    };
+    let implementation = dense_output_implementation(&device);
+    let statics = implementation
+        .statics
+        .iter()
+        .fold(NativeSpecialization::new(), |spec, name| {
+            spec.with_static(
+                name.clone(),
+                if name == "DS" || name == "DB" {
+                    0
+                } else if name == "H" {
+                    1024
+                } else {
+                    4096
+                },
+            )
+        });
+    let default = implementation.default_specialization(&statics).unwrap();
+    // One specialization per other value of each launch's code parameters.
+    let mut specializations = Vec::new();
+    for (launch, declared) in implementation.launches.iter().enumerate() {
+        for parameter in declared.params.iter().filter(|parameter| parameter.code) {
+            for value in &parameter.values {
+                let changed =
+                    default
+                        .clone()
+                        .with_launch_param(launch, parameter.name.clone(), *value);
+                if changed != default && implementation.validate(&changed).is_ok() {
+                    specializations.push(changed);
+                }
+            }
+        }
+    }
+    let elements = || dense_output::Elements {
+        DW: Element::bf16(),
+        A: Element::bf16(),
+    };
+    let footprint = || seismic::ProcessMemory::footprint_now().expect("macOS reports a footprint");
+    let mib = |bytes: i64| bytes as f64 / (1 << 20) as f64;
+    // What stays once a compile's kernel is released follows the compiles:
+    // the first half of the specializations, compiled and released one at
+    // a time, then all of them on four threads.
+    let start = footprint();
+    let half = specializations.len() / 2;
+    for specialization in &specializations[..half] {
+        drop(dense_output::native_for_device_with(
+            &device,
+            elements(),
+            specialization,
+        ));
+    }
+    eprintln!(
+        "{half} compiled and released one at a time: +{:.1} MiB stays",
+        mib(footprint() as i64 - start as i64)
+    );
+    let before = footprint();
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let (most, kernels) = std::thread::scope(|scope| {
+        let sampler = scope.spawn(|| {
+            let mut most = 0;
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                most = most.max(footprint());
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            most
+        });
+        let began = Instant::now();
+        let workers = specializations
+            .chunks(specializations.len().div_ceil(4).max(1))
+            .map(|chunk| {
+                let device = &device;
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .filter_map(|specialization| {
+                            dense_output::native_for_device_with(device, elements(), specialization)
+                                .ok()
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        let kernels = workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        eprintln!(
+            "{} of {} specializations compiled on 4 threads in {:.2} s",
+            kernels.len(),
+            specializations.len(),
+            began.elapsed().as_secs_f64()
+        );
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        (sampler.join().unwrap(), kernels)
+    });
+    let held = footprint();
+    let count = kernels.len().max(1) as i64;
+    drop(kernels);
+    let released = footprint();
+    eprintln!(
+        "footprint: before {:.1} MiB; most while compiling +{:.1} MiB; with {count} kernels held \
+         +{:.1} MiB ({:.2} MiB a kernel); all released +{:.1} MiB",
+        mib(before as i64),
+        mib(most as i64 - before as i64),
+        mib(held as i64 - before as i64),
+        mib(held as i64 - before as i64) / count as f64,
+        mib(released as i64 - before as i64),
+    );
+}
+
+/// A unit's record is stored provisional when its served choice changes,
+/// and settled once when the
+/// optional work stops, not with every piece: a unit that measured without
+/// promoting publishes its measurements once, at the stop.
+#[test]
+fn a_record_is_published_with_a_promotion_and_once_when_the_work_stops() {
+    let Some(device) = metal() else {
+        return;
+    };
+    let (definition, load) = fixture_load();
+    let import = ImportKernels {
+        import_dense: HashMap::new(),
+        repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
+    };
+    let limits = TuningLimits {
+        max_rows: 64,
+        max_projected_rows: 8,
+        context_tokens: 256,
+    };
+    let implementation = dense_output_implementation(&device);
+    let statics = implementation
+        .statics
+        .iter()
+        .fold(NativeSpecialization::new(), |spec, name| {
+            spec.with_static(
+                name.clone(),
+                if name == "DS" || name == "DB" {
+                    0
+                } else if name == "H" {
+                    8
+                } else {
+                    16
+                },
+            )
+        });
+    /// After each piece and each closing publication: what happened, and
+    /// the configurations the stored record holds as measured.
+    struct Stored<'c> {
+        cache: &'c KernelCache,
+        seen: RefCell<Vec<(&'static str, usize)>>,
+    }
+    impl Stored<'_> {
+        fn measured(&self) -> usize {
+            let stored = std::fs::read_dir(self.cache.root().join("evidence"))
+                .unwrap()
+                .flatten()
+                .map(|record| record.path())
+                .collect::<Vec<_>>();
+            let [record] = stored.as_slice() else {
+                panic!("one unit stores one record: {stored:?}");
+            };
+            serde_json::from_slice::<TuningResult>(&std::fs::read(record).unwrap())
+                .unwrap()
+                .configurations
+                .iter()
+                .filter(|record| matches!(record.outcome, Outcome::Measured { .. }))
+                .count()
+        }
+    }
+    impl TuningObserver for Stored<'_> {
+        fn event(&self, event: &TuningEvent) {
+            let what = match event {
+                TuningEvent::Stage(stage) if stage.promoted => "promoted",
+                TuningEvent::Stage(_) => "piece",
+                TuningEvent::Published { .. } => "published",
+                _ => return,
+            };
+            self.seen.borrow_mut().push((what, self.measured()));
+        }
+    }
+    let points = row_points(limits).len();
+    for unqualified in [false, true] {
+        let root = std::env::temp_dir().join(format!(
+            "magnitude-tuning-publication-{}-{unqualified}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let cache = KernelCache::open(root.clone(), crate::DEFAULT_KERNEL_CACHE_BYTES).unwrap();
+        let stored = Stored {
+            cache: &cache,
+            seen: RefCell::new(Vec::new()),
+        };
+        let mut case = FakeCase::new(&implementation, &statics, "published");
+        case.unqualified = unqualified;
+        let mut tuner = Tuner::count(
+            &device,
+            TuningContext {
+                definition: &definition,
+                weights: &ZeroTuningWeights,
+                observer: &stored,
+                cache: Some(&cache),
+                numerical_profile: super::precision::ResolvedNumericalProfile::standard(),
+                settings: TuningSettings::STANDARD,
+            },
+            limits,
+            TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
+            fixture_invocations(&case, &statics, limits),
+        );
+        tuner.tune(&case, &implementation, &statics).unwrap();
+        let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
+        // The mandatory phase published the canonical default's record.
+        assert_eq!(stored.measured(), 0);
+        tuner.tune(&case, &implementation, &statics).unwrap();
+        let tuner = tuner.search().unwrap();
+        // Discovery and the challenger's measurement store nothing.
+        let mut expected = vec![("piece", 0); points + 1];
+        if unqualified {
+            // Nothing was promoted: the measurements are published once,
+            // when the work stops.
+            expected.push(("published", 2));
+        } else {
+            // The promotion publishes the record with everything
+            // measured, provisional; the record is settled when the work
+            // stops.
+            expected.push(("promoted", 2));
+            expected.push(("published", 2));
+        }
+        assert_eq!(*stored.seen.borrow(), expected);
+        let tuned = tuner.conclude();
+        assert_eq!(tuned[0].measured, 2);
+        assert_eq!(stored.measured(), 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+/// Work that runs past the budget completes, and the load succeeds with
+/// every unit's record: exceeding the budget is never a failure.
+#[test]
+fn ordinary_and_zero_demand_units_outlasting_the_budget_fail_nothing() {
+    struct LateObserver(Cell<bool>);
+    impl TuningObserver for LateObserver {
+        fn event(&self, event: &TuningEvent) {
+            if matches!(event, TuningEvent::Finished(_)) {
+                self.0.set(true);
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+    let Some(device) = metal() else {
+        return;
+    };
+    let (definition, load) = fixture_load();
+    let import = ImportKernels {
+        import_dense: HashMap::new(),
+        repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
+    };
+    let implementation = dense_output_implementation(&device);
+    let statics = implementation
+        .statics
+        .iter()
+        .fold(NativeSpecialization::new(), |spec, name| {
+            spec.with_static(name.clone(), if name == "DS" || name == "DB" { 0 } else { 8 })
+        });
+    for launches in [0, 1] {
+        let mut case = FakeCase::new(&implementation, &statics, "late-publication");
+        case.launches = launches;
+        let observer = LateObserver(Cell::new(false));
+        let mut tuner = Tuner::count(
+            &device,
+            TuningContext {
+                definition: &definition,
+                weights: &ZeroTuningWeights,
+                observer: &observer,
+                cache: None,
+                numerical_profile: super::precision::ResolvedNumericalProfile::standard(),
+                settings: TuningSettings {
+                    budget: Duration::from_millis(50),
+                    fresh: true,
+                },
+            },
+            LIMITS,
+            TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
+            fixture_invocations(&case, &statics, LIMITS),
+        );
+        tuner.tune(&case, &implementation, &statics).unwrap();
+        let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
+        tuner.tune(&case, &implementation, &statics).unwrap();
+        let tuner = tuner.search().unwrap();
+        assert!(
+            observer.0.get(),
+            "the regression exercises completion, not just admission"
+        );
+        assert!(tuner.started.elapsed() > Duration::from_millis(50));
+        assert_eq!(tuner.conclude().len(), 1);
+    }
+}
+
+/// A unit the census meets without serving demand is served at its
+/// canonical default, settled as a record made without demand. The store's
+/// key holds no demand: a later load without demand reads that record and
+/// forms nothing, as it reads any settled one, and a load that serves the
+/// unit searches it instead of replaying the unsearched default.
+#[test]
+fn a_record_made_without_demand_is_read_without_demand_and_searched_with_it() {
+    let device = crate::test_support::open_backend(
+        &seismic::Devices::discover(&[]).unwrap(),
+        BackendName::Cpu,
+    )
+    .unwrap();
+    let (definition, load) = fixture_load();
+    let import = ImportKernels {
+        import_dense: HashMap::new(),
+        repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
+    };
+    let limits = TuningLimits {
+        max_rows: 64,
+        max_projected_rows: 8,
+        context_tokens: 256,
+    };
+    let implementation = dense_output_implementation(&device);
+    let statics = implementation
+        .statics
+        .iter()
+        .fold(NativeSpecialization::new(), |spec, name| {
+            spec.with_static(
+                name.clone(),
+                if name == "DS" || name == "DB" {
+                    0
+                } else if name == "H" {
+                    8
+                } else {
+                    16
+                },
+            )
+        });
+    let root = std::env::temp_dir().join(format!(
+        "magnitude-tuning-without-demand-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let cache = KernelCache::open(root.clone(), crate::DEFAULT_KERNEL_CACHE_BYTES).unwrap();
+    let recorder = Recorder::default();
+    let prepare = |case: &FakeCase| {
+        let mut tuner = Tuner::count(
+            &device,
+            TuningContext {
+                definition: &definition,
+                weights: &ZeroTuningWeights,
+                observer: &recorder,
+                cache: Some(&cache),
+                numerical_profile: super::precision::ResolvedNumericalProfile::standard(),
+                settings: TuningSettings::STANDARD,
+            },
+            limits,
+            TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
+            fixture_invocations(case, &statics, limits),
+        );
+        tuner.tune(case, &implementation, &statics).unwrap();
+        let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
+        tuner.tune(case, &implementation, &statics).unwrap();
+        let mut tuner = tuner.search().unwrap();
+        tuner.tune(case, &implementation, &statics).unwrap();
+        // A unit the load opened a search for has its slot; one served from
+        // its stored record has none.
+        let slot = tuner.slots.values().next().cloned();
+        let tuned = tuner.conclude();
+        assert_eq!(tuned.len(), 1, "the load tunes one unit");
+        (slot, tuned[0].origin)
+    };
+    let stored = |slot: &TuningCacheKey| {
+        cache
+            .tuning::<super::record::StoredChoice>(slot)
+            .expect("the unit's record is stored")
+            .0
+    };
+    let idle = || {
+        let mut case = FakeCase::new(&implementation, &statics, "without-demand");
+        case.launches = 0;
+        case
+    };
+    let served = FakeCase::new(&implementation, &statics, "without-demand");
+    // The setup: one unit, of no launches on the loads without demand and
+    // some on the one with it, under one key.
+    let launched = |case: &FakeCase| {
+        let demand = fixture_invocations(case, &statics, limits);
+        assert_eq!(demand.units.len(), 1, "the fixture tunes one unit");
+        demand
+            .units
+            .values()
+            .flat_map(|counts| counts.launches())
+            .map(|(_, count)| count)
+            .sum::<f64>()
+    };
+    assert_eq!(launched(&idle()), 0.);
+    assert!(launched(&served) > 0.);
+    assert_eq!(idle().bindings, served.bindings);
+    // The first load without demand forms the canonical default and
+    // settles it as made without demand.
+    let first = idle();
+    let (slot, origin) = prepare(&first);
+    let slot = slot.expect("the first load opens the unit's search");
+    assert_eq!(first.formations.get(), 1);
+    assert!(first.stages.borrow().is_empty(), "nothing is searched");
+    assert_eq!(origin, TuningOrigin::Searched);
+    let record = stored(&slot);
+    assert!(record.settled && !record.demanded, "{record:?}");
+    // Another load without demand reads it: nothing is formed or searched.
+    let again = idle();
+    assert_eq!(prepare(&again), (None, TuningOrigin::Stored));
+    assert_eq!(again.formations.get(), 0);
+    assert!(again.stages.borrow().is_empty());
+    // A load that serves the unit does not replay it: it searches the unit
+    // and settles what it found, as made with demand.
+    let (searched, origin) = prepare(&served);
+    assert_eq!(searched, Some(slot.clone()), "the loads tune one key");
+    assert_eq!(origin, TuningOrigin::Searched);
+    assert_eq!(served.formations.get(), 1);
+    assert!(!served.stages.borrow().is_empty(), "the unit is searched");
+    let record = stored(&slot);
+    assert!(record.settled && record.demanded, "{record:?}");
+    // A load without demand after it reads that record.
+    let after = idle();
+    assert_eq!(prepare(&after), (None, TuningOrigin::Stored));
+    assert_eq!(after.formations.get(), 0);
+    assert!(after.stages.borrow().is_empty());
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -903,6 +1973,7 @@ fn the_tuner_drives_a_registered_case_and_reports_progress() {
     let import = ImportKernels {
         import_dense: HashMap::new(),
         repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
     };
     let recorder = Recorder::default();
     let context = TuningContext {
@@ -910,23 +1981,22 @@ fn the_tuner_drives_a_registered_case_and_reports_progress() {
         weights: &ZeroTuningWeights,
         observer: &recorder,
         cache: None,
-        error_classes: &NO_ERROR_CLASSES,
+        numerical_profile: super::precision::ResolvedNumericalProfile::standard(),
+        settings: TuningSettings::STANDARD,
     };
     let limits = TuningLimits {
         max_rows: 64,
         max_projected_rows: 8,
         context_tokens: 256,
     };
-    let implementation = seismic::generated::native_implementation::<dense_output::Entry>(&device)
-        .unwrap()
-        .unwrap();
+    let implementation = dense_output_implementation(&device);
     let statics = implementation
         .statics
         .iter()
         .fold(NativeSpecialization::new(), |spec, name| {
             spec.with_static(
                 name.clone(),
-                if name == "DS" {
+                if name == "DS" || name == "DB" {
                     0
                 } else if name == "H" {
                     8
@@ -942,6 +2012,7 @@ fn the_tuner_drives_a_registered_case_and_reports_progress() {
         context,
         limits,
         TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
+        fixture_invocations(&case, &statics, limits),
     );
     let defaults = implementation.default_specialization(&statics).unwrap();
     assert_eq!(
@@ -949,14 +2020,20 @@ fn the_tuner_drives_a_registered_case_and_reports_progress() {
         defaults
     );
     assert!(case.seen.borrow().is_empty() && recorder.0.borrow().is_empty());
-    // The census builds the unit's points, cheapest first, and returns the
-    // defaults.
-    let mut tuner = tuner.census();
+    // The mandatory phase forms the canonical artifact and builds nothing;
+    // the walk after it still returns the defaults, now the published
+    // choice.
+    let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
+    assert_eq!(case.formations.get(), 1);
     assert_eq!(
         tuner.tune(&case, &implementation, &statics).unwrap(),
         defaults
     );
+    assert!(case.seen.borrow().is_empty());
+    // The optional phase builds each point once, cheapest first, as its
+    // discovery reaches it; the walk after it reads the unit's choice.
     let labels = ["m1", "m2", "m4", "m8", "m16", "m32", "m64"];
+    let mut tuner = tuner.search().unwrap();
     assert_eq!(
         case.seen
             .borrow()
@@ -965,55 +2042,110 @@ fn the_tuner_drives_a_registered_case_and_reports_progress() {
             .collect::<Vec<_>>(),
         labels
     );
-    // The search gets the points again, built once: from the census. The
-    // walk after it reads the unit's choice.
-    let mut tuner = tuner.search().unwrap();
-    assert_eq!(case.seen.borrow().len(), 2 * labels.len());
     let chosen = tuner.tune(&case, &implementation, &statics).unwrap();
     assert_eq!(chosen.launch_param(0, "ROWS"), Some(2));
-    assert_eq!(case.seen.borrow().len(), 2 * labels.len());
-    assert!(case
-        .seen
-        .borrow()
-        .iter()
-        .all(|(_, _, rotation)| *rotation == ROTATION_LAYERS));
-    // The only unit's share of step time is all of it.
-    let allowance = case.allowances.borrow()[0];
-    assert!(allowance <= TUNING_TIME && allowance > TUNING_TIME - Duration::from_millis(1));
-    let events = recorder.0.borrow();
-    // Progress counts milliseconds of the tuning time from the census.
-    let total = TUNING_TIME.as_millis() as usize;
-    assert_eq!(
-        events[0],
-        TuningEvent::Progress {
-            completed: 0,
-            total
-        }
+    assert_eq!(case.seen.borrow().len(), labels.len());
+    assert!(
+        case.seen
+            .borrow()
+            .iter()
+            .all(|(_, _, rotation)| *rotation == ROTATION_LAYERS)
     );
-    assert!(matches!(events[1], TuningEvent::Progress { .. }));
+    // Discovery first, then the challenger, then its conversion.
+    let mut expected = vec![seismic::Stage::Discovery; labels.len()];
+    expected.extend([seismic::Stage::Measure, seismic::Stage::Promote]);
+    assert_eq!(*case.stages.borrow(), expected);
+    let events = recorder.0.borrow();
+    // Progress counts milliseconds of the tuning time from the count.
+    let total = STANDARD_TUNING_BUDGET.as_millis() as usize;
+    // The mandatory phase is attributed first: forming and publishing.
     assert!(matches!(
-        &events[2],
+        &events[0],
+        TuningEvent::Mandatory {
+            entry: "dense_output",
+            ..
+        }
+    ));
+    assert!(matches!(events[1], TuningEvent::Progress { total: all, .. } if all == total));
+    assert!(matches!(
+        &events[3],
         TuningEvent::Started {
             entry: "dense_output",
             points: 7,
             ..
         }
     ));
-    assert!(matches!(events[3], TuningEvent::Progress { .. }));
-    let TuningEvent::Finished(tuned) = &events[4] else {
-        panic!("tuning reports completion");
+    // Every piece of work is reported with its forecast and what it took.
+    let stages = events
+        .iter()
+        .filter_map(|event| match event {
+            TuningEvent::Stage(stage) => Some(stage),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        stages.iter().map(|stage| stage.stage).collect::<Vec<_>>(),
+        expected
+    );
+    assert!(
+        stages[..labels.len()]
+            .iter()
+            .all(|stage| stage.forecast_seconds.is_none() && stage.unpriced == 1),
+        "discovery is unpriced"
+    );
+    for stage in &stages[labels.len()..] {
+        // Its runtime price and the publication of the unit's record.
+        assert!(stage.forecast_seconds.unwrap() >= case.defaults_seconds);
+        assert_eq!(stage.share, 1.);
+    }
+    assert_eq!(
+        stages
+            .iter()
+            .map(|stage| stage.promoted)
+            .filter(|promoted| *promoted)
+            .count(),
+        1
+    );
+    // One complete record per unit, then what became of the budget.
+    let finished = events
+        .iter()
+        .filter_map(|event| match event {
+            TuningEvent::Finished(tuned) => Some(tuned),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [tuned] = finished.as_slice() else {
+        panic!("tuning reports one record per unit");
     };
-    assert!(matches!(events[5], TuningEvent::Progress { .. }));
+    let Some(TuningEvent::Budget(budget)) = events.last() else {
+        panic!("tuning reports what became of its budget");
+    };
+    assert_eq!(budget.budget_seconds, STANDARD_TUNING_BUDGET.as_secs_f64());
+    assert_eq!(budget.stages, expected.len());
+    assert_eq!(budget.overrun_seconds, 0.);
+    assert!(budget.unused_seconds > 0. && budget.refused.is_empty());
+    assert!((budget.used_seconds + budget.unused_seconds - budget.budget_seconds).abs() < 1e-9);
+    // A unit with no work left holds no inputs: the inputs its pieces
+    // built were on the device while it worked, and none of them is when
+    // the optional work ends, before the tuning does.
+    assert!(budget.memory.peak_bytes > budget.memory.mandatory_bytes);
+    assert_eq!(budget.memory.ended_bytes, budget.memory.mandatory_bytes);
     // What the search reached is reported with the unit, not stored.
-    let progress = tuned.progress.expect("a searched unit reports its progress");
+    let progress = tuned
+        .progress
+        .expect("a searched unit reports its progress");
     assert_eq!(progress.share, 1.);
-    assert!(progress.standing.is_some_and(|standing| standing.finished));
+    assert_eq!(progress.stages, expected.len());
+    assert_eq!(progress.standing.cost, 0.5);
+    // The defaults and the promoted challenger are measured; one is
+    // rejected.
     assert_eq!(
         (tuned.measured, tuned.excluded, tuned.rejections),
-        (1, 1, 1)
+        (2, 1, 1)
     );
-    assert!(matches!(tuned.search, Some((_, SearchStop::Exhausted))));
-    assert_eq!(tuner.tuned(), [tuned.clone()]);
+    assert!(tuned.qualified);
+    assert_eq!(tuned.stop, Some(SearchStop::Exhausted));
+    assert_eq!(tuner.conclude(), [(*tuned).clone()]);
 }
 
 /// Stored tuning results (tuning spec §C2): a miss tunes and stores the
@@ -1024,24 +2156,27 @@ fn stored_results_are_offered_to_runtime_validation_and_changed_keys_miss() {
     let Some(device) = metal() else {
         return;
     };
+    eprintln!(
+        "terminal-cache reload qualification backend: {:?}",
+        device.backend()
+    );
     let (definition, load) = fixture_load();
     let import = ImportKernels {
         import_dense: HashMap::new(),
         repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
     };
     let root = std::env::temp_dir().join(format!("magnitude-tuning-cache-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let cache = KernelCache::open(root.clone(), crate::DEFAULT_KERNEL_CACHE_BYTES).unwrap();
-    let implementation = seismic::generated::native_implementation::<dense_output::Entry>(&device)
-        .unwrap()
-        .unwrap();
+    let implementation = dense_output_implementation(&device);
     let statics = implementation
         .statics
         .iter()
         .fold(NativeSpecialization::new(), |spec, name| {
             spec.with_static(
                 name.clone(),
-                if name == "DS" {
+                if name == "DS" || name == "DB" {
                     0
                 } else if name == "H" {
                     8
@@ -1057,23 +2192,39 @@ fn stored_results_are_offered_to_runtime_validation_and_changed_keys_miss() {
     };
     // One load: a count, a census and a search. Returns the unit's outcome,
     // whether its search started, and whether tuning reported progress.
-    let load_once = |case: &FakeCase, limits: TuningLimits| -> (TunedEntry, bool, bool) {
+    let load_with = |case: &FakeCase,
+                     limits: TuningLimits,
+                     settings: TuningSettings|
+     -> (TunedEntry, bool, bool) {
         let recorder = Recorder::default();
         let context = TuningContext {
             definition: &definition,
             weights: &ZeroTuningWeights,
             observer: &recorder,
             cache: Some(&cache),
-            error_classes: &NO_ERROR_CLASSES,
+            numerical_profile: super::precision::ResolvedNumericalProfile::standard(),
+            settings,
         };
         let weights = || TuningWeights::new(&device, &load, &ZeroTuningWeights, &import);
-        let mut tuner = Tuner::count(&device, context, limits, weights());
+        let mut tuner = Tuner::count(
+            &device,
+            context,
+            limits,
+            weights(),
+            fixture_invocations(case, &statics, limits),
+        );
+        let formed = case.formations.get();
         tuner.tune(case, &implementation, &statics).unwrap();
-        let mut tuner = tuner.census();
+        assert_eq!(
+            case.formations.get(),
+            formed,
+            "counting cached defaults cannot compile"
+        );
+        let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
         tuner.tune(case, &implementation, &statics).unwrap();
         let mut tuner = tuner.search().unwrap();
         let chosen = tuner.tune(case, &implementation, &statics).unwrap();
-        let tuned = tuner.tuned().pop().unwrap();
+        let tuned = tuner.conclude().pop().unwrap();
         assert_eq!(chosen, tuned.overall.specialization());
         let events = recorder.0.borrow();
         let started = events
@@ -1084,6 +2235,8 @@ fn stored_results_are_offered_to_runtime_validation_and_changed_keys_miss() {
             .any(|event| matches!(event, TuningEvent::Progress { .. }));
         (tuned, started, progressed)
     };
+    let load_once =
+        |case: &FakeCase, limits: TuningLimits| load_with(case, limits, TuningSettings::STANDARD);
     let stored_results = || std::fs::read_dir(root.join("tuning")).unwrap().count();
 
     let first = FakeCase::new(&implementation, &statics, "implementation a");
@@ -1110,10 +2263,17 @@ fn stored_results_are_offered_to_runtime_validation_and_changed_keys_miss() {
         (stored.measured, stored.excluded),
         (searched.measured, searched.excluded)
     );
-    assert_eq!(
-        (stored.search, stored.time.clone()),
-        (None, TuningTime::default())
-    );
+    assert_eq!(stored.time, TuningTime::default());
+    assert_eq!(stored.stop, searched.stop);
+    assert_eq!(stored_results(), 1);
+
+    // A different graph call frequency does not grant a new first-load search.
+    let mut more_calls = FakeCase::new(&implementation, &statics, "implementation a");
+    more_calls.launches = 7;
+    let (reused, started, progressed) = load_once(&more_calls, limits);
+    assert_eq!(reused.origin, TuningOrigin::Stored);
+    assert_eq!(reused.overall, searched.overall);
+    assert!(!started && !progressed && more_calls.seen.borrow().is_empty());
     assert_eq!(stored_results(), 1);
 
     // A changed implementation digest, and changed tuning points, are new
@@ -1131,26 +2291,91 @@ fn stored_results_are_offered_to_runtime_validation_and_changed_keys_miss() {
     );
     assert_eq!(stored_results(), 3);
 
-    // A unit whose start never fits the tuning time (confirming defaults
-    // this slow would not end in it) keeps its defaults unmeasured and
-    // stores nothing, so the next load searches it instead of reading
-    // those defaults as its result.
+    // A unit whose longest completed operation already outlasts the budget
+    // starts no unpriced discovery: it keeps the default its mandatory
+    // phase published, and every later load consumes that choice.
     let mut slow = FakeCase::new(&implementation, &statics, "implementation c");
-    slow.defaults_seconds = TUNING_TIME.as_secs_f64();
+    slow.defaults_seconds = STANDARD_TUNING_BUDGET.as_secs_f64();
     let (kept, started, _) = load_once(&slow, limits);
+    assert!(slow.seen.borrow().is_empty() && slow.stages.borrow().is_empty());
     assert_eq!(kept.origin, TuningOrigin::Searched);
     assert!(!started);
-    assert_eq!(stored_results(), 3);
-    let quick = FakeCase::new(&implementation, &statics, "implementation c");
-    let (searched, started, _) = load_once(&quick, limits);
-    assert_eq!(searched.origin, TuningOrigin::Searched);
-    assert!(started && searched.search.is_some());
+    assert_eq!(kept.overall, slow.defaults);
+    let canonical = kept.overall.specialization();
+    // A final fallback needs the real declaration's complete launch maps;
+    // a fake singleton ROWS map is not the same native specialization.
+    let truncated = Configuration {
+        launches: vec![
+            [(
+                "ROWS".to_owned(),
+                canonical.launch_param(0, "ROWS").unwrap(),
+            )]
+            .into_iter()
+            .collect(),
+        ],
+        ..kept.overall.clone()
+    }
+    .specialization();
+    assert!(!slow.stored_valid(&device, &truncated));
+    assert!(slow.stored_valid(&device, &canonical));
     assert_eq!(stored_results(), 4);
+    let quick = FakeCase::new(&implementation, &statics, "implementation c");
+    let (settled, started, progressed) = load_once(&quick, limits);
+    assert_eq!(settled.origin, TuningOrigin::Stored);
+    assert!(!started && !progressed && quick.seen.borrow().is_empty());
+    assert_eq!(settled.overall, kept.overall);
+    assert_eq!(stored_results(), 4);
+    let mut inactive = FakeCase::new(&implementation, &statics, "implementation inactive");
+    inactive.launches = 0;
+    let (canonical, started, progressed) = load_once(&inactive, limits);
+    assert_eq!(canonical.overall, inactive.defaults);
+    assert!(
+        !started && progressed,
+        "canonical formation shares the first-load clock"
+    );
+    assert_eq!(inactive.formations.get(), 1);
+    assert!(inactive.stages.borrow().is_empty());
+    // That record was made without demand: a load that serves the unit
+    // searches it, and replaces it under the same key.
+    let mut activated = FakeCase::new(&implementation, &statics, "implementation inactive");
+    activated.launches = 7;
+    let (searched_active, started, _) = load_once(&activated, limits);
+    assert_eq!(searched_active.origin, TuningOrigin::Searched);
+    assert!(started && !activated.seen.borrow().is_empty(), "a load with demand searches a record made without it");
+    assert_eq!(stored_results(), 5);
+    // A fresh load searches a unit whose result is stored, and replaces it.
+    let fresh = FakeCase::new(&implementation, &statics, "implementation a");
+    let fresh_settings = TuningSettings {
+        fresh: true,
+        ..TuningSettings::STANDARD
+    };
+    let (researched, started, progressed) = load_with(&fresh, limits, fresh_settings);
+    assert_eq!(researched.origin, TuningOrigin::Searched);
+    assert!(started && progressed && !fresh.seen.borrow().is_empty());
+    assert_eq!(stored_results(), 5);
+    // A result serves a load whose budget is no larger than the one it was
+    // searched within, and nothing is stored for it.
+    let rebudgeted = FakeCase::new(&implementation, &statics, "implementation a");
+    let half = TuningSettings {
+        budget: STANDARD_TUNING_BUDGET / 2,
+        ..TuningSettings::STANDARD
+    };
+    assert_eq!(
+        load_with(&rebudgeted, limits, half).0.origin,
+        TuningOrigin::Stored
+    );
+    assert_eq!(stored_results(), 5);
     std::fs::remove_dir_all(root).unwrap();
 }
 
+/// A unit's stored record holds every candidate's measurements, which are
+/// the same under every α: a later load under another α reads the same
+/// record and chooses again among the choices its search served, forming
+/// and measuring nothing. A stricter α that no longer admits the promoted
+/// challenger serves the choice before it; a looser α serves no candidate
+/// the search rejected, since none was timed, confirmed or covered.
 #[test]
-fn tuning_a_weight_without_its_import_entry_is_a_typed_failure() {
+fn a_stored_record_is_served_under_another_alpha_without_forming_or_measuring() {
     let Some(device) = metal() else {
         return;
     };
@@ -1158,16 +2383,366 @@ fn tuning_a_weight_without_its_import_entry_is_a_typed_failure() {
     let import = ImportKernels {
         import_dense: HashMap::new(),
         repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
     };
-    let recorder = Recorder::default();
-    let implementation = seismic::generated::native_implementation::<dense_output::Entry>(&device)
-        .unwrap()
-        .unwrap();
+    let root = std::env::temp_dir().join(format!("magnitude-tuning-alpha-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let cache = KernelCache::open(root.clone(), crate::DEFAULT_KERNEL_CACHE_BYTES).unwrap();
+    let implementation = dense_output_implementation(&device);
     let statics = implementation
         .statics
         .iter()
         .fold(NativeSpecialization::new(), |spec, name| {
-            spec.with_static(name.clone(), if name == "DS" { 0 } else { 8 })
+            spec.with_static(
+                name.clone(),
+                if name == "DS" || name == "DB" {
+                    0
+                } else if name == "H" {
+                    8
+                } else {
+                    16
+                },
+            )
+        });
+    let limits = TuningLimits {
+        max_rows: 64,
+        max_projected_rows: 8,
+        context_tokens: 256,
+    };
+    // One load under `alpha`: the unit's outcome, and its case, which
+    // counts what the load formed, built and measured.
+    let load_under = |alpha: f64| -> (TunedEntry, FakeCase) {
+        let case = FakeCase::new(&implementation, &statics, "implementation a");
+        let profile = super::precision::NumericalProfile {
+            alpha: seismic::Limit::new(alpha).unwrap(),
+            cpu_sites: true,
+        }
+        .resolve()
+        .unwrap();
+        let recorder = Recorder::default();
+        let context = TuningContext {
+            definition: &definition,
+            weights: &ZeroTuningWeights,
+            observer: &recorder,
+            cache: Some(&cache),
+            numerical_profile: &profile,
+            settings: TuningSettings::STANDARD,
+        };
+        let mut tuner = Tuner::count(
+            &device,
+            context,
+            limits,
+            TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
+            fixture_invocations(&case, &statics, limits),
+        );
+        tuner.tune(&case, &implementation, &statics).unwrap();
+        let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
+        tuner.tune(&case, &implementation, &statics).unwrap();
+        let mut tuner = tuner.search().unwrap();
+        let chosen = tuner.tune(&case, &implementation, &statics).unwrap();
+        let tuned = tuner.conclude().pop().unwrap();
+        assert_eq!(chosen, tuned.overall.specialization());
+        (tuned, case)
+    };
+    let untouched = |case: &FakeCase| {
+        case.formations.get() == 0
+            && case.seen.borrow().is_empty()
+            && case.stages.borrow().is_empty()
+    };
+    let stored_results = || std::fs::read_dir(root.join("tuning")).unwrap().count();
+
+    // The search: its challenger, a quarter of α from the defaults, is
+    // promoted; another candidate, half as far again as α, is rejected.
+    let (searched, first) = load_under(8.);
+    assert_eq!(searched.origin, TuningOrigin::Searched);
+    assert!(searched.qualified && first.formations.get() == 1);
+    assert_eq!(searched.overall, first.chosen);
+    let evidence = |tuned: &TunedEntry| tuned.receipt.read().unwrap();
+    assert_eq!(
+        (searched.rejections, evidence(&searched).reselection.clone()),
+        (1, None)
+    );
+    assert_eq!(stored_results(), 1);
+
+    // A stricter α than the challenger's ratio of 2: the same record, the
+    // choice before the challenger, no work.
+    let (strict, case) = load_under(1.);
+    assert_eq!(strict.origin, TuningOrigin::Stored);
+    assert!(untouched(&case), "re-selection forms and measures nothing");
+    assert_eq!(strict.overall, case.defaults);
+    assert!(!strict.qualified);
+    // Chosen again from the evidence, which this load therefore holds.
+    assert!(matches!(strict.receipt, Receipt::Held(_)));
+    let strict_evidence = evidence(&strict);
+    assert_eq!(strict_evidence.requirement, steps(1.));
+    let reselection = strict_evidence.reselection.as_ref().unwrap();
+    assert_eq!(reselection.searched, steps(8.));
+    assert!(reselection.unserved.is_empty());
+    // Both candidates are beyond this α; their measurements are unchanged.
+    assert_eq!(strict.rejections, 2);
+    assert_eq!(
+        strict_evidence.observations,
+        evidence(&searched).observations
+    );
+    assert_eq!(stored_results(), 1);
+
+    // A looser α than the rejected candidate's ratio of 12 admits its
+    // measurements, but it has no timing, confirmation or coverage: the
+    // promoted challenger is still served, and the record says what was
+    // left unserved.
+    let (loose, case) = load_under(16.);
+    assert_eq!(loose.origin, TuningOrigin::Stored);
+    assert!(untouched(&case));
+    assert_eq!(loose.overall, searched.overall);
+    assert!(loose.qualified && loose.rejections == 0);
+    let loose_evidence = evidence(&loose);
+    let reselection = loose_evidence.reselection.as_ref().unwrap();
+    assert_eq!(reselection.unserved.len(), 1);
+    assert_eq!(reselection.unserved[0].launches[0]["ROWS"], 4);
+    assert_ne!(reselection.unserved[0], loose.overall);
+
+    // The α it was searched under again: the stored choice as it was.
+    let (again, case) = load_under(8.);
+    assert!(untouched(&case));
+    assert_eq!(again.overall, searched.overall);
+    assert_eq!(
+        (again.rejections, again.measured),
+        (searched.rejections, searched.measured)
+    );
+    // Its evidence is named, not read: the load decoded the choice alone.
+    // Whoever states it reads what the search stored.
+    assert!(matches!(again.receipt, Receipt::Stored(_)));
+    assert_eq!(
+        evidence(&again).observations,
+        evidence(&searched).observations
+    );
+    assert_eq!(evidence(&again).reselection, None);
+    assert_eq!(stored_results(), 1, "no α has a record of its own");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A first load whose every unit ends unqualified (its reference was
+/// unavailable) stores that terminal disposition; a later load with the same
+/// cache reuses it and never searches or reports tuning time.
+#[test]
+fn unqualified_terminal_choices_are_reused_with_their_disposition_and_without_search() {
+    let Some(device) = metal() else {
+        return;
+    };
+    let (definition, load) = fixture_load();
+    let import = ImportKernels {
+        import_dense: HashMap::new(),
+        repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
+    };
+    let root = std::env::temp_dir().join(format!(
+        "magnitude-tuning-unqualified-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let cache = KernelCache::open(root.clone(), crate::DEFAULT_KERNEL_CACHE_BYTES).unwrap();
+    let implementation = dense_output_implementation(&device);
+    let statics = implementation
+        .statics
+        .iter()
+        .fold(NativeSpecialization::new(), |spec, name| {
+            spec.with_static(
+                name.clone(),
+                match name.as_str() {
+                    "DS" | "DB" => 0,
+                    "H" => 8,
+                    _ => 16,
+                },
+            )
+        });
+    let limits = TuningLimits {
+        max_rows: 64,
+        max_projected_rows: 8,
+        context_tokens: 256,
+    };
+    let load_once = |case: &FakeCase| -> (TunedEntry, bool) {
+        let recorder = Recorder::default();
+        let context = TuningContext {
+            definition: &definition,
+            weights: &ZeroTuningWeights,
+            observer: &recorder,
+            cache: Some(&cache),
+            numerical_profile: super::precision::ResolvedNumericalProfile::standard(),
+            settings: TuningSettings::STANDARD,
+        };
+        let weights = || TuningWeights::new(&device, &load, &ZeroTuningWeights, &import);
+        let mut tuner = Tuner::count(
+            &device,
+            context,
+            limits,
+            weights(),
+            fixture_invocations(case, &statics, limits),
+        );
+        tuner.tune(case, &implementation, &statics).unwrap();
+        let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
+        tuner.tune(case, &implementation, &statics).unwrap();
+        let mut tuner = tuner.search().unwrap();
+        tuner.tune(case, &implementation, &statics).unwrap();
+        let tuned = tuner.conclude().pop().unwrap();
+        let searched = recorder.0.borrow().iter().any(|event| {
+            matches!(
+                event,
+                TuningEvent::Started { .. } | TuningEvent::Progress { .. }
+            )
+        });
+        (tuned, searched)
+    };
+    let mut first = FakeCase::new(&implementation, &statics, "implementation a");
+    first.unqualified = true;
+    let (tuned, searched) = load_once(&first);
+    assert!(searched, "the first load tunes");
+    assert_eq!(tuned.origin, TuningOrigin::Searched);
+    assert!(!tuned.qualified);
+
+    let mut again = FakeCase::new(&implementation, &statics, "implementation a");
+    again.unqualified = true;
+    let (stored, searched) = load_once(&again);
+    assert!(
+        !searched,
+        "a stored unqualified choice is reused without search"
+    );
+    assert_eq!(stored.origin, TuningOrigin::Stored);
+    assert!(!stored.qualified);
+    assert_eq!(stored.overall, tuned.overall);
+    // A stored disposition reports exactly what its first load decided.
+    assert_eq!(super::trace::qualification(&tuned), "unqualified_rejected");
+    assert_eq!(again.formations.get(), 0, "a later load is metadata only");
+    assert_eq!(
+        super::trace::qualification(&stored),
+        super::trace::qualification(&tuned)
+    );
+    assert!(again.seen.borrow().is_empty());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The mandatory phase comes first: every canonical artifact is formed and
+/// published before any input is built, whatever the budget.
+#[test]
+fn canonical_prerequisites_precede_every_census_and_a_spent_budget_starts_nothing_optional() {
+    let Some(device) = metal() else {
+        return;
+    };
+    let (definition, load) = fixture_load();
+    let import = ImportKernels {
+        import_dense: HashMap::new(),
+        repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
+    };
+    let recorder = Recorder::default();
+    let implementation = dense_output_implementation(&device);
+    let statics = implementation
+        .statics
+        .iter()
+        .fold(NativeSpecialization::new(), |spec, name| {
+            spec.with_static(name.clone(), if name == "DS" || name == "DB" { 0 } else { 8 })
+        });
+    let mut first = FakeCase::new(&implementation, &statics, "prerequisite-first");
+    first.bindings = "first".into();
+    let mut last = FakeCase::new(&implementation, &statics, "prerequisite-last");
+    last.bindings = "last".into();
+    let mut invocations = fixture_invocations(&first, &statics, LIMITS);
+    fixture_add(&mut invocations, &last, &statics, LIMITS);
+    let context = |budget| TuningContext {
+        definition: &definition,
+        weights: &ZeroTuningWeights,
+        observer: &recorder,
+        cache: None,
+        numerical_profile: super::precision::ResolvedNumericalProfile::standard(),
+        settings: TuningSettings {
+            budget,
+            fresh: true,
+        },
+    };
+    let mut tuner = Tuner::count(
+        &device,
+        context(STANDARD_TUNING_BUDGET),
+        LIMITS,
+        TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
+        invocations.clone(),
+    );
+    for case in [&first, &last] {
+        tuner.tune(case, &implementation, &statics).unwrap();
+        assert_eq!(case.formations.get(), 0);
+    }
+    let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
+    for case in [&first, &last] {
+        assert_eq!(case.formations.get(), 1);
+        assert!(
+            case.seen.borrow().is_empty(),
+            "no input construction during prerequisites"
+        );
+    }
+    // The walk after the mandatory phase collects the units; it builds and
+    // measures nothing either.
+    for case in [&first, &last] {
+        tuner.tune(case, &implementation, &statics).unwrap();
+        assert!(case.seen.borrow().is_empty());
+    }
+    // Every unit serves its published default before any optional work.
+    assert_eq!(
+        tuner.chosen.len(),
+        2,
+        "each unit holds a served choice from the mandatory phase"
+    );
+
+    // A budget already spent starts nothing optional and fails nothing:
+    // the mandatory phase still forms and publishes the unit's default.
+    let mut spent = Tuner::count(
+        &device,
+        context(Duration::ZERO),
+        LIMITS,
+        TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
+        invocations,
+    );
+    spent.tune(&last, &implementation, &statics).unwrap();
+    let mut spent = spent.census(UntunedEntries::default()).unwrap();
+    assert_eq!(last.formations.get(), 2);
+    spent.tune(&last, &implementation, &statics).unwrap();
+    let mut spent = spent.search().unwrap();
+    let chosen = spent.tune(&last, &implementation, &statics).unwrap();
+    assert_eq!(
+        chosen,
+        implementation.default_specialization(&statics).unwrap()
+    );
+    assert!(last.seen.borrow().is_empty() && last.stages.borrow().is_empty());
+    let tuned = spent.conclude();
+    assert_eq!(tuned.len(), 1);
+    assert!(!tuned[0].qualified);
+    let events = recorder.0.borrow();
+    let Some(TuningEvent::Budget(budget)) = events.last() else {
+        panic!("tuning reports what became of its budget");
+    };
+    assert_eq!((budget.stages, budget.refused.len()), (0, 1));
+    assert_eq!(budget.unused_seconds, 0.);
+    assert!(
+        budget.overrun_seconds > 0.,
+        "the mandatory phase alone ran past it"
+    );
+}
+
+#[test]
+fn the_count_forms_nothing_and_a_weight_without_its_import_entry_is_a_typed_failure() {
+    let Some(device) = metal() else {
+        return;
+    };
+    let (definition, load) = fixture_load();
+    let import = ImportKernels {
+        import_dense: HashMap::new(),
+        repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
+    };
+    let recorder = Recorder::default();
+    let implementation = dense_output_implementation(&device);
+    let statics = implementation
+        .statics
+        .iter()
+        .fold(NativeSpecialization::new(), |spec, name| {
+            spec.with_static(name.clone(), if name == "DS" || name == "DB" { 0 } else { 8 })
         });
     let case = DenseOutputTuning {
         down: Element::bf16(),
@@ -1180,6 +2755,10 @@ fn tuning_a_weight_without_its_import_entry_is_a_typed_failure() {
             },
         )],
     };
+    // A real case opens under the engine's standard caller profile.
+    let standard = super::precision::NumericalProfile::standard()
+        .resolve()
+        .unwrap();
     let mut tuner = Tuner::count(
         &device,
         TuningContext {
@@ -1187,21 +2766,74 @@ fn tuning_a_weight_without_its_import_entry_is_a_typed_failure() {
             weights: &ZeroTuningWeights,
             observer: &recorder,
             cache: None,
-            error_classes: &NO_ERROR_CLASSES,
+            numerical_profile: &standard,
+            settings: TuningSettings::STANDARD,
         },
         LIMITS,
         TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
+        fixture_invocations(&case, &statics, LIMITS),
     );
+    // The count walk forms nothing. Entering census first forms all canonical
+    // artifacts inside the clock, without importing weights.
+    let formed = device.programs_formed().programs;
     tuner.tune(&case, &implementation, &statics).unwrap();
-    // The census builds the unit's inputs, its weights among them.
-    let mut tuner = tuner.census();
+    assert_eq!(device.programs_formed().programs, formed);
+    // The mandatory phase forms the canonical artifact without inputs; the
+    // unit's discovery builds them, its weights among them. A weight that
+    // cannot be imported is a defect, not a matter of time: it is a typed
+    // failure of the load.
+    let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
+    assert!(device.programs_formed().programs > formed);
+    tuner.tune(&case, &implementation, &statics).unwrap();
     assert!(matches!(
-        tuner.tune(&case, &implementation, &statics),
+        tuner.search(),
         Err(CatalogFailure::Tuning {
             entry: "dense_output",
             ..
         })
     ));
+
+    // A unit with no workload still needs the canonical kernel. Counting it
+    // cannot form that kernel before the clock, and its census needs no
+    // weight imports or empirical self-comparison.
+    let mut invocations = fixture_invocations(&case, &statics, LIMITS);
+    for demand in invocations.units.values_mut() {
+        *demand = demand.scaled(0);
+    }
+    let mut tuner = Tuner::count(
+        &device,
+        TuningContext {
+            definition: &definition,
+            weights: &ZeroTuningWeights,
+            observer: &recorder,
+            cache: None,
+            numerical_profile: &standard,
+            settings: TuningSettings::STANDARD,
+        },
+        LIMITS,
+        TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
+        invocations,
+    );
+    let formed = device.programs_formed().programs;
+    tuner.tune(&case, &implementation, &statics).unwrap();
+    assert_eq!(device.programs_formed().programs, formed);
+    assert!(tuner.tuned.is_empty());
+    let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
+    let formed = device.programs_formed().programs;
+    tuner.tune(&case, &implementation, &statics).unwrap();
+    tuner.tune(&case, &implementation, &statics).unwrap();
+    assert_eq!(
+        device.programs_formed().programs,
+        formed,
+        "terminal selection forms nothing"
+    );
+    assert_eq!(
+        tuner.tuned.len(),
+        1,
+        "one terminal choice across repeated calls"
+    );
+    let tuned = &tuner.tuned[0];
+    assert!(tuned.time.forming_seconds > 0.0);
 }
 
 #[test]
@@ -1213,11 +2845,11 @@ fn tuning_batches_are_packed_by_the_batch_builder() {
     let import = ImportKernels {
         import_dense: HashMap::new(),
         repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
     };
     let mut weights = TuningWeights::new(&device, &load, &ZeroTuningWeights, &import);
     let mut shared = HashMap::new();
     let noise = Noise::default();
-    let building = RefCell::new(BuildBudget::default());
     let mut inputs = TuningInputs {
         model: ModelInputs {
             definition: &definition,
@@ -1228,9 +2860,10 @@ fn tuning_batches_are_packed_by_the_batch_builder() {
         weights: &mut weights,
         noise: &noise,
         shared: &mut shared,
-        building: &building,
     };
-    let batch = inputs.batch(6, 256, 2, 512).unwrap();
+    let batch = inputs
+        .batch(6, 256, &[vec![[0, 256]], vec![[256, 512]]], 512)
+        .unwrap();
     assert_eq!(batch.actual_rows, 6);
     assert_eq!(batch.actual_slots, 2);
     assert_eq!(batch.class.rows(), 8);
@@ -1241,7 +2874,54 @@ fn tuning_batches_are_packed_by_the_batch_builder() {
     assert_eq!(batch.coordinates[3][0], 256);
     assert_eq!(&batch.bank[..2], [1, 2]);
     assert_eq!(&batch.following_bank[..2], [3, 4]);
-    assert!(inputs.batch(1, 256, 2, 512).is_err());
+    assert!(
+        inputs
+            .batch(1, 256, &[vec![[0, 256]], vec![[256, 512]]], 512)
+            .is_err()
+    );
+    // Two requests that arrived together lie where the store places them:
+    // apart, each row seeing its own request's ranges, in the span class
+    // of the most ranges a request has.
+    let point = across_sequences(
+        &PointShape {
+            context: Some(600),
+            ..row_point(2, 1.)
+        },
+        2,
+    );
+    let placement =
+        history_placement(&inputs, magnitude_state::KvCodec::AffineK8V4, None, &point).unwrap();
+    assert_eq!(placement.sequences.len(), 2);
+    assert_eq!(placement.sequences[0], [[0, 512], [512, 600]]);
+    let second = &placement.sequences[1];
+    assert!(second[0][0] > 600 + 256, "{second:?}");
+    assert_eq!(
+        second.iter().map(|range| range[1] - range[0]).sum::<i32>(),
+        600
+    );
+    let placed = inputs
+        .batch(2, 600, &placement.sequences, placement.extent)
+        .unwrap();
+    assert_eq!(placed.class.segments(), second.len().next_power_of_two());
+    let history = &placed.histories[0];
+    assert_eq!(&history.visible[0][..2], [[0, 512], [512, 600]]);
+    assert_eq!(history.visible[1][0], second[0]);
+    assert_eq!(
+        history.destinations[..2],
+        [placement.extent as i32, placement.extent as i32 + 1]
+    );
+    // One request alone holds its history in one span.
+    let alone = history_placement(
+        &inputs,
+        magnitude_state::KvCodec::AffineK8V4,
+        None,
+        &PointShape {
+            context: Some(600),
+            ..row_point(2, 1.)
+        },
+    )
+    .unwrap();
+    assert_eq!((alone.sequences, alone.extent), (vec![vec![[0, 600]]], 600));
     let scratch = inputs.scratch(Element::f32(), &[2, 3]).unwrap();
     assert_eq!(scratch.read_to_host().unwrap(), vec![0; 24]);
     let activation = inputs.activation(Element::bf16(), &[4, 4], 1).unwrap();
@@ -1268,11 +2948,11 @@ fn case_state_restores_its_written_rows() {
     let import = ImportKernels {
         import_dense: HashMap::new(),
         repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
     };
     let mut weights = TuningWeights::new(&device, &load, &ZeroTuningWeights, &import);
     let mut shared = HashMap::new();
     let noise = Noise::default();
-    let building = RefCell::new(BuildBudget::default());
     let inputs = TuningInputs {
         model: ModelInputs {
             definition: &definition,
@@ -1283,7 +2963,6 @@ fn case_state_restores_its_written_rows() {
         weights: &mut weights,
         noise: &noise,
         shared: &mut shared,
-        building: &building,
     };
     let values = (0..8).map(|value| value as f32).collect::<Vec<_>>();
     let tensor = inputs.f32s(&[4, 2], &values).unwrap();
@@ -1315,29 +2994,10 @@ fn case_state_restores_its_written_rows() {
     assert!(initializer(Vec::new(), false).unwrap().is_none());
 }
 
+/// Baselines precede candidate comparisons, without guessing a unit's cost;
+/// every operation receives the same session deadline.
 #[test]
-fn building_predicted_not_to_fit_is_refused() {
-    let mut budget = BuildBudget::default();
-    // Nothing is measured yet: building runs.
-    budget.limit(Duration::ZERO);
-    assert!(budget.admit(Building::Import, 1 << 30).is_ok());
-    budget.record(Building::Import, 1 << 20, 0.01);
-    // A gigabyte at ten milliseconds per megabyte does not fit a second.
-    budget.limit(Duration::from_secs(1));
-    assert!(budget.admit(Building::Import, 1 << 30).is_err());
-    assert!(budget.refused());
-    // A megabyte does, and a new point starts unrefused.
-    budget.limit(Duration::from_secs(1));
-    assert!(!budget.refused());
-    assert!(budget.admit(Building::Import, 1 << 20).is_ok());
-    // Each kind of building has its own rate.
-    assert!(budget.admit(Building::Generation, 1 << 30).is_ok());
-}
-
-/// Units are started largest share of step time first, whatever the order
-/// they are prepared in, and each admits points within its share.
-#[test]
-fn units_start_by_their_share_of_step_time() {
+fn units_measure_baselines_before_search() {
     let Some(device) = metal() else {
         return;
     };
@@ -1345,18 +3005,17 @@ fn units_start_by_their_share_of_step_time() {
     let import = ImportKernels {
         import_dense: HashMap::new(),
         repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
     };
     let recorder = Recorder::default();
-    let implementation = seismic::generated::native_implementation::<dense_output::Entry>(&device)
-        .unwrap()
-        .unwrap();
+    let implementation = dense_output_implementation(&device);
     let statics = implementation
         .statics
         .iter()
         .fold(NativeSpecialization::new(), |spec, name| {
             spec.with_static(
                 name.clone(),
-                if name == "DS" {
+                if name == "DS" || name == "DB" {
                     0
                 } else if name == "H" {
                     8
@@ -1382,45 +3041,1098 @@ fn units_start_by_their_share_of_step_time() {
             weights: &ZeroTuningWeights,
             observer: &recorder,
             cache: None,
-            error_classes: &NO_ERROR_CLASSES,
+            numerical_profile: super::precision::ResolvedNumericalProfile::standard(),
+            settings: TuningSettings::STANDARD,
         },
         limits,
         TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
+        {
+            let mut demand = fixture_invocations(&small, &statics, limits);
+            fixture_add(&mut demand, &large, &statics, limits);
+            demand
+        },
     );
     tuner.tune(&small, &implementation, &statics).unwrap();
     tuner.tune(&large, &implementation, &statics).unwrap();
-    let mut tuner = tuner.census();
+    let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
     tuner.tune(&small, &implementation, &statics).unwrap();
     tuner.tune(&large, &implementation, &statics).unwrap();
     let mut tuner = tuner.search().unwrap();
     tuner.tune(&small, &implementation, &statics).unwrap();
     tuner.tune(&large, &implementation, &statics).unwrap();
-    // Equal times at every point: the shares of step time follow launches,
-    // a quarter and three quarters.
-    let near = |allowance: Duration, share: f64| {
-        (allowance.as_secs_f64() - TUNING_TIME.as_secs_f64() * share).abs() < 1e-3
-    };
-    assert!(near(small.allowances.borrow()[0], 0.25));
-    assert!(near(large.allowances.borrow()[0], 0.75));
-    // The large unit is started first, though prepared second.
-    let started = recorder
+    let pieces = recorder
         .0
         .borrow()
         .iter()
         .filter_map(|event| match event {
-            TuningEvent::Started { bindings, .. } => Some(bindings.clone()),
+            TuningEvent::Stage(stage) => Some((stage.bindings.clone(), stage.stage)),
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(started, ["large", "small"]);
+    let first_candidate = pieces
+        .iter()
+        .position(|(_, stage)| *stage != seismic::Stage::Discovery)
+        .expect("a candidate is measured");
+    assert!(
+        pieces[first_candidate..]
+            .iter()
+            .all(|(_, stage)| *stage != seismic::Stage::Discovery)
+    );
+    assert!(
+        pieces[..first_candidate]
+            .iter()
+            .any(|(binding, _)| binding == "small")
+    );
+    assert!(
+        pieces[..first_candidate]
+            .iter()
+            .any(|(binding, _)| binding == "large")
+    );
     let shares = tuner
-        .tuned()
+        .conclude()
         .iter()
         .map(|tuned| (tuned.bindings.clone(), tuned.progress.unwrap().share))
         .collect::<Vec<_>>();
     assert!(
-        matches!(&shares[..], [(first, large), (second, small)]
-            if first == "large" && second == "small" && (large - 0.75).abs() < 1e-9 && (small - 0.25).abs() < 1e-9),
+        matches!(&shares[..], [(first, small), (second, large)]
+            if first == "small" && second == "large" && (large - 0.75).abs() < 1e-9 && (small - 0.25).abs() < 1e-9),
         "{shares:?}"
     );
+}
+
+/// A cache can contain a choice that exceeds Metal's shared-memory limit at
+/// a served span class, which the declaration no longer admits. Reading
+/// that record must fail without reopening the search; a valid replacement
+/// keeps the key.
+#[test]
+fn stored_attention_choice_must_admit_every_served_span_class() {
+    use super::attention::{AttentionMix, AttentionPrefillK8V4Tuning, PrefillListing};
+    let Some(device) = metal() else { return };
+    let (definition, load) = fixture_load();
+    let import = ImportKernels {
+        import_dense: HashMap::new(),
+        repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
+    };
+    let case = AttentionPrefillK8V4Tuning(AttentionMix {
+        codec: magnitude_state::KvCodec::AffineK8V4.spec(seismic::DType::BF16, 128, 128),
+        listing: PrefillListing::Listed { capacity: 65536 },
+        activation: Element::bf16(),
+        shape: crate::AttentionShape {
+            form: crate::planning::AttentionForm {
+                gate: crate::planning::GateForm::None,
+                fresh: true,
+                query_norm: true,
+                key_norm: true,
+                value_norm: false,
+                values: crate::AttentionValues::Projected,
+                sinks: false,
+                rotary_adjacent: false,
+                rotary_trailing: false,
+                output_rotary: false,
+                absorbed_query: false,
+            },
+            key_rounding: crate::RoundingArgs::NONE,
+            widths: crate::planning::AttentionWidths {
+                hidden: 2048,
+                kv_heads: 2,
+                group: 16,
+                rotary_pairs: 32,
+                width: 128,
+                picks: 0,
+            },
+        },
+        scopes: Vec::new(),
+        epsilon: 1.0e-5,
+        window: None,
+        selection: None,
+        picked: None,
+    });
+    let implementation = seismic::generated::native_implementation::<
+        magnitude_kernels::attention_prefill_k8v4::Entry,
+    >(&device)
+    .unwrap()
+    .unwrap();
+    let dimensions: BTreeMap<_, _> = case
+        .0
+        .shape
+        .mix_dimensions(64, 4352, 1)
+        .into_iter()
+        .chain([("L", 1), ("HT", 16), ("B", 0)])
+        .chain(crate::operators::attention::graph::affine_dimensions(case.0.codec).unwrap())
+        .map(|(name, value)| (name.to_owned(), value))
+        .collect();
+    let statics = implementation
+        .statics
+        .iter()
+        .fold(NativeSpecialization::new(), |spec, name| {
+            spec.with_static(name.clone(), dimensions[name])
+        });
+    let defaults = implementation.default_specialization(&statics).unwrap();
+    let invalid = defaults
+        .clone()
+        .with_param("QT", 16)
+        .with_param("HEADS", 2)
+        .with_param("SPLIT_GROUPS", 256)
+        .with_param("DIRECT", 1)
+        .with_param("COISSUE", 1);
+    // The declaration charges the largest segment class, so it refuses the
+    // choice outright: four pairs need 33,328 threadgroup bytes there.
+    assert!(!case.stored_valid(&device, &invalid));
+    assert!(case.entry().prepare(&device, &invalid).is_err());
+
+    let root = std::env::temp_dir().join(format!("magnitude-span-cache-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let cache = KernelCache::open(root.clone(), crate::DEFAULT_KERNEL_CACHE_BYTES).unwrap();
+    let recorder = Recorder::default();
+    let limits = TuningLimits {
+        max_rows: 64,
+        max_projected_rows: 8,
+        context_tokens: 4096,
+    };
+    let context = TuningContext {
+        definition: &definition,
+        weights: &ZeroTuningWeights,
+        observer: &recorder,
+        cache: Some(&cache),
+        numerical_profile: super::precision::ResolvedNumericalProfile::standard(),
+        settings: TuningSettings::STANDARD,
+    };
+    let tuner = Tuner::count(
+        &device,
+        context,
+        limits,
+        TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
+        fixture_invocations(&case, &statics, limits),
+    );
+    let points = case.points(limits);
+    let (_, key, hit) = tuner.stored(&case, &statics, &points).unwrap().unwrap();
+    assert!(hit.is_none());
+    let configuration = |spec: &NativeSpecialization| Configuration {
+        statics: spec.statics().clone(),
+        params: spec.params().clone(),
+        launches: Vec::new(),
+    };
+    let mut record = TuningResult {
+        disposition: seismic::TuningDisposition::QualifiedCandidate,
+        tuning_identity: device.tuning_identity(),
+        entry: "attention_prefill_k8v4".into(),
+        backend: "metal".into(),
+        // The served points it was searched at: a record made with demand,
+        // which a load with demand reads.
+        points: points
+            .iter()
+            .map(|point| seismic::PointRecord { label: point.label.clone(), weight: point.weight, class: point.class.clone() })
+            .collect(),
+        requirement: context.numerical_profile.requirement(&case.entry()),
+        observations: Vec::new(),
+        served: vec![configuration(&defaults)],
+        reselection: None,
+        implementation_identity: String::new(),
+        parameters: Vec::new(),
+        configurations: Vec::new(),
+        overall: configuration(&invalid),
+        method: TuningMethod::Census,
+        time: TuningTime::default(),
+        coverage: None,
+        default_launches: Vec::new(),
+    };
+    cache.store_tuning(&key, &StoredChoice::of(&record, Duration::ZERO), &record);
+    assert!(
+        cache.tuning::<StoredChoice>(&key).is_some(),
+        "the stored choice parses"
+    );
+    assert!(
+        tuner
+            .stored(&case, &statics, &points)
+            .err()
+            .expect("invalid terminal choice must fail")
+            .contains("search cannot reopen"),
+        "an invalid terminal choice must fail without another tuning allowance"
+    );
+    record.overall = configuration(&defaults);
+    cache.store_tuning(&key, &StoredChoice::of(&record, Duration::ZERO), &record);
+    assert!(
+        tuner
+            .stored(&case, &statics, &points)
+            .err()
+            .expect("unqualified demanded choice fails")
+            .contains("lacks matching numerical evidence")
+    );
+    // Geometry remains reusable for an inactive unit without observations.
+    let inactive_points = points
+        .iter()
+        .cloned()
+        .map(|mut point| {
+            point.weight = 0.;
+            point
+        })
+        .collect::<Vec<_>>();
+    let hit = tuner
+        .stored(&case, &statics, &inactive_points)
+        .unwrap()
+        .unwrap()
+        .2
+        .unwrap();
+    assert_eq!(
+        hit.0.overall, record.overall,
+        "the valid replacement remains a cache hit"
+    );
+    // A record whose search stopped for want of room is the machine's
+    // moment, not the unit's: a search searches the unit again.
+    cache.store_tuning(&key, &StoredChoice::of(&record, Duration::ZERO).without_room(), &record);
+    assert!(
+        tuner.stored(&case, &statics, &inactive_points).unwrap().unwrap().2.is_none(),
+        "a record stopped for want of room is no cache hit"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn full_context_demand_is_nonnegative_and_covers_the_actual_longest_history() {
+    let limits = TuningLimits {
+        context_tokens: 262144,
+        ..LIMITS
+    };
+    let points = with_contexts(limits, None, served_row_points(limits, |rows| rows == 1));
+    assert!(
+        points
+            .iter()
+            .all(|point| point.weight.is_finite() && point.weight >= 0.)
+    );
+    assert!(points.iter().any(|point| point.context == Some(262144)));
+    assert!((points.iter().map(|point| point.weight).sum::<f64>() - 1.).abs() < 1e-12);
+}
+#[test]
+fn sliding_demand_clamps_to_the_physical_history_window() {
+    let limits = TuningLimits {
+        context_tokens: 262144,
+        ..LIMITS
+    };
+    let points = with_contexts(
+        limits,
+        Some(1024),
+        served_row_points(limits, |rows| rows == 1),
+    );
+    assert!(
+        points
+            .iter()
+            .all(|point| point.weight.is_finite() && point.weight >= 0.)
+    );
+    assert!(points.iter().all(|point| point.context.unwrap() <= 1024));
+    assert!((points.iter().map(|point| point.weight).sum::<f64>() - 1.).abs() < 1e-12);
+}
+
+/// A load never searches. With every record stored it prepares from them,
+/// in either mode. At a unit without a record it stops unprepared when it
+/// reports, and serves the canonical default when it serves defaults,
+/// forming, measuring and publishing nothing: the search that follows
+/// still finds the unit. Fresh tuning makes the reporting load report every
+/// unit; the load that serves defaults reads what is stored.
+#[test]
+fn a_load_reads_records_and_reports_or_serves_defaults_without_searching() {
+    let Some(device) = metal() else {
+        return;
+    };
+    let (definition, load) = fixture_load();
+    let import = ImportKernels {
+        import_dense: HashMap::new(),
+        repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
+    };
+    let root = std::env::temp_dir().join(format!("magnitude-tuning-serve-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let cache = KernelCache::open(root.clone(), crate::DEFAULT_KERNEL_CACHE_BYTES).unwrap();
+    let implementation = dense_output_implementation(&device);
+    let statics = implementation
+        .statics
+        .iter()
+        .fold(NativeSpecialization::new(), |spec, name| {
+            spec.with_static(
+                name.clone(),
+                if name == "DS" || name == "DB" {
+                    0
+                } else if name == "H" {
+                    8
+                } else {
+                    16
+                },
+            )
+        });
+    let limits = TuningLimits {
+        max_rows: 64,
+        max_projected_rows: 8,
+        context_tokens: 256,
+    };
+    let defaults = implementation.default_specialization(&statics).unwrap();
+    let invocations = |cases: &[&FakeCase]| {
+        cases
+            .iter()
+            .fold(
+                None,
+                |demand: Option<super::super::specialization::InvocationDemand>, case| {
+                    Some(match demand {
+                        None => fixture_invocations(*case, &statics, limits),
+                        Some(mut demand) => {
+                            fixture_add(&mut demand, *case, &statics, limits);
+                            demand
+                        }
+                    })
+                },
+            )
+            .unwrap_or_default()
+    };
+    // One load of `cases`, in walk order: each unit's choice or the load's
+    // stop, the units served unprepared, and the load's outcomes and events.
+    let load_of = |cases: &[&FakeCase],
+                   cache: Option<&KernelCache>,
+                   unprepared: UnpreparedUnits,
+                   fresh: bool| {
+        let recorder = Recorder::default();
+        let mut tuner = Tuner::serve(
+            &device,
+            TuningContext {
+                definition: &definition,
+                weights: &ZeroTuningWeights,
+                observer: &recorder,
+                cache,
+                numerical_profile: super::precision::ResolvedNumericalProfile::standard(),
+                settings: TuningSettings {
+                    fresh,
+                    ..TuningSettings::STANDARD
+                },
+            },
+            limits,
+            TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
+            invocations(cases),
+            unprepared,
+        );
+        let chosen = cases
+            .iter()
+            .map(|case| tuner.tune(*case, &implementation, &statics))
+            .collect::<Result<Vec<_>, _>>();
+        let served_unprepared = tuner.unprepared();
+        let tuned = tuner.conclude();
+        let reported = recorder
+            .0
+            .borrow()
+            .iter()
+            .filter(|event| matches!(event, TuningEvent::Unprepared { .. }))
+            .count();
+        (chosen, served_unprepared, tuned, reported)
+    };
+    // The search of `case`: what a Prepare runs.
+    let search = |case: &FakeCase| {
+        let mut tuner = Tuner::count(
+            &device,
+            TuningContext {
+                definition: &definition,
+                weights: &ZeroTuningWeights,
+                observer: &UnreportedTuning,
+                cache: Some(&cache),
+                numerical_profile: super::precision::ResolvedNumericalProfile::standard(),
+                settings: TuningSettings::STANDARD,
+            },
+            limits,
+            TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
+            invocations(&[case]),
+        );
+        tuner.tune(case, &implementation, &statics).unwrap();
+        let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
+        tuner.tune(case, &implementation, &statics).unwrap();
+        let mut tuner = tuner.search().unwrap();
+        // The search is over: the published choice is read, nothing more.
+        let chosen = tuner.tune(case, &implementation, &statics).unwrap();
+        let tuned = tuner.conclude().pop().unwrap();
+        assert_eq!(tuned.origin, TuningOrigin::Searched);
+        chosen
+    };
+    let stored_results =
+        || std::fs::read_dir(root.join("tuning")).map_or(0, |entries| entries.count());
+    let untouched = |case: &FakeCase| {
+        case.formations.get() == 0
+            && case.seen.borrow().is_empty()
+            && case.stages.borrow().is_empty()
+    };
+    let unit = |digest: &str, bindings: &str| {
+        let mut case = FakeCase::new(&implementation, &statics, digest);
+        case.bindings = bindings.into();
+        case
+    };
+
+    // No records: the reporting load stops at the unit, having formed,
+    // measured and published nothing.
+    let first = unit("served", "first");
+    let (chosen, served_unprepared, tuned, reported) =
+        load_of(&[&first], Some(&cache), UnpreparedUnits::Report, false);
+    assert!(matches!(
+        chosen,
+        Err(CatalogFailure::Unprepared { entry, ref bindings })
+            if entry == <dense_output::Entry as seismic::Entry>::NAME && bindings == "first"
+    ));
+    assert_eq!((served_unprepared, tuned.len(), reported), (0, 0, 0));
+    assert!(untouched(&first));
+    assert_eq!(stored_results(), 0);
+    // The load that serves defaults is total, with or without a cache, and
+    // still publishes nothing.
+    for cache in [Some(&cache), None] {
+        let (chosen, served_unprepared, tuned, reported) =
+            load_of(&[&first], cache, UnpreparedUnits::ServeDefaults, false);
+        assert_eq!(chosen.unwrap(), [defaults.clone()]);
+        assert_eq!((served_unprepared, tuned.len(), reported), (1, 0, 1));
+        assert!(untouched(&first));
+        assert_eq!(stored_results(), 0);
+    }
+
+    // The search publishes the unit's record: complete records. Both modes
+    // read it and are the same load.
+    let searched = search(&first);
+    assert_ne!(searched, defaults);
+    assert_eq!(stored_results(), 1);
+    for unprepared in [UnpreparedUnits::Report, UnpreparedUnits::ServeDefaults] {
+        let again = unit("served", "first");
+        let (chosen, served_unprepared, tuned, reported) =
+            load_of(&[&again], Some(&cache), unprepared, false);
+        assert_eq!(chosen.unwrap(), [searched.clone()]);
+        assert_eq!((served_unprepared, tuned.len(), reported), (0, 1, 0));
+        assert_eq!(tuned[0].origin, TuningOrigin::Stored);
+        assert!(untouched(&again));
+    }
+
+    // Partial records: a second unit has none. The reporting load stops at
+    // it; the load that serves defaults serves the first from its record
+    // and the second at its default.
+    let (again, second) = (unit("served", "first"), unit("served", "second"));
+    let (chosen, ..) = load_of(
+        &[&again, &second],
+        Some(&cache),
+        UnpreparedUnits::Report,
+        false,
+    );
+    assert!(matches!(
+        chosen,
+        Err(CatalogFailure::Unprepared { ref bindings, .. }) if bindings == "second"
+    ));
+    let (chosen, served_unprepared, tuned, reported) = load_of(
+        &[&again, &second],
+        Some(&cache),
+        UnpreparedUnits::ServeDefaults,
+        false,
+    );
+    assert_eq!(chosen.unwrap(), [searched.clone(), defaults.clone()]);
+    assert_eq!((served_unprepared, tuned.len(), reported), (1, 1, 1));
+    assert!(untouched(&again) && untouched(&second));
+    // The load published nothing for the second unit: a search still finds
+    // it unsearched.
+    assert_eq!(stored_results(), 1);
+    search(&second);
+    assert_eq!(stored_results(), 2);
+
+    // Fresh tuning: the reporting load reads no record, so the host's
+    // search runs again; the load that serves defaults reads the records.
+    let (chosen, ..) = load_of(&[&again], Some(&cache), UnpreparedUnits::Report, true);
+    assert!(matches!(chosen, Err(CatalogFailure::Unprepared { .. })));
+    let (chosen, served_unprepared, ..) = load_of(
+        &[&again],
+        Some(&cache),
+        UnpreparedUnits::ServeDefaults,
+        true,
+    );
+    assert_eq!(chosen.unwrap(), [searched]);
+    assert_eq!(served_unprepared, 0);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A canonical fallback stored on CPU carries the Seismic-owned worker and
+/// tier parameters, which the declaration does not name; the default it is
+/// checked against is the device's, which carries them, or every later
+/// Prepare refuses to reopen it.
+#[test]
+fn stored_cpu_fallback_matches_the_device_default() {
+    let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), BackendName::Cpu)
+        .unwrap();
+    let stored = seismic::generated::native_implementation::<shape_rows::Entry>(&device)
+        .unwrap()
+        .unwrap()
+        .default_specialization(&NativeSpecialization::new())
+        .unwrap();
+    for parameter in ["cpu.tier", "cpu.workers.0", "cpu.workers.1"] {
+        assert!(stored.param(parameter).is_some(), "the stored fallback carries {parameter}");
+    }
+    let declared = seismic::generated::native_implementation_for_backend::<shape_rows::Entry>(BackendName::Cpu)
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(declared.validate(&stored), Err(seismic::NativeSpecializationError::UnknownParameter(_))),
+        "the declaration names no Seismic-owned parameter"
+    );
+    let case = super::readout::ShapeRowsTuning { vocabulary: 1024 };
+    assert_eq!(
+        offered(&case, &device)
+            .unwrap()
+            .default_specialization(&NativeSpecialization::new())
+            .unwrap(),
+        stored
+    );
+}
+
+/// On a CPU whose tier forms quantized dots from vector integer products
+/// (AVX2, AVX-512, VNNI), a projection over packed weights defaults to its
+/// INT8 form, and its records are keyed apart from those of the F32 default.
+/// Over dense weights, and on tiers with portable integer dots (x86-64-v2,
+/// NEON), the declared F32 form stays the default.
+#[test]
+fn cpu_projection_default_form_follows_the_tier_integer_dots() {
+    let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), BackendName::Cpu)
+        .unwrap();
+    let implementation = dense_output_implementation(&device);
+    let statics = implementation
+        .statics
+        .iter()
+        .fold(NativeSpecialization::new(), |spec, name| {
+            spec.with_static(name.clone(), if name == "DS" || name == "DB" { 0 } else { 8 })
+        });
+    let case = |down| DenseOutputTuning {
+        down,
+        activation: Element::bf16(),
+        down_kind: WeightKind::DenseDown,
+        scopes: vec![WeightScope::TargetSublayer(
+            magnitude_family_contracts::SublayerIndex {
+                block: 0,
+                sublayer: 1,
+            },
+        )],
+    };
+    let int8 = |case: &DenseOutputTuning| {
+        offered(case, &device)
+            .unwrap()
+            .default_specialization(&statics)
+            .unwrap()
+            .param("INT8")
+            .unwrap()
+    };
+    let vector = seismic::cpu::Tier::detected().unwrap().quantized_dots() > 0;
+    let packed = [
+        "q4k@rows8",
+        "q6k@rows8",
+        "q8g32s@rows8",
+        "iq4xs@rows8",
+        "q4k@rows16",
+    ]
+    .map(|name| case(Element::named(name).expect("a CPU weight storage")));
+    for case in &packed {
+        assert_eq!(int8(case), u64::from(vector), "{}", case.down.name());
+    }
+    let dense = case(Element::bf16());
+    assert_eq!(int8(&dense), 0);
+    assert_eq!(
+        implementation
+            .default_specialization(&statics)
+            .unwrap()
+            .param("INT8"),
+        Some(0),
+        "the declaration's own default is the F32 form"
+    );
+    // A CPU digest names no binding: packed and dense weights share it
+    // exactly when they share the default.
+    let digest = |case: &DenseOutputTuning| case.digest(&device, &statics).unwrap();
+    assert_eq!(digest(&packed[0]) != digest(&dense), vector);
+}
+
+/// The host memory a search test's device is selected with: a figure of the
+/// test's own, so its plan never depends on the host it runs on.
+const TUNING_HOST_ROOM: u64 = 16 << 30;
+
+/// A bank's slot count may be a multiple of 101 (202): synthetic routes over
+/// it still draw distinct experts in every row, where a stride of 101 maps
+/// every popularity rank to expert 0 or 101.
+#[test]
+fn routes_over_a_multiple_of_101_slots_draw_distinct_experts_per_row() {
+    let (rows, selected) = (64, 8);
+    let shape = super::routed::RoutedShape { hidden: 128, experts: 202, selected, features: 128, shared: 0 };
+    let table = super::routed::routes(rows, shape);
+    assert_eq!(table.len() as u64, rows * selected);
+    for row in table.chunks(selected as usize) {
+        let distinct = row.iter().collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(distinct.len(), row.len(), "a row's experts are distinct: {row:?}");
+        assert!(row.iter().all(|expert| (0..202).contains(expert)), "a row routes over the slots: {row:?}");
+    }
+}
+
+/// A search of a streamed load forms and runs every streamed tuning case
+/// on the device, its all-defaults configuration included, over operands
+/// bound as a step binds them: the fused route (`routed_route_streamed`)
+/// at every lead, and the general selection (`routed_select_streamed`), of
+/// loads whose record's gate and up stage in the same stored form. Its
+/// three streamed layers route at a lead each (a route predicts only the
+/// layers that exist, `ExpertBankPlan::hints`), the second's experts' down
+/// stored in a form of its own, so its binding holds its lead alone: a lead
+/// none of a binding's layers launches builds no case. Its bank holds fewer
+/// slots than any layer has experts, and the units preparation forms for
+/// the banked layers' decode launches are of those slots: their keys carry
+/// them, and their cases read the stacks' leading experts.
+/// A case whose operands alias where the kernel forbids it fails here, and
+/// so does one whose launch condition's word a timed pass's cold copies
+/// (CUDA's) do not keep where the host reads it, where the search's budget
+/// (which counts the mandatory compiles) leaves it the time to form them.
+/// What the test holds on any host is that every lead's unit finishes, the
+/// decode units are keyed at the bank's slots, and the decode stacks formed
+/// are the bank's leading experts. It runs on the device the host has.
+#[test]
+fn a_streamed_load_searches_every_streamed_case_on_the_device() {
+    use crate::planning::fixtures::{relaid_manifest, streamed_experts_manifest};
+    use magnitude_family_contracts::{Operator, ScoreFunction};
+    use std::collections::BTreeSet;
+    /// Each finished unit's entry, lead (`AHEAD`) and bindings.
+    struct Finished(RefCell<Vec<(&'static str, Option<u64>, String)>>);
+    impl TuningObserver for Finished {
+        fn event(&self, event: &TuningEvent) {
+            if let TuningEvent::Finished(tuned) = event {
+                let ahead = tuned.statics.get("AHEAD").copied();
+                self.0.borrow_mut().push((tuned.entry, ahead, tuned.bindings.clone()));
+            }
+        }
+    }
+    /// Zero weights, recording each import's role, leading extent, and
+    /// whether it is of a stack's leading experts.
+    struct Imports(RefCell<Vec<(magnitude_family_contracts::WeightRole, Option<u64>, bool)>>);
+    impl TuningWeightSource for Imports {
+        fn source_bytes(&self, weight: &crate::WeightPlan, leading: bool) -> Result<Vec<u8>, String> {
+            self.0.borrow_mut().push((weight.role, weight.shape.first().copied(), leading));
+            crate::ZeroTuningWeights.source_bytes(weight, leading)
+        }
+
+        fn import_source(
+            &self,
+            device: &seismic::Device,
+            weight: &crate::WeightPlan,
+            leading: bool,
+        ) -> Result<seismic::Tensor, seismic::BuildError> {
+            self.0.borrow_mut().push((weight.role, weight.shape.first().copied(), leading));
+            crate::ZeroTuningWeights.import_source(device, weight, leading)
+        }
+    }
+    // Its search qualifies the bank's entries, a CPU site's among them,
+    // sized from the CPUs the process may run on.
+    let _placement = crate::test_support::process_placement();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
+    let selected = crate::test_support::selected_with_room(&catalog, TUNING_HOST_ROOM);
+    if !crate::test_support::is_device_backend(&selected) {
+        return;
+    }
+    let device = crate::test_support::open(&catalog, catalog.resolve(selected.info.selector()).unwrap()).unwrap();
+    // The planning fixture (an attention block, which every backend runs)
+    // three times, the later ones its first's mixer (tied), each with its
+    // feed-forward routed over experts of its own: by a softmax score
+    // beside a gated shared expert in the fused form, by a sigmoid score
+    // and no shared expert in the general form. Every lead is a unit.
+    let routed = |experts: u64, score, shared: bool| {
+        use crate::planning::fixtures::{descriptor, fixture_definition_of};
+        use magnitude_family_contracts::{
+            ActivationFunction, ExpertSelection, FeedForwardUp, RouteNormalization, RoutedFfn, Router,
+            RouterInput, SharedExpert, SharedExpertGate,
+        };
+        let (features, hidden) = (512, 512);
+        let silu = |gate: &str, up: &str, extents: &[u64]| FeedForwardUp::Gated {
+            activation: ActivationFunction::Silu,
+            limit: None,
+            gate: descriptor(gate, extents),
+            up: descriptor(up, extents),
+        };
+        let ffn = |block: u64| {
+            let name = |part: &str| format!("blk.{block}.{part}");
+            Operator::RoutedFfn(Box::new(RoutedFfn {
+                experts,
+                selected: 2,
+                intermediate: features,
+                router: Router {
+                    weight: descriptor(&name("ffn_gate_inp"), &[experts, hidden]),
+                    input: RouterInput::Operator,
+                    score,
+                    selection: ExpertSelection::TopK { bias: None },
+                    media_bias: None,
+                    normalization: RouteNormalization::Sum,
+                    scale: 1.0,
+                },
+                expert_up: silu(&name("ffn_gate_exps"), &name("ffn_up_exps"), &[experts, features, hidden]),
+                expert_down: descriptor(&name("ffn_down_exps"), &[experts, hidden, features]),
+                expert_scale: None,
+                latent: None,
+                shared: shared.then(|| SharedExpert {
+                    intermediate: features,
+                    up: silu(&name("ffn_gate_shexp"), &name("ffn_up_shexp"), &[features, hidden]),
+                    down: descriptor(&name("ffn_down_shexp"), &[hidden, features]),
+                    gate: SharedExpertGate::Sigmoid(descriptor(&name("ffn_gate_inp_shexp"), &[hidden])),
+                }),
+            }))
+        };
+        let mut definition = fixture_definition_of(hidden);
+        let blocks = &mut definition.decoder.blocks;
+        blocks.extend([blocks[0].clone(), blocks[0].clone()]);
+        for (block, layer) in blocks.iter_mut().enumerate() {
+            layer.sublayers[1].op = ffn(block as u64);
+        }
+        definition
+    };
+    // Metal's fused route routes over a multiple of 32 experts.
+    let forms = [
+        ("routed_route_streamed", routed(256, ScoreFunction::Softmax, true)),
+        ("routed_select_streamed", routed(256, ScoreFunction::Sigmoid, false)),
+    ];
+    for (streamed, definition) in forms {
+        // The second layer's down as Q4_0 blocks: a binding of its own.
+        let manifest = relaid_manifest(
+            streamed_experts_manifest(&definition),
+            &["blk.1.ffn_down_exps".to_owned()],
+            magnitude_artifacts::gguf::Encoding::Q4_0,
+            18,
+        );
+        let plan = |bound: Option<crate::WeightBound>| {
+            let prepared = crate::ExecutionPlanner::prepare(
+                &selected,
+                &manifest,
+                &definition,
+                crate::ComponentSelection { head: false, vision: false },
+                crate::ExecutionPath::Native,
+                crate::PlannedMethod::Plain,
+                magnitude_state::KvCodec::Dense,
+                crate::ResourceLimits {
+                    max_launch_rows: 2,
+                    max_launch_slots: 2,
+                    max_selected_rows: 2,
+                    max_drafting_slots: 2,
+                    exported_logits_rows: 0,
+                    max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
+                    max_image_cells: 0,
+                    lookahead: false,
+                    chain_capacity: std::num::NonZeroUsize::MIN,
+                    conversations: std::num::NonZeroUsize::MIN,
+                },
+            )
+            .unwrap();
+            let device = prepared.device().clone();
+            let room = crate::StableRoom::of(&device);
+            prepared
+                .streaming::<crate::AssessmentMemoryCharge>(&definition, bound, &room)
+                .unwrap()
+                .streamed(&definition, &crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices()), &room)
+                .unwrap()
+                .into_draft()
+        };
+        // The experts stream only where the weights do not all fit: capped at
+        // the load's weights less half its experts, so the bank holds half.
+        let whole = plan(None);
+        let experts = whole.load().expert_bank().expect("a routed load banks its experts");
+        let target_slots = (experts.floor() + experts.widest().get()) / 2;
+        let cap = whole
+            .load()
+            .clone()
+            .with_bank_slots(target_slots, experts.ceiling)
+            .unwrap()
+            .weight_bytes()
+            .unwrap();
+        let draft = plan(Some(crate::WeightBound::Cap(cap)));
+        assert!(draft.load().expert_bank().is_some(), "{streamed}: the load streams its experts");
+        // A decode launch of a banked layer reads its stack as the bank's
+        // slots: the tuning weights' decode stack is those leading experts,
+        // in proportion of the whole stack's bytes.
+        let bank = draft.load().expert_bank().unwrap();
+        let slots = bank.slots;
+        for layer in bank.layers() {
+            let role = magnitude_family_contracts::WeightRole {
+                scope: layer.scope,
+                kind: WeightKind::ExpertUp,
+            };
+            let whole = bank.resident_plan(role).expect("a banked layer has its resident plan");
+            assert!(slots < whole.shape[0], "{streamed}: the bank holds {slots} of {} experts", whole.shape[0]);
+            assert_eq!(
+                super::decode_experts(draft.load(), &[layer.scope], &[WeightKind::ExpertUp], whole.shape[0]),
+                slots,
+                "{streamed}: a decode launch's stack"
+            );
+            let leading = whole.leading(slots).expect("a stack has leading experts");
+            assert_eq!(
+                leading.scale.as_ref().map(|scale| scale.extent),
+                whole.scale.as_ref().map(|_| slots),
+                "its scale of those experts"
+            );
+            assert_eq!(leading.shape, [&[slots][..], &whole.shape[1..]].concat());
+            assert_eq!(leading.resident_bytes * whole.shape[0], whole.resident_bytes * slots);
+        }
+        // The decode stacks as a case forms them (`TuningWeights::decode_weight`):
+        // each banked layer's are its bank's leading `slots` experts, and only
+        // those. They are formed here, not read off a search: the search's
+        // budget counts the mandatory compiles, so a host that compiles slowly
+        // ends every unit's optional work before any case is formed, and a
+        // result that depended on cases formed would depend on the host.
+        let weights = Imports(RefCell::new(Vec::new()));
+        let import = crate::native::preparation::imports(&mut crate::native::specialization::Specializer::new(&device), draft.programs())
+            .unwrap_or_else(|error| panic!("{streamed}: {error:?}"));
+        let mut decode = TuningWeights::new(&device, draft.load(), &weights, &import);
+        for layer in bank.layers() {
+            for kind in [WeightKind::ExpertGate, WeightKind::ExpertUp, WeightKind::ExpertDown] {
+                let role = magnitude_family_contracts::WeightRole { scope: layer.scope, kind };
+                if bank.resident_plan(role).is_some() {
+                    decode.decode_weight(layer.scope, kind).unwrap_or_else(|error| panic!("{streamed}: {error}"));
+                }
+            }
+        }
+        let imports = weights.0.borrow();
+        for kind in [WeightKind::ExpertGate, WeightKind::ExpertUp, WeightKind::ExpertDown] {
+            assert!(
+                imports.iter().any(|(role, rows, leading)| role.kind == kind && *leading && *rows == Some(slots)),
+                "{streamed}: a decode case reads its {kind:?} stack as the bank's slots: {imports:?}"
+            );
+        }
+        assert!(
+            imports.iter().all(|(_, rows, leading)| *leading && *rows == Some(slots)),
+            "{streamed}: a decode stack is the bank's leading slots: {imports:?}"
+        );
+        drop(imports);
+        drop(decode);
+        let observer = Finished(RefCell::new(Vec::new()));
+        crate::AttestedPrograms::search_draft(
+            &draft,
+            &device,
+            crate::TuningContext {
+                definition: &definition,
+                weights: &crate::ZeroTuningWeights,
+                observer: &observer,
+                cache: None,
+                numerical_profile: crate::ResolvedNumericalProfile::standard(),
+                settings: crate::TuningSettings {
+                    budget: Duration::from_secs(20),
+                    fresh: true,
+                },
+            },
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{streamed}: {error}"));
+        // Every lead's unit with tuning parameters is searched; a round that
+        // recounts a follower at its resident unit's replaced choice searches
+        // it again.
+        let finished = observer.0.borrow();
+        let (streamed_tuned, hint_entry, hint_tuned) = if streamed == "routed_route_streamed" {
+            (
+                seismic::generated::native_implementation::<magnitude_kernels::routed_route_streamed::Entry>(&device)
+                    .unwrap()
+                    .unwrap()
+                    .has_tuning_parameters(),
+                "routed_hint_route",
+                seismic::generated::native_implementation::<magnitude_kernels::routed_hint_route::Entry>(&device)
+                    .unwrap()
+                    .unwrap()
+                    .has_tuning_parameters(),
+            )
+        } else {
+            (
+                seismic::generated::native_implementation::<magnitude_kernels::routed_select_streamed::Entry>(&device)
+                    .unwrap()
+                    .unwrap()
+                    .has_tuning_parameters(),
+                "routed_hint_select",
+                seismic::generated::native_implementation::<magnitude_kernels::routed_hint_select::Entry>(&device)
+                    .unwrap()
+                    .unwrap()
+                    .has_tuning_parameters(),
+            )
+        };
+        let route_units = finished
+            .iter()
+            .filter(|(entry, ..)| *entry == streamed)
+            .map(|&(_, ahead, _)| ahead)
+            .collect::<BTreeSet<_>>();
+        let expected_route = if streamed_tuned {
+            BTreeSet::from([None])
+        } else {
+            BTreeSet::new()
+        };
+        assert_eq!(route_units, expected_route, "{streamed}: route unit is searched: {finished:?}");
+        let leads = finished
+            .iter()
+            .filter(|(entry, ..)| *entry == hint_entry)
+            .map(|&(_, ahead, _)| ahead)
+            .collect::<BTreeSet<_>>();
+        let every = if hint_tuned {
+            (1..=crate::planning::HINT_LEADS as u64).map(Some).collect::<BTreeSet<_>>()
+        } else {
+            BTreeSet::new()
+        };
+        assert_eq!(leads, every, "{hint_entry}: every lead's unit is searched: {finished:?}");
+        // Every decode unit preparation formed for the banked layers is
+        // keyed at the bank's slots: units at two slot tables are two
+        // records. Both forms read the gate and up stacks, and the down.
+        let (ups, downs) = (
+            ["routed_expand", "routed_gate_up", "routed_up"],
+            ["routed_output", "routed_output_project", "routed_down", "routed_down_project"],
+        );
+        let decode = finished
+            .iter()
+            .filter(|(entry, ..)| ups.contains(entry) || downs.contains(entry))
+            .collect::<Vec<_>>();
+        for kinds in [&ups[..], &downs[..]] {
+            assert!(
+                decode.iter().any(|(entry, ..)| kinds.contains(entry)),
+                "{streamed}: a decode unit of {kinds:?} is searched: {finished:?}"
+            );
+        }
+        // Each is keyed by its row range after the slots (`ranged::Ranged`).
+        let at_slots = format!(",S={slots}");
+        for (entry, _, bindings) in &decode {
+            let unit = bindings.rsplit_once(",M=").map_or(bindings.as_str(), |(unit, _)| unit);
+            assert!(unit.ends_with(&at_slots), "{streamed}: {entry} is keyed at the bank's slots: {bindings}");
+        }
+    }
+}
+
+/// A compressed layer's attention cases read the picks' rows from a plane
+/// bound as its natives address it, a slab view (`selected`, a slab port):
+/// the cases of V4.1's slice C, whose sources hold more rows than a row
+/// picks at the load's context, so their picks name real rows, are measured
+/// on the device the host has, the declared default first (`attention_prefill`,
+/// which every backend serves rows beyond decode with). A plane bound as
+/// a plain tensor is refused at the call; before slab ports were declared,
+/// CUDA took its elements for slab addresses (an illegal address) and Metal
+/// and the CPU read through them. The budget lets every unit's search end,
+/// so each attention unit's default is measured whatever the backend's
+/// compile times.
+#[test]
+fn a_compressed_load_searches_its_attention_cases_on_the_device() {
+    use crate::operators::attention::tests::selected::{CompressedForm, compressed};
+    /// How many configurations each finished `attention_prefill` unit
+    /// measured: every backend serves rows beyond decode with it.
+    struct Finished(RefCell<Vec<usize>>);
+    impl TuningObserver for Finished {
+        fn event(&self, event: &TuningEvent) {
+            if let TuningEvent::Finished(tuned) = event {
+                if tuned.entry == "attention_prefill" {
+                    self.0.borrow_mut().push(tuned.measured);
+                }
+            }
+        }
+    }
+    let _placement = crate::test_support::process_placement();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
+    let selected = crate::test_support::selected_with_room(&catalog, TUNING_HOST_ROOM);
+    if !crate::test_support::is_device_backend(&selected) {
+        return;
+    }
+    let device = crate::test_support::open(&catalog, catalog.resolve(selected.info.selector()).unwrap()).unwrap();
+    let (definition, manifest) = compressed(CompressedForm::FullAndReuse);
+    let draft = crate::ExecutionPlanner::prepare(
+        &selected,
+        &manifest,
+        &definition,
+        crate::ComponentSelection { head: false, vision: false },
+        crate::ExecutionPath::Native,
+        crate::PlannedMethod::Plain,
+        magnitude_state::KvCodec::Dense,
+        crate::planning::fixtures::LIMITS,
+    )
+    .unwrap();
+    let observer = Finished(RefCell::new(Vec::new()));
+    crate::AttestedPrograms::search_draft(
+        &draft,
+        &device,
+        crate::TuningContext {
+            definition: &definition,
+            weights: &crate::ZeroTuningWeights,
+            observer: &observer,
+            cache: None,
+            numerical_profile: crate::ResolvedNumericalProfile::standard(),
+            settings: crate::TuningSettings {
+                budget: Duration::from_secs(600),
+                fresh: true,
+            },
+        },
+        None,
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    let measured = observer.0.borrow();
+    assert!(
+        !measured.is_empty() && measured.iter().all(|&measured| measured > 0),
+        "each attention_prefill unit measures its default: {measured:?}"
+    );
+}
+
+/// A compile wave is priced by how far the host's room fell, not by this
+/// process's footprint: compiles whose memory lies in another process (a
+/// toolchain's compiler service) narrow the next wave as their own would.
+#[test]
+fn compiles_holding_memory_outside_the_process_narrow_the_next_wave() {
+    let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), BackendName::Cpu)
+        .unwrap();
+    const GB: u64 = 1 << 30;
+    // Host RAM's own room, read as 6 GB at each decision.
+    let room = Some(RoomNow { device_bytes: 0, host_bytes: 6 * GB, host_shared: false });
+    let mut memory = TuningMemory {
+        process_began_bytes: seismic::ProcessMemory::footprint_now(),
+        // The first compile's price, as this process's footprint saw it.
+        compile_host_bytes: 64 << 20,
+        ..TuningMemory::default()
+    };
+    let before = memory.compile_threads(&device, room).expect("a host room bounds compiles");
+    assert!(before >= 64, "6 GB affords many 64 MB compiles: {before}");
+    // Four compiles ran at once; this process's footprint did not move, but
+    // the host's room fell 8 GB below its reading as the wave began.
+    let held = compile_wave_price(20 * GB, Some(12 * GB), 4).expect("the room fell");
+    assert_eq!(held, 2 * GB);
+    memory.price_compiles(held);
+    assert_eq!(memory.compile_host_bytes, 2 * GB);
+    assert_eq!(memory.mispriced.len(), 1, "a price risen past one set is a mispricing");
+    let after = memory.compile_threads(&device, room).expect("a host room bounds compiles");
+    assert!(after <= 3 && after < before, "the next wave narrows to what 6 GB affords at 2 GB a compile: {after}");
+    // A room that did not fall, or a missing reading, prices nothing.
+    assert_eq!(compile_wave_price(20 * GB, Some(20 * GB), 4), None);
+    assert_eq!(compile_wave_price(20 * GB, None, 4), None);
+}
+
+/// A DeepSeek V4.1 load on Metal refused routed_experts' second discovery
+/// point, 4.2 MB, under 3.8 GB free: the room its host growth shares with
+/// the device was priced again at the unit's host price, and that price
+/// kept the 4.9 GB its first point added building the inputs it still
+/// held. Where the device's memory is the host's, one room holds
+/// everything (no host room of its own prices the same bytes again), and
+/// only host work no piece prices, the compiles', takes of it beside a
+/// piece; and a unit's host price with its inputs resident leaves them out.
+#[test]
+fn a_shared_ceiling_is_one_room_and_host_prices_leave_resident_inputs_out() {
+    const GB: u64 = 1 << 30;
+    const UNIT: &str = "routed_experts [EGW=mxfp4g32@rows32,EUW=mxfp4g32@rows32,EDW=mxfp4g32@rows32,A=bf16]";
+    let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), BackendName::Cpu)
+        .unwrap();
+    let shared_room = RoomNow { device_bytes: 35 * GB, host_bytes: 44 * GB, host_shared: true };
+    let mut shared = TuningMemory::default();
+    shared.read_room(&device, shared_room);
+    assert_eq!(shared.host_ceiling_bytes, None, "no second host ceiling");
+    assert_eq!(shared.host_free(Some(shared_room)), allocation::HostRoom::Unbounded, "no second host room");
+    assert!(shared.shares_host_ceiling(), "a compile takes of the one room");
+    let apart_room = RoomNow { device_bytes: 24 * GB, host_bytes: 44 * GB, host_shared: false };
+    let mut apart = TuningMemory::default();
+    apart.read_room(&device, apart_room);
+    assert!(apart.host_ceiling_bytes.is_some());
+    assert_eq!(apart.host_free(Some(apart_room)), allocation::HostRoom::Free(44 * GB));
+    assert!(!apart.shares_host_ceiling(), "host RAM a domain apart");
+
+    // The first point built the inputs; the pieces that keep them are
+    // priced by what they add beyond them.
+    shared.host_piece(UNIT, false, 4_875_716_312);
+    shared.host_piece(UNIT, true, 4_241_100);
+    assert_eq!(shared.host_added(UNIT, true), Some(4_241_100));
+    assert_eq!(shared.host_added(UNIT, false), Some(4_875_716_312));
+    assert!(shared.mispriced.is_empty());
+}
+
+/// A search that ended at its budget serves any load whose budget is no
+/// larger, and none whose budget is larger; one that ended for another
+/// reason (it ran to its end, or was no search) serves every budget.
+#[test]
+fn a_record_serves_any_budget_no_larger_than_the_one_searched() {
+    use super::record::reached_within;
+    let seconds = Duration::from_secs;
+    let expired = Some(SearchStop::Expired);
+    assert!(reached_within(expired, 900_000, seconds(60)) && reached_within(expired, 900_000, seconds(900)));
+    assert!(!reached_within(expired, 900_000, seconds(901)));
+    assert!(reached_within(Some(SearchStop::Exhausted), 60_000, seconds(3600)));
+    assert!(reached_within(None, 0, seconds(3600)));
 }

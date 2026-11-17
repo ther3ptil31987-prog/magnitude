@@ -2,11 +2,28 @@
 //! catalog's Qwen3.5-family models, built into definitions and manifests
 //! without weights.
 
+pub(crate) use super::synthetic::{costs, kind};
 use crate::source_element;
 use magnitude_artifacts::gguf::Encoding;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DeclaredFeedForward {
+    Dense {
+        intermediate: u64,
+    },
+    /// Routed experts, `experts` in even blocks and `odd_experts` in odd
+    /// ones (a pruned decoder's layers differ in count).
+    Routed {
+        experts: u64,
+        odd_experts: u64,
+        selected: u64,
+        intermediate: u64,
+        shared_intermediate: u64,
+    },
+}
+
+/// One block's feed-forward of a `DeclaredFeedForward` (`at`).
+enum BlockFeedForward {
     Dense {
         intermediate: u64,
     },
@@ -16,6 +33,27 @@ pub(crate) enum DeclaredFeedForward {
         intermediate: u64,
         shared_intermediate: u64,
     },
+}
+
+impl DeclaredFeedForward {
+    /// Block `index`'s: a routed one's experts by the block's parity.
+    fn at(self, index: u64) -> BlockFeedForward {
+        match self {
+            Self::Dense { intermediate } => BlockFeedForward::Dense { intermediate },
+            Self::Routed {
+                experts,
+                odd_experts,
+                selected,
+                intermediate,
+                shared_intermediate,
+            } => BlockFeedForward::Routed {
+                experts: if index % 2 == 0 { experts } else { odd_experts },
+                selected,
+                intermediate,
+                shared_intermediate,
+            },
+        }
+    }
 }
 
 /// Header geometry of a Qwen3.5-family model, the fixture the plan and
@@ -109,6 +147,7 @@ pub(crate) const QWEN35_CONFIGURATIONS: [DeclaredConfiguration; 5] = [
         32,
         DeclaredFeedForward::Routed {
             experts: 256,
+            odd_experts: 256,
             selected: 8,
             intermediate: 512,
             shared_intermediate: 512,
@@ -123,6 +162,7 @@ pub(crate) const QWEN35_CONFIGURATIONS: [DeclaredConfiguration; 5] = [
         64,
         DeclaredFeedForward::Routed {
             experts: 256,
+            odd_experts: 256,
             selected: 8,
             intermediate: 1024,
             shared_intermediate: 1024,
@@ -130,18 +170,17 @@ pub(crate) const QWEN35_CONFIGURATIONS: [DeclaredConfiguration; 5] = [
     ),
 ];
 use magnitude_artifacts::{
-    gguf::TensorDescriptor, ArtifactIdentity, ComponentFile, ComponentManifest,
-    PackageIdentity, PackageManifest,
+    ArtifactIdentity, ComponentFile, ComponentManifest, PackageIdentity, PackageManifest,
+    gguf::TensorDescriptor,
 };
 use magnitude_family_contracts::{
     ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder, DenseFfn,
-    EmbeddingScale, EntryForm, ExitForm, ExitNorm, ExpertSelection, FeedForwardUp,
-    GateFunction, GatedDelta, HeadNorm, HistoryDomain, HistoryReads, InputNorm,
-    InputSemantics, KeyValue, MediaRowAttention, ModelDefinition, Operator, OutputForm,
-    RecurrentHeadMapping, ResidualForm, RmsNorm, Rotary, RouteNormalization, RoutedFfn,
-    Router, RouterInput,
-    ScoreFunction, SharedExpert, SharedExpertGate, Sublayer,
-    ValueNorm, ValueSource, WeightDescriptor,
+    EmbeddingScale, EntryForm, ExitForm, ExitNorm, ExpertSelection, FeedForwardUp, GateFunction, GateProjection,
+    RecurrentDecay, RecurrentGate,
+    GatedDelta, HeadNorm, HistoryRows, HistorySource, InputNorm, InputSemantics,
+    MediaRowAttention, ProjectedRows, RowProducer, RowRounding, TokenDomain, ModelDefinition, Operator, OutputForm, OutputProjection,
+    QueryKeys, QueryProjection, RecurrentHeadMapping, ResidualForm, RmsNorm, Rotary, RouteNormalization, RoutedFfn, Router, RouterInput, ScoreFunction,
+    SharedExpert, SharedExpertGate, Sublayer, ValueNorm, ValueSource, WeightDescriptor,
 };
 
 /// A header-shaped definition and manifest of a declared configuration.
@@ -169,7 +208,7 @@ pub(crate) fn declared_model(
         } else {
             Encoding::F32
         };
-        let nbytes = source_element(encoding)
+        let nbytes = source_element(encoding, *shape.last().unwrap())
             .unwrap()
             .canonical_byte_len(&shape)
             .unwrap();
@@ -192,6 +231,7 @@ pub(crate) fn declared_model(
     };
     let silu = |gate, up| FeedForwardUp::Gated {
         activation: ActivationFunction::Silu,
+        limit: None,
         gate,
         up,
     };
@@ -204,33 +244,37 @@ pub(crate) fn declared_model(
                 heads: c.heads,
                 kv_heads: c.kv_heads,
                 width: c.head_width,
-                query: tensor(
+                query: QueryProjection::Full(tensor(
                     name("attn_q"),
                     vec![2 * c.heads * c.head_width, c.hidden],
                     true,
-                ),
+                )),
+                query_keys: QueryKeys::Direct,
                 gate: AttentionGate::Interleaved {
                     function: GateFunction::Sigmoid,
                 },
-                key_value: KeyValue::Owned {
-                    key: tensor(
-                        name("attn_k"),
-                        vec![c.kv_heads * c.head_width, c.hidden],
-                        true,
-                    ),
-                    value: ValueSource::Projected(tensor(
-                        name("attn_v"),
-                        vec![c.kv_heads * c.head_width, c.hidden],
-                        true,
-                    )),
-                    key_norm: HeadNorm::Rms(rms(tensor(
-                        name("attn_k_norm"),
-                        vec![c.head_width],
-                        false,
-                    ))),
-                    value_norm: ValueNorm::None,
-                    domain: HistoryDomain::Token,
-                },
+                history: vec![HistorySource::visible(HistoryRows::Own(RowProducer::Projected(
+                    ProjectedRows {
+                        key: tensor(
+                            name("attn_k"),
+                            vec![c.kv_heads * c.head_width, c.hidden],
+                            true,
+                        ),
+                        value: ValueSource::Projected(tensor(
+                            name("attn_v"),
+                            vec![c.kv_heads * c.head_width, c.hidden],
+                            true,
+                        )),
+                        key_norm: HeadNorm::Rms(rms(tensor(
+                            name("attn_k_norm"),
+                            vec![c.head_width],
+                            false,
+                        ))),
+                        value_norm: ValueNorm::None,
+                        domain: TokenDomain::Token,
+                        rounding: RowRounding::None,
+                    },
+                )))],
                 query_norm: HeadNorm::Rms(rms(tensor(
                     name("attn_q_norm"),
                     vec![c.head_width],
@@ -243,13 +287,13 @@ pub(crate) fn declared_model(
                     axis_pattern: vec![0],
                 },
                 scale: 1.0 / (c.head_width as f64).sqrt(),
-                reads: HistoryReads::Visible,
                 media_rows: MediaRowAttention::Causal,
-                output: tensor(
+                sinks: None,
+                output: OutputProjection::Full(tensor(
                     name("attn_output"),
                     vec![c.hidden, c.heads * c.head_width],
                     true,
-                ),
+                )),
             }))
         } else {
             Operator::GatedDelta(Box::new(GatedDelta {
@@ -259,23 +303,33 @@ pub(crate) fn declared_model(
                 width: c.state_width,
                 head_mapping: RecurrentHeadMapping::Tiled,
                 query_key_value: tensor(name("attn_qkv"), vec![channels, c.hidden], true),
-                gate: tensor(name("attn_gate"), vec![inner, c.hidden], true),
-                alpha: tensor(name("ssm_alpha"), vec![c.value_heads, c.hidden], true),
                 beta: tensor(name("ssm_beta"), vec![c.value_heads, c.hidden], true),
                 convolution: tensor(
                     name("ssm_conv1d"),
                     vec![channels, c.convolution_width],
                     false,
                 ),
-                decay: tensor(name("ssm_a"), vec![c.value_heads], false),
-                time_bias: tensor(name("ssm_dt"), vec![c.value_heads], false),
+                decay: RecurrentDecay::PerHead {
+                    alpha: tensor(name("ssm_alpha"), vec![c.value_heads, c.hidden], true),
+                    time_bias: tensor(name("ssm_dt"), vec![c.value_heads], false),
+                    decay: tensor(name("ssm_a"), vec![c.value_heads], false),
+                },
+                key_norm_epsilon: 1e-6 * c.state_width as f64,
                 norm: rms(tensor(name("ssm_norm"), vec![c.state_width], false)),
+                output_gate: RecurrentGate {
+                    projection: GateProjection::Full(tensor(
+                        name("attn_gate"),
+                        vec![inner, c.hidden],
+                        true,
+                    )),
+                    function: GateFunction::Silu,
+                },
                 output: tensor(name("ssm_out"), vec![c.hidden, inner], true),
             }))
         };
         let feedforward_norm = tensor(name("post_attention_norm"), vec![c.hidden], false);
-        let feedforward = match c.feed_forward {
-            DeclaredFeedForward::Dense { intermediate } => Operator::DenseFfn(Box::new(DenseFfn {
+        let feedforward = match c.feed_forward.at(index) {
+            BlockFeedForward::Dense { intermediate } => Operator::DenseFfn(Box::new(DenseFfn {
                 intermediate,
                 up: silu(
                     tensor(name("ffn_gate"), vec![intermediate, c.hidden], true),
@@ -283,7 +337,7 @@ pub(crate) fn declared_model(
                 ),
                 down: tensor(name("ffn_down"), vec![c.hidden, intermediate], true),
             })),
-            DeclaredFeedForward::Routed {
+            BlockFeedForward::Routed {
                 experts,
                 selected,
                 intermediate,
@@ -297,6 +351,7 @@ pub(crate) fn declared_model(
                     input: RouterInput::Operator,
                     score: ScoreFunction::Softmax,
                     selection: ExpertSelection::TopK { bias: None },
+                    media_bias: None,
                     normalization: RouteNormalization::Sum,
                     scale: 1.0,
                 },
@@ -371,9 +426,7 @@ pub(crate) fn declared_model(
     let definition = ModelDefinition {
         family: magnitude_family_contracts::FamilyId("declared-qwen35".into()),
         artifact_identity: identity,
-        inputs: InputSemantics {
-            coordinate_axes: 1,
-        },
+        inputs: InputSemantics { coordinate_axes: 1 },
         decoder: Decoder {
             activation_dtype: ActivationDType::BF16,
             hidden: c.hidden,
@@ -385,7 +438,6 @@ pub(crate) fn declared_model(
                 scale: EmbeddingScale::Unit,
                 norm: None,
                 per_layer: None,
-                hash_routing: None,
             },
             blocks,
             exit: ExitForm {

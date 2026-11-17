@@ -13,6 +13,8 @@ description: "Connect Claude Code to your downloaded Magnitude models."
 
 Magnitude configures Claude Code’s gateway. Local model IDs use the `anthropic-local/` prefix. Keep Magnitude running while connected, including for hosted models: hosted requests still go to their provider through the gateway. Disconnect and restart Claude Code before using it independently again.
 
+If Claude Code isn’t signed in, **Connect** also adds a placeholder credential, and Magnitude serves every request from it with your loaded model, including the Claude models that built-in subagents ask for. If you sign in to Claude Code later, connect again so your own login is used for Claude models.
+
 ## Run Claude Code
 
 After connecting in Magnitude, start Claude Code with:
@@ -21,13 +23,21 @@ After connecting in Magnitude, start Claude Code with:
 claude --model anthropic-local/MODEL_ID
 ```
 
-Replace `MODEL_ID` with the exact model ID, such as `gemma-4-e2b-it-qat:gguf:q4`, rather than its display name. The command shown in **Connections** already includes the correct ID for your selected model, so you can copy it without editing. Keep Magnitude running; it loads the model when the agent requests it.
+Replace `MODEL_ID` with the exact model ID, such as `gemma-4-e4b-it-qat:gguf:q4`, rather than its display name. The command shown in **Connections** already includes the correct ID for your selected model, so you can copy it without editing. Keep Magnitude running; it loads the model when the agent requests it.
 
 ## Configuration
 
 **Connect** writes `~/.claude/settings.json`. Location overrides: `CLAUDE_CONFIG_DIR`.
 
-Write the configuration yourself only when the agent runs where Connections cannot reach it, such as another device or WSL; see [Network access](/api/network-access) for `ADDRESS` and `API_KEY`.
+### On another computer
+
+1. In Magnitude, turn on **Settings → Network access**.
+2. On the other computer, open `http://ADDRESS:10100` in a browser, using the address from **Reachable at**, and sign in with the **API key**.
+3. In **Connections**, click **Copy setup prompt** on Claude Code and send it to your agent.
+
+### Edit the files yourself
+
+Use the address from **Reachable at** for `ADDRESS` and the **API key** for `API_KEY`.
 
 `~/.claude/settings.json`:
 

@@ -4,28 +4,40 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use magnitude_executor::platform::MemoryReserves;
+use magnitude_executor::platform::ReleaseRate;
 use magnitude_service_api::{AppState, ServerIdentity, app};
-use magnitude_service_contracts::bootstrap_protocol::{IcnStartupRecord, IcnStartupRecordType};
+use magnitude_service_contracts::bootstrap_protocol::{
+    API_VERSION, IcnStartupRecord, IcnStartupRecordType,
+};
+use magnitude_service_models::lineage::CatalogLineage;
 use magnitude_service_models::{
-    HuggingFaceDiscovery, InventoryConfig, ManagedModelDownloads, ManagedModelStore, ModelDomainResolver,
+    HuggingFaceDiscovery, InventoryConfig, ManagedModelDownloads, ModelDomainResolver,
     managed_model_services,
 };
-use magnitude_service_server::assessment::ManagedModelAssessments;
-use magnitude_service_server::assessment::assessor::ModelAssessor;
-use magnitude_service_server::assessment::environment::AssessmentEnvironment;
+use magnitude_service_server::assessment::assessor::{EngineHeaderVerdicts, ModelAssessor};
+use magnitude_service_server::assessment::candidates::{
+    ManagedModelCandidates, engine_architectures,
+};
+use magnitude_service_server::assessment::environment::{
+    AssessmentEnvironment, ServingDevice, assessment_structure,
+};
+use magnitude_service_server::assessment::measurement::{self, ServiceMachine};
+use magnitude_service_server::assessment::{HostDevice, ManagedModelAssessments};
 use magnitude_service_server::build_identity;
-use magnitude_service_server::configurations::ResolvedConfigurations;
+use magnitude_service_server::configurations::{LoadBounds, ResolvedConfigurations};
+use magnitude_service_server::device_lock::DeviceLock;
 use magnitude_service_server::hardware::HardwareInventory;
+use magnitude_service_server::machine_budget::{Duty, MachineBudget};
+use magnitude_service_server::model_store::{ServedStore, open_served_store};
 use magnitude_service_server::residency::controller::{
     MODEL_IDLE_TIMEOUT, ModelInstances, ResidencyEnvironment,
 };
-use magnitude_service_server::residency::supervisor::SeismicHostMemory;
 use magnitude_service_server::residency::worker::run_inference_worker;
 use magnitude_service_server::serving::ServiceModels;
 use magnitude_service_server::worker_process::{self, WorkerLauncher};
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 
+mod allocator;
 mod installation;
 mod parent_control;
 mod startup;
@@ -64,12 +76,22 @@ enum Command {
         /// Magnitude-owned root for all disposable derived cache data, including formed kernels.
         #[arg(long)]
         cache_root: Option<PathBuf>,
-        /// Additional read-only Hugging Face hub cache roots.
-        #[arg(long = "hf-cache", visible_alias = "hf-cache-dir")]
-        hf_caches: Vec<PathBuf>,
+        /// JSON local-models configuration (roots, added models, hidden models, drafters) in
+        /// effect before the first scan; the owner replaces it at runtime.
+        #[arg(long)]
+        local_models_config: Option<PathBuf>,
         /// Verified release or prepared development installation.
         #[arg(long)]
         installation: PathBuf,
+        /// Evaluation: the ceiling on every load's weights.
+        #[arg(long, hide = true)]
+        weight_cap: Option<u64>,
+        /// Evaluation: the context every load serves, in place of its model's declared one.
+        #[arg(long, hide = true)]
+        context_tokens: Option<usize>,
+        /// Evaluation: every load decodes plainly, its drafter left out.
+        #[arg(long, hide = true)]
+        plain: bool,
     },
     Doctor,
     Version {
@@ -78,24 +100,43 @@ enum Command {
     },
     /// The contained engine worker: load one model and serve it over standard streams.
     #[command(hide = true)]
-    InferenceWorker,
+    InferenceWorker {
+        /// The threads the worker may run at once: its share of the machine.
+        #[arg(long)]
+        threads: std::num::NonZeroUsize,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
+    // The measurement job's device probes run in processes of this executable.
+    seismic::serve_probe_if_asked();
+    // SAFETY: no other thread has started yet.
+    unsafe { magnitude_service_server::isolate_hub_credentials() };
+    magnitude_executor::diagnostics::install();
     magnitude_executor::platform::relax_gpu_watchdog();
     let cli = Cli::parse();
     match cli.command {
-        // The engine worker owns standard output for its protocol: it installs no telemetry
-        // subscriber and runs no async runtime of the service's.
-        Command::InferenceWorker => {
+        // The engine worker owns standard output for its protocol: it exports no telemetry and
+        // runs no async runtime of the service's. Its events go to standard error, which the
+        // service records in its log, at the level the launcher sets (`RUST_LOG`).
+        Command::InferenceWorker { threads } => {
             worker_process::install_parent_watchdog()?;
-            std::process::exit(run_inference_worker());
+            telemetry::init_worker()?;
+            run_inference_worker(threads)
         }
-        command => tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .context("failed to start the service runtime")?
-            .block_on(run(command)),
+        command => {
+            if matches!(command, Command::Serve { .. }) {
+                allocator::configure();
+                // The service's own pools (catalog assessment, inventory scans, the engine's
+                // auxiliary pools it opens) are background work beside a serving worker.
+                seismic::threads::set_share(MachineBudget::host().share(Duty::Background).get());
+            }
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("failed to start the service runtime")?
+                .block_on(run(command))
+        }
     }
 }
 
@@ -120,31 +161,18 @@ async fn run(command: Command) -> anyhow::Result<()> {
             auth_token,
             model_store,
             cache_root,
-            hf_caches,
+            local_models_config,
             installation,
+            weight_cap,
+            context_tokens,
+            plain,
         } => {
+            magnitude_service_utils::owner::spawn("the allocator's release of free memory", allocator::release_free_memory());
+            let bounds = LoadBounds { weight_bound: weight_cap.map(magnitude_executor::WeightBound::Cap), context_tokens, plain };
             let installation = installation::Installation::load(&installation)
                 .context("invalid ICN installation")?;
             let release_catalog = Arc::new(open_installation_catalog(&installation)?);
             let worker_launcher = WorkerLauncher::current()?;
-            let reserves = MemoryReserves::standard();
-            let catalog = Arc::new(
-                tokio::task::spawn_blocking(seismic::DeviceCatalog::discover)
-                    .await
-                    .context("device discovery task failed")?
-                    .context("device discovery failed")?,
-            );
-            // Every model is assessed on the device a load selects, established once from the
-            // discovered devices: selection, host memory and bandwidth.
-            let assessment_environment = {
-                let catalog = Arc::clone(&catalog);
-                Arc::new(
-                    tokio::task::spawn_blocking(move || AssessmentEnvironment::establish(&catalog))
-                        .await
-                        .context("assessment environment task failed")?
-                        .context("failed to establish the assessment environment")?,
-                )
-            };
             let inventory_root = match model_store {
                 Some(root) => root,
                 None => InventoryConfig::default_root()
@@ -157,12 +185,60 @@ async fn run(command: Command) -> anyhow::Result<()> {
             };
             let mut inventory_config = InventoryConfig::with_roots(inventory_root, cache_root)
                 .context("invalid model inventory configuration")?;
-            inventory_config.hf_cache_dirs.extend(hf_caches);
+            if let Some(path) = local_models_config {
+                inventory_config.local_models = read_local_models_configuration(&path)?;
+            }
             inventory_config.catalog_models = release_catalog.catalog().models.clone();
-            let inventory = Arc::new(
-                ManagedModelStore::open(inventory_config)
-                    .await
-                    .context("failed to initialize model inventory")?,
+            inventory_config.catalog_header_digests = release_catalog.file_header_digests();
+            inventory_config.architectures = engine_architectures();
+            inventory_config.scan_threads = seismic::threads::share();
+            let ServedStore {
+                store: inventory,
+                devices: catalog,
+                volumes,
+            } = open_served_store(inventory_config).await?;
+            let kernels = inventory.derived_cache().kernel_directory();
+            let storage = inventory.root().to_owned();
+            // The machine's page-release rate, kept with its figures in the kernel cache.
+            let release = ReleaseRate::of_machine(Some((kernels.as_path(), &*catalog.topology())));
+            // The serving device is decided once over the discovered topology. Every model is
+            // assessed on it, from that topology and a status sample, under what the
+            // measurement job has stored of this machine; every load and the hardware report
+            // use it. Nothing is measured here: the service is ready at once, and the job
+            // measures what is missing in a worker of its own: the executor's fixed cost
+            // points, whatever the models.
+            let (serving, structure, stored) = {
+                let catalog = Arc::clone(&catalog);
+                let (kernels, storage) = (kernels.clone(), storage.clone());
+                magnitude_service_utils::blocking::run(move || {
+                    let serving = ServingDevice::select(&catalog)?;
+                    let structure = Arc::new(assessment_structure(&catalog, serving, Some(kernels.as_path()))?);
+                    let stored = structure.stored(&kernels, &storage);
+                    anyhow::Ok((serving, structure, stored))
+                })
+                .await
+                .context("failed to establish the assessment structure")?
+            };
+            let assessment_environment = Arc::new(
+                AssessmentEnvironment::new(Arc::clone(&stored.structure), stored.measurements.clone())
+                    .context("failed to establish the assessment environment")?,
+            );
+            let device = DeviceLock::default();
+            let host = HostDevice::new(
+                &device,
+                serving.selector().backend() == seismic::BackendName::Cpu,
+            );
+            let measurement = measurement::start(
+                Arc::new(ServiceMachine::new(
+                    structure,
+                    worker_launcher.clone(),
+                    inventory.served_paths(),
+                    kernels.clone(),
+                    storage,
+                )),
+                stored,
+                device.clone(),
+                host.settled(),
             );
             let model_downloads = Arc::new(
                 ManagedModelDownloads::open(inventory.clone())
@@ -172,7 +248,6 @@ async fn run(command: Command) -> anyhow::Result<()> {
             let native_build = build_identity::native_build();
             let model_variants =
                 ModelDomainResolver::new(inventory.clone(), release_catalog.catalog().clone());
-            let kernel_directory = inventory.derived_cache().kernel_directory();
             let assessor = Arc::new(ModelAssessor::new(
                 inventory.clone(),
                 model_variants.clone(),
@@ -184,45 +259,79 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 model_variants: model_variants.clone(),
                 configurations: Arc::new(ResolvedConfigurations::new(
                     inventory.clone(),
-                    kernel_directory,
-                    reserves,
+                    kernels,
+                    release,
+                    serving,
+                    bounds,
                 )),
-                host_memory: Arc::new(SeismicHostMemory::new(catalog.clone())),
                 catalog: catalog.clone(),
-                reserves,
                 idle_timeout: MODEL_IDLE_TIMEOUT,
                 launcher: worker_launcher,
+                device,
                 instance_id_namespace: instance_id.clone(),
             });
             let model_services = managed_model_services(
-                model_variants,
+                model_variants.clone(),
                 model_downloads.clone(),
                 Arc::new(instances.clone()),
                 Arc::new(instances.clone()),
             )
             .context("failed to initialize model domains")?;
+            let architectures = engine_architectures();
+            let lineage = CatalogLineage::new(inventory.clone(), release_catalog.catalog().clone());
+            let candidates = ManagedModelCandidates::new(
+                assessor.clone(),
+                lineage.clone(),
+                architectures.clone(),
+                model_services.catalog.clone(),
+                model_services.local.clone(),
+                host.clone(),
+            );
+            candidates.start_enrichment(model_variants.clone());
+            // Requested downloads of custom models resolve against the local-models configuration
+            // read before the first scan, so every request resumes once its files can be worked out.
+            model_downloads.set_custom_model_acquisition(candidates.clone());
+            magnitude_service_utils::owner::spawn("the requested downloads' resumption", {
+                let installations = model_services.installations.clone();
+                async move { installations.resume_requested_downloads().await }
+            });
             let assessments = ManagedModelAssessments::start(
                 assessor,
                 model_services.catalog.clone(),
-                model_services.discovered.clone(),
+                model_services.local.clone(),
+                measurement,
+                host,
             );
+            // Assessment judges a model unbounded: its verdict does not speak to a bounded load.
+            if bounds == LoadBounds::default() {
+                instances.attach_assessments(assessments.clone());
+            }
             let mut state = AppState::new()
                 .with_model_downloads(model_downloads)
-                .with_hugging_face_catalog(Arc::new(HuggingFaceDiscovery::new(inventory.clone())))
+                .with_hugging_face_catalog(Arc::new(HuggingFaceDiscovery::new(
+                    inventory.clone(),
+                    architectures,
+                    Arc::new(EngineHeaderVerdicts),
+                    lineage,
+                    candidates.clone(),
+                    candidates.clone(),
+                )))
+                .with_model_candidates(candidates)
                 .with_identity(ServerIdentity {
                     instance_id: instance_id.clone(),
-                    api_version: 1,
+                    api_version: API_VERSION,
                     native_build: native_build.clone(),
                 })
                 .with_model_domains(
                     model_services.catalog.clone(),
-                    model_services.discovered.clone(),
+                    model_services.local.clone(),
                     model_services.installations.clone(),
                 )
                 .with_model_assessments(assessments)
                 .with_hardware(Arc::new(HardwareInventory::new(
-                    catalog,
-                    reserves,
+                    Arc::clone(catalog.inventory()),
+                    volumes,
+                    serving,
                     Arc::new(instances.clone()),
                 )))
                 .with_model_controller(Arc::new(instances.clone()));
@@ -242,7 +351,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 origin: format!("http://{address}"),
                 instance_id: instance_id.clone(),
                 pid: std::process::id(),
-                api_version: 1,
+                api_version: API_VERSION,
                 native_build,
             };
             println!("MAGNITUDE_ICN_READY {}", serde_json::to_string(&startup)?);
@@ -277,9 +386,24 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 println!("{}", env!("CARGO_PKG_VERSION"));
             }
         }
-        Command::InferenceWorker => unreachable!("the inference worker runs without the service runtime"),
+        Command::InferenceWorker { .. } => {
+            unreachable!("the inference worker runs without the service runtime")
+        }
     }
     Ok(())
+}
+
+fn read_local_models_configuration(
+    path: &std::path::Path,
+) -> anyhow::Result<magnitude_service_contracts::models::LocalModelsConfiguration> {
+    let bytes = std::fs::read(path).with_context(|| {
+        format!(
+            "failed to read local-models configuration {}",
+            path.display()
+        )
+    })?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid local-models configuration {}", path.display()))
 }
 
 #[cfg(unix)]
@@ -310,20 +434,66 @@ mod tests {
             "/tmp/installation.json",
             "--models-dir",
             "/tmp/models",
-            "--hf-cache-dir",
-            "/tmp/hf",
         ])
         .expect("documented inventory flag aliases should parse");
-        let Command::Serve {
-            model_store,
-            hf_caches,
-            ..
-        } = aliases.command
-        else {
+        let Command::Serve { model_store, .. } = aliases.command else {
             panic!("expected serve command")
         };
         assert_eq!(model_store, Some(PathBuf::from("/tmp/models")));
-        assert_eq!(hf_caches, vec![PathBuf::from("/tmp/hf")]);
+    }
+
+    #[test]
+    fn hugging_face_caches_come_only_from_the_local_models_configuration() {
+        assert!(
+            Cli::try_parse_from([
+                env!("CARGO_BIN_NAME"),
+                "serve",
+                "--installation",
+                "/tmp/installation.json",
+                "--hf-cache",
+                "/tmp/hf",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn local_models_configuration_is_read_before_the_first_scan() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("local-models.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "roots": [{ "kind": "Ollama", "path": "/home/u/.ollama/models", "enabled": true }],
+                "added": [],
+                "hidden": [],
+                "drafters": []
+            })
+            .to_string(),
+        )
+        .expect("configuration file");
+        let parsed = Cli::try_parse_from([
+            env!("CARGO_BIN_NAME"),
+            "serve",
+            "--installation",
+            "/tmp/installation.json",
+            "--local-models-config",
+            path.to_str().expect("utf-8 path"),
+        ])
+        .expect("the local-models configuration flag parses");
+        let Command::Serve {
+            local_models_config: Some(configured),
+            ..
+        } = parsed.command
+        else {
+            panic!("expected serve command with a local-models configuration")
+        };
+        let configuration =
+            read_local_models_configuration(&configured).expect("valid configuration");
+        assert_eq!(configuration.roots.len(), 1);
+
+        std::fs::write(&path, b"{\"roots\": 3}").expect("invalid configuration file");
+        assert!(read_local_models_configuration(&path).is_err());
     }
 
     #[test]
@@ -351,6 +521,5 @@ mod tests {
         assert_eq!(value.native_build, build_identity::native_build());
         assert_eq!(value.target, build_identity::TARGET);
         assert_eq!(value.profile, build_identity::PROFILE);
-        assert!(!value.backends.is_empty());
     }
 }

@@ -1,11 +1,17 @@
 import { Option } from "effect"
 import {
+  comparisonTokensPerSecond,
+  localModelIntelligence,
   localModelServingState,
+  type GenerationPerformanceEvidence,
   type GenerationPerformanceSamples,
   type LocalModel,
   type LocalModelServingState,
+  type LocalModelPerformance,
+  type MachineMeasurement,
+  type SpeculativeMethod,
 } from "@magnitudedev/sdk"
-import { formatMemorySize } from "./format-bytes"
+import { formatContext, formatMemorySize } from "./format-bytes"
 import { localModelSpeculativeMethodLabel } from "./model-presentation"
 
 const clamp01 = (value: number): number => Math.min(1, Math.max(0, value))
@@ -39,41 +45,42 @@ type ModelAssessment = AssessedModel["assessment"]
 const memoryUseRatio = (assessment: ModelAssessment): number => {
   if (assessment._tag !== "Fits") return 1
   return assessment.memory.domains.reduce((highestUse, domain) => {
-    const usableCapacityBytes =
-      domain.capacityBytes - domain.compatibilityReserveBytes
     const use =
-      usableCapacityBytes <= 0
+      domain.capacityBytes <= 0
         ? domain.requiredBytes > 0
           ? 1
           : 0
-        : domain.requiredBytes / usableCapacityBytes
+        : domain.requiredBytes / domain.capacityBytes
     return Math.max(highestUse, clamp01(use))
   }, 0)
 }
 
-const speculationValue = (model: LocalModel): number => {
+/** Every speculative method's rank, weakest first; the radar spaces them evenly up to the strongest. */
+const SPECULATION_RANK: Record<SpeculativeMethod["_tag"], number> = {
+  Mtp: 1,
+  DFlash: 2,
+  DSpark: 3,
+  DFlash2: 4,
+  LiLiCorr: 5,
+}
+const STRONGEST_SPECULATION_RANK = Math.max(...Object.values(SPECULATION_RANK))
+
+/** A model's speculation on the radar: none is 0, the strongest method 1. */
+const speculationValue = (method: Option.Option<SpeculativeMethod>): number => Option.match(method, {
+  onNone: () => 0,
+  onSome: ({ _tag }) => SPECULATION_RANK[_tag] / STRONGEST_SPECULATION_RANK,
+})
+
+const modelSpeculationValue = (model: LocalModel): number => {
   const serving = Option.getOrUndefined(localModelServingState(model))
-  if (serving?._tag !== "Assessed") return 0
-  return Option.match(serving.speculativeMethod, {
-    onNone: () => 0,
-    onSome: (method) => {
-      switch (method._tag) {
-        case "Mtp": return 1 / 4
-        case "DFlash": return 2 / 4
-        case "DSpark": return 3 / 4
-        case "DFlash2": return 1
-      }
-    },
-  })
+  return serving?._tag === "Assessed" ? speculationValue(serving.speculativeMethod) : 0
 }
 
 const fidelityLabel = (rank: number): string =>
   rank >= 70 ? "Very high" : rank >= 45 ? "High" : rank >= 30 ? "Medium" : "Reduced"
 
-const shortVariantLabel = (model: LocalModel): string =>
-  String(model.presentation.variantLabel).match(/\b(?:IQ|Q)\d+(?:\.\d+)?\b/i)?.[0] ??
-  String(model.presentation.variantLabel).split(/[ _-]/, 1)[0] ??
-  String(model.presentation.variantLabel)
+const shortVariantLabel = (label: string): string =>
+  label.match(/\b(?:IQ|Q)\d+(?:\.\d+)?\b/i)?.[0] ?? label.split(/[ _-]/, 1)[0] ?? label
 
 const quantizationBits = (model: LocalModel): Option.Option<number> => {
   const serving = Option.getOrUndefined(localModelServingState(model))
@@ -88,12 +95,9 @@ const quantizationBits = (model: LocalModel): Option.Option<number> => {
   return Option.none()
 }
 
-const discoveredFidelityLabel = (bits: Option.Option<number>): string =>
-  Option.match(bits, {
-    onNone: () => "Not assessed",
-    onSome: (value) =>
-      value >= 8 ? "Very high" : value >= 5 ? "High" : value >= 4 ? "Medium" : "Reduced",
-  })
+/** A model's fidelity rank, ten per weight bit of its quant (Q4 is 40, Q8 is 80). */
+const fidelityRank = (model: LocalModel): Option.Option<number> =>
+  Option.map(quantizationBits(model), (bits) => bits * 10)
 
 const memoryFitLabel = (assessment: ModelAssessment): string => {
   const use = memoryUseRatio(assessment)
@@ -104,37 +108,60 @@ const memoryFitLabel = (assessment: ModelAssessment): string => {
   return "Tight"
 }
 
-/** How to read an estimated speed: arithmetic over bandwidth, not a benchmark. */
+/** How to read an estimated speed: arithmetic over this machine's measurements, not a benchmark. */
 export const localModelSpeedNote = "Rough estimate. Does not account for speculative decoding."
+
+/** The context depths an estimated speed's range is shown at, capped at the model's context length. */
+export const localModelSpeedRangeContexts = [25_000, 75_000] as const
+
+const thousands = (tokens: number): string => `${tokens / 1_000}K`
 
 /** The explanation behind an estimated speed's info icon. */
 export const localModelSpeedTooltip =
-  "Estimated from your machine's memory bandwidth. Actual performance will differ. Does not include speculative decoding."
+  `Decode speed with ${localModelSpeedRangeContexts.map(thousands).join("–")} tokens of context; short conversations decode faster. Estimated from measurements of your machine running Magnitude's own kernels. Actual performance will differ. Does not include speculative decoding.`
 
-export const performanceRangeSpeedLabel = (
+/** The estimate whose context depth is nearest `contextTokens`. */
+const nearestSample = (
   samples: GenerationPerformanceSamples,
+  contextTokens: number,
+): GenerationPerformanceEvidence => samples.reduce((closest, candidate) =>
+  Math.abs(candidate.contextTokens - contextTokens) < Math.abs(closest.contextTokens - contextTokens)
+    ? candidate
+    : closest)
+
+const measurementLabel = (measurement: MachineMeasurement): string =>
+  measurement._tag === "Failed"
+    ? `Measuring this machine failed; retrying at ${new Date(measurement.retryAt).toLocaleTimeString([], {
+        hour: "numeric",
+        minute: "2-digit",
+      })}`
+    : "Measuring this machine…"
+
+/** A fit's speed, resident or streamed, as offered. */
+export const performanceRangeSpeedLabel = (
+  performance: LocalModelPerformance,
   contextLength: number
 ): string => {
-  const lowerContext = Math.min(25_000, contextLength)
-  const upperContext = Math.min(75_000, contextLength)
-  const lowerSample = samples.find(
-    ({ contextTokens }) => contextTokens === lowerContext
-  )
-  const upperSample = samples.find(
-    ({ contextTokens }) => contextTokens === upperContext
-  )
-  if (lowerSample === undefined || upperSample === undefined) return "Not assessed"
-  const lower = Math.min(
-    lowerSample.estimatedTokensPerSecond,
-    upperSample.estimatedTokensPerSecond
-  )
-  const upper = Math.max(
-    lowerSample.estimatedTokensPerSecond,
-    upperSample.estimatedTokensPerSecond
-  )
-  return Math.round(lower) === Math.round(upper)
-    ? `~${Math.round(lower)} tok/s`
-    : `~${Math.round(lower)}–${Math.round(upper)} tok/s`
+  switch (performance._tag) {
+    case "Pending": return measurementLabel(performance.measurement)
+    case "Unavailable": return performance.failure.message
+    case "Estimated": {
+      const speeds = localModelSpeedRangeContexts
+        .map((contextTokens) => nearestSample(performance.samples, Math.min(contextTokens, contextLength)))
+        .map(({ estimatedTokensPerSecond }) => Math.round(estimatedTokensPerSecond))
+      const lower = Math.min(...speeds)
+      const upper = Math.max(...speeds)
+      return lower === upper ? `~${lower} tok/s` : `~${lower}–${upper} tok/s`
+    }
+  }
+}
+
+/** The estimated decode speed at the depth models are compared at; none unless the model fits and its speed is estimated. */
+export const localModelEstimatedTokensPerSecond = (model: LocalModel): Option.Option<number> => {
+  const serving = Option.getOrUndefined(localModelServingState(model))
+  if (serving?._tag !== "Assessed" || serving.assessment._tag !== "Fits") return Option.none()
+  const { residency: { performance }, served } = serving.assessment
+  return comparisonTokensPerSecond(performance, served.contextLength)
 }
 
 export const localModelRadarAxes = (
@@ -146,35 +173,27 @@ export const localModelRadarAxes = (
   }
 
   const assessment = serving.assessment
-  const comparisonContext = Math.min(50_000, assessment.profile.contextLength)
-  const samples = assessment.performance
-  const catalog = model._tag === "Catalog" ? Option.some(model.catalogData) : Option.none()
+  const performance = assessment.residency.performance
   const speculation = Option.getOrElse(localModelSpeculativeMethodLabel(model), () => "None")
-  const bits = quantizationBits(model)
-  const quantization = serving.metadata.quantization
+  const variant = String(model.presentation.variantLabel)
+  const fidelity = fidelityRank(model)
+  const intelligence = localModelIntelligence(model)
   const axes: LocalModelRadarAxes = [
     {
-      value: Option.map(catalog, ({ intelligence }) =>
-        clamp01(intelligence / 100)
-      ),
+      value: Option.map(intelligence, (score) => clamp01(score / 100)),
       label: "INTELLIGENCE",
-      detail: Option.match(catalog, {
-        onNone: () => "Not assessed",
-        onSome: ({ intelligence }) => `${intelligence}%`,
+      detail: Option.match(intelligence, {
+        onNone: () => "Not rated",
+        onSome: (score) => `${score}%`,
       }),
     },
     {
-      value: Option.some(normalizeLocalModelRadarSpeed(samples.reduce((closest, candidate) =>
-        Math.abs(candidate.contextTokens - comparisonContext) <
-        Math.abs(closest.contextTokens - comparisonContext)
-          ? candidate
-          : closest
-      ).estimatedTokensPerSecond)),
+      value: Option.map(localModelEstimatedTokensPerSecond(model), normalizeLocalModelRadarSpeed),
       label: "SPEED",
-      detail: performanceRangeSpeedLabel(samples, assessment.profile.contextLength),
+      detail: performanceRangeSpeedLabel(performance, assessment.served.contextLength),
     },
     {
-      value: Option.some(speculationValue(model)),
+      value: Option.some(modelSpeculationValue(model)),
       label: "SPECULATION",
       detail: speculation,
     },
@@ -186,15 +205,11 @@ export const localModelRadarAxes = (
       )})`,
     },
     {
-      value: Option.match(catalog, {
-        onNone: () => Option.map(bits, (value) => clamp01(value / 8)),
-        onSome: ({ fidelityRank }) => Option.some(clamp01(fidelityRank / 100)),
-      }),
+      value: Option.map(fidelity, (rank) => clamp01(rank / 100)),
       label: "FIDELITY",
-      detail: Option.match(catalog, {
-        onNone: () => `${discoveredFidelityLabel(bits)} (${quantization})`,
-        onSome: ({ fidelityRank }) =>
-          `${fidelityLabel(fidelityRank)} (${shortVariantLabel(model)})`,
+      detail: Option.match(fidelity, {
+        onNone: () => `Not rated (${variant})`,
+        onSome: (rank) => `${fidelityLabel(rank)} (${shortVariantLabel(variant)})`,
       }),
     },
   ]
@@ -204,3 +219,44 @@ export const localModelRadarAxes = (
     ? Option.some(axes)
     : Option.none()
 }
+
+/** How much of this computer's usable memory the model needs when it fits, from 0 to 1. */
+export const localModelMemoryUse = (model: LocalModel): Option.Option<number> => {
+  const serving = Option.getOrUndefined(localModelServingState(model))
+  return serving?._tag === "Assessed" && serving.assessment._tag === "Fits" ? Option.some(memoryUseRatio(serving.assessment)) : Option.none()
+}
+
+/** What a model card states beyond its fit: catalog intelligence and the estimated speed range. */
+export interface LocalModelFacts {
+  readonly intelligence: Option.Option<number>
+  readonly speed: Option.Option<string>
+}
+
+export const localModelFacts = (model: LocalModel): LocalModelFacts => {
+  const serving = Option.getOrUndefined(localModelServingState(model))
+  const fits = serving?._tag === "Assessed" && serving.assessment._tag === "Fits" ? serving.assessment : undefined
+  return {
+    intelligence: localModelIntelligence(model),
+    speed: fits === undefined
+      ? Option.none()
+      : Option.some(performanceRangeSpeedLabel(fits.residency.performance, fits.served.contextLength)),
+  }
+}
+
+export interface LocalModelMemoryPart {
+  readonly label: string
+  readonly bytes: number
+}
+
+/** What a fitting model's memory holds, in order: weights, context at the length it is served at, and overhead. */
+export const localModelMemoryParts = (assessment: Extract<ModelAssessment, { readonly _tag: "Fits" }>): readonly [LocalModelMemoryPart, LocalModelMemoryPart, LocalModelMemoryPart] => [
+  { label: "Weights", bytes: assessment.memory.breakdown.weightsBytes },
+  { label: `${formatContext(assessment.served.contextLength)} context`, bytes: assessment.memory.breakdown.contextBytes },
+  { label: "Overhead", bytes: assessment.memory.breakdown.overheadBytes },
+]
+
+/** The full context a fitting model is served below, which this computer has no memory for. */
+export const localModelUnservedContext = (assessment: Extract<ModelAssessment, { readonly _tag: "Fits" }>): Option.Option<string> =>
+  assessment.served.contextLength < assessment.profile.contextLength
+    ? Option.some(`full ${formatContext(assessment.profile.contextLength)} doesn’t fit`)
+    : Option.none()

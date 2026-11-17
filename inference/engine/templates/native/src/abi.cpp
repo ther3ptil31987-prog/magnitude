@@ -22,7 +22,16 @@ struct abi_error : std::runtime_error {
 struct template_state {
     common_chat_templates_ptr compiled;
     json special_tokens;
+    bool reads_preserve_thinking;
 };
+// Whether the template source names `preserve_thinking` as a Jinja identifier,
+// decided from its tokens so text and string literals do not count.
+bool reads_preserve_thinking(const std::string & source) {
+    for (const auto & token : jinja::lexer().tokenize(source).tokens) {
+        if (token.t == jinja::token::identifier && token.value == "preserve_thinking") { return true; }
+    }
+    return false;
+}
 // A schema keyword the prepared constraint does not enforce, for a tool's
 // arguments (named) or for the JSON output (unnamed).
 struct subject_relaxation {
@@ -38,6 +47,7 @@ struct prepared_state {
     common_chat_parser_params parser;
     std::vector<std::string> diagnostics;
     std::set<subject_relaxation> relaxations;
+    uint64_t renders;
 };
 std::mutex mutex;
 uint64_t next_handle = 1;
@@ -69,6 +79,7 @@ int32_t guarded(templates_buffer * error, F && function) noexcept {
         std::lock_guard<std::mutex> lock(mutex);
         templates_native::diagnostics.clear();
         templates_native::relaxations.clear();
+        templates_native::renders = 0;
         try {
             function();
             return TEMPLATES_OK;
@@ -167,6 +178,7 @@ int32_t templates_template_create(const uint8_t * input, uint64_t size,
         state->compiled = common_chat_templates_init(source,
             tokens.value("bos_token", std::string()), tokens.value("eos_token", std::string()));
         state->special_tokens = std::move(tokens);
+        state->reads_preserve_thinking = reads_preserve_thinking(source);
         auto id = allocate_handle();
         templates.emplace(id, std::move(state));
         *output = id;
@@ -223,6 +235,10 @@ int32_t templates_request_create(uint64_t handle, const uint8_t * input, uint64_
         request.messages = common_chat_msgs_parse_oaicompat(data.at("messages"));
         if (request.messages.empty()) { throw std::invalid_argument("Request requires messages"); }
         request.tool_choice = common_chat_tool_choice_parse_oaicompat(data.value("tool_choice", std::string("auto")));
+        // Thinking is enabled unless the caller turns it off, as in upstream
+        // common chat, so a template's own `enable_thinking` fallback never
+        // decides the default.
+        request.enable_thinking = true;
         // Schemas are valid JSON Schemas (the host admits only those) and
         // always lower; lowering records what the constraint does not enforce.
         std::set<subject_relaxation> relaxations;
@@ -260,6 +276,12 @@ int32_t templates_request_create(uint64_t handle, const uint8_t * input, uint64_
                 if (key == "enable_thinking") { request.enable_thinking = value.get<bool>(); }
             }
         }
+        // Reasoning stays on every assistant message unless the caller turns it
+        // off, so a new user message appends to the previous prompt instead of
+        // rewriting earlier replies, and the prefix cache reuses earlier tasks.
+        if (state.reads_preserve_thinking && !request.chat_template_kwargs.count("preserve_thinking")) {
+            request.chat_template_kwargs["preserve_thinking"] = "true";
+        }
         if (data.contains("json_schema")) {
             if (!request.tools.empty()) { throw std::invalid_argument("Combining tools with JSON output is unsupported"); }
             lower(std::nullopt, data.at("json_schema"));
@@ -277,6 +299,7 @@ int32_t templates_request_create(uint64_t handle, const uint8_t * input, uint64_
         prepared->parser.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
         if (!prepared->parameters.parser.empty()) { prepared->parser.parser.load(prepared->parameters.parser); }
         prepared->diagnostics = templates_native::diagnostics;
+        prepared->renders = templates_native::renders;
         for (auto & recorded : templates_native::relaxations) {
             relaxations.insert({ recorded.tool, std::move(recorded.relaxation) });
         }
@@ -312,7 +335,7 @@ int32_t templates_request_describe(uint64_t handle, templates_buffer * output, t
             {"preserved_tokens", params.preserved_tokens}, {"additional_stops", params.additional_stops},
             {"supports_thinking", params.supports_thinking}, {"thinking_start", params.thinking_start_tag},
             {"thinking_ends", params.thinking_end_tags}, {"diagnostics", state.diagnostics},
-            {"relaxations", relaxations}}).dump());
+            {"relaxations", relaxations}, {"renders", state.renders}}).dump());
     });
 }
 

@@ -227,6 +227,9 @@ struct parser_build_context {
     common_chat_peg_builder & p;
     const generation_params &         inputs;
     common_peg_parser                 reasoning_parser;
+    // Reasoning that opens and never closes, ending the output, when the
+    // format extracts tagged reasoning.
+    std::optional<common_peg_parser>  unclosed_reasoning_parser;
     bool                              extracting_reasoning = false;
     const analyze_reasoning *         reasoning            = nullptr;
     const analyze_content *           content              = nullptr;
@@ -313,6 +316,14 @@ struct analyze_tools : analyze_base {
                   const analyze_reasoning &    reasoning);
 
     common_peg_parser build_parser(parser_build_context & ctx) const override;
+
+    // Every marker the analysis derived
+    std::vector<std::string> markers() const;
+
+    // Whether the derived format can delimit a call: no marker holds probe names or values, and a
+    // tagged argument value has a closing marker. A format the analysis could not separate from the
+    // probe data (e.g. Python-style calls) is not a tool format.
+    bool is_coherent() const;
 
   private:
     // Extract tool calling 'haystack' for further analysis and delegate further analysis based on format

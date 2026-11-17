@@ -16,11 +16,13 @@ hf-hub.workspace = true
 magnitude-artifacts = { path = "../../engine/artifacts" }
 magnitude-service-contracts.workspace = true
 magnitude-service-utils.workspace = true
+notify.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 same-file.workspace = true
+seismic-lang.workspace = true
 sha2-state = { package = "sha2", version = "0.11.0" }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "time"] }
@@ -29,3 +31,8 @@ tempfile = "3.24.0"
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+[dev-dependencies]
+magnitude-family-registry = { path = "../../engine/families/registry" }
+# Equality of header values, for the tests that compare them.
+magnitude-artifacts = { path = "../../engine/artifacts", features = ["equality"] }

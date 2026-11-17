@@ -4,14 +4,16 @@
 //! interpreted; every vision tensor is bound once.
 
 use crate::{invalid, product, Error};
-use magnitude_artifacts::gguf::{Directory, Scalar, Value};
-use magnitude_family_common::{HeaderError, Tensors};
+use magnitude_artifacts::gguf::{Directory, Element, PROJECTOR_ARCHITECTURE, Scalar, Value};
+use magnitude_family_common::{
+    architecture_keys, array_elements, projector_type, HeaderError, Tensors,
+};
 use magnitude_family_contracts::{
     CellReduction, ImportTransform, LinearClamp, MergerStage, PositionSampling, RmsNorm,
     Standardize, UnweightedRms, VisionActivation, VisionAttention, VisionAttentionScale,
     VisionAttentionSpan, VisionBlock, VisionDescription, VisionFeedForward, VisionLinear,
-    VisionMerger, VisionNorm, VisionPositions, VisionPreprocessing, VisionResampling, VisionResize,
-    VisionStem, VisionUp, WeightDescriptor, ActivationDType,
+    VisionMerger, VisionNorm, VisionOperator, VisionPositions, VisionPreprocessing,
+    VisionResampling, VisionResize, VisionStem, VisionUp, WeightDescriptor, ActivationDType,
 };
 
 /// The released vision configuration's facts the header does not record:
@@ -55,10 +57,10 @@ impl Reader<'_> {
 
     fn triple(&self, key: &str) -> Result<[f64; 3], Error> {
         let values = match self.directory.value(key) {
-            Some(Value::Array(values)) if values.len() == 3 => values
+            Some(Value::Array(values)) if values.len() == 3 => array_elements(key, values)?
                 .iter()
                 .map(|value| match value {
-                    Scalar::Float(value) if value.is_finite() => Some(*value),
+                    Element::Float(value) if value.is_finite() => Some(value),
                     _ => None,
                 })
                 .collect::<Option<Vec<_>>>(),
@@ -103,7 +105,7 @@ impl Reader<'_> {
         let vision =
             |name: &&str| name.starts_with("v.") || (name.starts_with("mm.") && !name.starts_with("mm.a."));
         if let Some(name) = self.tensors.unbound().find(vision) {
-            return Err(HeaderError::UnboundWeight(name.to_owned()).into());
+            return Err(HeaderError::UnboundWeights(vec![name.to_owned()]).into());
         }
         Ok(())
     }
@@ -136,18 +138,22 @@ pub fn describe_projector(
     directory: &Directory,
     output_hidden: u64,
 ) -> Result<VisionDescription, Error> {
-    if directory.value("general.architecture").and_then(Value::string) != Some("clip")
-        || directory.value("general.type").and_then(Value::string) != Some("mmproj")
-        || directory.value("clip.has_vision_encoder")
-            != Some(&Value::Scalar(Scalar::Bool(true)))
-    {
-        return Err(invalid("unsupported Gemma projector identity"));
+    #[derive(Clone, Copy)]
+    enum Form {
+        /// `gemma4v`.
+        Encoder,
+        /// `gemma4uv`.
+        Unified,
     }
-    for entry in &directory.metadata {
-        let known = entry.name.starts_with("general.")
-            || IGNORED_PREFIXES
-                .iter()
-                .any(|prefix| entry.name.starts_with(prefix))
+    let form = projector_type(
+        directory,
+        &[("gemma4v", Form::Encoder), ("gemma4uv", Form::Unified)],
+        output_hidden,
+    )?;
+    for (_, entry) in architecture_keys(directory, PROJECTOR_ARCHITECTURE) {
+        let known = IGNORED_PREFIXES
+            .iter()
+            .any(|prefix| entry.name.starts_with(prefix))
             || [
                 "clip.has_vision_encoder",
                 "clip.vision.projector_type",
@@ -174,17 +180,11 @@ pub fn describe_projector(
         directory,
         tensors: Tensors::new(directory),
     };
-    if reader.unsigned("clip.vision.projection_dim")? != output_hidden {
-        return Err(invalid("projector width differs from the decoder width"));
-    }
-    let kind = directory
-        .value("clip.vision.projector_type")
-        .and_then(Value::string)
-        .ok_or_else(|| invalid("Gemma projector declares no projector type"))?;
-    let description = match kind {
-        "gemma4v" => encoder(&mut reader, output_hidden)?,
-        "gemma4uv" => unified(&mut reader, output_hidden)?,
-        kind => return Err(invalid(format!("unsupported Gemma projector type {kind:?}"))),
+    // Declared, and the target's (`projector_type`).
+    reader.unsigned("clip.vision.projection_dim")?;
+    let description = match form {
+        Form::Encoder => encoder(&mut reader, output_hidden)?,
+        Form::Unified => unified(&mut reader, output_hidden)?,
     };
     reader.finish()?;
     description
@@ -219,9 +219,10 @@ fn encoder(reader: &mut Reader, output_hidden: u64) -> Result<VisionDescription,
         let query = reader.linear(&format!("{p}attn_q"), hidden, hidden)?;
         let key = reader.linear(&format!("{p}attn_k"), hidden, hidden)?;
         blocks.push(VisionBlock {
-            attention_norm: rms(reader.tensor(&format!("{p}ln1.weight"), &[hidden])?),
-            attention: VisionAttention {
+            operator_norm: rms(reader.tensor(&format!("{p}ln1.weight"), &[hidden])?),
+            operator: VisionOperator::Attention(VisionAttention {
                 heads,
+                kv_heads: heads,
                 width,
                 query: VisionLinear {
                     weight: permuted(query.weight, &order),
@@ -247,17 +248,18 @@ fn encoder(reader: &mut Reader, output_hidden: u64) -> Result<VisionDescription,
                     epsilon,
                 }),
                 value_norm: Some(UnweightedRms { epsilon }),
-                rotary_base: ROTARY_BASE,
+                rotary_base: Some(ROTARY_BASE),
                 scale: VisionAttentionScale::Unit,
                 span: VisionAttentionSpan::Full,
                 output: reader.linear(&format!("{p}attn_out"), hidden, hidden)?,
-            },
-            attention_post_norm: Some(rms(
+            }),
+            operator_post_norm: Some(rms(
                 reader.tensor(&format!("{p}attn_post_norm.weight"), &[hidden])?
             )),
             feedforward_norm: rms(reader.tensor(&format!("{p}ln2.weight"), &[hidden])?),
             feedforward: VisionFeedForward {
                 up: VisionUp::Gated {
+                    limit: None,
                     gate: reader.linear(&format!("{p}ffn_gate"), intermediate, hidden)?,
                     up: reader.linear(&format!("{p}ffn_up"), intermediate, hidden)?,
                 },
@@ -297,8 +299,9 @@ fn encoder(reader: &mut Reader, output_hidden: u64) -> Result<VisionDescription,
         stem: VisionStem::Patch {
             frames: vec![reader.tensor("v.patch_embd.weight", &[hidden, 3, patch, patch])?],
             bias: None,
-            positions: table,
+            positions: Some(table),
             norm: None,
+            registers: None,
         },
         window: None,
         blocks,
@@ -313,9 +316,11 @@ fn encoder(reader: &mut Reader, output_hidden: u64) -> Result<VisionDescription,
                 epsilon,
             }),
             stages: vec![MergerStage {
+                norm: None,
                 linear: reader.linear("mm.input_projection", output_hidden, hidden)?,
                 activation: None,
             }],
+            feed_forward: None,
             output_norm: None,
         },
     })
@@ -381,9 +386,11 @@ fn unified(reader: &mut Reader, output_hidden: u64) -> Result<VisionDescription,
                 epsilon,
             }),
             stages: vec![MergerStage {
+                norm: None,
                 linear: reader.linear("mm.input_projection", output_hidden, hidden)?,
                 activation: None,
             }],
+            feed_forward: None,
             output_norm: None,
         },
     })

@@ -1,6 +1,30 @@
-import { Option } from "effect"
+import { Effect, Fiber, Layer, Option, Schema, SubscriptionRef } from "effect"
+import { CatalogModelSyncLive } from "./catalog-model-sync"
 import { describe, expect, it } from "vitest"
-import { modelCommandFailure } from "./model-commands"
+import { modelCommandFailure, type ModelCommandsApi } from "./model-commands"
+import { CustomModelCommands, type CustomModelCommandsApi } from "./custom-model-commands"
+import { LocalModels } from "./local-models"
+
+const UPGRADED_ALIAS = "hf:unsloth/Qwen3.5-4B-MTP-GGUF/Qwen3.5-4B-UD-Q4_K_XL.gguf"
+const localModels = {
+  state: Effect.succeed({
+    models: [{ _tag: "Catalog", modelId: "model-a:gguf:test", catalogData: { aliases: [UPGRADED_ALIAS] }, storedComponents: [] }],
+    unsupported: [],
+    hidden: [],
+  }),
+} as never
+
+const customCalls: string[] = []
+const customCommands = {
+  remove: (modelId: string) => Effect.sync(() => { customCalls.push(`custom remove ${modelId}`); return {} }),
+  sync: (modelId: string) => Effect.sync(() => { customCalls.push(`custom sync ${modelId}`); return { outcome: "Installing" as const } }),
+  cancelSync: (modelId: string) => Effect.sync(() => { customCalls.push(`custom cancel ${modelId}`); return {} }),
+  acknowledgeSyncFailure: (modelId: string) => Effect.sync(() => { customCalls.push(`custom acknowledge ${modelId}`); return {} }),
+  hide: (modelId: string) => Effect.sync(() => { customCalls.push(`custom hide ${modelId}`) }),
+  externalCatalogFiles: (modelId: string) => Effect.succeed(modelId === "model-c:gguf:test"
+    ? Option.some({ path: "/home/ada/.cache/huggingface/hub/models--o--r/snapshots/c/m.gguf", location: Option.some("HuggingFaceCache") })
+    : Option.none()),
+} as unknown as CustomModelCommandsApi
 
 describe("modelCommandFailure", () => {
   it("preserves the server's structured remote failure details", () => {
@@ -63,7 +87,9 @@ it("retries active and slot Stop against the exact stopping instance", async () 
     yield* commands.stopActiveModel
     yield* commands.stopSlot(PRIMARY_SLOT_ID)
   }).pipe(
-    Effect.provide(ModelCommandsLive),
+    Effect.provide(ModelCommandsLive.pipe(Layer.provide(CatalogModelSyncLive))),
+    Effect.provideService(CustomModelCommands, customCommands),
+    Effect.provideService(LocalModels, localModels),
     Effect.provideService(IcnInstances, { get: Effect.succeed(snapshot) } as never),
     Effect.provideService(IcnClient, { models: { stopModelInstance: ({ path }: { path: { instance_id: string } }) => Effect.sync(() => { stopped.push(path.instance_id); return {} }) } } as never),
     Effect.provideService(ModelSlotController, { state: Effect.succeed({ slots: { primary: { _tag: "ConfiguredLocal", selection: { providerModelId: "model-a:gguf:test" } } } }) } as never),
@@ -74,11 +100,59 @@ it("retries active and slot Stop against the exact stopping instance", async () 
   expect(stopped).toEqual(["retained-instance", "retained-instance"])
 })
 
+it("stops a model named by any ID form, and refuses one that isn't on this computer", async () => {
+  const { IcnClient, IcnInstances, IcnCatalog, IcnCatalogInstallations } = await import("@magnitudedev/icn")
+  const { ModelInstancesSnapshot } = await import("@magnitudedev/icn-protocol/schemas")
+  const { ModelIdSchema } = await import("@magnitudedev/acn-protocol")
+  const { ModelCommands, ModelCommandsLive } = await import("./model-commands")
+  const { ModelSlotController } = await import("./model-slot-controller")
+  const { LocalModelRemovals } = await import("./local-model-removals")
+  const added = "hf:owner/repo/model-Q4_K_M.gguf"
+  const imported = "local:folder-model-q4_0:aaaaaaaaaaaa"
+  const olderLabel = "local:older-name-q4_0:aaaaaaaaaaaa"
+  const stopped: string[] = []
+  const running = (id: string, modelId: string) => ({ id, modelId, lifecycle: { _tag: "Loading", fraction: 0.5, stage: "loading_weights" } })
+  const snapshot = Schema.decodeUnknownSync(ModelInstancesSnapshot)({ revision: 1, instances: [
+    running("catalog-instance", "model-a:gguf:test"), running("added-instance", added), running("imported-instance", imported),
+  ] })
+  const stop = (model: string) => Effect.gen(function* () {
+    const commands = yield* ModelCommands
+    return yield* commands.stopModel(Schema.decodeUnknownSync(ModelIdSchema)(model))
+  }).pipe(
+    Effect.provide(ModelCommandsLive.pipe(Layer.provide(CatalogModelSyncLive))),
+    Effect.provideService(CustomModelCommands, customCommands),
+    Effect.provideService(LocalModels, { state: Effect.succeed({
+      models: [
+        { _tag: "Catalog", modelId: "model-a:gguf:test", catalogData: { aliases: [UPGRADED_ALIAS] } },
+        { _tag: "Custom", modelId: added },
+        { _tag: "Catalog", modelId: "model-b:gguf:test", catalogData: { aliases: [] } },
+      ],
+      hidden: [{ _tag: "Custom", modelId: imported }],
+    }) } as never),
+    Effect.provideService(IcnInstances, { get: Effect.succeed(snapshot) } as never),
+    Effect.provideService(IcnClient, { models: { stopModelInstance: ({ path }: { path: { instance_id: string } }) => Effect.sync(() => { stopped.push(path.instance_id); return {} }) } } as never),
+    Effect.provideService(ModelSlotController, {} as never),
+    Effect.provideService(IcnCatalog, {} as never),
+    Effect.provideService(IcnCatalogInstallations, {} as never),
+    Effect.provideService(LocalModelRemovals, {} as never),
+  )
+  // A local model named under an older label is the same model.
+  for (const model of ["model-a:gguf:test", UPGRADED_ALIAS, added, imported, olderLabel]) {
+    expect(await Effect.runPromise(stop(model))).toEqual({ stopped: true })
+  }
+  expect(stopped).toEqual(["catalog-instance", "catalog-instance", "added-instance", "imported-instance", "imported-instance"])
+  const unknown = await Effect.runPromise(stop("hf:owner/repo/missing.gguf").pipe(Effect.flip))
+  expect(unknown).toMatchObject({ _tag: "LocalModelMutationFailed", code: "model_not_found", message: "hf:owner/repo/missing.gguf is not a model on this computer." })
+  expect(stopped).toHaveLength(5)
+  // A model on this computer that isn't running has nothing to stop, and says so.
+  expect(await Effect.runPromise(stop("model-b:gguf:test"))).toEqual({ stopped: false })
+  expect(stopped).toHaveLength(5)
+})
+
 it("stops a running model before removing it, and removes an idle model without stopping", async () => {
   const { Effect, Schema } = await import("effect")
   const { IcnClient, IcnInstances, IcnCatalog, IcnCatalogInstallations } = await import("@magnitudedev/icn")
   const { ModelInstancesSnapshot } = await import("@magnitudedev/icn-protocol/schemas")
-  const { CatalogFormModelIdSchema } = await import("@magnitudedev/acn-protocol")
   const { ModelCommands, ModelCommandsLive } = await import("./model-commands")
   const { ModelSlotController } = await import("./model-slot-controller")
   const { LocalModelRemovals } = await import("./local-model-removals")
@@ -87,19 +161,351 @@ it("stops a running model before removing it, and removes an idle model without 
     id: "loaded-instance", modelId: "model-a:gguf:test",
     lifecycle: { _tag: "Loading", fraction: 0.5, stage: "loading_weights" },
   }] })
+  const { ModelIdSchema } = await import("@magnitudedev/acn-protocol")
   const remove = (model: string) => Effect.gen(function* () {
     const commands = yield* ModelCommands
-    yield* commands.remove(Schema.decodeUnknownSync(CatalogFormModelIdSchema)(model))
+    yield* commands.remove(Schema.decodeUnknownSync(ModelIdSchema)(model))
   }).pipe(
-    Effect.provide(ModelCommandsLive),
+    Effect.provide(ModelCommandsLive.pipe(Layer.provide(CatalogModelSyncLive))),
+    Effect.provideService(CustomModelCommands, customCommands),
+    Effect.provideService(LocalModels, localModels),
     Effect.provideService(IcnInstances, { get: Effect.succeed(snapshot) } as never),
     Effect.provideService(IcnClient, { models: { stopModelInstance: ({ path }: { path: { instance_id: string } }) => Effect.sync(() => { calls.push(`stop ${path.instance_id}`); return {} }) } } as never),
     Effect.provideService(LocalModelRemovals, { remove: (modelId: string) => Effect.sync(() => { calls.push(`remove ${modelId}`); return {} }) } as never),
     Effect.provideService(ModelSlotController, {} as never),
     Effect.provideService(IcnCatalog, {} as never),
-    Effect.provideService(IcnCatalogInstallations, {} as never),
+    Effect.provideService(IcnCatalogInstallations, { get: Effect.succeed({ state: { operations: [] } }) } as never),
   )
   await Effect.runPromise(remove("model-a:gguf:test"))
   await Effect.runPromise(remove("model-b:gguf:test"))
+  await Effect.runPromise(remove("hf:owner/repo/model-Q4_K_M.gguf"))
+  await Effect.runPromise(remove("model-c:gguf:test"))
   expect(calls).toEqual(["stop loaded-instance", "remove model-a:gguf:test", "remove model-b:gguf:test"])
+  expect(customCalls).toContain("custom remove hf:owner/repo/model-Q4_K_M.gguf")
+  expect(customCalls).toContain("custom hide model-c:gguf:test")
+})
+
+it("removes only the parts Magnitude stores or is fetching for a catalog model whose weights are found elsewhere, and hides one without any", async () => {
+  const { IcnClient, IcnInstances, IcnCatalog, IcnCatalogInstallations, IcnLocalModels } = await import("@magnitudedev/icn")
+  const { ModelIdSchema } = await import("@magnitudedev/acn-protocol")
+  const { ModelCommands, ModelCommandsLive } = await import("./model-commands")
+  const { ModelSlotController } = await import("./model-slot-controller")
+  const { LocalModelRemovalsLive } = await import("./local-model-removals")
+  const calls: string[] = []
+  const cachePath = "/home/ada/.cache/huggingface/hub/models--unsloth--Qwen3.5-4B-MTP-GGUF/snapshots/c/Qwen3.5-4B-UD-Q4_K_XL.gguf"
+  const external = (storedComponents: readonly string[]) => ({
+    _tag: "Catalog",
+    modelId: "qwen3.5-4b:gguf:q4",
+    catalogData: { aliases: [] },
+    acquisitionState: {
+      _tag: "Installed",
+      installation: { _tag: "Resolved", installedBytes: 1, primaryPath: cachePath, ownership: "External" },
+      residencyState: { _tag: "Unloaded" },
+    },
+    missingComponents: [],
+    storedComponents,
+  })
+  const remove = (storedComponents: readonly string[], removal: unknown, operationState = "Completed") => Effect.gen(function* () {
+    const commands = yield* ModelCommands
+    return yield* commands.remove(Schema.decodeUnknownSync(ModelIdSchema)("qwen3.5-4b:gguf:q4"))
+  }).pipe(
+    Effect.provide(ModelCommandsLive.pipe(Layer.provide(CatalogModelSyncLive), Layer.provide(LocalModelRemovalsLive))),
+    Effect.provideService(CustomModelCommands, {
+      ...customCommands,
+      externalCatalogFiles: () => Effect.succeed(Option.some({ path: cachePath, location: Option.some("HuggingFaceCache") })),
+    } as unknown as CustomModelCommandsApi),
+    Effect.provideService(LocalModels, { state: Effect.succeed({ models: [external(storedComponents)], hidden: [] }) } as never),
+    Effect.provideService(IcnInstances, { get: Effect.succeed({ revision: 1, instances: [] }) } as never),
+    Effect.provideService(IcnClient, { catalog: {
+      removeCatalogModelInstallation: ({ path }: { path: { model_id: string } }) => Effect.sync(() => {
+        calls.push(`remove ${path.model_id}`)
+        return removal
+      }),
+      cancelCatalogInstallation: ({ path }: { path: { operation_id: string } }) => Effect.sync(() => {
+        calls.push(`cancel ${path.operation_id}`)
+        return {}
+      }),
+    } } as never),
+    Effect.provideService(IcnCatalog, { refresh: Effect.void } as never),
+    Effect.provideService(IcnCatalogInstallations, {
+      get: Effect.succeed({ state: { operations: [{ operationId: "op-drafter", modelId: "qwen3.5-4b:gguf:q4", state: { _tag: operationState } }] } }),
+      refresh: Effect.void,
+    } as never),
+    Effect.provideService(IcnLocalModels, { pruneDrafters: Effect.void } as never),
+    Effect.provideService(ModelSlotController, {} as never),
+  )
+
+  // The projector and drafter Magnitude stores are removed; ICN keeps the found weights.
+  expect(await Effect.runPromise(remove(["Projector", "Drafter"], { _tag: "Removed", reclaimedBytes: 2, keptComponents: [] }))).toEqual({ keptComponents: [] })
+  expect(calls).toEqual(["remove qwen3.5-4b:gguf:q4"])
+
+  // With nothing of Magnitude's, Remove never reaches ICN and hides the found copy, as it hides any found model.
+  customCalls.length = 0
+  expect(await Effect.runPromise(remove([], { _tag: "Removed", reclaimedBytes: 0, keptComponents: [] }))).toEqual({ keptComponents: [] })
+  expect(customCalls).toEqual(["custom hide qwen3.5-4b:gguf:q4"])
+  expect(calls).toHaveLength(1)
+
+  // A drafter another model serves with stays, and ICN still completes the removal, so the model is never left as a
+  // failed removal (Linux CUDA round 4e) nor hidden.
+  calls.length = 0
+  customCalls.length = 0
+  expect(await Effect.runPromise(remove(["Drafter"], { _tag: "Removed", reclaimedBytes: 0, keptComponents: ["Drafter"] })))
+    .toEqual({ keptComponents: ["Drafter"] })
+  expect(calls).toEqual(["remove qwen3.5-4b:gguf:q4"])
+  expect(customCalls).toEqual([])
+
+  // A drafter still queued is Magnitude's own part too: Remove cancels its installation and never hides the model,
+  // which keeps running from the found file (QA mac round 4).
+  calls.length = 0
+  customCalls.length = 0
+  expect(await Effect.runPromise(remove([], { _tag: "Removed", reclaimedBytes: 0, keptComponents: [] }, "Pending"))).toEqual({ keptComponents: [] })
+  expect(calls).toEqual(["cancel op-drafter"])
+  expect(customCalls).toEqual([])
+
+  // With a stored projector beside the queued drafter, the drafter is cancelled and the projector removed.
+  calls.length = 0
+  expect(await Effect.runPromise(remove(["Projector"], { _tag: "Removed", reclaimedBytes: 1, keptComponents: [] }, "Running"))).toEqual({ keptComponents: [] })
+  expect(calls).toEqual(["cancel op-drafter", "remove qwen3.5-4b:gguf:q4"])
+})
+
+it("reports whether a catalog sync installs, updates, or finds the model current", async () => {
+  const { IcnClient, IcnInstances, IcnCatalog, IcnCatalogInstallations } = await import("@magnitudedev/icn")
+  const { ModelIdSchema } = await import("@magnitudedev/acn-protocol")
+  const { ModelCommands, ModelCommandsLive } = await import("./model-commands")
+  const { ModelSlotController } = await import("./model-slot-controller")
+  const { LocalModelRemovals } = await import("./local-model-removals")
+  const sync = (localState: string, admission: string) => Effect.gen(function* () {
+    const commands = yield* ModelCommands
+    return (yield* commands.sync(Schema.decodeUnknownSync(ModelIdSchema)("model-a:gguf:test"))).outcome
+  }).pipe(
+    Effect.provide(ModelCommandsLive.pipe(Layer.provide(CatalogModelSyncLive))),
+    Effect.provideService(CustomModelCommands, customCommands),
+    Effect.provideService(LocalModels, localModels),
+    Effect.provideService(IcnInstances, { get: Effect.succeed({ revision: 1, instances: [] }) } as never),
+    Effect.provideService(IcnClient, {
+      catalog: { installCatalogModel: () => Effect.succeed({ _tag: admission, operationId: "op" }) },
+    } as never),
+    Effect.provideService(IcnCatalog, {
+      get: Effect.succeed({ revision: 1, state: { models: [{ id: "model-a:gguf:test", localState: { _tag: localState } }] } }),
+      refresh: Effect.void,
+    } as never),
+    Effect.provideService(IcnCatalogInstallations, { refresh: Effect.void } as never),
+    Effect.provideService(ModelSlotController, {} as never),
+    Effect.provideService(LocalModelRemovals, { forget: () => Effect.void } as never),
+  )
+  expect(await Effect.runPromise(sync("NotInstalled", "Admitted"))).toBe("Installing")
+  expect(await Effect.runPromise(sync("Installed", "Admitted"))).toBe("Updating")
+  expect(await Effect.runPromise(sync("Installed", "Current"))).toBe("AlreadyCurrent")
+})
+
+/** `models pull` and the desktop's Download agree: ACN refuses a catalog model that doesn't fit before anything downloads (QA mac-m4). */
+it("refuses to download a catalog model that does not fit, and still updates an installed one or starts an unassessed one", async () => {
+  const { IcnClient, IcnInstances, IcnCatalog, IcnCatalogInstallations } = await import("@magnitudedev/icn")
+  const { ModelIdSchema, ModelVersionNotRunnable } = await import("@magnitudedev/acn-protocol")
+  const { ModelCommands, ModelCommandsLive } = await import("./model-commands")
+  const { ModelSlotController } = await import("./model-slot-controller")
+  const { LocalModelRemovals } = await import("./local-model-removals")
+  const deficitBytes = 5_600_000_000
+  const doesNotFit = { _tag: "Assessed", assessment: { _tag: "DoesNotFit", deficitBytes } }
+  const installed = {
+    _tag: "Installed",
+    installation: { _tag: "Resolved", installedBytes: 1, primaryPath: "/models/m.gguf", ownership: "Managed" },
+    residencyState: { _tag: "Unloaded" },
+  }
+  const catalogModel = (modelId: string, servingState: unknown, acquisitionState: unknown) =>
+    ({ _tag: "Catalog", modelId, catalogData: { aliases: [] }, servingState, acquisitionState })
+  const installs: string[] = []
+  const sync = (model: string) => Effect.gen(function* () {
+    const commands = yield* ModelCommands
+    return (yield* commands.sync(Schema.decodeUnknownSync(ModelIdSchema)(model))).outcome
+  }).pipe(
+    Effect.either,
+    Effect.provide(ModelCommandsLive.pipe(Layer.provide(CatalogModelSyncLive))),
+    Effect.provideService(CustomModelCommands, customCommands),
+    Effect.provideService(LocalModels, { state: Effect.succeed({
+      models: [
+        catalogModel("too-large:gguf:q4", doesNotFit, { _tag: "NotInstalled" }),
+        catalogModel("too-large-partial:gguf:q4", doesNotFit, { _tag: "InstallFailed", failure: {} }),
+        catalogModel("installed-too-large:gguf:q4", doesNotFit, { ...installed, _tag: "UpdateAvailable" }),
+        catalogModel("assessing:gguf:q4", { _tag: "Assessing", profile: {} }, { _tag: "NotInstalled" }),
+        catalogModel("fits:gguf:q4", { _tag: "Assessed", assessment: { _tag: "Fits" } }, { _tag: "NotInstalled" }),
+      ],
+      unsupported: [],
+      hidden: [],
+    }) } as never),
+    Effect.provideService(IcnInstances, { get: Effect.succeed({ revision: 1, instances: [] }) } as never),
+    Effect.provideService(IcnClient, {
+      catalog: { installCatalogModel: ({ path }: { path: { model_id: string } }) => Effect.sync(() => {
+        installs.push(path.model_id)
+        return { _tag: "Admitted", operationId: "op" }
+      }) },
+    } as never),
+    Effect.provideService(IcnCatalog, {
+      get: Effect.succeed({ revision: 1, state: { models: [{ id: "installed-too-large:gguf:q4", localState: { _tag: "Installed" } }] } }),
+      refresh: Effect.void,
+    } as never),
+    Effect.provideService(IcnCatalogInstallations, { refresh: Effect.void } as never),
+    Effect.provideService(ModelSlotController, {} as never),
+    Effect.provideService(LocalModelRemovals, { forget: () => Effect.void } as never),
+  )
+
+  for (const model of ["too-large:gguf:q4", "too-large-partial:gguf:q4"]) {
+    const refused = await Effect.runPromise(sync(model))
+    expect(refused._tag === "Left" && refused.left).toBeInstanceOf(ModelVersionNotRunnable)
+    expect(refused).toMatchObject({ _tag: "Left", left: { reference: model, version: model, verdict: { _tag: "DoesNotFit", deficitBytes } } })
+  }
+  expect(installs).toEqual([])
+  expect(await Effect.runPromise(sync("installed-too-large:gguf:q4"))).toMatchObject({ _tag: "Right", right: "Updating" })
+  expect(await Effect.runPromise(sync("assessing:gguf:q4"))).toMatchObject({ _tag: "Right", right: "Installing" })
+  expect(await Effect.runPromise(sync("fits:gguf:q4"))).toMatchObject({ _tag: "Right", right: "Installing" })
+  expect(installs).toEqual(["installed-too-large:gguf:q4", "assessing:gguf:q4", "fits:gguf:q4"])
+})
+
+it("downloads only the named component of a catalog model and refuses custom models", async () => {
+  const { IcnClient, IcnInstances, IcnCatalog, IcnCatalogInstallations } = await import("@magnitudedev/icn")
+  const { ModelIdSchema } = await import("@magnitudedev/acn-protocol")
+  const { ModelCommands, ModelCommandsLive } = await import("./model-commands")
+  const { ModelSlotController } = await import("./model-slot-controller")
+  const { LocalModelRemovals } = await import("./local-model-removals")
+  const requested: unknown[] = []
+  const download = (model: string, admission: string) => Effect.gen(function* () {
+    const commands = yield* ModelCommands
+    return yield* commands.downloadCatalogComponent(Schema.decodeUnknownSync(ModelIdSchema)(model), "Projector")
+  }).pipe(
+    Effect.provide(ModelCommandsLive.pipe(Layer.provide(CatalogModelSyncLive))),
+    Effect.provideService(CustomModelCommands, customCommands),
+    Effect.provideService(LocalModels, localModels),
+    Effect.provideService(IcnInstances, { get: Effect.succeed({ revision: 1, instances: [] }) } as never),
+    Effect.provideService(IcnClient, {
+      catalog: {
+        installCatalogModel: () => Effect.die("a component download never installs the whole bundle"),
+        installCatalogComponent: (request: unknown) => Effect.sync(() => {
+          requested.push(request)
+          return { _tag: admission, operationId: "op" }
+        }),
+      },
+    } as never),
+    Effect.provideService(IcnCatalog, { refresh: Effect.void } as never),
+    Effect.provideService(IcnCatalogInstallations, { refresh: Effect.void } as never),
+    Effect.provideService(ModelSlotController, {} as never),
+    Effect.provideService(LocalModelRemovals, {} as never),
+  )
+  expect(await Effect.runPromise(download("model-a:gguf:test", "Admitted"))).toEqual({ started: true })
+  expect(await Effect.runPromise(download("model-a:gguf:test", "Current"))).toEqual({ started: false })
+  expect(requested).toEqual([
+    { path: { model_id: "model-a:gguf:test", component: "Projector" } },
+    { path: { model_id: "model-a:gguf:test", component: "Projector" } },
+  ])
+  const refused = await Effect.runPromise(download("hf:owner/repo/model-Q4_K_M.gguf", "Admitted").pipe(Effect.flip))
+  expect(refused._tag === "LocalModelMutationFailed" && refused.code).toBe("catalog_component_requires_catalog_model")
+  expect(requested).toHaveLength(2)
+})
+
+describe("load acknowledgement", () => {
+  const loadFixture = async (initial: unknown, ensure: (modelId: string) => unknown) => {
+    const { IcnClient, IcnInstances, IcnCatalog, IcnCatalogInstallations } = await import("@magnitudedev/icn")
+    const { ModelInstancesSnapshot } = await import("@magnitudedev/icn-protocol/schemas")
+    const { ModelCommands, ModelCommandsLive } = await import("./model-commands")
+    const { ModelSlotController } = await import("./model-slot-controller")
+    const { LocalModelRemovals } = await import("./local-model-removals")
+    const decode = Schema.decodeUnknownSync(ModelInstancesSnapshot)
+    const instances = await Effect.runPromise(SubscriptionRef.make(decode(initial)))
+    const slotsRefreshed: string[] = []
+    const run = <A, E>(use: (commands: ModelCommandsApi) => Effect.Effect<A, E>) =>
+      Effect.runPromise(ModelCommands.pipe(
+        Effect.flatMap(use),
+        Effect.either,
+        Effect.provide(ModelCommandsLive.pipe(Layer.provide(CatalogModelSyncLive))),
+        Effect.provideService(CustomModelCommands, customCommands),
+    Effect.provideService(LocalModels, localModels),
+    Effect.provideService(CustomModelCommands, customCommands),
+    Effect.provideService(LocalModels, localModels),
+        Effect.provideService(IcnInstances, { get: SubscriptionRef.get(instances), changes: instances.changes } as never),
+        Effect.provideService(IcnClient, { models: { ensureModelInstance: ({ payload }: { payload: { modelId: string } }) => ensure(payload.modelId) } } as never),
+        Effect.provideService(ModelSlotController, {
+          state: Effect.succeed({ slots: { primary: { _tag: "ConfiguredLocal", selection: { providerModelId: "model-a:gguf:test" } } } }),
+          refresh: Effect.sync(() => { slotsRefreshed.push("primary") }),
+        } as never),
+        Effect.provideService(IcnCatalog, {} as never),
+        Effect.provideService(IcnCatalogInstallations, {} as never),
+        Effect.provideService(LocalModelRemovals, {} as never),
+      ))
+    const publish = (snapshot: unknown) => SubscriptionRef.set(instances, decode(snapshot))
+    return { run, publish, slotsRefreshed }
+  }
+  const loading = (revision: number) => ({ revision, instances: [{
+    id: "instance-1", modelId: "model-a:gguf:test",
+    lifecycle: { _tag: "Loading", stage: "optimizing", fraction: 0.1 },
+  }] })
+
+  it("acknowledges a load once ICN admits it while the warm demand keeps waiting for readiness", async () => {
+    const { ModelIdSchema } = await import("@magnitudedev/acn-protocol")
+    const demands: string[] = []
+    let demandInterrupted = false
+    const fixture = await loadFixture({ revision: 1, instances: [] }, (modelId) => Effect.sync(() => { demands.push(modelId) }).pipe(
+      Effect.zipRight(Effect.never),
+      Effect.onInterrupt(() => Effect.sync(() => { demandInterrupted = true })),
+    ))
+    const outcome = await fixture.run((commands) => Effect.gen(function* () {
+      const load = yield* commands.loadModel(Schema.decodeUnknownSync(ModelIdSchema)("model-a:gguf:test")).pipe(Effect.fork)
+      yield* Effect.yieldNow()
+      expect(Option.isNone(yield* Fiber.poll(load))).toBe(true)
+      yield* fixture.publish(loading(2))
+      const acknowledged = yield* Fiber.join(load)
+      yield* Effect.yieldNow()
+      expect(demandInterrupted).toBe(false)
+      return acknowledged
+    }))
+
+    expect(outcome).toMatchObject({ _tag: "Right", right: {} })
+    expect(demands).toEqual(["model-a:gguf:test"])
+  })
+
+  it("delivers the warm demand for an already admitted model and acknowledges without waiting", async () => {
+    const { ModelIdSchema } = await import("@magnitudedev/acn-protocol")
+    const demands: string[] = []
+    const fixture = await loadFixture(loading(1), (modelId) => Effect.sync(() => { demands.push(modelId) }).pipe(Effect.zipRight(Effect.never)))
+    const outcome = await fixture.run((commands) => commands.loadModel(Schema.decodeUnknownSync(ModelIdSchema)("model-a:gguf:test")).pipe(
+      Effect.zipLeft(Effect.yieldNow()),
+    ))
+
+    expect(outcome).toMatchObject({ _tag: "Right", right: {} })
+    expect(demands).toEqual(["model-a:gguf:test"])
+  })
+
+  it("loads the catalog model when a request names the ID its files had as a found model before an upgrade", async () => {
+    const { ModelIdSchema } = await import("@magnitudedev/acn-protocol")
+    const demands: string[] = []
+    const fixture = await loadFixture(loading(1), (modelId) => Effect.sync(() => { demands.push(modelId) }).pipe(Effect.zipRight(Effect.never)))
+    const outcome = await fixture.run((commands) => commands.loadModel(Schema.decodeUnknownSync(ModelIdSchema)(UPGRADED_ALIAS)).pipe(
+      Effect.zipLeft(Effect.yieldNow()),
+    ))
+    expect(outcome).toMatchObject({ _tag: "Right", right: {} })
+    expect(demands).toEqual(["model-a:gguf:test"])
+  })
+
+  it("reports a demand rejected before admission", async () => {
+    const { ModelIdSchema } = await import("@magnitudedev/acn-protocol")
+    const fixture = await loadFixture({ revision: 1, instances: [] }, () => Effect.fail({
+      _tag: "GeneratedClientRemoteError", operationId: "ensureModelInstance", status: 409, headers: {},
+      body: { error: { code: "memory_shortage", message: "Not enough memory", type: "model_error", param: Option.none() } },
+    }))
+    const outcome = await fixture.run((commands) => commands.loadModel(Schema.decodeUnknownSync(ModelIdSchema)("model-a:gguf:test")))
+
+    expect(outcome).toMatchObject({ _tag: "Left", left: { _tag: "LocalModelMutationFailed", code: "memory_shortage" } })
+  })
+
+  it("acknowledges a slot load at admission and refreshes the slot", async () => {
+    const { PRIMARY_SLOT_ID } = await import("@magnitudedev/acn-protocol")
+    const fixture = await loadFixture({ revision: 1, instances: [] }, () => Effect.never)
+    const outcome = await fixture.run((commands) => Effect.gen(function* () {
+      const load = yield* commands.loadSlot(PRIMARY_SLOT_ID).pipe(Effect.fork)
+      yield* Effect.yieldNow()
+      yield* fixture.publish(loading(2))
+      return yield* Fiber.join(load)
+    }))
+
+    expect(outcome).toMatchObject({ _tag: "Right", right: {} })
+    expect(fixture.slotsRefreshed).toEqual(["primary"])
+  })
 })

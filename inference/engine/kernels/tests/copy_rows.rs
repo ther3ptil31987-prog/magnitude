@@ -1,4 +1,9 @@
+mod common;
+mod declared;
+
 use magnitude_kernels::copy_rows;
+use seismic_lang::reference_math::conversion::canonical_nan;
+use seismic_lang::types::DType;
 
 fn slabbed_rows(
     device: &seismic::Device,
@@ -8,19 +13,18 @@ fn slabbed_rows(
     bytes: &[u8],
     slab_rows: u64,
 ) -> seismic::SlabTensor {
-    let mut slabs = seismic::SlabTensor::new(
+    let slabs = crate::common::slab_tensor(
         device,
         slab_rows,
         rows,
-        vec![seismic::SlabRegion {
+        &[seismic::SlabRegion {
             element,
             row_shape: row_shape.to_vec(),
         }],
-    )
-    .unwrap();
+    );
     let row_bytes = bytes.len() / rows as usize;
     for index in 0..rows.div_ceil(slab_rows) {
-        slabs.add_slab().unwrap();
+        slabs.add_slab(seismic::SlabFill::Zeroed).unwrap();
         let start = index * slab_rows;
         let count = slab_rows.min(rows - start);
         slabs
@@ -37,17 +41,12 @@ fn slabbed_rows(
 #[test]
 fn portable_copy_moves_only_the_indexed_dense_rows() {
     use seismic_lang::{
-        checked::{check_source, SourceFile, SourceSet},
         entry::ElementBindings,
         interp::{Arg, Interpreter, TensorData},
         registry,
         types::DType,
     };
-    let module = check_source(SourceSet::new(vec![SourceFile {
-        path: "state.seismic".into(),
-        text: include_str!("../kernels/state.seismic").into(),
-    }]))
-    .unwrap();
+    let module = crate::common::kernels();
     let logical = module
         .entry(
             module.entry_named("copy_rows").unwrap(),
@@ -101,7 +100,7 @@ fn generated_surface_exposes_native_and_planned_dense_plane_bindings() {
 
 #[test]
 fn native_copies_indexed_word_plane_rows_bit_exactly_on_every_device() {
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     for backend in [
         seismic::BackendName::Metal,
         seismic::BackendName::Cuda,
@@ -135,9 +134,9 @@ fn copy_word_plane_rows(device: &seismic::Device) {
             .unwrap();
     let to = seismic::Tensor::from_host(&device, seismic::Element::i32(), &[2], &indices(&[0, 2]))
         .unwrap();
-    copy_rows::native_for_device_with(
+    declared::prepared(
         &device,
-        copy_rows::Elements { A: element },
+        &copy_rows::native_entry_with(copy_rows::Elements { A: element }),
         &seismic::NativeSpecialization::new(),
     )
     .unwrap()
@@ -162,7 +161,7 @@ fn copy_word_plane_rows(device: &seismic::Device) {
 
 /// The host's GPU (Metal on macOS, else Vulkan when present), then the CPU.
 fn devices() -> Vec<seismic::Device> {
-    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
     let gpu = if cfg!(target_os = "macos") {
         Some(catalog.open_backend(seismic::BackendName::Metal).unwrap())
     } else {
@@ -198,9 +197,9 @@ fn assert_native_two_byte_plane_copy(
     let to = seismic::Tensor::from_host(&device, seismic::Element::i32(), &[2], &indices(&[0, 2]))
         .unwrap();
 
-    copy_rows::native_for_device_with(
+    declared::prepared(
         &device,
-        copy_rows::Elements { A: element },
+        &copy_rows::native_entry_with(copy_rows::Elements { A: element }),
         &seismic::NativeSpecialization::new(),
     )
     .unwrap()
@@ -218,22 +217,38 @@ fn assert_native_two_byte_plane_copy(
         .chunks_exact(2)
         .map(|bytes| u16::from_le_bytes(bytes.try_into().unwrap()))
         .collect::<Vec<_>>();
+    // The source as it reads out of the engine: a NaN is the registry's one NaN.
+    let (infinity, dtype) = if element == seismic::Element::f16() {
+        (0x7c00, DType::F16)
+    } else {
+        (0x7f80, DType::BF16)
+    };
+    let nan = canonical_nan(dtype) as u16;
+    let source = source
+        .iter()
+        .map(|&bits| if bits & 0x7fff > infinity { nan } else { bits })
+        .collect::<Vec<u16>>();
     assert_eq!(&actual[0..6], &source[18..24], "{:?}", device.backend());
     assert_eq!(&actual[6..12], &source[6..12], "{:?}", device.backend());
     assert_eq!(&actual[12..18], &source[6..12], "{:?}", device.backend());
     assert_eq!(&actual[18..24], &source[18..24], "{:?}", device.backend());
 }
 
+/// Each indexed F16 and BF16 row lands at its destination with every value
+/// it held (infinities and signed zero included), the other rows keep theirs,
+/// and a NaN reads out as the registry's one NaN. Read from the host, a bit
+/// move and a store of the widened value agree on every non-NaN value, so this
+/// checks where rows land and that no value changes, not that the copy moves
+/// bits.
 #[test]
-fn native_copies_f16_and_bf16_plane_rows_bit_exactly() {
+fn native_copies_f16_and_bf16_plane_rows_value_exactly() {
     for device in devices() {
-        native_copies_f16_and_bf16_plane_rows_bit_exactly_on(&device);
+        native_copies_f16_and_bf16_plane_rows_value_exactly_on(&device);
     }
 }
 
-fn native_copies_f16_and_bf16_plane_rows_bit_exactly_on(device: &seismic::Device) {
-    // Deliberately include NaNs, infinities, signed zero, and ordinary values:
-    // copy_rows moves dense state packets and must never numerically convert them.
+fn native_copies_f16_and_bf16_plane_rows_value_exactly_on(device: &seismic::Device) {
+    // NaNs, infinities, signed zero and ordinary values.
     let f16 = [
         0x0000, 0x8000, 0x3c00, 0xbc00, 0x7c00, 0xfc00, 0x7e01, 0x3555, 0x0400, 0x7bff, 0x1234,
         0xabcd, 0x0101, 0x0202, 0x0303, 0x0404, 0x0505, 0x0606, 0x0707, 0x0808, 0x0909, 0x0a0a,
@@ -278,9 +293,9 @@ fn native_copy_across_slab_boundary_on(device: &seismic::Device) {
     let to =
         seismic::Tensor::from_host(&device, seismic::Element::i32(), &[1], &2_i32.to_le_bytes())
             .unwrap();
-    copy_rows::native_for_device_with(
+    declared::prepared(
         &device,
-        copy_rows::Elements { A: element },
+        &copy_rows::native_entry_with(copy_rows::Elements { A: element }),
         &seismic::NativeSpecialization::new(),
     )
     .unwrap()

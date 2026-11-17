@@ -1,0 +1,807 @@
+//! The engine loaded in process and driven through its executor domain,
+//! below the scheduler: every step's operations are chosen by the harness,
+//! and every step can be traced per device submission.
+
+use crate::artifacts::Artifacts;
+use magnitude_artifacts::InputLayout;
+use magnitude_engine::composition::{
+    EngineConfiguration, ResolvedEngineConfiguration, load_in_process,
+};
+use magnitude_engine::load_native_domain;
+use magnitude_engine::options::{
+    ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection, ResolvedMethod,
+};
+use magnitude_executor::platform::{DeviceRequest, ReleaseRate};
+use magnitude_executor::{
+    Demand, DomainError, ExecutionPath, ExecutorDomain, NumericalProfile, Operation, Outcome,
+    PhysicalDecision, ProgramFamily, RequestId, ReservedResources, ResumeState, Sampling, SelectSpec,
+    Shaping, StateBindings, TokenId, TuningSettings, WorkKind,
+};
+use magnitude_family_contracts::PreparedModelInput;
+use magnitude_scheduler::owner::{BetweenFlights, MemoryHost, between_flights, relieve};
+use magnitude_scheduler::ServiceLimits;
+use magnitude_state::KvCodec;
+use seismic::{SubmissionTrace, TracedSubmission, host_seconds};
+use std::cell::Cell;
+use std::path::PathBuf;
+
+/// Rows of one prefill forward, as the service bounds them.
+pub const PREFILL_ROWS: usize = magnitude_executor::EVALUATION_PREFILL_ROWS;
+
+/// How every load of one run is made.
+pub struct EngineOptions {
+    pub cache_dir: Option<PathBuf>,
+    pub device: DeviceRequest,
+    /// The host's KV policy, when named (`ModelPolicy::kv_codec`).
+    pub kv_codec: Option<KvCodec>,
+    pub numerical_profile: Option<NumericalProfile>,
+    /// The bound on each load's weights: a cap on every weight byte, or the
+    /// device's room alone (`ModelPolicy::weight_bound`).
+    pub weight_bound: Option<magnitude_executor::WeightBound>,
+    pub budget: std::time::Duration,
+    /// Search afresh in the Prepare of the run's first load. Later loads of
+    /// the run reuse what it stored, as any later load would.
+    pub fresh: Cell<bool>,
+    /// The run's tuning trace; every Prepare and every load appends to it.
+    pub tuning_trace: PathBuf,
+    /// Arguments of this executable's worker role besides its subcommand:
+    /// the development tools that belong to a model's Prepare.
+    pub worker_arguments: Vec<std::ffi::OsString>,
+}
+
+impl EngineOptions {
+    /// The tuning settings of the run's next load.
+    fn tuning(&self) -> TuningSettings {
+        TuningSettings {
+            budget: self.budget,
+            fresh: self.fresh.replace(false),
+        }
+    }
+}
+
+/// What one load serves.
+pub struct Load {
+    /// How the load generates: `Plain` the target alone, else the engine's own selection of a drafter.
+    pub method: ModelMethod,
+    pub proposals: Option<u8>,
+    pub context_tokens: usize,
+    /// Sequences the load holds at once, each up to `context_tokens`: the
+    /// plan charges their state (`ServiceLimits::conversations`).
+    pub sequences: std::num::NonZeroUsize,
+    /// Rows one decode step may carry: concurrent sequences times their width.
+    pub decode_rows: usize,
+    /// Rows one launch exports full logits for; zero loads as served.
+    pub exported_logits_rows: usize,
+    pub lookahead: bool,
+}
+
+/// Resolve the catalog model for `load`, as the engine's host would.
+pub fn configuration(
+    artifacts: &Artifacts,
+    options: &EngineOptions,
+    load: &Load,
+) -> Result<ResolvedEngineConfiguration, String> {
+    let separate = |named: bool| match (&artifacts.drafter, named) {
+        (Some(drafter), _) => Ok(Some(drafter.path.clone())),
+        (None, false) => Ok(None),
+        (None, true) => Err(format!("{} declares no drafter", artifacts.model)),
+    };
+    // A separate draft is loaded where the method takes one: `Auto` takes the catalog's when it has one (else its
+    // draft head), a method naming a separate draft's variant requires it, and the others take none.
+    let draft = match (load.method, load.method.draft_variant()) {
+        (ModelMethod::Auto, _) => separate(false)?,
+        (_, Some(_)) => separate(true)?,
+        (_, None) => None,
+    };
+    // The machine's figures live in the kernel cache, keyed by its host.
+    let topology = match &options.cache_dir {
+        Some(_) => Some(seismic::Devices::discover(&[]).map_err(|error| error.to_string())?.topology()),
+        None => None,
+    };
+    let release = ReleaseRate::of_machine(options.cache_dir.as_deref().zip(topology.as_deref()));
+    let mut resolved = EngineConfiguration {
+        package: PackageOptions {
+            target: artifacts.target.clone(),
+            projector: ProjectorSelection::Disabled,
+            draft,
+        },
+        model: ModelPolicy {
+            draft_policy: None,
+            method: load.method,
+            mtp_proposals: load.proposals,
+            kv_codec: options.kv_codec,
+            lookahead: load.lookahead,
+            exported_logits_rows: load.exported_logits_rows,
+            numerical_profile: options.numerical_profile.clone(),
+            weight_bound: options.weight_bound,
+        },
+        context_tokens: Some(load.context_tokens),
+        service: ServiceLimits {
+            prefill_tokens: PREFILL_ROWS,
+            decode_tokens: load.decode_rows,
+            decode_share: 0.5,
+            locality_seconds: 1.0,
+            conversations: load.sequences,
+        },
+        path: ExecutionPath::Native,
+        device: options.device,
+        kernel_cache: options.cache_dir.clone(),
+        release,
+    }
+    .resolve()
+    .map_err(|error| error.to_string())?;
+    resolved.manifest.tuning = options.tuning();
+    resolved.manifest.tuning_trace = Some(options.tuning_trace.clone());
+    Ok(resolved)
+}
+
+/// The subcommand this executable runs the engine's worker under.
+pub const WORKER_COMMAND: &str = "worker";
+
+/// This executable in its worker role, with `arguments`: what a load starts
+/// for the model's Prepare when it finds tuning units without a stored
+/// record, and what `memory` loads in.
+pub fn worker(arguments: &[std::ffi::OsString]) -> Result<std::process::Command, String> {
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("locating the harness executable: {error}"))?;
+    let mut worker = std::process::Command::new(executable);
+    worker.arg(WORKER_COMMAND).args(arguments);
+    Ok(worker)
+}
+
+/// The paths a load of `artifacts` serves: the target's directory.
+fn served_paths(artifacts: &Artifacts) -> Result<Vec<PathBuf>, String> {
+    let directory = std::path::absolute(&artifacts.target)
+        .map_err(|error| error.to_string())?
+        .parent()
+        .ok_or_else(|| format!("{} has no directory", artifacts.target.display()))?
+        .to_path_buf();
+    Ok(vec![directory])
+}
+
+/// The machine a load of `resolved` serves on, discovered with the paths
+/// of `artifacts`, and the executor the load selects, by the records of the
+/// kernel cache at `root`.
+fn selected_machine(
+    artifacts: &Artifacts,
+    resolved: &magnitude_engine::composition::ResolvedEngineConfiguration,
+    root: &std::path::Path,
+) -> Result<(Vec<PathBuf>, seismic::Devices, magnitude_executor::platform::SelectedDevice), String> {
+    let manifest = &resolved.manifest;
+    let paths = served_paths(artifacts)?;
+    let catalog = seismic::Devices::discover(&paths).map_err(|error| error.to_string())?;
+    let selected = magnitude_executor::platform::select_recorded(&catalog, manifest.path, manifest.device, &manifest.release, Some(root))
+        .map_err(|error| error.to_string())?;
+    Ok((paths, catalog, selected))
+}
+
+/// Run the measurement job's probes of the device a load of `load` selects
+/// (`worker::measure::probe_machine`), each in a probe process of this
+/// executable, so the device's probed properties are measured before a
+/// check reads them; reports each result and each probe that kept none.
+/// Needs a kernel cache, whose records select the device; the results are
+/// kept in the process's program store (`seismic::ProgramStore::user`).
+pub fn probe(artifacts: &Artifacts, options: &EngineOptions, load: &Load) -> Result<(), String> {
+    let resolved = configuration(artifacts, options, load)?;
+    let root = resolved.manifest.kernel_cache.as_ref().ok_or("probing needs a kernel cache (--cache-dir)")?;
+    let (paths, _, selected) = selected_machine(artifacts, &resolved, root)?;
+    let run = magnitude_engine::worker::measure::probe_machine(
+        &paths,
+        selected.info.selector(),
+        std::time::Duration::from_secs_f64(magnitude_executor::assessment::MEASUREMENT_SECONDS),
+    )?;
+    for kept in &run.kept {
+        eprintln!("magnitude-harness: probe {}: {}\n{}", kept.probe, kept.result.line(), kept.report);
+    }
+    for failure in &run.failures {
+        eprintln!("magnitude-harness: {failure}");
+    }
+    Ok(())
+}
+
+/// The model's Prepare alone, as a load that found tuning records missing
+/// runs it: its search, in a worker process of this executable, publishing
+/// records to the kernel cache, with nothing imported or loaded here.
+pub fn prepare(artifacts: &Artifacts, options: &EngineOptions, load: &Load) -> Result<(), String> {
+    use magnitude_engine::worker::Preparation;
+    let resolved = configuration(artifacts, options, load)?;
+    let command = worker(&options.worker_arguments)?;
+    match magnitude_engine::composition::prepare_in_process(&resolved.manifest, command, |_| {})
+        .map_err(|error| error.to_string())?
+    {
+        Preparation::Prepared | Preparation::Unneeded => Ok(()),
+        Preparation::Unshared => Err("a Prepare needs a kernel cache (--cache-dir)".into()),
+        Preparation::Incomplete(error) => Err(format!("the Prepare did not finish: {error}")),
+    }
+}
+
+/// Run the measurement job, by its own code (`worker::measure`), until the
+/// executor's costs and then the points a load of `resolved` waits on are
+/// recorded: no job runs beside the harness, and a cell times what a served
+/// load is once its job has run. The load's points come of its plan, which
+/// prices its holdings on the standing figures, so those settle first, as
+/// every load in its own process settles them (`composition::settle_prices`).
+/// The rest stops early only where the jobs' time gives no next job before
+/// one measures (`worker::measure::JobTime`), reporting why, and the load
+/// then serves what is pending as any load does. Nothing to do without a
+/// kernel cache.
+fn settle_measurements(artifacts: &Artifacts, resolved: &magnitude_engine::composition::ResolvedEngineConfiguration) -> Result<(), String> {
+    use magnitude_engine::worker::measure::{InProcessJobs, JobsStopped};
+    let manifest = &resolved.manifest;
+    let Some(root) = &manifest.kernel_cache else {
+        return Ok(());
+    };
+    magnitude_engine::composition::settle_prices(manifest).map_err(|error| error.to_string())?;
+    let (paths, catalog, _) = selected_machine(artifacts, resolved, root)?;
+    let catalog = std::rc::Rc::new(catalog);
+    magnitude_engine::request_load_points(&catalog, manifest, resolved.host.package()).map_err(|error| error.to_string())?;
+    let mut jobs = InProcessJobs::of_load(&catalog, paths, manifest)?.expect("a load with a kernel cache has jobs");
+    let mut left = jobs.outstanding()?;
+    while !left.is_empty() {
+        match jobs.run() {
+            Ok(run) => left = run.outstanding,
+            Err(stopped @ JobsStopped::Stalled { .. }) => {
+                eprintln!("magnitude-harness: not measured: {stopped}");
+                break;
+            }
+            Err(stopped) => return Err(stopped.to_string()),
+        }
+    }
+    Ok(())
+}
+
+pub struct Engine {
+    pub(crate) domain: ExecutorDomain,
+    /// The domain's state bindings while no flight carries them.
+    pub(crate) bindings: Option<StateBindings>,
+    device: seismic::Device,
+    pub vocabulary: usize,
+    /// The loaded generation method: which drafter, if any, and its width.
+    pub method: ResolvedMethod,
+    next_request: u64,
+    /// Under cross-step pipelining a step's submissions are traced during
+    /// the previous step, so traces are collected per window.
+    pub lookahead: bool,
+    /// Where a streamed load's experts are stored in the served file
+    /// ([`expert_ranges`]); none of a load that holds its experts whole.
+    expert_ranges: Vec<FileRange>,
+    /// The load's memory between steps, which the scheduler's one memory
+    /// step owns ([`magnitude_scheduler::owner::between_flights`]), on the
+    /// clock from its open.
+    memory: BetweenFlights,
+    opened: std::time::Instant,
+}
+
+/// What the scheduler's memory step runs on below it: a domain, its memory
+/// between steps and the clock then, and no request the step would touch:
+/// no wait retries on an availability change, no prefix is retained, no
+/// request is preempted or refused, and an unload ends the run.
+struct Unrequested<'a, F: ProgramFamily> {
+    domain: &'a mut magnitude_executor::ExecutorDomain<F>,
+    memory: &'a mut BetweenFlights,
+    now: u64,
+}
+
+impl<F: ProgramFamily> MemoryHost for Unrequested<'_, F> {
+    type Family = F;
+
+    fn domain(&mut self) -> &mut magnitude_executor::ExecutorDomain<F> {
+        self.domain
+    }
+
+    fn memory(&mut self) -> &mut BetweenFlights {
+        self.memory
+    }
+
+    fn now(&self) -> u64 {
+        self.now
+    }
+
+    /// The harness drives each step to its end itself: a resize's wake
+    /// needs no waiter, as the next step's boundary advances it.
+    fn completion(&self) -> magnitude_executor::CompletionWake {
+        magnitude_executor::CompletionWake::new(|| {})
+    }
+
+    fn advance_epoch(&mut self) {}
+
+    fn unload(&mut self) {}
+
+    fn evict_owed_prefixes(&mut self) -> bool {
+        false
+    }
+
+    fn prefix_value(&self) -> Option<(u64, u64)> {
+        None
+    }
+
+    /// The run's sequences are its own: none is evicted, so no relief
+    /// names one.
+    fn evictable(&self) -> std::collections::BTreeSet<RequestId> {
+        std::collections::BTreeSet::new()
+    }
+
+    fn preempt(&mut self, sequences: &[RequestId]) -> Result<(), magnitude_scheduler::publication::RequestError> {
+        panic!("invariant violated: a relief names the harness's sequences {sequences:?}, none of which is evictable")
+    }
+}
+
+/// The boundary after a step, as the scheduler's owner runs it after
+/// reconciling a flight: its one memory step at `now` on the service clock
+/// (memory read, the expert bank's resize advanced and its derived target
+/// followed), on the bindings the step returned.
+fn between_steps<F: ProgramFamily>(
+    domain: &mut magnitude_executor::ExecutorDomain<F>,
+    memory: &mut BetweenFlights,
+    bindings: &mut StateBindings,
+    now: u64,
+) -> Result<(), String> {
+    let mut host = Unrequested { domain, memory, now };
+    match between_flights(&mut host, Some(bindings)).map_err(|error| error.to_string())? {
+        true => Err("the memory guarantee could not be kept: the model would unload".into()),
+        false => Ok(()),
+    }
+}
+
+/// One open request and its accepted position.
+pub struct Sequence {
+    pub request: RequestId,
+    pub position: usize,
+    /// The token the last step selected.
+    pub selected: Option<TokenId>,
+}
+
+/// A sequence's accepted state and selection, which sequences open from
+/// as it stood ([`Engine::open_from`]), as the service resumes a cached
+/// prefix.
+pub struct Checkpoint {
+    state: ResumeState,
+    selected: Option<TokenId>,
+}
+
+/// Host and device times of one step. All times are `seismic::host_seconds`.
+pub struct Step {
+    pub start: f64,
+    pub submitted: f64,
+    pub finished: f64,
+    /// When its outcomes were reconciled, before the work between steps.
+    pub reconciled: f64,
+    pub end: f64,
+    pub submissions: Vec<TracedSubmission>,
+}
+
+/// A domain error as the harness reports it.
+pub fn text(error: DomainError) -> String {
+    error.to_string()
+}
+
+impl Engine {
+    /// What the device's graphs cost serving so far
+    /// (`ExecutorDomain::graph_replays`).
+    pub fn graph_replays(&self) -> seismic::GraphReplays {
+        self.domain.graph_replays()
+    }
+
+    pub fn open(
+        artifacts: &Artifacts,
+        options: &EngineOptions,
+        load: &Load,
+    ) -> Result<Self, String> {
+        let resolved = configuration(artifacts, options, load)?;
+        settle_measurements(artifacts, &resolved)?;
+        let vocabulary = usize::try_from(resolved.manifest.definition.decoder.vocabulary)
+            .map_err(|_| "vocabulary exceeds the host domain")?;
+        let method = resolved.manifest.model.method;
+        let (domain, bindings, _) = load_in_process(
+            &resolved.manifest,
+            |unprepared| {
+                load_native_domain(
+                    &resolved.manifest,
+                    resolved.host.shared_package(),
+                    unprepared,
+                )
+            },
+            worker(&options.worker_arguments)?,
+            |_| {},
+        )
+        .map_err(|error| error.to_string())?;
+        let device = domain.resources().device().clone();
+        let expert_ranges = expert_ranges(domain.expert_bank_plan(), resolved.host.package().target())?;
+        Ok(Self {
+            domain,
+            bindings: Some(bindings),
+            device,
+            vocabulary,
+            method,
+            next_request: 1,
+            lookahead: load.lookahead,
+            expert_ranges,
+            memory: BetweenFlights::new(),
+            opened: std::time::Instant::now(),
+        })
+    }
+
+    /// How many pages of the load's expert stacks the file cache holds now,
+    /// of how many (the OS's own answer, `mincore`): a streamed load reads
+    /// its experts past the cache, so any it holds served a read from it.
+    pub fn cached_expert_pages(&self) -> Result<(u64, u64), String> {
+        cached_pages(&self.expert_ranges)
+    }
+
+    pub fn device(&self) -> &seismic::Device {
+        &self.device
+    }
+
+    /// [`between_steps`] after a step, on the clock from the load's open.
+    pub(crate) fn between_steps(&mut self) -> Result<(), String> {
+        let now = u64::try_from(self.opened.elapsed().as_nanos()).map_err(|_| "the run outlasts the clock")?;
+        let bindings = self.bindings.as_mut().expect("no flight holds the state bindings");
+        between_steps(&mut self.domain, &mut self.memory, bindings, now)
+    }
+
+    pub(crate) fn bindings(&mut self) -> StateBindings {
+        self.bindings
+            .take()
+            .expect("no flight holds the state bindings")
+    }
+
+    pub fn open_sequence(&mut self) -> Result<Sequence, String> {
+        Ok(Sequence { request: self.open_request(None)?, position: 0, selected: None })
+    }
+
+    /// A request opened with fresh state, or `from`'s.
+    fn open_request(&mut self, from: Option<&ResumeState>) -> Result<RequestId, String> {
+        let request = RequestId(self.next_request);
+        self.next_request += 1;
+        self.domain
+            .install_input(request, PreparedModelInput::continuation_only())?;
+        let bindings = self
+            .bindings
+            .as_mut()
+            .expect("no flight holds the state bindings");
+        // The harness runs no chain between its steps. A sequence opens
+        // holding the rows it resumes and a launch's rows ahead, as the
+        // service's requests do; its steps reserve ahead as they go
+        // ([`Self::provision`]).
+        let unchained = self.domain.unchained(bindings).expect("no chain is under way between the harness's steps");
+        let rows = from.map_or(0, ResumeState::position) as u64;
+        self.domain.open_state(unchained, request, from, rows).map_err(text)?;
+        Ok(request)
+    }
+
+    /// Prefetch the stored-table rows the sequence reads as it feeds
+    /// `tokens` from its position (`ExecutorDomain::prefetch_prompt`), and
+    /// wait until the tables have taken them: what a step then reads after it
+    /// is queued is what no prefetch held.
+    pub fn prefetch(&self, sequence: &Sequence, tokens: &[TokenId]) -> Result<(), String> {
+        for prefetched in self.domain.prefetch_prompt(sequence.request, sequence.position, tokens)? {
+            prefetched.wait();
+        }
+        Ok(())
+    }
+
+    /// The sequence's accepted state and selection ([`Checkpoint`]).
+    pub fn checkpoint(&self, sequence: &Sequence) -> Result<Checkpoint, String> {
+        Ok(Checkpoint { state: self.domain.resume_state(sequence.request)?, selected: sequence.selected })
+    }
+
+    /// A sequence opened from `checkpoint`: its state, position and
+    /// selection as the checkpoint's sequence stood.
+    pub fn open_from(&mut self, checkpoint: &Checkpoint) -> Result<Sequence, String> {
+        Ok(Sequence {
+            request: self.open_request(Some(&checkpoint.state))?,
+            position: checkpoint.state.position(),
+            selected: checkpoint.selected,
+        })
+    }
+
+    pub fn close(&mut self, sequence: Sequence) -> Result<(), String> {
+        self.domain.close(sequence.request)
+    }
+
+    pub fn greedy(position: usize) -> SelectSpec {
+        SelectSpec {
+            sampling: Sampling::Greedy,
+            seed: 0,
+            position,
+            domain: 0,
+            mask: None,
+            shaping: Shaping::default(),
+            history: None,
+        }
+    }
+
+    /// A forward of `tokens` at the sequence's position. `SELECT` selects
+    /// greedily from the last row (a decode, or a finishing prefill).
+    pub fn forward(
+        sequence: &Sequence,
+        kind: WorkKind,
+        tokens: Vec<TokenId>,
+        demand: Demand,
+    ) -> Operation {
+        Self::forward_at(sequence, sequence.position, kind, tokens, demand)
+    }
+
+    /// [`Self::forward`] at `position`.
+    fn forward_at(
+        sequence: &Sequence,
+        position: usize,
+        kind: WorkKind,
+        tokens: Vec<TokenId>,
+        demand: Demand,
+    ) -> Operation {
+        let last = position + tokens.len() - 1;
+        let select = if demand.contains(Demand::SELECT) {
+            vec![Self::greedy(last)]
+        } else {
+            Vec::new()
+        };
+        let committed = tokens.len();
+        Operation::Forward {
+            request: sequence.request,
+            kind,
+            tokens,
+            position,
+            conditioning: None,
+            demand,
+            select,
+            committed,
+            prime: None,
+        }
+    }
+
+    /// Plan the prompt chunks after the sequence's next one as the owner
+    /// does before submitting a lone prompt chunk
+    /// (`ExecutorDomain::plan_prompt`, no decode waiting here), the
+    /// prompt's grouping (`InputLayout::group_chunks`) forming them. `rest`
+    /// is the prompt from the sequence's position; its last chunk selects
+    /// when `select`. Nothing is planned while a chain is queued: its chunks
+    /// are claimed.
+    pub fn plan_prompt(
+        &mut self,
+        sequence: &Sequence,
+        rest: &[TokenId],
+        select: bool,
+    ) -> Result<(), String> {
+        if self.domain.chain_holder().is_some() {
+            return Ok(());
+        }
+        self.domain.plan_prompt(None, true, true, |chunks| {
+            let grouped = InputLayout::new(rest.len(), Vec::new())?
+                .group_chunks(PREFILL_ROWS.min(rest.len()), PREFILL_ROWS, None, chunks)?;
+            Ok(grouped
+                .into_iter()
+                .map(|chunk| {
+                    let demand = match select && chunk.end == rest.len() {
+                        true => Demand::SELECT,
+                        false => Demand::NONE,
+                    };
+                    let position = sequence.position + chunk.start;
+                    let tokens = rest[chunk].to_vec();
+                    Self::forward_at(sequence, position, WorkKind::Prefill, tokens, demand)
+                })
+                .collect())
+        })
+    }
+
+    /// Submit one group of target forwards, wait, commit every row and
+    /// advance the sequences. Returns the step's timings (submissions from
+    /// `trace`, when given) and the outcomes in operation order.
+    /// A step a late pulse interrupted is aborted and run again from its
+    /// accepted state, as the scheduler's rounds are.
+    pub fn step(
+        &mut self,
+        operations: Vec<Operation>,
+        sequences: &mut [&mut Sequence],
+        trace: Option<&SubmissionTrace>,
+    ) -> Result<(Step, Vec<Outcome>), String> {
+        loop {
+            if let Some(step) = self.attempt(operations.clone(), sequences, trace)? {
+                return Ok(step);
+            }
+        }
+    }
+
+    /// Provision `operations` as the service's owner does, so the step's
+    /// reservation takes nothing more: a growth of a sequence's reservation
+    /// short of memory is relieved through the scheduler's one relief path,
+    /// taking cache alone (the run's sequences are never preempted), and
+    /// waits at the next boundary for a shrink that relief owes it.
+    pub(crate) fn provision(&mut self, bindings: &mut StateBindings, operations: &[Operation]) -> Result<(), String> {
+        loop {
+            let first = self.domain.provision(bindings, operations, None);
+            let now = u64::try_from(self.opened.elapsed().as_nanos()).map_err(|_| "the run outlasts the clock")?;
+            let mut host = Unrequested { domain: &mut self.domain, memory: &mut self.memory, now };
+            let relieved = relieve(&mut host, bindings, first, false, |host, bindings| {
+                Ok(host.domain().provision(bindings, operations, None))
+            })
+            .map_err(|error| error.to_string())?;
+            match relieved.current {
+                Ok(()) => return Ok(()),
+                Err(magnitude_executor::DomainError::Capacity(_)) if relieved.pending => {
+                    between_steps(&mut self.domain, &mut self.memory, bindings, now)?;
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+    }
+
+    /// One submission of `step`'s forwards: none where the flight was
+    /// interrupted, its outcomes aborted.
+    fn attempt(
+        &mut self,
+        operations: Vec<Operation>,
+        sequences: &mut [&mut Sequence],
+        trace: Option<&SubmissionTrace>,
+    ) -> Result<Option<(Step, Vec<Outcome>)>, String> {
+        let mut bindings = self.bindings();
+        let start = host_seconds();
+        self.provision(&mut bindings, &operations)?;
+        let ReservedResources::Target(reservation) = self
+            .domain
+            .reserve(&mut bindings, &operations)
+            .map_err(text)?
+            .into_resources()
+        else {
+            return Err("a forward step runs on the target lane".into());
+        };
+        let flight = self
+            .domain
+            .submit_target(bindings, &operations, reservation)
+            .map_err(|failure| failure.error().to_string())?;
+        let submitted = host_seconds();
+        let (pending, bindings) = self.domain.finish_target(flight).map_err(text)?;
+        self.bindings = Some(bindings);
+        let finished = host_seconds();
+        if pending.len() != sequences.len() {
+            return Err("step outcomes differ from its sequences".into());
+        }
+        // A flight is interrupted whole, and a forward step's state stays
+        // resident: only a prefill chain's chunk releases it.
+        if pending.iter().any(|pending| matches!(pending.outcome(), Outcome::Interrupted { .. })) {
+            for pending in pending {
+                if !matches!(pending.outcome(), Outcome::Interrupted { resident: true, .. }) {
+                    return Err("a step's flight was interrupted in part, or released its state".into());
+                }
+                self.domain.abort(pending).map_err(text)?;
+            }
+            return Ok(None);
+        }
+        let mut outcomes = Vec::with_capacity(pending.len());
+        for (pending, sequence) in pending.into_iter().zip(sequences.iter_mut()) {
+            if pending.request() != sequence.request {
+                return Err("step outcome order differs from its sequences".into());
+            }
+            if let Outcome::Forward { rows } = pending.outcome() {
+                sequence.selected = rows
+                    .last()
+                    .and_then(|row| row.selected)
+                    .map(|row| row.token);
+            }
+            outcomes.push(pending.outcome().clone());
+            let rows = pending.rows();
+            self.domain
+                .reconcile(
+                    pending,
+                    PhysicalDecision {
+                        accepted_rows: rows,
+                    },
+                )
+                .map_err(text)?;
+            sequence.position += rows;
+        }
+        let reconciled = host_seconds();
+        self.between_steps()?;
+        let end = host_seconds();
+        let submissions = trace
+            .map(|trace| trace.collect().map_err(|error| error.to_string()))
+            .transpose()?
+            .unwrap_or_default();
+        Ok(Some((
+            Step {
+                start,
+                submitted,
+                finished,
+                reconciled,
+                end,
+                submissions,
+            },
+            outcomes,
+        )))
+    }
+
+    /// Accept `tokens` from the sequence's position in prefill chunks, as the
+    /// service runs a prompt. The last chunk selects when `select`.
+    pub fn prefill(
+        &mut self,
+        sequence: &mut Sequence,
+        tokens: &[TokenId],
+        select: bool,
+    ) -> Result<(), String> {
+        let chunks = tokens.chunks(PREFILL_ROWS).collect::<Vec<_>>();
+        for (index, chunk) in chunks.iter().enumerate() {
+            let demand = if select && index + 1 == chunks.len() {
+                Demand::SELECT
+            } else {
+                Demand::NONE
+            };
+            self.plan_prompt(sequence, &tokens[index * PREFILL_ROWS..], select)?;
+            let operation = Self::forward(sequence, WorkKind::Prefill, chunk.to_vec(), demand);
+            self.step(vec![operation], &mut [&mut *sequence], None)?;
+        }
+        Ok(())
+    }
+}
+
+/// A range of a file: its path, and the offset and bytes of the range.
+pub type FileRange = (PathBuf, u64, u64);
+
+/// The distinct ranges of the served file a streamed load's experts are
+/// stored in under its bank `bank` (none for a load that streams nothing),
+/// in order: two stacks of row ranges of one stored tensor lie in one.
+pub fn expert_ranges(
+    bank: Option<&magnitude_executor::ExpertBankPlan>,
+    artifact: &magnitude_artifacts::gguf::GgufArtifact,
+) -> Result<Vec<FileRange>, String> {
+    let mut ranges = std::collections::BTreeSet::new();
+    for layer in bank.map(|bank| bank.stored_stacks(artifact)).transpose()?.into_iter().flatten() {
+        for stack in layer {
+            ranges.extend(stack.file_ranges());
+        }
+    }
+    Ok(ranges.into_iter().collect())
+}
+
+/// The pages of `ranges` the file cache holds, and all their pages.
+pub fn cached_pages(ranges: &[FileRange]) -> Result<(u64, u64), String> {
+    ranges.iter().try_fold((0, 0), |(cached, pages), (path, offset, bytes)| {
+        let (held, all) = seismic_io::cached_pages(path, *offset, *bytes)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        Ok((cached + held, pages + all))
+    })
+}
+
+pub fn tokens(ids: &[u32]) -> Vec<TokenId> {
+    ids.iter().copied().map(TokenId).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use magnitude_executor::fixtures::{bank_backends, banked, count_decode, host_tier, measure_load, misses_at};
+
+    /// A capped load on a discrete-shaped device, its bank whole on the
+    /// device and a host tier beside it, grows that tier across the
+    /// harness's step boundaries as the owner's do: the ledger derives the
+    /// tier's target from the reading and the first boundary takes one step
+    /// to every expert (the tier is the inclusive copy every miss reaches,
+    /// priced by no record), and no further. No timer holds the growth back:
+    /// room the reading shows is room it takes. On every backend discovery
+    /// reports available.
+    #[test]
+    fn a_capped_load_grows_its_host_tier_across_step_boundaries() {
+        for backend in bank_backends() {
+            let (mut domain, mut bindings) = banked(backend, 2, 2);
+            host_tier(&mut domain, 4);
+            let decode = misses_at(4, 100);
+            count_decode(&mut domain, decode);
+            measure_load(&mut domain, &mut bindings);
+            let host_slots = |domain: &magnitude_executor::ExecutorDomain<_>| {
+                domain.expert_residency().unwrap().unwrap().host.unwrap().slots
+            };
+            let mut memory = BetweenFlights::new();
+            // A boundary every 200 ms of the service clock, past the memory
+            // observation interval, for 12 s.
+            let slots = std::iter::once(host_slots(&domain))
+                .chain((0..60u64).map(|boundary| {
+                    between_steps(&mut domain, &mut memory, &mut bindings, boundary * 200_000_000).unwrap();
+                    host_slots(&domain)
+                }))
+                .collect::<Vec<_>>();
+            assert_eq!(slots[1], 4, "the first boundary grows to every expert: {slots:?}");
+            assert_eq!(slots.last(), Some(&4), "grown to every expert: {slots:?}");
+            let grown = slots.windows(2).filter(|pair| pair[1] != pair[0]).count();
+            assert_eq!(grown, 1, "one step: {slots:?}");
+        }
+    }
+}

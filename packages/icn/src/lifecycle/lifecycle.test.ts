@@ -24,6 +24,8 @@ import {
   IcnLifecycleConfig,
   IcnStorageConfig,
   renderIcnArguments,
+  icnChildEnvironment,
+  writeLocalModelsConfiguration,
   IcnPreparationReporter,
 } from "./index.js";
 
@@ -43,7 +45,8 @@ const config = (host: "127.0.0.1" | "::1" = "127.0.0.1") =>
     storage: new IcnStorageConfig({
       modelStore: Option.some("/data/models"),
       cacheRoot: Option.some("/data/cache"),
-      huggingFaceCaches: ["/read-only/hf"],
+      localModelsConfigurationFile: "/data/cache/local-models-configuration.json",
+      localModels: { roots: [], added: [], hidden: [], drafters: [] },
     }),
     host,
     startupTimeout: Duration.seconds(30),
@@ -51,6 +54,7 @@ const config = (host: "127.0.0.1" | "::1" = "127.0.0.1") =>
     forceShutdownTimeout: Duration.seconds(2),
     outputLimitBytes: 64 * 1024,
     logFile: Option.none(),
+    echoOutput: false,
   });
 
 describe("ICN managed launch", () => {
@@ -88,11 +92,43 @@ describe("ICN managed launch", () => {
       "/data/models",
       "--cache-root",
       "/data/cache",
-      "--hf-cache",
-      "/read-only/hf",
+      "--local-models-config",
+      "/data/cache/local-models-configuration.json",
     ]);
     expect(args).not.toContain("--model");
     expect(args).not.toContain("--context-size");
+  });
+
+  it("never gives ICN a Hugging Face token through its environment", () => {
+    const environment = icnChildEnvironment({}, "secret", {})
+    expect(environment.HF_HUB_DISABLE_IMPLICIT_TOKEN).toBe("1")
+    expect(environment).not.toHaveProperty("HF_TOKEN")
+  });
+
+  it("writes the local-models snapshot named at spawn", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "icn-local-models-config-"));
+    try {
+      const file = join(directory, "nested", "local-models.json");
+      await Effect.runPromise(writeLocalModelsConfiguration(new IcnStorageConfig({
+        modelStore: Option.none(),
+        cacheRoot: Option.none(),
+        localModelsConfigurationFile: file,
+        localModels: {
+          roots: [{ kind: "Ollama", path: "/models/ollama", enabled: false }],
+          added: [],
+          hidden: ["hf:owner/repo/model.gguf"],
+          drafters: [],
+        },
+      })).pipe(Effect.provide(BunContext.layer)));
+      expect(JSON.parse(await Bun.file(file).text())).toEqual({
+        roots: [{ kind: "Ollama", path: "/models/ollama", enabled: false }],
+        added: [],
+        hidden: ["hf:owner/repo/model.gguf"],
+        drafters: [],
+      });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 
   it("brackets IPv6 loopback while retaining port zero", () => {
