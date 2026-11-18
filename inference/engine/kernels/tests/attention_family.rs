@@ -9,8 +9,7 @@
 //
 // A host model of the portable body is checked against the reference
 // interpreter at small shapes and stands for it at the others. Natives run on
-// the backends named by ATTENTION_BACKENDS (a comma list of metal, cuda,
-// vulkan and cpu; default: every backend the host opens).
+// every backend the host has, or the one SEISMIC_TEST_BACKEND requests.
 #![allow(dead_code)]
 
 mod common;
@@ -812,28 +811,16 @@ fn portable(entry: &str, case: &Case) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
 // ---------------------------------------------------------------------------
 // Devices.
 
+/// Every backend the host has, or a requested one alone
+/// ([`seismic_native_tests::devices`]).
 fn devices() -> Vec<Device> {
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    let names =
-        std::env::var("ATTENTION_BACKENDS").unwrap_or_else(|_| "metal,cuda,vulkan,cpu".into());
-    names
-        .split(',')
-        .filter_map(|name| {
-            let backend = match name.trim() {
-                "metal" => BackendName::Metal,
-                "cuda" => BackendName::Cuda,
-                "vulkan" => BackendName::Vulkan,
-                "cpu" => BackendName::Cpu,
-                other => panic!("ATTENTION_BACKENDS: unknown backend {other}"),
-            };
-            catalog.open_backend(backend).ok()
-        })
-        .collect()
+    use BackendName::{Cpu, Cuda, Metal, Vulkan};
+    seismic_native_tests::devices(&[Metal, Cuda, Vulkan, Cpu])
 }
 
 fn tensor(device: &Device, element: Element, shape: &[usize], bytes: Vec<u8>) -> Tensor {
     let shape = shape.iter().map(|x| *x as u64).collect::<Vec<_>>();
-    Tensor::from_host(device, element, &shape, &bytes).unwrap()
+    Tensor::from_host(&seismic::Charges::tally(device), element, &shape, &bytes).unwrap()
 }
 
 fn bf16_tensor(device: &Device, shape: &[usize], values: &[f32]) -> Tensor {
@@ -908,6 +895,7 @@ struct Bound {
 
 impl Bound {
     fn new(device: &Device, case: &Case) -> Self {
+        let charges = seismic::Charges::tally(device);
         let form = case.form;
         let (m, w, t, kv, heads) = (
             case.rows,
@@ -940,7 +928,7 @@ impl Bound {
             layouts.push(SlabLayout::for_regions(per, selected_rows_total, &[region()]).unwrap());
         }
         let pool = crate::common::slab_pool(device, &layouts);
-        let slabs = SlabTensor::in_pool(&pool, slab_rows, t as u64, &history_regions).unwrap();
+        let slabs = SlabTensor::in_pool(&charges, &pool, slab_rows, t as u64, &history_regions).unwrap();
         let row_bytes = kv * w * 2;
         let planes = stored.iter().map(|values| {
             values
@@ -978,7 +966,7 @@ impl Bound {
         let (selected_slabs, selected) = if selected_rows_total == 0 {
             (None, bf16_tensor(device, &[0, kv, w], &[]))
         } else {
-            let slabs = SlabTensor::in_pool(&pool, per, selected_rows_total, &[region()]).unwrap();
+            let slabs = SlabTensor::in_pool(&charges, &pool, per, selected_rows_total, &[region()]).unwrap();
             let bytes = case.selected.iter().flat_map(|v| bf16_bits(*v).to_le_bytes()).collect::<Vec<_>>();
             for index in 0..selected_rows_total.div_ceil(per) {
                 slabs.add_slab(seismic::SlabFill::Zeroed).unwrap();
@@ -1010,18 +998,18 @@ impl Bound {
             fresh: i32_tensor(device, &[m, 2], &case.fresh),
             destinations: i32_tensor(device, &[m], &case.destinations),
             selection: Tensor::from_host(
-                device,
+                &charges,
                 Element::u32(),
                 &[m as u64, case.selection_words as u64],
                 &case.selection.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>(),
             )
             .unwrap(),
-            block_slots: Tensor::from_host(device, Element::i32(), &[0, case.block_rows as u64], &[]).unwrap(),
+            block_slots: Tensor::from_host(&charges, Element::i32(), &[0, case.block_rows as u64], &[]).unwrap(),
             selected_rows: i32_tensor(device, &[m, case.picks], &case.selected_rows),
             selected,
             _selected_slabs: selected_slabs,
             form: Tensor::from_host(
-                device,
+                &charges,
                 Element::i32(),
                 &case.extents().map(|extent| extent as u64),
                 &[],
@@ -1539,11 +1527,12 @@ impl Attend {
     /// Runs the entry on `case`: the result and final histories.
     fn run(&self, device: &Device, case: &Case) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), String> {
         let mut bound = Bound::new(device, case);
+        let charges = seismic::Charges::tally(device);
         let rounding = case.rounding_scalars();
         macro_rules! call {
             ($kernel:expr, $module:ident $(, $extra:ident: $value:expr)*) => {{
                 $kernel
-                    .call($module::Args {
+                    .call(&charges, $module::Args {
                         $($extra: $value,)*
                         query: &bound.query,
                         gate: &bound.gate,
@@ -1603,15 +1592,16 @@ impl Attend {
             return self.run(device, case);
         };
         let mut earlier_bound = Bound::new(device, earlier);
+        let charges = seismic::Charges::tally(device);
         let mut bound = Bound::new(device, case);
         let earlier_rounding = earlier.rounding_scalars();
         let rounding = case.rounding_scalars();
         let shape = |c: &Case| [c.rows as u64, c.form.heads() as u64, c.form.w() as u64];
-        let mut earlier_out = Tensor::zeros(device, Element::bf16(), &shape(earlier))
+        let mut earlier_out = Tensor::zeros(&charges, Element::bf16(), &shape(earlier))
             .map_err(|error| format!("{error:?}"))?;
-        let mut result = Tensor::zeros(device, Element::bf16(), &shape(case))
+        let mut result = Tensor::zeros(&charges, Element::bf16(), &shape(case))
             .map_err(|error| format!("{error:?}"))?;
-        let mut batch = seismic::NativeTensorBatch::new(device);
+        let mut batch = seismic::NativeTensorBatch::new(&charges);
         macro_rules! push {
             ($kernel:expr, $module:ident, $c:expr, $b:expr, $r:expr, $out:expr $(, $extra:ident: $value:expr)*) => {{
                 batch
@@ -1866,6 +1856,7 @@ fn cpu_output_reads_the_operand_the_decode_emits() {
         return;
     };
     let device = &device;
+    let charges = seismic::Charges::tally(device);
     let case = Case::new(QWEN_SMALL, 64, decode_rows(5)[..1].to_vec(), 16, 1.0, 1.0 / (32f32).sqrt(), 11);
     let (heads, w, d) = (case.form.heads(), case.form.w(), 64usize);
     let q8 = Element::stored("q8g32s", device.backend().resident_layout()).unwrap();
@@ -1876,20 +1867,20 @@ fn cpu_output_reads_the_operand_the_decode_emits() {
             bytes.extend_from_slice(&seismic_lang::registry::f16_bits(1.0 / 64.0).to_le_bytes());
             bytes.extend((0..32).map(|value| ((((block * 32 + value) * 29 + 7) % 61) as i8 - 30) as u8));
         }
-        let source = Tensor::from_host(device, external, &[1, d as u64, (heads * w) as u64], &bytes).unwrap();
+        let source = Tensor::from_host(&charges, external, &[1, d as u64, (heads * w) as u64], &bytes).unwrap();
         let entry = repack_weight::native_entry_with(repack_weight::Elements { E: external, U: q8 });
         let specialization = declared::declared(device, &entry, |name| panic!("unexpected static {name}"), &[]).unwrap();
         entry
             .prepare(device, &specialization)
             .unwrap()
-            .call(repack_weight::Args { source: &source })
+            .call(&charges, repack_weight::Args { source: &source })
             .unwrap()
             .value
             .reshape(&[d as u64, (heads * w) as u64])
             .unwrap()
     };
     let hidden = f32_tensor(device, &[1, d], &(0..d).map(|index| index as f32 / 32.0 - 1.0).collect::<Vec<_>>());
-    let inject = Tensor::zeros(device, Element::f32(), &[1, 0]).unwrap();
+    let inject = Tensor::zeros(&charges, Element::f32(), &[1, 0]).unwrap();
     let absent = f32_tensor(device, &[0], &[]);
     let output = {
         let entry = attention_output::native_entry_with(attention_output::Elements { OW: q8, A: Element::bf16() });
@@ -1925,7 +1916,7 @@ fn cpu_output_reads_the_operand_the_decode_emits() {
         // Alone, the output forms its own operand.
         let mut bound = Bound::new(device, &case);
         let attended = decode
-            .call(attention_decode::Args {
+            .call(&charges, attention_decode::Args {
                 query: &bound.query,
                 gate: &bound.gate,
                 key: &bound.key,
@@ -1959,7 +1950,7 @@ fn cpu_output_reads_the_operand_the_decode_emits() {
             .unwrap()
             .value;
         let alone = output
-            .call(attention_output::Args {
+            .call(&charges, attention_output::Args {
                 hidden: &hidden,
                 inject: &inject,
                 gated: &attended,
@@ -2002,8 +1993,8 @@ fn cpu_output_reads_the_operand_the_decode_emits() {
         ];
         let mut ports = inputs.map(&mut port);
         let stored = [
-            Tensor::zeros(device, attended.element(), &attended.extents()).unwrap(),
-            Tensor::zeros(device, alone.element(), &alone.extents()).unwrap(),
+            Tensor::zeros(&charges, attended.element(), &attended.extents()).unwrap(),
+            Tensor::zeros(&charges, alone.element(), &alone.extents()).unwrap(),
         ];
         let stored_ports = [&stored[0], &stored[1]].map(&mut port);
         let [
@@ -2089,10 +2080,10 @@ fn cpu_output_reads_the_operand_the_decode_emits() {
         let plan = graph.seal().unwrap();
         let mut bindings = plan.bindings();
         for (port, tensor) in ports.iter().zip(inputs).chain(stored_ports.iter().zip(&stored)) {
-            bindings.set(port, tensor).unwrap();
+            bindings.set(&charges, port, tensor).unwrap();
         }
         let (_, completion) =
-            plan.new_slot().unwrap().attach(bindings, plan.new_outputs().unwrap()).unwrap().submit().unwrap();
+            plan.new_slot(&charges).unwrap().attach(bindings, plan.new_outputs(&charges).unwrap()).unwrap().submit().unwrap();
         completion.wait().unwrap();
         let bytes = |tensor: &Tensor| tensor.read_to_host().unwrap();
         assert_eq!(bytes(&stored[0]), bytes(&attended), "{label} attended row");
@@ -3363,11 +3354,12 @@ fn cross_form_bounds(case: &Case, vector: &[f32]) -> Vec<f32> {
 
 /// The dense append of `case` on `device`: its final key and value planes.
 fn run_append(device: &Device, case: &Case) -> Result<(Vec<f32>, Vec<f32>), String> {
+    let charges = seismic::Charges::tally(device);
     let mut bound = Bound::new(device, case);
     let form = case.form;
     let [_, ra, rt, _, vk, kr, _] = case.extents();
     let append_form = Tensor::from_host(
-        device,
+        &charges,
         Element::i32(),
         &[0, ra as u64, rt as u64, vk as u64, kr as u64],
         &[],
@@ -3391,7 +3383,7 @@ fn run_append(device: &Device, case: &Case) -> Result<(Vec<f32>, Vec<f32>), Stri
     )
     .map_err(|error| error.to_string())?;
     kernel
-        .call(attention_append_dense::Args {
+        .call(&charges, attention_append_dense::Args {
             key: &bound.key,
             value: &bound.value,
             key_norm: &bound.key_norm,
@@ -3881,24 +3873,23 @@ fn verify_sequences(sequences: &[(&[(i32, i32)], usize)], range: std::ops::Range
 }
 
 /// Every row of a verify block (`block_rows` gives its rows `range`), at
-/// every verify width, is bit for bit the row launched alone (plain decode)
-/// under one specialization: the same row over the same history, its earlier
-/// block rows fresh keys in the wider launches and history rows (as the
-/// widest launch appended them) in the narrower (`verify_blocks`). So its
-/// reduction order is set by its own keys' positions alone, whichever rows
-/// share its tile and whether its tile's other rows reach further (a tile
-/// row's masked tail), and a prepared fresh key and value equal the appended
-/// ones bit for bit. Every configuration the other tests sweep is checked on
-/// every backend, in the decode entry, or in the prefill entry where the
-/// decode declaration refuses the case's forms (DECODE_REFUSALS: it serves
-/// the same rows as a decode class). GLM's selected read (a WorkList bitmap
-/// of picked units and the tail, which the prefill entry alone reads) is held
-/// through Vulkan's prefill vector form alone: the prefill matrix form's key
-/// tiles start at each span's edges (history, then fresh), which move with
-/// the verify width, so its reduction order is not a row's key positions. With `earlier` (a case per entry of
-/// `cases`, over a longer history) each configuration's entry first serves
-/// that launch, so its scratch holds the longer launch's partitions: a launch
-/// reads only the partitions it wrote.
+/// every verify width, attends its own history within the host model's
+/// bound (`check`): the same row over the same history, its earlier block
+/// rows fresh keys in the wider launches and history rows (as the widest
+/// launch appended them) in the narrower (`verify_blocks`). So a row reads
+/// its own keys' positions, whichever rows share its tile and whether its
+/// tile's other rows reach further (a tile row's masked tail), and its
+/// launch appends its fresh keys and values where they belong. The host
+/// model takes the widest launch's own prepared keys (`expected_with`), as
+/// a rounded key may move by one code. Every configuration the other tests
+/// sweep is checked on every backend, in the decode entry, or in the
+/// prefill entry where the decode declaration refuses the case's forms
+/// (DECODE_REFUSALS: it serves the same rows as a decode class), and GLM's
+/// selected read (a WorkList bitmap of picked units and the tail, which the
+/// prefill entry alone reads) on Vulkan. With `earlier` (a case per entry of `cases`, over a longer
+/// history) each configuration's entry first serves that launch, so its
+/// scratch holds the longer launch's partitions: a launch reads only the
+/// partitions it wrote.
 fn check_verify_widths(
     cases: &[(&str, bool, Case)],
     earlier: Option<&[(&str, bool, Case)]>,
@@ -3915,10 +3906,10 @@ fn check_verify_widths(
             let widened = earlier.map(|earlier| case.with_selection_words(earlier[index].2.selection_words));
             let case = widened.as_ref().unwrap_or(case);
             let decode = *entry_decode && !(case.picks > 0 && DECODE_REFUSALS.contains(&device.backend()));
-            for config in case_configurations(&device, decode, case)
-                .into_iter()
-                .filter(|config| *entry_decode || config.contains(&("MATRIX", 0)))
-            {
+            // The host model at the device's prepared keys, formed again
+            // only when a configuration prepares other keys.
+            let mut model: Option<(Vec<f32>, (Vec<f32>, Vec<f32>, Vec<f32>))> = None;
+            for config in case_configurations(&device, decode, case) {
                 let specialization = config
                     .iter()
                     .fold(statics(&device, case.form, case.sink_rows()), |s, (n, v)| s.with_param(*n, *v));
@@ -3930,32 +3921,24 @@ fn check_verify_widths(
                     let widest = attend
                         .run_after(&device, earlier.map(|earlier| &earlier[index].2), case)
                         .unwrap_or_else(|error| panic!("{label} width {VERIFY_ROWS}: {error}"));
+                    let own = case.prepared_keys(&widest.1);
+                    if model.as_ref().is_none_or(|(keys, _)| *keys != own) {
+                        model = Some((own.clone(), case.expected_with(Some(&own))));
+                    }
+                    let expected = &model.as_ref().expect("the host model is formed").1;
+                    check(&format!("{label} width {VERIFY_ROWS}"), &widest, expected, case);
                     let row = case.form.heads() * case.form.w();
-                    let mut alone = vec![Vec::new(); VERIFY_ROWS];
                     for block in verify_blocks() {
                         let narrow = case.narrowed(block_rows(block.clone()), block.clone(), &widest.1, &widest.2);
                         let actual = attend
                             .run(&device, &narrow)
                             .unwrap_or_else(|error| panic!("{label} rows {block:?}: {error}"));
-                        if block.len() == 1 {
-                            alone[block.start] = bits(&actual.0);
-                        }
-                        for (j, i) in block.clone().enumerate() {
-                            assert_eq!(
-                                bits(&actual.0[j * row..(j + 1) * row]),
-                                alone[i],
-                                "{label}: row {i} in rows {block:?} differs from row {i} alone"
-                            );
-                        }
-                        assert_eq!(bits(&actual.1), bits(&widest.1), "{label} rows {block:?}: key plane");
-                        assert_eq!(bits(&actual.2), bits(&widest.2), "{label} rows {block:?}: value plane");
-                    }
-                    for i in 0..VERIFY_ROWS {
-                        assert_eq!(
-                            bits(&widest.0[i * row..(i + 1) * row]),
-                            alone[i],
-                            "{label}: row {i} of the widest block differs from row {i} alone"
+                        let rows = (
+                            expected.0[block.start * row..block.end * row].to_vec(),
+                            expected.1.clone(),
+                            expected.2.clone(),
                         );
+                        check(&format!("{label} rows {block:?}"), &actual, &rows, case);
                     }
                 }));
                 if outcome.is_err() {
@@ -4008,7 +3991,7 @@ fn verify_cases_over(store: usize, slab_rows: usize, rows: &dyn Fn() -> Vec<Row>
     ]
 }
 
-/// A verify block's rows over one history are the same at every width
+/// A verify block's rows over one history attend it at every width
 /// (`check_verify_widths`), at the histories that reach every path: 28 rows,
 /// whose block rows' 29 to 36 keys straddle the 32-key tile edge, so a tile
 /// holds history and fresh keys in a different split at each width and rows
@@ -4018,7 +4001,7 @@ fn verify_cases_over(store: usize, slab_rows: usize, rows: &dyn Fn() -> Vec<Row>
 /// most 2048), so each partition holds several chunks. The 40 picks over a 96-row pick plane of
 /// 32-row slabs fill one pick tile and part of a second, some of them -1.
 #[test]
-fn decode_rows_are_the_same_at_every_verify_width() {
+fn verify_rows_attend_their_history_at_every_width() {
     for history in [28, 60, 70, 2100] {
         let rows = || verify_rows(&[(0, history)], 0..VERIFY_ROWS);
         let cases = verify_cases(history as usize + VERIFY_ROWS, &rows);
@@ -4030,7 +4013,7 @@ fn decode_rows_are_the_same_at_every_verify_width() {
 /// partition on both decode (`MIN_TILES = 1`) and prefill-decode
 /// (`MIN_TILES = 16`) grids while leaving higher partitions empty — launched in
 /// one `NativeTensorBatch` right after an 8400-row block on the same entry and
-/// scratch arena equal each row launched alone: the partitions the longer
+/// scratch arena attend their own history: the partitions the longer
 /// launch filled and the shorter leaves empty are not read
 /// (`check_verify_widths`, `earlier`).
 #[test]
@@ -4047,9 +4030,10 @@ fn a_shorter_history_does_not_read_a_longer_launchs_partitions() {
 
 /// A launch's tile holds rows of two sequences (three rows of one over 70
 /// history rows, five of another over its own 40, so the 2- and 4-row tiles
-/// each hold both) and each row is bit for bit the row launched alone.
+/// each hold both) and each row attends its own sequence's history
+/// (`check_verify_widths`).
 #[test]
-fn a_tile_of_two_sequences_keeps_each_row_as_it_is_alone() {
+fn a_tile_of_two_sequences_attends_each_rows_own_history() {
     let (a, b): (&[(i32, i32)], &[(i32, i32)]) = (&[(0, 70)], &[(100, 140)]);
     let sequences = [(a, 3), (b, VERIFY_ROWS - 3)];
     let rows = || verify_sequences(&sequences, 0..VERIFY_ROWS);
@@ -4085,6 +4069,7 @@ fn attention_decode_at_deepseek_v41_decode_shape_times() {
     else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let (context, window, picks, pooled) = (32768usize, 128usize, 512usize, 32768 / 4);
     let row = Row {
         spans: vec![((context - window) as i32, context as i32)],
@@ -4185,7 +4170,7 @@ fn attention_decode_at_deepseek_v41_decode_shape_times() {
             written: Default::default(),
         };
         let result = attention_decode::native_tune_with(
-            &device,
+            &charges,
             attention_decode::Elements { A: Element::bf16() },
             &configuration,
             vec![point],
@@ -4236,6 +4221,7 @@ fn attention_prefill_with_picks_at_deepseek_v41_prefill_shape_times() {
     else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let (rows, window, picks, pooled) = (2048usize, 128i32, 512usize, 2048usize);
     let case = Case::new(V41, 64 + rows, window_rows(rows, 0, window), 4096, 1.0, 1.0 / (512f32).sqrt(), 110)
         .with_theta(1.0e4)
@@ -4311,7 +4297,7 @@ fn attention_prefill_with_picks_at_deepseek_v41_prefill_shape_times() {
         written: Default::default(),
     };
     let result = attention_prefill::native_tune_with(
-        &device,
+        &charges,
         attention_prefill::Elements { A: Element::bf16() },
         &configuration,
         vec![point],
@@ -4366,6 +4352,7 @@ fn attention_at_deepseek_v41_decode_shape_times_on_vulkan() {
     else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let (context, window, picks, pooled) = (32768usize, 128usize, 512usize, 32768 / 4);
     let row = Row {
         spans: vec![((context - window) as i32, context as i32)],
@@ -4438,7 +4425,7 @@ fn attention_at_deepseek_v41_decode_shape_times_on_vulkan() {
                     written: Default::default(),
                 };
                 let result = $module::native_tune_with(
-                    &device,
+                    &charges,
                     $module::Elements { A: Element::bf16() },
                     &configuration,
                     vec![point],
@@ -4629,6 +4616,7 @@ fn native_grouped_rows(
     inputs: usize,
     outputs: usize,
 ) -> Vec<f32> {
+    let charges = seismic::Charges::tally(device);
     let rows = source.len() / (groups * inputs);
     let statics = NativeSpecialization::new().with_static("WS", 0);
     // Each backend's declared statics: the CPU's WS alone, Metal's with
@@ -4658,7 +4646,7 @@ fn native_grouped_rows(
     )
     .unwrap();
     let out = kernel
-        .call(project_rows::Args {
+        .call(&charges, project_rows::Args {
             source: &bf16_tensor(device, &[rows, groups * inputs], source),
             weight: &bf16_tensor(device, &[groups * outputs, inputs], weight),
             weight_scale: &f32_tensor(device, &[0], &[]),

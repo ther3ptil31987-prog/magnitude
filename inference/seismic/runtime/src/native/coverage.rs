@@ -219,8 +219,8 @@ pub enum CoverageError {
     /// A skeleton could not be preprocessed: the coverage machinery, not a
     /// kernel, is at fault.
     Skeleton(String),
-    /// Entry `0`'s declaration reads a device property, so it has no
-    /// defaults offline: coverage forms on no device.
+    /// Entry `0`'s declaration reads a device property, so it cannot be
+    /// formed offline: coverage forms on no device.
     DeviceDependent(String),
 }
 
@@ -297,6 +297,14 @@ const VULKAN_BASE: seismic_vulkan::FormationTarget = seismic_vulkan::FormationTa
     denorm_preserve_32: true,
 };
 
+/// The Vulkan floor's cooperative-matrix target: the baseline with the
+/// matrix path formed, whose sources no baseline formation compiles.
+const VULKAN_MATRIX: seismic_vulkan::FormationTarget = seismic_vulkan::FormationTarget {
+    matrix: true,
+    matrix_hardware: true,
+    ..VULKAN_BASE
+};
+
 impl Former {
     fn open(backend: BackendName) -> Result<Self, CoverageError> {
         match backend {
@@ -349,14 +357,23 @@ impl Former {
         }
     }
 
+    /// The configuration a search starts from: the first of [`Self::bases`].
     fn base(&self) -> Configuration {
+        self.bases()[0]
+    }
+
+    /// The configurations every entry's base forms in ([`form_bases`]):
+    /// each source path a configuration selects, so a check that forms only
+    /// the bases still compiles every path. On Vulkan the floor baseline and
+    /// its cooperative-matrix target.
+    fn bases(&self) -> Vec<Configuration> {
         match self {
-            Self::Vulkan => Configuration::Vulkan(VULKAN_BASE),
-            Self::Cuda { architectures, .. } => Configuration::Cuda {
+            Self::Vulkan => vec![Configuration::Vulkan(VULKAN_BASE), Configuration::Vulkan(VULKAN_MATRIX)],
+            Self::Cuda { architectures, .. } => vec![Configuration::Cuda {
                 architecture: architectures[0],
-            },
+            }],
             #[cfg(target_os = "macos")]
-            Self::Metal { .. } => Configuration::Metal { tensor_ops: false },
+            Self::Metal { .. } => vec![Configuration::Metal { tensor_ops: false }],
         }
     }
 
@@ -887,8 +904,10 @@ impl<'m> Subject<'m> {
         let Some(declaration) = module.native_implementation(info.id, backend) else {
             return Ok(None);
         };
-        // Coverage forms offline, on no device: a declaration whose
-        // defaults read the device has none here.
+        // Coverage forms whole programs offline, on no device: a
+        // declaration that reads the device anywhere (its defaults, or its
+        // launches' geometry, as only CPU declarations do, which coverage
+        // never forms) cannot be formed here.
         if declaration.device_independent().is_none() {
             return Err(CoverageError::DeviceDependent(info.name.clone()));
         }
@@ -979,9 +998,8 @@ impl<'m> Subject<'m> {
         let statics = self.statics(implementation, &[])?;
         Some(Row {
             specialization: implementation
-                .device_independent()
+                .default_specialization_without_device(&statics)
                 .expect(INDEPENDENT)
-                .default_specialization(&statics)
                 .expect("searched statics admit a configuration"),
             bindings,
             configuration,
@@ -997,9 +1015,8 @@ impl<'m> Subject<'m> {
             Ok(()) => row.specialization.clone(),
             Err(seismic_lang::checked::NativeSpecializationError::Inadmissible) => {
                 match implementation
-                    .device_independent()
+                    .default_specialization_without_device(&statics_of(&row.specialization))
                     .expect(INDEPENDENT)
-                    .default_specialization(&statics_of(&row.specialization))
                 {
                     Ok(specialization) => specialization,
                     Err(seismic_lang::checked::NativeSpecializationError::Inadmissible) => {
@@ -1275,9 +1292,8 @@ impl<'m> Admissible<'m> {
     ) -> Self {
         let mut admissible = Self::new(implementation, statics);
         admissible.first = implementation
-            .device_independent()
+            .default_specialization_without_device(statics)
             .expect(INDEPENDENT)
-            .default_specialization(statics)
             .expect("a row's statics admit its specialization");
         if variant_programs {
             admissible.variants = (0..implementation.launches.len())
@@ -1874,17 +1890,18 @@ impl Search {
     }
 }
 
-/// The base of `subject`'s search, formed and recorded in `search`: the first
-/// binding in candidate order that is admitted, implemented and not rejected
-/// by the toolchain.
+/// The base of `subject`'s search in `configuration`, formed and recorded in
+/// `search`: the first binding in candidate order that is admitted,
+/// implemented and not rejected by the toolchain.
 fn search_base(
     subject: &Subject<'_>,
     forms: Forms<'_>,
+    configuration: Configuration,
     search: &mut Search,
 ) -> Result<Option<Row>, CoverageError> {
     base_row(
         subject,
-        forms.former.base(),
+        configuration,
         |row, mut evaluated| {
             search
                 .universe
@@ -1905,7 +1922,7 @@ fn search_base(
 
 fn search(subject: &Subject<'_>, forms: Forms<'_>) -> Result<Option<Search>, CoverageError> {
     let mut search = Search::default();
-    let base = search_base(subject, forms, &mut search)?;
+    let base = search_base(subject, forms, forms.former.base(), &mut search)?;
     let Some(base) = base else {
         return Ok(None);
     };
@@ -2349,12 +2366,13 @@ pub fn cover(
     Ok(coverage)
 }
 
-/// Form the base configuration of every native implementation of `module`
-/// with `toolchain`, through `forming`, in parallel across entries: each
-/// entry's first binding in candidate order that is admitted and
-/// implemented, without [`cover`]'s search of the others. What a caller that
-/// must run on every change bounds by entry, one formation of each.
-/// `progress` counts the entries formed.
+/// Form the base of every native implementation of `module` in each of the
+/// backend's base configurations ([`Former::bases`]) with `toolchain`,
+/// through `forming`, in parallel across entries: each entry's first binding
+/// in candidate order that is admitted and implemented, without [`cover`]'s
+/// search of the others. What a caller that must run on every change bounds
+/// by entry, one formation of each per base configuration. `progress`
+/// counts the entries formed.
 pub fn form_bases(
     module: &CheckedModule,
     toolchain: &Toolchain,
@@ -2367,11 +2385,15 @@ pub fn form_bases(
     };
     let subjects = subjects(module, toolchain.backend())?;
     progress.begin(subjects.len());
+    let configurations = toolchain.former.bases();
     let bases = in_parallel(&subjects, |subject| {
         let mut search = Search::default();
-        let base = search_base(subject, forms, &mut search);
+        let mut implemented = true;
+        for configuration in &configurations {
+            implemented &= search_base(subject, forms, *configuration, &mut search)?.is_some();
+        }
         progress.advance();
-        base.map(|base| (base.is_some(), search))
+        Ok::<_, CoverageError>((implemented, search))
     });
     let mut coverage = Coverage::default();
     for (subject, base) in subjects.iter().zip(bases) {
@@ -2415,7 +2437,7 @@ fn in_parallel<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + Sync) -> 
     std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(workers);
         for _ in 0..workers {
-            handles.push(scope.spawn(|| {
+            handles.push(seismic_threads::spawn_scoped(scope, "coverage", || {
                 loop {
                     let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some(item) = items.get(index) else {
@@ -2427,7 +2449,7 @@ fn in_parallel<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + Sync) -> 
                         .expect("no worker panics holding the lock")
                         .push((index, result));
                 }
-            }));
+            }).expect("invariant violated: the host starts a thread"));
         }
         for handle in handles {
             if let Err(payload) = handle.join() {
@@ -2542,9 +2564,8 @@ fn form_request(
         .expect("a request names an entry with a native implementation");
     let specialization = subject
         .implementation(&request.bindings)
-        .device_independent()
+        .default_specialization_without_device(&request.statics)
         .expect(INDEPENDENT)
-        .default_specialization(&request.statics)
         .map_err(|error| RequestFailure::Inadmissible(error.to_string()))?;
     let row = Row {
         bindings: request.bindings.clone(),

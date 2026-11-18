@@ -25,7 +25,7 @@ pub fn slab_pool(device: &seismic::Device, layouts: &[seismic::SlabLayout]) -> s
     let slab = layouts.iter().map(|layout| layout.slab_bytes).max().expect("a pool holds a layout");
     let granule = slab.next_power_of_two().max(1 << 20);
     let contract = seismic::Contract::DeviceOnly;
-    device.pool(contract, granule, 2 * granule, seismic::PoolEntries::one(device.entry(contract))).unwrap()
+    seismic::Pool::open(&seismic::PoolCharges::one(&seismic::Charges::tally(device)), contract, granule, 2 * granule).unwrap()
 }
 
 /// A slab store of `regions`, `rows_per_slab` rows a slab over
@@ -38,19 +38,20 @@ pub fn slab_tensor(
     regions: &[seismic::SlabRegion],
 ) -> seismic::SlabTensor {
     let layout = seismic::SlabLayout::for_regions(rows_per_slab, logical_rows, regions).unwrap();
-    seismic::SlabTensor::in_pool(&slab_pool(device, &[layout]), rows_per_slab, logical_rows, regions).unwrap()
+    seismic::SlabTensor::in_pool(&seismic::Charges::tally(device), &slab_pool(device, &[layout]), rows_per_slab, logical_rows, regions).unwrap()
 }
 
 /// The ordinal of `E`'s Metal launch `launch`, its kernel `<entry>_<launch>`.
 #[allow(dead_code)]
 pub fn metal_launch<E: seismic::Entry>(launch: &str) -> usize {
+    metal_launch_of::<E>(launch).unwrap_or_else(|| panic!("`{}` has no Metal launch `{launch}`", E::NAME))
+}
+
+/// The declaration index of `E`'s Metal launch `launch`, where it has one.
+pub fn metal_launch_of<E: seismic::Entry>(launch: &str) -> Option<usize> {
     let native = seismic::generated::native_implementation_for_backend::<E>(seismic::BackendName::Metal)
         .expect("the kernel bundle decodes")
         .unwrap_or_else(|| panic!("`{}` has a Metal implementation", E::NAME));
     let kernel = format!("{}_{launch}", E::NAME);
-    native
-        .launches
-        .iter()
-        .position(|candidate| candidate.kernel == kernel)
-        .unwrap_or_else(|| panic!("`{}` has no Metal launch `{kernel}`", E::NAME))
+    native.launches.iter().position(|candidate| candidate.kernel == kernel)
 }

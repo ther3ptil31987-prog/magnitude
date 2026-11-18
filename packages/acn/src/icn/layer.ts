@@ -1,6 +1,7 @@
+import { writeFileAtomic } from "@magnitudedev/utils/atomic-file";
 import { ProcessGroupController } from "@magnitudedev/utils/process-groups";
 import { ProcessGroupControllerLive } from "@magnitudedev/utils/process-groups/native";
-import { FetchHttpClient, FileSystem } from "@effect/platform";
+import { FetchHttpClient } from "@effect/platform";
 import { ModelAssessmentsSnapshot } from "@magnitudedev/icn-protocol/schemas";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -34,6 +35,7 @@ import {
   IcnInstancesLive,
   IcnStorageConfig,
   IcnPreparationReporter,
+  IcnUnexpectedExit,
 } from "@magnitudedev/icn";
 import { ACN_VERSION } from "../version";
 import { hostDiscoveryEnvironment, resolveAutomaticLocations } from "./discovery-roots";
@@ -67,7 +69,6 @@ const AcceptanceAssessmentDiagnostics = Schema.Struct({
 const acceptanceAssessmentDiagnostics = Layer.scopedDiscard(Effect.gen(function* () {
   const path = process.env.MAGNITUDE_ACCEPTANCE_ASSESSMENT_DIAGNOSTICS;
   if (!path) return;
-  const fs = yield* FileSystem.FileSystem;
   const assessments = yield* IcnModelAssessments;
   const icnProcess = yield* IcnProcess;
   yield* Effect.gen(function* () {
@@ -79,8 +80,7 @@ const acceptanceAssessmentDiagnostics = Layer.scopedDiscard(Effect.gen(function*
           assessments: snapshot,
           inferenceDiagnosticTail,
         });
-        yield* fs.writeFileString(`${path}.pending`, report);
-        yield* fs.rename(`${path}.pending`, path);
+        yield* writeFileAtomic(path, report);
       }).pipe(Effect.catchAll(() => Effect.void));
       yield* Effect.sleep("5 seconds");
     }
@@ -198,6 +198,14 @@ const makeProcess = (dataDir: string, modelStore: string, localModels: LocalMode
     )))
     : UnixIcnChildSpawner.pipe(Layer.provide(Layer.succeed(ProcessGroupController, ProcessGroupControllerLive)))));
 
+/**
+ * What people are told when the engine stops unexpectedly: its exit status when it exited with one, else nothing, so
+ * the owner says it in its own words. An engine killed by a signal reaches here as the platform's failure to read an
+ * exit code, whose message is the whole command line; that stays in the log.
+ */
+export const icnExitDetail = (error: unknown): string | undefined =>
+  error instanceof IcnUnexpectedExit ? `The inference engine stopped unexpectedly (exit status ${error.code}).` : undefined;
+
 const makeSupervision = () =>
   Layer.scopedDiscard(
     Effect.gen(function* () {
@@ -208,7 +216,7 @@ const makeSupervision = () =>
           Effect.logFatal("ICN exited unexpectedly; stopping ACN").pipe(
             Effect.annotateLogs({ cause: error.message }),
             Effect.zipRight(
-              lifecycle.beginStopping({ reason: "icn-exited", detail: error.message })
+              lifecycle.beginStopping({ reason: "icn-exited", detail: icnExitDetail(error) })
             )
           )
         ),

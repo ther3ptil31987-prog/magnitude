@@ -139,9 +139,13 @@ fn an_ngram_decoder_steps_on_host_and_selected_tokens() {
     std::fs::remove_dir_all(&directory).ok();
 }
 
-/// A verification row computes, bit for bit, the logits and the selection
-/// plain decode computes at the same history: drafting never changes what a
-/// target emits. One prompt, then its continuation decoded a token a step;
+/// Logits of one history from launches of different row classes agree within
+/// float rounding: the classes sum in their own orders, which precision
+/// admission, not bit identity, governs.
+const ROW_CLASS_KL: f64 = 1e-4;
+
+/// A verification row scores its history as plain decode does, within
+/// [`ROW_CLASS_KL`]. One prompt, then its continuation decoded a token a step;
 /// then, from the same prompt, each verification width up to the decode row
 /// bound feeds that continuation as one forward, and each of its rows'
 /// logits are the decode step's at its position. The prompt (37 tokens) puts
@@ -149,12 +153,11 @@ fn an_ngram_decoder_steps_on_host_and_selected_tokens() {
 /// every width splits a row's keys between history and the pass's fresh rows
 /// at another place. Dense and K8/V4 history, on every backend present, of a
 /// plain load, an MTP load and a load streaming its routed experts over a
-/// bank of about half the slots: the rows a drafted round verifies, so the
-/// tokens it emits are plain decode's. A DFlash load needs a package of two
-/// components, which this harness's one-file package cannot hold; the
+/// bank of about half the slots: the rows a drafted round verifies. A DFlash
+/// load needs a package of two components, which this harness's one-file package cannot hold; the
 /// serving pair compares it end to end.
 #[test]
-fn a_verification_row_scores_as_plain_decode_at_its_history() {
+fn a_verification_row_scores_its_history_as_plain_decode_does() {
     const PROMPT: usize = 37;
     const ROWS: usize = magnitude_kernels::constants::VERIFY_ROWS as usize;
     let _placement = crate::test_support::process_placement();
@@ -185,7 +188,7 @@ fn a_verification_row_scores_as_plain_decode_at_its_history() {
     ];
     let token = |position: usize| (position * 37 + 11) as u32 % 256;
     // Every row selects greedily, as a served round does, and exports its
-    // logits: each row's logits bits and its selection.
+    // logits.
     let scoring = |request: RequestId, kind: WorkKind, tokens: &[u32], position: usize| {
         let Operation::Forward { request, kind, tokens, position, conditioning, committed, prime, .. } =
             forward(request, kind, tokens, position, false)
@@ -214,10 +217,12 @@ fn a_verification_row_scores_as_plain_decode_at_its_history() {
             prime,
         }
     };
-    let scores = |outcome: &Outcome| -> Vec<(Vec<u32>, Option<(u32, u8)>)> {
-        step_bits(outcome)
-            .into_iter()
-            .map(|(_, logits, selected)| (logits.expect("every row exports its logits"), selected))
+    let scores = |outcome: &Outcome| -> Vec<Vec<f32>> {
+        let Outcome::Forward { rows } = outcome else {
+            panic!("a forward has a forward outcome: {outcome:?}");
+        };
+        rows.iter()
+            .map(|row| row.logits.as_ref().expect("every row exports its logits").read_to_host().unwrap())
             .collect()
     };
     let backends = [
@@ -269,13 +274,11 @@ fn a_verification_row_scores_as_plain_decode_at_its_history() {
                     let (outcome, returned) =
                         run(&mut domain, bindings, scoring(request, WorkKind::Verify, &tokens, PROMPT), false, backend);
                     bindings = returned;
-                    for (row, (logits, selected)) in scores(&outcome).iter().enumerate() {
-                        let (plain_logits, plain_selected) = &decoded[row];
-                        if logits != plain_logits || selected != plain_selected {
-                            let differing = logits.iter().zip(plain_logits).filter(|(a, b)| a != b).count();
+                    for (row, logits) in scores(&outcome).iter().enumerate() {
+                        let kl = kl_of(&decoded[row], logits);
+                        if !(kl <= ROW_CLASS_KL) {
                             failures.push(format!(
-                                "{backend:?} {name} {codec:?}: width {width} row {row}: {differing} of {} logits differ from plain decode's; selected {selected:?}, plain {plain_selected:?}",
-                                logits.len()
+                                "{backend:?} {name} {codec:?}: width {width} row {row}: KL {kl:.3e} from plain decode's logits"
                             ));
                         }
                     }
@@ -287,7 +290,7 @@ fn a_verification_row_scores_as_plain_decode_at_its_history() {
     for (_, (directory, _, _), _, _) in &loads {
         std::fs::remove_dir_all(directory).ok();
     }
-    assert!(failures.is_empty(), "verification rows that are not plain decode's:\n{}", failures.join("\n"));
+    assert!(failures.is_empty(), "verification rows that do not score as plain decode:\n{}", failures.join("\n"));
 }
 
 /// On Metal and on the CPU, a load streaming its experts through a bank
@@ -1745,12 +1748,11 @@ fn a_zero_valued_engram_input_leaves_its_attention_decoder_unchanged() {
 /// as well as history segments (`BlockKeeps::HistoryAndBank`): the
 /// launch's two slots' tables bind a graph sealed for two. Each request's
 /// two decode steps hash its own prompt's token window, so its logits stay
-/// within float rounding of its decode alone (`TOGETHER_KL`: the two
+/// within float rounding of its decode alone ([`ROW_CLASS_KL`]: the two
 /// launches' row classes differ).
 #[test]
 fn engram_requests_decode_together_as_each_alone() {
     use crate::planning::fixtures::engram_fixture_definition;
-    const TOGETHER_KL: f64 = 1e-4;
     let _placement = crate::test_support::process_placement();
     let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let (directory, definition, package) =
@@ -1795,7 +1797,7 @@ fn engram_requests_decode_together_as_each_alone() {
         assert_eq!(together.len(), 4);
         for (at, (together, alone)) in together.iter().zip(&alone).enumerate() {
             let kl = kl_of(alone, together);
-            assert!(kl <= TOGETHER_KL, "{backend:?}: decode {} of request {}: KL {kl:.3e}", at / 2, at % 2 + 1);
+            assert!(kl <= ROW_CLASS_KL, "{backend:?}: decode {} of request {}: KL {kl:.3e}", at / 2, at % 2 + 1);
         }
     }
     std::fs::remove_dir_all(&directory).ok();
@@ -2125,7 +2127,7 @@ fn a_starved_step_is_interrupted_and_its_rerun_scores_as_unstarved() {
         let (reference, returned) = run(&mut domain, bindings, operation(unstarved), false, backend);
         let (pending, returned) = starved_step(&mut domain, returned, operation(starved), PATIENCE_BOUND, backend);
         assert!(
-            matches!(pending.outcome(), Outcome::Interrupted { resident: true, .. }),
+            matches!(pending.outcome(), Outcome::Interrupted { .. }),
             "{backend:?}: a starved step is interrupted: {:?}",
             pending.outcome()
         );
@@ -2179,14 +2181,14 @@ fn starved_step(
 }
 
 /// A prompt chain whose host starves past every wait's patience while its
-/// chunks run is interrupted at the chunk that launched it, the chain
-/// released with its holder's state (`Outcome::Interrupted` not resident),
-/// so the sequence re-prefills, as an evicted one. The chain's later chunks
-/// run in its launch (layer-major), so the first chunk's flight is the one
-/// their waits fall in. Re-opened and prefilled again, it decodes bit for
-/// bit as a sequence whose prompt was never starved.
+/// chunks run is interrupted at the chunk that launched it: aborted, the
+/// chain concludes with no chunk reconciled, and its holder's state is the
+/// one it opened with. The chain's later chunks run in its launch
+/// (layer-major), so the first chunk's flight is the one their waits fall
+/// in. Prefilled again from that state, it decodes bit for bit as a
+/// sequence whose prompt was never starved.
 #[test]
-fn a_starved_chunk_of_a_chain_releases_it_and_the_rerun_scores_as_unstarved() {
+fn a_starved_chunk_of_a_chain_concludes_it_and_the_rerun_scores_as_unstarved() {
     let _placement = crate::test_support::process_placement();
     let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     // At the kl's shape, where a banked load's prompt runs as one chain
@@ -2220,17 +2222,15 @@ fn a_starved_chunk_of_a_chain_releases_it_and_the_rerun_scores_as_unstarved() {
         let (pending, returned) =
             starved_step(&mut domain, bindings, prompt_chunk(request, 0, chunks, rows), PATIENCE_BOUND, backend);
         assert!(
-            matches!(pending.outcome(), Outcome::Interrupted { resident: false, .. }),
-            "{backend:?}: a starved chunk of a chain is interrupted, its state released: {:?}",
+            matches!(pending.outcome(), Outcome::Interrupted { .. }),
+            "{backend:?}: a starved chunk of a chain is interrupted: {:?}",
             pending.outcome()
         );
         domain.abort(pending).unwrap_or_else(|error| panic!("{backend:?}: {error}"));
-        assert_eq!(domain.chain_holder(), None, "{backend:?}: the chain was released");
-        assert!(domain.resume_state(request).is_err(), "{backend:?}: the holder's state was released");
-        // Re-opened, it re-prefills and decodes as the unstarved sequence.
-        let mut bindings = returned;
-        domain.open_served(&mut bindings, request, None).unwrap();
-        let (rerun, returned) = prompt_then_decode(&mut domain, bindings, request, chunks, rows, backend);
+        assert_eq!(domain.chain_holder(), None, "{backend:?}: the chain concluded");
+        assert_eq!(domain.resume_state(request).unwrap().position(), 0, "{backend:?}: at the state it opened with");
+        // It prefills again and decodes as the unstarved sequence.
+        let (rerun, returned) = prompt_then_decode(&mut domain, returned, request, chunks, rows, backend);
         assert!(rerun == reference, "{backend:?}: the re-prefilled sequence decodes as unstarved: {}", first_difference(&reference, &rerun));
         drop(returned);
     }
@@ -2857,7 +2857,7 @@ fn cpu_loads_whole_and_tier_placed_expert_banks() {
     .unwrap();
     let mut programs = AttestedPrograms::prepare_draft(
         &base_draft,
-        &device,
+        &seismic::Charges::tally(&device),
         crate::TuningContext {
             definition: &definition,
             weights: &crate::ZeroTuningWeights,
@@ -2927,14 +2927,16 @@ fn cpu_loads_whole_and_tier_placed_expert_banks() {
         }
         .unwrap();
         let mut weights = ledgers
-            .claim(&device, crate::memory::ledger::CommittedKind::Load, demand)
+            .changes()
+            .change(|keeping| ledgers.claim(&keeping.claims(), &device, crate::memory::ledger::CommittedKind::Load, demand))
             .unwrap();
         let host_tables = crate::memory::ClaimDemand {
             host: load.host_table_bytes().unwrap(),
             ..Default::default()
         };
         let host_tables = ledgers
-            .claim(&device, crate::memory::ledger::CommittedKind::Load, host_tables)
+            .changes()
+            .change(|keeping| ledgers.claim(&keeping.claims(), &device, crate::memory::ledger::CommittedKind::Load, host_tables))
             .unwrap();
         // On CPU both `DeviceOnly` and `Shared` lie in `HostRam` at the bank's
         // one uniform granule, so a tier-placed CPU fixture shares that single
@@ -2976,7 +2978,7 @@ fn cpu_loads_whole_and_tier_placed_expert_banks() {
         )
         .unwrap();
         let target = weights
-            .allocate(|| residency.load_target(&definition, &package, &host_tables, Box::new(|_, _| ())))
+            .allocate(&device, |charges| residency.load_target(charges, &definition, &package, &host_tables, Box::new(|_, _| ())))
             .unwrap();
         recorded.record(weights);
         recorded.record(host_tables);
@@ -3060,10 +3062,8 @@ fn cpu_loads_whole_and_tier_placed_expert_banks() {
             .unwrap();
         let empty_tier = tier_up.slice_leading(0, 0).unwrap();
         assert_eq!(empty_tier.extents()[0], 0);
-        empty_tier.hold_record_table().unwrap();
         let sub_tier = tier_up.slice_leading(0, 2).unwrap();
         assert_eq!(sub_tier.extents()[0], 2);
-        sub_tier.hold_record_table().unwrap();
         assert_eq!(bank.host_tier(), Some((bank.host_slots(), 8)));
         let _served = crate::experts::ServedBank::new(
             bank.clone(),

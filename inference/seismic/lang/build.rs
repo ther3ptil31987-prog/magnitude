@@ -1,12 +1,13 @@
-//! Each backend's tables header (`<seismic/tables.*>`), rendered from ggml's
-//! tables (`magnitude_ggml::tables`): the ids of its grids and codebooks
-//! (`SEISMIC_GRID_<NAME>`, `SEISMIC_CODEBOOK_<NAME>`: position + 1, so that 0
-//! names none, which a bound element's decode axes name), each grid's points
-//! and each codebook's values (on Metal and Vulkan, which read them), and
-//! their bindings by id: `grids::table<ID>::points()` and
-//! `codebooks::table<ID>::values()` (Vulkan `GRIDS_TABLE_<ID>`,
-//! `CODEBOOKS_TABLE_<ID>`). A
-//! `u32` grid point is one word and a `u64` point its (low, high) words;
+//! Each backend's tables (CUDA's and Metal's header `<seismic/tables.*>`),
+//! rendered from ggml's tables (`magnitude_ggml::tables`): the ids of its
+//! grids and codebooks (`SEISMIC_GRID_<NAME>`, `SEISMIC_CODEBOOK_<NAME>`:
+//! position + 1, so that 0 names none, which a bound element's decode axes
+//! name), each grid's points and each codebook's values (on Metal and
+//! Vulkan, which read them), and their bindings by id:
+//! `grids::table<ID>::points()` and `codebooks::table<ID>::values()` (Vulkan
+//! `GRIDS_TABLE_<ID>`, `CODEBOOKS_TABLE_<ID>`, arrays of the device's tables
+//! buffer: see `vulkan`; its layout is not an includable header). A `u32`
+//! grid point is one word and a `u64` point its (low, high) words;
 //! codebook values are exact floats. A 16-value codebook also has a dialect's own forms of its values:
 //! on Metal each code byte's two values + the zero its lane producer enters
 //! codebook values at (`metal/producers.decl`; `codebooks::pairs<ID>`: the
@@ -14,9 +15,12 @@
 //! words (`codebooks::words<ID>`: `W0`..`W3`, values 4w..4w + 3 in word w)
 //! and whether they are E2M1 doubled (`codebooks::e2m1<ID>`). On CUDA a grid
 //! whose lane magnitudes are few also has the operands of its magnitudes
-//! (`grids::magnitudes<ID>`, see `magnitudes`). On Vulkan each table's
+//! (`grids::magnitudes<ID>`, see `magnitudes`); on Metal a grid of lanes
+//! -1, 0 and 1 also has its points as 2-bit codes (`grids::trits<ID>`, see
+//! `trits`). On Vulkan each table's
 //! `u32` words (`GRIDS_WORDS_<ID>`, `CODEBOOKS_WORDS_<ID>`, 0 for id 0) size
-//! the copy its library stages in shared memory. A dialect declares some
+//! the copy its library stages in shared memory, and the tables buffer also
+//! holds every conversion's lookup table. A dialect declares some
 //! tables only where its includer reads them (`Dialect::guarded`), each
 //! under `SEISMIC_TABLES_READ_<TABLE>(ID)`, which the includer defines.
 
@@ -28,6 +32,13 @@ mod native_name;
 #[path = "src/producer_decl.rs"]
 mod producer_decl;
 use native_name::native_macro;
+
+// The registered lookup tables of conversion recipes, which the Vulkan
+// tables buffer also holds; the build reads only their values.
+#[allow(dead_code)]
+#[path = "src/external_tables.rs"]
+mod external_tables;
+use external_tables::RepackTable;
 
 /// A table space: its namespace and the accessor of a table's elements.
 #[derive(Clone, Copy)]
@@ -83,6 +94,15 @@ enum Element {
     Float,
 }
 
+impl Element {
+    fn bytes(self) -> usize {
+        match self {
+            Self::Pair => 8,
+            Self::Word | Self::Float => 4,
+        }
+    }
+}
+
 struct Dialect {
     file: &'static str,
     begin: &'static str,
@@ -109,10 +129,6 @@ struct Dialect {
     /// The tables the dialect declares only where its includer reads them
     /// (`Table::read`).
     guarded: &'static [Table],
-    /// Whether the dialect states each table's `u32` words
-    /// (`GRIDS_WORDS_<ID>`, `CODEBOOKS_WORDS_<ID>`, 0 for id 0), which its
-    /// library stages in shared memory.
-    words: bool,
 }
 
 impl Dialect {
@@ -127,10 +143,10 @@ impl Dialect {
     }
 }
 
-const DIALECTS: [Dialect; 3] = [
+const DIALECTS: [Dialect; 2] = [
     Dialect {
         file: "tables.h",
-        begin: "namespace grids { template <uint ID> struct table; }\nnamespace codebooks { template <uint ID> struct table; template <uint ID> struct pairs; }\n\n",
+        begin: "namespace grids { template <uint ID> struct table; template <uint ID> struct trits { static constant constexpr bool any = false; }; }\nnamespace codebooks { template <uint ID> struct table; template <uint ID> struct pairs; }\n\n",
         end: "",
         ty: |element| match element {
             Element::Word => "uint",
@@ -149,10 +165,9 @@ const DIALECTS: [Dialect; 3] = [
                 space.accessor()
             )
         },
-        grid: |_, _| String::new(),
+        grid: trits,
         values: true,
         guarded: &[],
-        words: false,
         sixteen: |id, name, values, zero| {
             let pairs: Vec<String> = (0..256)
                 .map(|byte| {
@@ -185,7 +200,7 @@ const DIALECTS: [Dialect; 3] = [
         pair: |low, high| format!("{{0x{low:08x}u, 0x{high:08x}u}}"),
         bind: |space, id, name, ty| {
             format!(
-                "namespace {} {{ template <> struct table<{id}> {{ __device__ static const {ty} *{}() {{ return {name}; }} }}; }}\n",
+                "namespace {} {{ template <> struct table<{id}> {{ static constexpr unsigned SIZE = sizeof({name}) / sizeof({name}[0]); __device__ static const {ty} *{}() {{ return {name}; }} }}; }}\n",
                 space.name(),
                 space.accessor()
             )
@@ -205,31 +220,6 @@ const DIALECTS: [Dialect; 3] = [
         values: false,
         // A grid's magnitude operands' only reader is the records GEMV.
         guarded: &[Table::Magnitudes],
-        words: false,
-    },
-    Dialect {
-        file: "tables.glsl",
-        begin: "#ifndef SEISMIC_TABLES_GLSL\n#define SEISMIC_TABLES_GLSL\n\n",
-        end: "#endif\n",
-        ty: |element| match element {
-            Element::Word => "uint",
-            Element::Pair => "uvec2",
-            Element::Float => "float",
-        },
-        open: |space, name, ty, len| format!("const {ty} {}_{name}[{len}] = {ty}[](\n", space.name()),
-        close: ");\n\n",
-        pair: |low, high| format!("uvec2(0x{low:08x}u, 0x{high:08x}u)"),
-        bind: |space, id, name, _| {
-            let space = space.name();
-            format!("#define {}_TABLE_{id} {space}_{name}\n", native_macro(space))
-        },
-        sixteen: |_, _, _, _| String::new(),
-        grid: |_, _| String::new(),
-        values: true,
-        // glslang emits every declared constant array, read or not: a
-        // module holds only the tables its includer reads.
-        guarded: &[Table::Grid, Table::Codebook],
-        words: true,
     },
 ];
 
@@ -242,6 +232,33 @@ fn e2m1_doubled(values: [i8; 16]) -> bool {
         let magnitude = if exponent == 0 { mantissa } else { (2 + mantissa) << (exponent - 1) };
         i32::from(values[code as usize]) == if code & 8 != 0 { -magnitude } else { magnitude }
     })
+}
+
+/// On Metal, an eight-lane grid whose lanes are each -1, 0 or 1 (ggml's
+/// `iq1s_grid`) also has its points as 2-bit codes, lane j's value + 1 at
+/// bits 2j of a ushort (`grids::trits<ID>::codes()`): a quarter of the
+/// points' bytes, so the table stays resident in the constant cache, and
+/// `packets::split_fields` spreads a point's codes to its lanes' bytes.
+/// Other grids have none (`trits<ID>::any` false).
+fn trits(id: usize, points: GridPoints) -> String {
+    let GridPoints::Lanes8(points) = points else { return String::new() };
+    let codes: Option<Vec<String>> = points
+        .iter()
+        .map(|point| {
+            (0..8).try_fold(0u16, |codes, lane| {
+                let value = (point >> (8 * lane)) as u8 as i8;
+                (-1..=1).contains(&value).then(|| codes | (((value + 1) as u16) << (2 * lane)))
+            })
+        })
+        .map(|codes| codes.map(|codes| format!("0x{codes:04x}")))
+        .collect();
+    let Some(codes) = codes else { return String::new() };
+    let mut text = format!("namespace grids {{ constant ushort trits_{id}[{}] = {{\n", codes.len());
+    body(&mut text, &codes);
+    text += &format!(
+        "}}; template <> struct trits<{id}> {{ static constant constexpr bool any = true; static constant ushort *codes() {{ return trits_{id}; }} }}; }}\n"
+    );
+    text
 }
 
 /// A grid's magnitude operands, for a grid of at most four distinct lane
@@ -330,11 +347,88 @@ fn magnitudes(id: usize, points: GridPoints) -> String {
     )
 }
 
-/// `words` as an array's lines, four a line, with no trailing comma (a GLSL
-/// array constructor takes none).
+/// `words` as an array's lines, four a line.
 fn body(text: &mut String, words: &[String]) {
     let lines: Vec<String> = words.chunks(4).map(|line| line.join(", ")).collect();
     writeln!(text, "    {}", lines.join(",\n    ")).unwrap();
+}
+
+/// The Vulkan tables, ggml's grids and codebooks and every conversion's
+/// lookup table (`RepackTable::ALL`): their bytes (`tables.bin`,
+/// `source::VULKAN_TABLES`), which a device holds in one read-only storage
+/// buffer at the push constant `seismic_tables` (seismic/runtime's Vulkan
+/// ABI), and `tables.glsl`, that buffer's block `seismic_tables_t`, the
+/// bindings of its arrays and each grid's and codebook's `u32` words. Every
+/// Vulkan program's prefix holds it. A constant array would be no table:
+/// glslang copies a constant array indexed by a variable into the
+/// invocation's own storage at every use, which the driver places in local
+/// memory (and formation refuses, `seal::contract`). The arrays are std430,
+/// eight-byte points before four-byte words and values, so each starts
+/// aligned with no padding and the bytes are the arrays' elements in
+/// declaration order.
+fn vulkan(out: &std::path::Path) {
+    // Each array: its member, the binding that names it, its element and its bytes.
+    let mut members: Vec<(String, String, Element, Vec<u8>)> = Vec::new();
+    for (index, grid) in GRIDS.iter().enumerate() {
+        let (element, bytes): (_, Vec<u8>) = match grid.points {
+            GridPoints::Lanes4(points) => (Element::Word, points.iter().flat_map(|point| point.to_le_bytes()).collect()),
+            GridPoints::Lanes8(points) => (Element::Pair, points.iter().flat_map(|point| point.to_le_bytes()).collect()),
+        };
+        let space = Space::Grids.name();
+        members.push((format!("{space}_{}", grid.name), format!("{}_TABLE_{}", native_macro(space), index + 1), element, bytes));
+    }
+    for (index, codebook) in CODEBOOKS.iter().enumerate() {
+        let bytes = codebook.values.iter().flat_map(|value| f32::from(*value).to_le_bytes()).collect();
+        let space = Space::Codebooks.name();
+        members.push((format!("{space}_{}", codebook.name), format!("{}_TABLE_{}", native_macro(space), index + 1), Element::Float, bytes));
+    }
+    // A conversion's lookup table, entry `i` the 32-bit word of its value
+    // (sign-extended): `SEISMIC_REPACK_TABLE_<RepackTable::index>`.
+    for table in RepackTable::ALL {
+        let bytes = table.values().iter().flat_map(|value| value.to_le_bytes()).collect();
+        members.push((format!("repacks_{}", table.index()), format!("SEISMIC_REPACK_TABLE_{}", table.index()), Element::Word, bytes));
+    }
+    members.sort_by_key(|(_, _, element, _)| std::cmp::Reverse(element.bytes()));
+    let mut text = String::from(
+        "// Seismic native library: ggml's grids and codebooks (`ggml-common.h`),\n\
+         // rendered from `magnitude_ggml::tables` by seismic/lang/build.rs, and the\n\
+         // conversions' lookup tables (`RepackTable`): the device's tables buffer\n\
+         // (`seismic_tables`). Byte `j` of a grid point is its lane `j`; an\n\
+         // eight-lane point's lanes 0..3 are its first word, lanes 4..7 its second.\n\n\
+         #ifndef SEISMIC_TABLES_GLSL\n#define SEISMIC_TABLES_GLSL\n\n",
+    );
+    for (index, grid) in GRIDS.iter().enumerate() {
+        writeln!(text, "#define SEISMIC_GRID_{} {}", native_macro(grid.name), index + 1).unwrap();
+    }
+    for (index, codebook) in CODEBOOKS.iter().enumerate() {
+        writeln!(text, "#define SEISMIC_CODEBOOK_{} {}", native_macro(codebook.name), index + 1).unwrap();
+    }
+    text += "#define GRIDS_WORDS_0 0u\n#define CODEBOOKS_WORDS_0 0u\n";
+    for (index, grid) in GRIDS.iter().enumerate() {
+        writeln!(text, "#define GRIDS_WORDS_{} {}u", index + 1, grid.points.words()).unwrap();
+    }
+    for (index, codebook) in CODEBOOKS.iter().enumerate() {
+        writeln!(text, "#define CODEBOOKS_WORDS_{} {}u", index + 1, codebook.values.len()).unwrap();
+    }
+    text += "\nlayout(buffer_reference, std430, buffer_reference_align = 16) readonly restrict buffer seismic_tables_t {\n";
+    let mut bytes = Vec::new();
+    for (member, _, element, values) in &members {
+        let ty = match element {
+            Element::Word => "uint",
+            Element::Pair => "uvec2",
+            Element::Float => "float",
+        };
+        assert_eq!(bytes.len() % element.bytes(), 0, "a table starts aligned to its element");
+        writeln!(text, "    {ty} {member}[{}];", values.len() / element.bytes()).unwrap();
+        bytes.extend_from_slice(values);
+    }
+    text += "};\n\n";
+    for (member, binding, _, _) in &members {
+        writeln!(text, "#define {binding} (seismic_tables_t(seismic_tables).{member})").unwrap();
+    }
+    text += "\n#endif\n";
+    std::fs::write(out.join("tables.glsl"), text).expect("tables header");
+    std::fs::write(out.join("tables.bin"), bytes).expect("tables bytes");
 }
 
 /// A backend's producer predicates (`<seismic/producers.*>`), rendered from
@@ -518,7 +612,9 @@ fn main() {
     // producer declarations.
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/producer_decl.rs");
+    println!("cargo:rerun-if-changed=src/external_tables.rs");
     let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
+    vulkan(&out);
     let declaration = |directory: &str| {
         let path = format!("native-library/{directory}/producers.decl");
         println!("cargo:rerun-if-changed={path}");
@@ -555,15 +651,6 @@ fn main() {
         }
         for (index, codebook) in CODEBOOKS.iter().enumerate() {
             writeln!(text, "#define SEISMIC_CODEBOOK_{} {}", native_macro(codebook.name), index + 1).unwrap();
-        }
-        if dialect.words {
-            text += "#define GRIDS_WORDS_0 0u\n#define CODEBOOKS_WORDS_0 0u\n";
-            for (index, grid) in GRIDS.iter().enumerate() {
-                writeln!(text, "#define GRIDS_WORDS_{} {}u", index + 1, grid.points.words()).unwrap();
-            }
-            for (index, codebook) in CODEBOOKS.iter().enumerate() {
-                writeln!(text, "#define CODEBOOKS_WORDS_{} {}u", index + 1, codebook.values.len()).unwrap();
-            }
         }
         text += "\n";
         for (index, grid) in GRIDS.iter().enumerate() {

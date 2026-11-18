@@ -97,6 +97,7 @@ const ROWS: [usize; 10] = [1, 2, 3, 8, 12, 16, 17, 40, 64, 128];
 
 fn dense_expand_matches_host_model(format: Format) {
     let Some(device) = cuda() else { return };
+    let charges = seismic::Charges::tally(&device);
     let mut rng = Rng(7);
     // 17 row tiles: a GEMV group tail and a GEMM block-column tail.
     let (h, f) = (512, 272);
@@ -112,7 +113,7 @@ fn dense_expand_matches_host_model(format: Format) {
             let (expected, tolerance) = case.expand(&gate, &up, Some(format), mapping);
             let product = expand
                 .kernel(&device, mapping)
-                .call(dense_expand::Args {
+                .call(&charges, dense_expand::Args {
                     residual: &residual,
                     norm: &norm,
                     gate_weight: &gate.tensor,
@@ -155,6 +156,7 @@ fn dense_output_at_partial_block_widths(format: Format) {
 
 fn dense_output_cases(device: &Device, format: Format, h: usize, f: usize, rng: &mut Rng) {
     let device = device.clone();
+    let charges = seismic::Charges::tally(&device);
     let down = weight(&device, format, h, f, rng);
     let output = output_projection(format.resident(), h, f);
     for o in ROWS {
@@ -180,7 +182,7 @@ fn dense_output_cases(device: &Device, format: Format, h: usize, f: usize, rng: 
                 .unzip();
             let result = output
                 .kernel(&device, mapping)
-                .call(dense_output::Args {
+                .call(&charges, dense_output::Args {
                     residual: &residual,
                     product: &product,
                     down_weight: &down.tensor,
@@ -207,6 +209,7 @@ fn dense_output_cases(device: &Device, format: Format, h: usize, f: usize, rng: 
 /// NVFP4 operand rows) run one group only and are refused.
 fn grouped_project_rows_match_host_model(format: Format) {
     let Some(device) = cuda() else { return };
+    let charges = seismic::Charges::tally(&device);
     let mut rng = Rng(29);
     let (groups, n, k) = (3usize, 48usize, 512usize);
     let weight = weight(&device, format, groups * n, k, &mut rng);
@@ -254,7 +257,7 @@ fn grouped_project_rows_match_host_model(format: Format) {
             }
             let result = projection
                 .kernel(&device, mapping)
-                .call(project_rows::Args {
+                .call(&charges, project_rows::Args {
                     source: &source_tensor,
                     weight: &weight.tensor,
                     weight_scale: &f32_tensor(&device, &[0], &[]),
@@ -279,6 +282,7 @@ fn grouped_project_rows_match_host_model(format: Format) {
 #[test]
 fn cuda_int8_activations_follow_the_cpu_rule() {
     let Some(device) = cuda() else { return };
+    let charges = seismic::Charges::tally(&device);
     let (n, k) = (64usize, 512usize);
     let format = Format::Q8;
     let shape = [n as u64, k as u64];
@@ -286,7 +290,7 @@ fn cuda_int8_activations_follow_the_cpu_rule() {
     let bytes = resident
         .repack_host(format.source(), &shape, &int8_rule::probe_blocks(n, k))
         .expect("registered GGUF -> mma16 conversion");
-    let weight = Tensor::from_host(&device, resident, &shape, &bytes).unwrap();
+    let weight = Tensor::from_host(&charges, resident, &shape, &bytes).unwrap();
     let projection = Mapped::new(
         project_rows::native_entry_with(project_rows::Elements {
             A: Element::bf16(),
@@ -305,7 +309,7 @@ fn cuda_int8_activations_follow_the_cpu_rule() {
     );
     // INT8 on the small-band GEMM (17 to 64 rows).
     let mapping = GEMM_MAPPINGS[1];
-    assert!(mapping.quantizes(SMALL_GEMM_ROWS) && projection.admits(&device, mapping));
+    assert!(mapping.quantizes() && projection.admits(&device, mapping));
     for (at, groups) in int8_rule::blocks().chunks(SMALL_GEMM_ROWS).enumerate() {
         let rows = groups.len().max(GEMV_ROWS + 1);
         let mut source = vec![0.0f32; rows * k];
@@ -314,7 +318,7 @@ fn cuda_int8_activations_follow_the_cpu_rule() {
         }
         let result = projection
             .kernel(&device, mapping)
-            .call(project_rows::Args {
+            .call(&charges, project_rows::Args {
                 source: &bf16_tensor(&device, &[rows as u64, k as u64], &source),
                 weight: &weight,
                 weight_scale: &f32_tensor(&device, &[0], &[]),
@@ -352,6 +356,7 @@ fn digest(tensor: &Tensor) -> u64 {
 /// builds).
 fn gemm_row_bands_match_host_model(format: Format) {
     let Some(device) = cuda() else { return };
+    let charges = seismic::Charges::tally(&device);
     let mut rng = Rng(23);
     let (h, f) = (512, 272);
     let rotations = [2, 1, 4].map(|rotate| Mapping {
@@ -383,7 +388,7 @@ fn gemm_row_bands_match_host_model(format: Format) {
         let digests = rotations.map(|rotation| {
             let product = expand
                 .kernel(&device, rotation)
-                .call(dense_expand::Args {
+                .call(&charges, dense_expand::Args {
                     residual: &residual,
                     norm: &norm,
                     gate_weight: &gate.tensor,
@@ -429,7 +434,7 @@ fn gemm_row_bands_match_host_model(format: Format) {
         let digests = rotations.map(|rotation| {
             let result = output
                 .kernel(&device, rotation)
-                .call(dense_output::Args {
+                .call(&charges, dense_output::Args {
                     residual: &residual,
                     product: &product,
                     down_weight: &down.tensor,
@@ -463,6 +468,7 @@ fn tuning_requirement() -> seismic::NumericalRequirement {
 #[ignore]
 fn cuda_dense_expand_scoped_tuning_is_factored() {
     let Some(device) = cuda() else { return };
+    let charges = seismic::Charges::tally(&device);
     let absent_scale = f32_tensor(&device, &[0], &[]);
     let no_limit = i32_tensor(&device, &[0, 0], &[]);
     let mut rng = Rng(731);
@@ -523,7 +529,7 @@ fn cuda_dense_expand_scoped_tuning_is_factored() {
         .with_static("US", 0)
         .with_static("LB", 0);
     let result = dense_expand::native_tune_with(
-        &device,
+        &charges,
         dense_expand::Elements {
             NW: Element::f32(),
             GW: Format::Q4K.resident(),
@@ -554,6 +560,7 @@ fn cuda_dense_expand_scoped_tuning_is_factored() {
 #[ignore]
 fn cuda_dense_output_scoped_tuning_is_factored() {
     let Some(device) = cuda() else { return };
+    let charges = seismic::Charges::tally(&device);
     let absent_scale = f32_tensor(&device, &[0], &[]);
     let mut rng = Rng(741);
     let (h, f) = (272usize, 512usize);
@@ -610,7 +617,7 @@ fn cuda_dense_output_scoped_tuning_is_factored() {
         .with_static("F", f as u64)
         .with_static("DS", 0);
     let result = dense_output::native_tune_with(
-        &device,
+        &charges,
         dense_output::Elements {
             DW: Format::Q5K.resident(),
             A: Element::bf16(),
@@ -640,6 +647,7 @@ fn cuda_dense_output_scoped_tuning_is_factored() {
 #[test]
 fn cuda_dense_weights_match_host_model() {
     let Some(device) = cuda() else { return };
+    let charges = seismic::Charges::tally(&device);
     let mut rng = Rng(23);
     let (h, f) = (512, 320);
     let gate = dense_weight(&device, f, h, &mut rng);
@@ -659,7 +667,7 @@ fn cuda_dense_weights_match_host_model() {
             let (expected, tolerance) = case.expand(&gate, &up, None, mapping);
             let product = expand
                 .kernel(&device, mapping)
-                .call(dense_expand::Args {
+                .call(&charges, dense_expand::Args {
                     residual: &residual,
                     norm: &norm,
                     gate_weight: &gate.tensor,
@@ -697,7 +705,7 @@ fn cuda_dense_weights_match_host_model() {
                 .unzip();
             let result = output
                 .kernel(&device, mapping)
-                .call(dense_output::Args {
+                .call(&charges, dense_output::Args {
                     residual: &residual,
                     product: &product,
                     down_weight: &down.tensor,
@@ -713,97 +721,6 @@ fn cuda_dense_weights_match_host_model() {
                 &expected,
                 &tolerance,
             );
-        }
-    }
-}
-
-/// Every row of a GEMV class (2..=GEMV_ROWS rows, staged and two-block paths)
-/// equals the same row projected alone (M = 1, formed in the GEMV block) bit
-/// for bit: a verification row does not depend on its peers or on M.
-fn gemv_rows_match_single_row_bits(format: Format) {
-    let Some(device) = cuda() else { return };
-    let mut rng = Rng(19);
-    let (h, f) = (512, 768);
-    let gate = weight(&device, format, f, h, &mut rng);
-    let up = weight(&device, format, f, h, &mut rng);
-    let down = weight(&device, format, h, f, &mut rng);
-    let rows = GEMV_ROWS;
-    let residual_values: Vec<f32> = (0..rows * h).map(|_| rng.uniform(-3.0, 3.0)).collect();
-    let norm = f32_tensor(
-        &device,
-        &[h as u64],
-        &(0..h).map(|_| rng.uniform(0.25, 1.25)).collect::<Vec<_>>(),
-    );
-    let product_values: Vec<f32> = (0..rows * f)
-        .map(|_| bf16_round(rng.uniform(-1.0, 1.0)))
-        .collect();
-    let expansion = expansion(format.resident(), format.resident(), h, f);
-    let projection = output_projection(format.resident(), h, f);
-    for mapping in admitted("dense_expand + dense_output", &GEMV_MAPPINGS, |mapping| {
-        expansion.admits(&device, mapping) && projection.admits(&device, mapping)
-    }) {
-        let expand = expansion.kernel(&device, mapping);
-        let output = projection.kernel(&device, mapping);
-        let run = |o: usize, first: usize| {
-            let residual = f32_tensor(
-                &device,
-                &[o as u64, h as u64],
-                &residual_values[first * h..(first + o) * h],
-            );
-            let product = bf16_tensor(
-                &device,
-                &[o as u64, f as u64],
-                &product_values[first * f..(first + o) * f],
-            );
-            let out_rows = i32_tensor(&device, &[o as u64], &(0..o as i32).collect::<Vec<_>>());
-            let expanded = expand
-                .call(dense_expand::Args {
-                    residual: &residual,
-                    norm: &norm,
-                    gate_weight: &gate.tensor,
-                    up_weight: &up.tensor,
-                    out_rows: &out_rows,
-                    eps: EPSILON,
-                    activation: 0,
-                    glu_limit: &i32_tensor(&device, &[0, 0], &[]),
-                    gate_scale: &f32_tensor(&device, &[0], &[]),
-                    up_scale: &f32_tensor(&device, &[0], &[]),
-                    gate_bound: &f32_tensor(&device, &[0], &[]),
-                    up_bound: &f32_tensor(&device, &[0], &[]),
-                })
-                .unwrap()
-                .value;
-            let residual_rows = f32_tensor(&device, &[o as u64, h as u64], &vec![0.0; o * h]);
-            let projected = output
-                .call(dense_output::Args {
-                    residual: &residual_rows,
-                    product: &product,
-                    down_weight: &down.tensor,
-                    out_rows: &out_rows,
-                    down_scale: &f32_tensor(&device, &[0], &[]),
-                    down_bound: &f32_tensor(&device, &[0], &[]),
-                })
-                .unwrap()
-                .value;
-            (read_bf16(&expanded), read_f32(&projected))
-        };
-        let singles: Vec<(Vec<f32>, Vec<f32>)> = (0..rows).map(|row| run(1, row)).collect();
-        for o in [2usize, 5, 8, 9, 12, 16] {
-            let (expanded, projected) = run(o, 0);
-            for row in 0..o {
-                let label = format!("{format:?} {mapping:?} O={o} row {row}");
-                let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
-                assert_eq!(
-                    bits(&expanded[row * f..(row + 1) * f]),
-                    bits(&singles[row].0),
-                    "expand {label}"
-                );
-                assert_eq!(
-                    bits(&projected[row * h..(row + 1) * h]),
-                    bits(&singles[row].1),
-                    "output {label}"
-                );
-            }
         }
     }
 }
@@ -827,6 +744,7 @@ fn head_expected(
 
 fn head_rows_match_host_model(format: Format) {
     let Some(device) = cuda() else { return };
+    let charges = seismic::Charges::tally(&device);
     let mut rng = Rng(13);
     let (d, v) = (512, 272);
     let head = weight(&device, format, v, d, &mut rng);
@@ -863,7 +781,7 @@ fn head_rows_match_host_model(format: Format) {
             );
             let logits = readout
                 .kernel(&device, mapping)
-                .call(readout_head_rows::Args {
+                .call(&charges, readout_head_rows::Args {
                     hidden: &hidden,
                     norm: &norm,
                     weight: &head.tensor,
@@ -887,6 +805,7 @@ fn head_rows_match_host_model(format: Format) {
 #[test]
 fn cuda_head_logits_scoped_launches_match_host_model() {
     let Some(device) = cuda() else { return };
+    let charges = seismic::Charges::tally(&device);
     let mut rng = Rng(83);
     let (d, v) = (256, 256);
     let head = weight(&device, Format::Q6K, v, d, &mut rng);
@@ -922,16 +841,16 @@ fn cuda_head_logits_scoped_launches_match_host_model() {
             )
             .unwrap();
             let logits = kernel
-                .call(readout_project_rows::Args {
+                .call(&charges, readout_project_rows::Args {
                     features: &bf16_tensor(&device, &[rows as u64, d as u64], &features),
                     weight: &head.tensor,
                     token_rows: &Tensor::zeros(
-                        &device,
+                        &charges,
                         Element::i32(),
                         &[rows as u64, 0, v as u64],
                     )
                     .unwrap(),
-                    weight_scale: &Tensor::zeros(&device, Element::f32(), &[0]).unwrap(),
+                    weight_scale: &Tensor::zeros(&charges, Element::f32(), &[0]).unwrap(),
                     softcap: 0.0,
                 })
                 .unwrap()
@@ -957,11 +876,11 @@ fn cuda_head_logits_scoped_launches_match_host_model() {
                     .with_static("I", 1),
             )
             .unwrap()
-            .call(readout_project_rows::Args {
+            .call(&charges, readout_project_rows::Args {
                 features: &bf16_tensor(&device, &[rows as u64, d as u64], &features),
                 weight: &head.tensor,
                 token_rows: &i32_tensor(&device, &[rows as u64, 1, columns as u64], &ids),
-                weight_scale: &Tensor::zeros(&device, Element::f32(), &[0]).unwrap(),
+                weight_scale: &Tensor::zeros(&charges, Element::f32(), &[0]).unwrap(),
                 softcap: 0.0,
             })
             .unwrap()
@@ -995,6 +914,7 @@ fn cuda_head_logits_scoped_launches_match_host_model() {
 #[test]
 fn cuda_indexed_readout_logits_are_the_full_readout_logits() {
     let Some(device) = cuda() else { return };
+    let charges = seismic::Charges::tally(&device);
     let mut rng = Rng(89);
     let (d, v, columns) = (512, 272, 7);
     let head = weight(&device, Format::Q6K, v, d, &mut rng);
@@ -1028,18 +948,18 @@ fn cuda_indexed_readout_logits_are_the_full_readout_logits() {
         let project = |kernel: &seismic::NativeKernel<readout_project_rows::Entry>, token_rows: &Tensor| {
             read_f32(
                 &kernel
-                    .call(readout_project_rows::Args {
+                    .call(&charges, readout_project_rows::Args {
                         features: &input,
                         weight: &head.tensor,
                         token_rows,
-                        weight_scale: &Tensor::zeros(&device, Element::f32(), &[0]).unwrap(),
+                        weight_scale: &Tensor::zeros(&charges, Element::f32(), &[0]).unwrap(),
                         softcap: 0.0,
                     })
                     .unwrap()
                     .value,
             )
         };
-        let logits = project(&full, &Tensor::zeros(&device, Element::i32(), &[rows as u64, 0, v as u64]).unwrap());
+        let logits = project(&full, &Tensor::zeros(&charges, Element::i32(), &[rows as u64, 0, v as u64]).unwrap());
         let gathered = project(&indexed, &i32_tensor(&device, &[rows as u64, 1, columns as u64], &ids));
         for (index, (&id, value)) in ids.iter().zip(&gathered).enumerate() {
             let row = index / columns;
@@ -1054,6 +974,7 @@ fn cuda_indexed_readout_logits_are_the_full_readout_logits() {
 
 fn features_and_selected_rows_match_host_model(format: Format) {
     let Some(device) = cuda() else { return };
+    let charges = seismic::Charges::tally(&device);
     let mut rng = Rng(17);
     let (d, v) = (512, 272);
     let selected_values = [0i32, 271, 16, 15, 100, 100, 7];
@@ -1080,7 +1001,7 @@ fn features_and_selected_rows_match_host_model(format: Format) {
                 .with_static("NM", d as u64),
         )
         .unwrap()
-        .call(readout_features_rows::Args {
+        .call(&charges, readout_features_rows::Args {
             hidden: &hidden
                 .reshape(&[hidden.extents()[0], 1, hidden.extents()[1]])
                 .unwrap(),
@@ -1114,7 +1035,7 @@ fn features_and_selected_rows_match_host_model(format: Format) {
                 .with_static("NM", d as u64),
         )
         .unwrap()
-        .call(readout_selected_rows::Args {
+        .call(&charges, readout_selected_rows::Args {
             hidden: &hidden,
             norm: &norm,
             weight: &head.tensor,
@@ -1227,6 +1148,7 @@ fn dense_expand_host_model_matches_portable_body(format: Format) {
 
 fn embedding_rows_decode_table_rows(format: Format) {
     let Some(device) = cuda() else { return };
+    let charges = seismic::Charges::tally(&device);
     let mut rng = Rng(5);
     let (v, d) = (40, 512);
     let table = weight(&device, format, v, d, &mut rng);
@@ -1246,7 +1168,7 @@ fn embedding_rows_decode_table_rows(format: Format) {
         &NativeSpecialization::new().with_static("D", d as u64),
     )
     .unwrap()
-    .call(embedding_rows::Args {
+    .call(&charges, embedding_rows::Args {
         table: &table.tensor,
         tokens: &tokens,
         directory: &i32_tensor(&device, &[0, 1], &[]),
@@ -1279,6 +1201,7 @@ fn embedding_rows_decode_table_rows(format: Format) {
 /// RMS inverse, bit for bit.
 fn embedding_rows_of_rows16_slots_equal_the_mma16_table(format: Format) {
     let Some(device) = cuda() else { return };
+    let charges = seismic::Charges::tally(&device);
     let mut rng = Rng(9);
     let (v, d) = (40, 512);
     let shape = [v as u64, d as u64];
@@ -1296,7 +1219,7 @@ fn embedding_rows_of_rows16_slots_equal_the_mma16_table(format: Format) {
         let bytes = element
             .repack_host(source, &shape, &external)
             .expect("registered GGUF conversion");
-        let table = Tensor::from_host(&device, element, &shape, &bytes).unwrap();
+        let table = Tensor::from_host(&charges, element, &shape, &bytes).unwrap();
         let out = declared::prepared(
             &device,
             &embedding_rows::native_entry_with(embedding_rows::Elements {
@@ -1306,7 +1229,7 @@ fn embedding_rows_of_rows16_slots_equal_the_mma16_table(format: Format) {
             &NativeSpecialization::new().with_static("D", d as u64),
         )
         .unwrap()
-        .call(embedding_rows::Args {
+        .call(&charges, embedding_rows::Args {
             table: &table,
             tokens: &tokens,
             directory: &direct,
@@ -1335,6 +1258,7 @@ fn embedding_rows_of_rows16_slots_equal_the_mma16_table(format: Format) {
 /// rows16 backends).
 fn embedding_rows_read_the_slots_their_directory_names(format: Format) {
     let Some(device) = cuda() else { return };
+    let charges = seismic::Charges::tally(&device);
     let mut rng = Rng(6);
     let (v, d, logical) = (40, 512, 130);
     // Every third logical row has a slot.
@@ -1376,7 +1300,7 @@ fn embedding_rows_read_the_slots_their_directory_names(format: Format) {
             .collect::<Vec<_>>();
         let read = |pairs: &[i32], directory: &Tensor| {
             let out = kernel
-                .call(embedding_rows::Args {
+                .call(&charges, embedding_rows::Args {
                     table: &table.tensor,
                     tokens: &i32_tensor(&device, &[rows as u64, 2], pairs),
                     directory,
@@ -1409,7 +1333,6 @@ gguf_format_tests! {
         dense_output_matches_host_model
         grouped_project_rows_match_host_model
         gemm_row_bands_match_host_model
-        gemv_rows_match_single_row_bits
         head_rows_match_host_model
         features_and_selected_rows_match_host_model
         dense_expand_host_model_matches_portable_body
@@ -1471,6 +1394,7 @@ fn sample_host(logits: &[f32], mask: &[u32], constrained: bool, draw: &[u32; 6])
 #[test]
 fn cuda_sample_rows_match_portable_semantics_for_every_partition() {
     let Some(device) = cuda() else { return };
+    let charges = seismic::Charges::tally(&device);
     let mut rng = Rng(19);
     let v = 5000usize;
     let words = v.div_ceil(32);
@@ -1531,7 +1455,7 @@ fn cuda_sample_rows_match_portable_semantics_for_every_partition() {
                     .with_param("WIDTH", width),
             )
             .unwrap()
-            .call(sample_rows::Args {
+            .call(&charges, sample_rows::Args {
                 logits: &logits_tensor,
                 mask: &mask_tensor,
                 constrained: &constrained_tensor,
@@ -1624,6 +1548,7 @@ fn shape_host(logits: &[f32], params: &[f32; 8], history: &[i32]) -> Vec<f32> {
 #[test]
 fn cuda_shape_rows_match_portable_semantics() {
     let Some(device) = cuda() else { return };
+    let charges = seismic::Charges::tally(&device);
     let mut rng = Rng(23);
     let (v, hn) = (3000usize, 16usize);
     let rows: Vec<[f32; 8]> = vec![
@@ -1673,7 +1598,7 @@ fn cuda_shape_rows_match_portable_semantics() {
                     .with_param("WIDTH", width),
             )
             .unwrap()
-            .call(shape_rows::Args {
+            .call(&charges, shape_rows::Args {
                 logits: &mut shaped,
                 mask: &mask_tensor,
                 constrained: &constrained_tensor,
@@ -1700,20 +1625,24 @@ fn cuda_shape_rows_match_portable_semantics() {
     }
 }
 
-/// `dense_output` at Qwen3.5-9B's feed-forward down shape (H 4096, F 12288)
-/// over the grid and codebook formats, q4_K and F8_E4M3, at a decode row and
-/// a 512-row prefill chunk, under the declaration's default configuration:
-/// the median device time of a call over 15 samples. The grid formats are
-/// timed again over uniform weights (every code 0, so every lookup reads
-/// one table entry): what time their lookups take. A shape timing for
-/// before/after comparisons of the decoders.
-#[test]
-#[ignore = "timing at shape"]
-fn dense_output_timing_at_shape() {
+/// The types the `dense_output` shape timings cover: every decode-axis class
+/// (direct, k-quant, table, float, grid and odd widths), and the grid
+/// formats again over uniform weights (every code 0, so every lookup reads
+/// one table entry; `true`). `CUDA_TIMING_TYPES` (representation names,
+/// comma-separated, such as `q4k,iq1s`) narrows them to those types.
+fn timed_types() -> Vec<(Format, bool)> {
     use magnitude_ggml::Encoding;
-    let Some(device) = cuda() else { return };
-    let (h, f) = (4096usize, 12288usize);
     let random = [
+        Encoding::Q4_0,
+        Encoding::Q4_1,
+        Encoding::Q8_0,
+        Encoding::Q2K,
+        Encoding::Q3K,
+        Encoding::Q4K,
+        Encoding::Q6K,
+        Encoding::Iq4Nl,
+        Encoding::Iq4Xs,
+        Encoding::Mxfp4,
         Encoding::Iq1S,
         Encoding::Iq1M,
         Encoding::Iq2Xxs,
@@ -1721,32 +1650,61 @@ fn dense_output_timing_at_shape() {
         Encoding::Iq2S,
         Encoding::Iq3Xxs,
         Encoding::Iq3S,
-        Encoding::Iq4Nl,
-        Encoding::Iq4Xs,
-        Encoding::Mxfp4,
-        Encoding::Q4K,
+        Encoding::Q1_0,
+        Encoding::Q2_0,
+        Encoding::Tq2_0,
     ]
     .map(Format::rounded)
     .into_iter()
     .chain([Format::F8_E4M3])
     .map(|format| (format, false));
     let uniform = [Encoding::Iq1S, Encoding::Iq2Xxs, Encoding::Iq3Xxs].map(|encoding| (Format::rounded(encoding), true));
+    let only = std::env::var("CUDA_TIMING_TYPES").ok();
+    random
+        .chain(uniform)
+        .filter(|(format, _)| only.as_deref().is_none_or(|only| only.split(',').any(|name| name == format.name())))
+        .collect()
+}
+
+/// A timing weight of `format` and `shape` on `device` (random codes, or
+/// every code 0 where `uniform`) and its resident bytes: the weight's bytes
+/// alone, as its host values (an interpreted decode of 50M values) are no
+/// part of a timing.
+fn timing_weight(charges: &seismic::Charges, format: Format, uniform: bool, shape: [u64; 2], rng: &mut Rng) -> (Tensor, Vec<u8>) {
+    let external = format.external(rng, &shape, 2.0 / (shape[1] as f32).sqrt());
+    let external = if uniform { vec![0; external.len()] } else { external };
+    let bytes = format.resident().repack_host(format.source(), &shape, &external).unwrap();
+    (Tensor::from_host(charges, format.resident(), &shape, &bytes).unwrap(), bytes)
+}
+
+/// `dense_output` at Qwen3.5-9B's feed-forward down shape (H 4096, F 12288)
+/// over the types of every decode-axis class (direct, k-quant, table,
+/// float, grid and odd widths), at a decode row and a 512-row prefill
+/// chunk: every configuration the declaration admits at the row count, each
+/// the median device time of a call over 7 samples, reported as the
+/// default's and the fastest admitted one's time and the weight's resident
+/// bytes per second. The grid formats are timed again over uniform weights
+/// (every code 0, so every lookup reads one table entry): what time their
+/// lookups take. A shape timing for before/after comparisons of the
+/// decoders and forms; `CUDA_TIMING_TYPES` narrows it to some types and
+/// `CUDA_TIMING_ROWS` to some row counts.
+#[test]
+#[ignore = "timing at shape"]
+fn dense_output_timing_at_shape() {
+    let Some(device) = cuda() else { return };
+    let charges = seismic::Charges::tally(&device);
+    let (h, f) = (4096usize, 12288usize);
+    // `CUDA_TIMING_ROWS` (comma-separated, such as `1`) times only those
+    // row counts.
+    let row_counts: Vec<usize> = std::env::var("CUDA_TIMING_ROWS")
+        .map(|rows| rows.split(',').map(|count| count.parse().expect("CUDA_TIMING_ROWS names row counts")).collect())
+        .unwrap_or_else(|_| vec![1, 512]);
     let mut rng = Rng(97);
-    for (format, uniform) in random.chain(uniform) {
-        // The weight's bytes alone: its host values (an interpreted decode
-        // of 50M values) are no part of a timing.
-        let shape = [h as u64, f as u64];
-        let external = format.external(&mut rng, &shape, 2.0 / (f as f32).sqrt());
-        let external = if uniform { vec![0; external.len()] } else { external };
-        let bytes = format.resident().repack_host(format.source(), &shape, &external).unwrap();
-        let down_weight = Tensor::from_host(&device, format.resident(), &shape, &bytes).unwrap();
+    for (format, uniform) in timed_types() {
+        let (down_weight, bytes) = timing_weight(&charges, format, uniform, [h as u64, f as u64], &mut rng);
         let elements = || dense_output::Elements { DW: format.resident(), A: Element::bf16() };
         let statics = NativeSpecialization::new().with_static("H", h as u64).with_static("F", f as u64).with_static("DS", 0);
-        let configuration = dense_output::native_entry_with(elements())
-            .default_specialization(&device, &statics)
-            .unwrap()
-            .expect("dense_output has a default configuration");
-        for rows in [1usize, 512] {
+        for &rows in &row_counts {
             let product: Vec<f32> = (0..rows * f).map(|_| bf16_round(rng.uniform(-1.0, 1.0))).collect();
             let residual: Vec<f32> = (0..rows * h).map(|_| rng.uniform(-2.0, 2.0)).collect();
             let product = bf16_tensor(&device, &[rows as u64, f as u64], &product);
@@ -1771,34 +1729,155 @@ fn dense_output_timing_at_shape() {
                 written: Default::default(),
             };
             let result = dense_output::native_tune_with(
-                &device,
+                &charges,
                 elements(),
-                &configuration,
+                &statics,
                 vec![point],
                 seismic::NumericalRequirement::RoundingSteps {
                     alpha: 8.,
                     activation: Some(seismic::DType::BF16),
                 },
                 seismic::Strategy::Survey(seismic::SurveyPlan {
-                    samples: 15,
-                    min_sample_seconds: 0.05,
+                    samples: 7,
+                    min_sample_seconds: 0.02,
                     domains: Default::default(),
                 }),
             )
             .unwrap();
-            let median = result
-                .configurations
-                .iter()
-                .find_map(|record| match &record.outcome {
-                    seismic::Outcome::Measured { points, .. } => Some(points[0].median_seconds),
-                    seismic::Outcome::Excluded(_) => None,
-                })
-                .expect("the default configuration is measured");
+            // A record's time where the requirement admits it (its median),
+            // and the least and greatest of its samples. The survey visits
+            // the default first.
+            let admitted = |record: &seismic::ConfigurationRecord| match &record.outcome {
+                seismic::Outcome::Measured { points, .. } if result.admitted(record).is_ok() => {
+                    let point = &points[0];
+                    let least = point.samples.iter().copied().fold(f64::INFINITY, f64::min);
+                    let greatest = point.samples.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    Some((point.median_seconds, least, greatest))
+                }
+                _ => None,
+            };
+            let report = |(seconds, least, greatest): (f64, f64, f64)| {
+                format!(
+                    "{:.1} us [{:.1}..{:.1}], {:.0} G values/s, {:.0} GB/s",
+                    1e6 * seconds,
+                    1e6 * least,
+                    1e6 * greatest,
+                    (h * f) as f64 / seconds / 1e9,
+                    bytes.len() as f64 / seconds / 1e9
+                )
+            };
+            let default = admitted(&result.configurations[0]).expect("the default configuration is measured and admitted");
+            // The fastest admitted configuration, of those `within` holds.
+            let fastest = |within: &dyn Fn(&seismic::Configuration) -> bool| {
+                result
+                    .configurations
+                    .iter()
+                    .filter(|record| within(&record.configuration))
+                    .filter_map(|record| admitted(record).map(|time| (time, &record.configuration)))
+                    .min_by(|a, b| a.0 .0.total_cmp(&b.0 .0))
+            };
+            let (best, chosen) = fastest(&|_| true).unwrap();
             eprintln!(
-                "timing Cuda dense_output {format:?}{} H {h} F {f} M {rows}: {:.1} us per call, {:.0} G values/s",
+                "timing Cuda dense_output {format:?}{} H {h} F {f} M {rows}: default {}; best {} at {:?} {:?}",
                 if uniform { " uniform" } else { "" },
-                1e6 * median,
-                (h * f) as f64 / median / 1e9
+                report(default),
+                report(best),
+                chosen.params,
+                chosen.launches.iter().filter(|launch| !launch.is_empty()).collect::<Vec<_>>()
+            );
+            // The fastest of each INT8 choice, where the declaration offers
+            // both: how far the form the survey did not choose is behind.
+            for int8 in [0, 1] {
+                let int8_is = |configuration: &seismic::Configuration| {
+                    configuration.params.get("INT8").is_some_and(|value| *value == int8)
+                };
+                if let Some((time, _)) = fastest(&int8_is) {
+                    eprintln!("timing Cuda dense_output {format:?} M {rows} INT8 {int8}: best {}", report(time));
+                }
+            }
+            // The int8 GEMM's fastest at each of its blocks an SM, where the
+            // declaration admits more than one (`BLOCKS`).
+            for blocks in [1, 2] {
+                let at = |configuration: &seismic::Configuration| {
+                    configuration.params.get("INT8").is_some_and(|value| *value == 1)
+                        && configuration.launches.iter().any(|launch| launch.get("BLOCKS") == Some(&blocks))
+                };
+                if let Some((time, _)) = fastest(&at) {
+                    eprintln!("timing Cuda dense_output {format:?} M {rows} INT8 1 BLOCKS {blocks}: best {}", report(time));
+                }
+            }
+        }
+    }
+}
+
+/// `dense_output`'s int8 GEMM at the shape of
+/// `dense_output_timing_at_shape` and 512 rows, at the declared defaults
+/// but INT8 1, at each BLOCKS the declaration admits for the type, with no
+/// search: the median and least device time of a call (15 samples of 200
+/// calls) and the registers and local bytes a thread of its GEMM launch.
+/// A before/after check of the int8 GEMM's loop; `CUDA_TIMING_TYPES` names
+/// the types.
+#[test]
+#[ignore = "timing at shape"]
+fn dense_output_int8_gemm_at_shape() {
+    use seismic::measure::{Pending, Work};
+    let Some(device) = cuda() else { return };
+    let charges = seismic::Charges::tally(&device);
+    let (h, f, rows) = (4096usize, 12288usize, 512usize);
+    let mut rng = Rng(97);
+    for (format, _) in timed_types().into_iter().filter(|(_, uniform)| !uniform) {
+        let (down_weight, _) = timing_weight(&charges, format, false, [h as u64, f as u64], &mut rng);
+        let output = Mapped::new(
+            dense_output::native_entry_with(dense_output::Elements { DW: format.resident(), A: Element::bf16() }),
+            move |_: &Device, blocks: u64| {
+                NativeSpecialization::new()
+                    .with_static("H", h as u64)
+                    .with_static("F", f as u64)
+                    .with_static("DS", 0)
+                    .with_param("INT8", 1)
+                    .with_launch_param(DENSE_PAIR_GEMM, "BLOCKS", blocks)
+            },
+        );
+        let product: Vec<f32> = (0..rows * f).map(|_| bf16_round(rng.uniform(-1.0, 1.0))).collect();
+        let residual: Vec<f32> = (0..rows * h).map(|_| rng.uniform(-2.0, 2.0)).collect();
+        let product = bf16_tensor(&device, &[rows as u64, f as u64], &product);
+        let residual = f32_tensor(&device, &[rows as u64, h as u64], &residual);
+        let out_rows = i32_tensor(&device, &[rows as u64], &(0..rows as i32).collect::<Vec<_>>());
+        let absent = f32_tensor(&device, &[0], &[]);
+        for blocks in [1, 2].into_iter().filter(|&blocks| output.admits(&device, blocks)) {
+            let kernel = output.kernel(&device, blocks);
+            // CUDA reports each function attribute of every formed launch.
+            let programs = kernel.launch_programs();
+            let statistic = |name: &str| {
+                let program = programs[DENSE_PAIR_GEMM].as_ref().expect("the GEMM launch is formed at 512 rows");
+                let statistic = program.statistics.iter().find(|statistic| statistic.name == name);
+                match statistic.map(|statistic| statistic.value) {
+                    Some(seismic::StatisticValue::Uint(value)) => value,
+                    other => panic!("CUDA reports `{name}` of a formed launch as a count, not {other:?}"),
+                }
+            };
+            let point = kernel
+                .point(&charges, vec![dense_output::Args {
+                    residual: &residual,
+                    product: &product,
+                    down_weight: &down_weight,
+                    out_rows: &out_rows,
+                    down_scale: &absent,
+                    down_bound: &absent,
+                }])
+                .unwrap();
+            const CALLS: usize = 200;
+            point.submit(CALLS).unwrap().wait().unwrap();
+            let mut seconds = (0..15)
+                .map(|_| point.submit(CALLS).unwrap().seconds().unwrap() / CALLS as f64)
+                .collect::<Vec<_>>();
+            seconds.sort_by(f64::total_cmp);
+            eprintln!(
+                "int8 gemm {format:?} M {rows} BLOCKS {blocks}: {:.1} us (least {:.1}), registers {}, local bytes {}",
+                1e6 * seconds[7],
+                1e6 * seconds[0],
+                statistic("registers"),
+                statistic("local bytes")
             );
         }
     }

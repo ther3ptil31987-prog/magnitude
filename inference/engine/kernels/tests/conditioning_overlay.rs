@@ -3,19 +3,13 @@ use magnitude_kernels::conditioning_overlay;
 use seismic_lang::reference_math::conversion::canonical_nan;
 use seismic_lang::types::DType;
 
-/// The host's GPU (Metal on macOS, else Vulkan when present), then the CPU.
+/// The host's GPU (Metal on macOS, else Vulkan when present), then the CPU;
+/// a requested backend among them alone
+/// ([`seismic_native_tests::first_and_cpu`]).
 fn devices() -> Vec<seismic::Device> {
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    let gpu = if cfg!(target_os = "macos") {
-        Some(catalog.open_backend(seismic::BackendName::Metal).unwrap())
-    } else {
-        catalog.open_backend(seismic::BackendName::Vulkan).ok()
-    };
-    gpu.into_iter()
-        .chain(std::iter::once(
-            catalog.open_backend(seismic::BackendName::Cpu).unwrap(),
-        ))
-        .collect()
+    use seismic::BackendName::{Cpu, Metal, Vulkan};
+    let gpu = if cfg!(target_os = "macos") { Metal } else { Vulkan };
+    seismic_native_tests::first_and_cpu(&[gpu], &[gpu, Cpu])
 }
 
 /// The overlay publishes every conditioned value exactly (infinities, signed
@@ -26,6 +20,7 @@ fn devices() -> Vec<seismic::Device> {
 #[test]
 fn native_overlay_publishes_conditioned_rows_value_exactly() {
     for device in devices() {
+        let charges = seismic::Charges::tally(&device);
         for (rows, width) in [(1usize, 2usize), (5, 37), (3, 2560)] {
             let special = [
                 0x7fc0_1234u32,
@@ -50,14 +45,14 @@ fn native_overlay_publishes_conditioned_rows_value_exactly() {
             };
             let shape = [rows as u64, width as u64];
             let source = seismic::Tensor::from_host(
-                &device,
+                &charges,
                 seismic::Element::f32(),
                 &shape,
                 &bytes(&input),
             )
             .unwrap();
             let mut out = seismic::Tensor::from_host(
-                &device,
+                &charges,
                 seismic::Element::f32(),
                 &shape,
                 &bytes(&vec![0xdead_beef; rows * width]),
@@ -65,7 +60,7 @@ fn native_overlay_publishes_conditioned_rows_value_exactly() {
             .unwrap();
             declared::prepared(&device, &conditioning_overlay::native_entry(), &seismic::NativeSpecialization::new())
                 .unwrap()
-                .call(conditioning_overlay::Args {
+                .call(&charges, conditioning_overlay::Args {
                     input: &source,
                     out: &mut out,
                 })

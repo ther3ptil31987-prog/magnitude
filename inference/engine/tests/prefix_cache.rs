@@ -241,11 +241,58 @@ fn path(turn: &Turn) -> Vec<TokenId> {
     turn.prompt.iter().chain(&turn.output).copied().collect()
 }
 
+/// A request the host abandons keeps what it computed: the same prompt sent
+/// again resumes at least where the abandoned one stopped (a prompt group's
+/// chain under way runs on, so it keeps that group whole), and a stopped
+/// reply resumes where it stopped.
+#[test]
+#[ignore = "requires a device and MAGNITUDE_TEST_GGUF"]
+fn an_abandoned_request_resumes_where_it_stopped() {
+    let (mut host, vocabulary, tokenizer) = owner();
+    let prompt = (7..10).flat_map(|seed| text(&tokenizer, seed * 10, 600)).collect::<Vec<_>>();
+    let mut stream = host
+        .admit(greedy(&prompt, vocabulary, 12), text_input(&prompt), PrefixRetention::Retain { cache_points: Vec::new() }, 12)
+        .unwrap();
+    let id = stream.id;
+    host.step_until(&mut [&mut stream], Duration::from_secs(300), |host, _| {
+        host.snapshot(id).is_some_and(|snapshot| snapshot.resident_position >= 512)
+    });
+    let stopped = host.snapshot(id).unwrap().resident_position;
+    assert!(stopped < prompt.len() - 1, "stopped mid-prompt");
+    host.owner_mut().cancel(id);
+    host.release(stream, Duration::from_secs(300));
+    let [resumed] = run(&mut host, vocabulary, &[prompt.clone()], 12).try_into().ok().unwrap();
+    eprintln!("stopped at {stopped} of {}; resumed with {} cached", prompt.len(), resumed.cached);
+    assert!(
+        (stopped..prompt.len()).contains(&resumed.cached),
+        "the prompt resumes where the abandoned request stopped or beyond"
+    );
+
+    let longer = text(&tokenizer, 8, 400);
+    let mut stream = host
+        .admit(greedy(&longer, vocabulary, 200), text_input(&longer), PrefixRetention::Retain { cache_points: Vec::new() }, 200)
+        .unwrap();
+    let id = stream.id;
+    host.step_until(&mut [&mut stream], Duration::from_secs(300), |_, streams| streams[0].output.len() >= 40);
+    let reached = host.snapshot(id).unwrap().resident_position;
+    host.owner_mut().cancel(id);
+    let mut seen = stream.output.clone();
+    host.release(stream, Duration::from_secs(300));
+    assert!(longer.len() + seen.len() >= reached, "the reply up to its state was seen");
+    seen.truncate(reached - longer.len());
+    let mut again = longer.clone();
+    again.extend(&seen);
+    again.extend(text(&tokenizer, 9, 20));
+    let [continued] = run(&mut host, vocabulary, &[again], 4).try_into().ok().unwrap();
+    eprintln!("stopped mid-reply at {reached}; the next request resumed with {} cached", continued.cached);
+    assert_eq!(continued.cached, reached, "the reply seen so far stays cached");
+}
+
 /// Every turn of a conversation extends the previous prompt and reply, as a
 /// chat template that re-renders prior replies exactly produces. Each turn
 /// resumes at the end of the previous reply.
 #[test]
-#[ignore = "requires a Metal or CUDA device and MAGNITUDE_TEST_GGUF"]
+#[ignore = "requires a device and MAGNITUDE_TEST_GGUF"]
 fn conversation_turns_resume_at_the_previous_reply() {
     let (mut host, vocabulary, tokenizer) = owner();
     let mut prompt = text(&tokenizer, 1, 200);
@@ -265,7 +312,6 @@ fn conversation_turns_resume_at_the_previous_reply() {
         prompt = path(&done);
         prompt.extend(text(&tokenizer, 100 + turn, 40));
     }
-    host.owner().reconcile_memory_charge().unwrap();
 }
 
 /// The prefixes a growing conversation leaves cached never take the state
@@ -274,7 +320,7 @@ fn conversation_turns_resume_at_the_previous_reply() {
 /// the previous reply. A recurrent model pins one bank per cached prefix, so
 /// without the bound each turn would hold two more.
 #[test]
-#[ignore = "requires a Metal or CUDA device and MAGNITUDE_TEST_GGUF"]
+#[ignore = "requires a device and MAGNITUDE_TEST_GGUF"]
 fn a_growing_conversation_stays_within_the_charged_workload_state() {
     let resolved = resolved(false);
     let vocabulary = resolved.manifest.definition.decoder.vocabulary as usize;
@@ -293,9 +339,7 @@ fn a_growing_conversation_stays_within_the_charged_workload_state() {
         if let Some(end) = previous {
             assert_eq!(done.cached, end, "turn {turn} resumes at the last reply");
         }
-        let charge = host.owner().reconcile_memory_charge().unwrap();
-        let occupied = charge.target_state.occupied()
-            + charge.head_state.map_or(0, |head| head.occupied());
+        let occupied = host.owner().state_bytes().occupied();
         eprintln!(
             "turn {turn}: prompt={} cached={} prefixes={} occupied={occupied} workload={workload}",
             done.prompt.len(),
@@ -318,7 +362,7 @@ fn a_growing_conversation_stays_within_the_charged_workload_state() {
 /// retained prefixes stood stay committed after its own caching releases
 /// them.
 #[test]
-#[ignore = "requires a Metal or CUDA device and MAGNITUDE_TEST_GGUF"]
+#[ignore = "requires a device and MAGNITUDE_TEST_GGUF"]
 fn distinct_conversations_commit_no_state_beyond_the_charged_workload() {
     let resolved = resolved(false);
     let vocabulary = resolved.manifest.definition.decoder.vocabulary as usize;
@@ -331,9 +375,7 @@ fn distinct_conversations_commit_no_state_beyond_the_charged_workload() {
     for conversation in 0..24 {
         let prompt = text(&tokenizer, 200 + conversation, 600);
         run(&mut host, vocabulary, &[prompt], 12);
-        let charge = host.owner().reconcile_memory_charge().unwrap();
-        let committed =
-            charge.target_state.total() + charge.head_state.map_or(0, |head| head.total());
+        let committed = host.owner().state_bytes().committed();
         let prefixes = host.owner().cached_prefixes();
         released |= prefixes < 2 * (conversation as usize + 1);
         eprintln!("conversation {conversation}: prefixes={prefixes} committed={committed} workload={workload}");
@@ -349,7 +391,7 @@ fn distinct_conversations_commit_no_state_beyond_the_charged_workload() {
 /// diverges inside it; the next turn resumes one row before the previous
 /// prompt's end.
 #[test]
-#[ignore = "requires a Metal or CUDA device and MAGNITUDE_TEST_GGUF"]
+#[ignore = "requires a device and MAGNITUDE_TEST_GGUF"]
 fn a_rewritten_reply_resumes_at_the_previous_prompt() {
     let (mut host, vocabulary, tokenizer) = owner();
     let first = text(&tokenizer, 2, 200);
@@ -374,7 +416,7 @@ fn a_rewritten_reply_resumes_at_the_previous_prompt() {
 /// shorter than the minimum branch gain, yet each resumes where the previous
 /// turn left its prompt, rather than all at the first turn's last message.
 #[test]
-#[ignore = "requires a Metal or CUDA device and MAGNITUDE_TEST_GGUF"]
+#[ignore = "requires a device and MAGNITUDE_TEST_GGUF"]
 fn short_rewritten_turns_resume_where_the_previous_turn_left_its_prompt() {
     let (mut host, vocabulary, tokenizer) = owner();
     let suffix = tokenizer
@@ -410,7 +452,6 @@ fn short_rewritten_turns_resume_where_the_previous_turn_left_its_prompt() {
         assert_ne!(reply[0], suffix[0]);
         history.extend(reply);
     }
-    host.owner().reconcile_memory_charge().unwrap();
 }
 
 /// A long system prompt, then a last message that changes on every request,
@@ -419,7 +460,7 @@ fn short_rewritten_turns_resume_where_the_previous_turn_left_its_prompt() {
 /// resumes at that start, however its message begins: the second message
 /// shares a leading phrase with the first, the third starts differently.
 #[test]
-#[ignore = "requires a Metal or CUDA device and MAGNITUDE_TEST_GGUF"]
+#[ignore = "requires a device and MAGNITUDE_TEST_GGUF"]
 fn a_changed_last_message_resumes_at_its_declared_start() {
     let (mut host, vocabulary, tokenizer) = owner();
     let system = text(&tokenizer, 20, 1000);
@@ -452,14 +493,13 @@ fn a_changed_last_message_resumes_at_its_declared_start() {
         cached.push(done.cached);
     }
     assert_eq!(cached, [0, system.len(), system.len()]);
-    host.owner().reconcile_memory_charge().unwrap();
 }
 
 /// Without a declared cache point, a changed last message diverges below
 /// every retained state: the request recomputes its prompt and retains a
 /// state at the divergence, where the next request diverging there resumes.
 #[test]
-#[ignore = "requires a Metal or CUDA device and MAGNITUDE_TEST_GGUF"]
+#[ignore = "requires a device and MAGNITUDE_TEST_GGUF"]
 fn an_undeclared_divergence_is_retained_by_the_request_that_finds_it() {
     let (mut host, vocabulary, tokenizer) = owner();
     let system = text(&tokenizer, 30, 1000);
@@ -499,7 +539,7 @@ impl Lcg {
 /// an earlier finished request, or one row before an earlier prompt's end,
 /// whichever ends deepest within its prompt.
 #[test]
-#[ignore = "requires a Metal or CUDA device and MAGNITUDE_TEST_GGUF"]
+#[ignore = "requires a device and MAGNITUDE_TEST_GGUF"]
 fn arbitrary_request_sequences_resume_from_their_deepest_cached_prefix() {
     let (mut host, vocabulary, tokenizer) = owner();
     let seed = std::env::var("PREFIX_CACHE_SEED")
@@ -554,7 +594,6 @@ fn arbitrary_request_sequences_resume_from_their_deepest_cached_prefix() {
             assert!(turn.cached < turn.prompt.len());
         }
         finished.extend(turns);
-        host.owner().reconcile_memory_charge().unwrap();
     }
 }
 
@@ -695,7 +734,6 @@ fn vision_claims_its_slots_on_an_image_and_releases_them_at_idle() {
         let idle = charged(&domain);
         assert_eq!(encoded - idle, released);
         assert!(released > 0, "idle released no vision storage");
-        domain.reconcile_memory_charge(&[]).unwrap();
         eprintln!(
             "vision cycle: opened={opened} encoded={encoded} idle={idle} released={released}"
         );
@@ -740,7 +778,6 @@ fn image_conditioning_survives_eviction_and_cached_resumption() {
     let encodes = domain.open_served(&mut bindings, reference, None).unwrap();
     assert_eq!(encodes.len(), 1);
     bindings = encode(&mut domain, bindings, encodes);
-    domain.reconcile_memory_charge(&[]).unwrap();
     bindings = forward(&mut domain, bindings, reference, &input, 0..split).1;
     let after_image = domain.resume_state(reference).unwrap();
     let (expected, next) = forward(&mut domain, bindings, reference, &input, split..end);
@@ -775,7 +812,5 @@ fn image_conditioning_survives_eviction_and_cached_resumption() {
     assert_eq!(bits(&continued), bits(&expected));
     domain.close(resumed).unwrap();
 
-    domain.reconcile_memory_charge(&[&after_image]).unwrap();
     drop(after_image);
-    domain.reconcile_memory_charge(&[]).unwrap();
 }

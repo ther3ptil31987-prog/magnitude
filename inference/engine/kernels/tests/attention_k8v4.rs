@@ -201,7 +201,7 @@ fn u32_tensor(device: &Device, shape: &[usize], values: &[u32]) -> Tensor {
         .iter()
         .flat_map(|value| value.to_le_bytes())
         .collect::<Vec<_>>();
-    Tensor::from_host(device, Element::u32(), &shape, &bytes).unwrap()
+    Tensor::from_host(&seismic::Charges::tally(device), Element::u32(), &shape, &bytes).unwrap()
 }
 
 fn f16_tensor(device: &Device, shape: &[usize], bits: &[u16]) -> Tensor {
@@ -210,7 +210,7 @@ fn f16_tensor(device: &Device, shape: &[usize], bits: &[u16]) -> Tensor {
         .iter()
         .flat_map(|value| value.to_le_bytes())
         .collect::<Vec<_>>();
-    Tensor::from_host(device, Element::f16(), &shape, &bytes).unwrap()
+    Tensor::from_host(&seismic::Charges::tally(device), Element::f16(), &shape, &bytes).unwrap()
 }
 
 fn words(tensor: &Tensor) -> Vec<u32> {
@@ -263,6 +263,8 @@ struct Bound {
     value_codes: Tensor,
     value_coefficients: Tensor,
     slab_rows: u32,
+    /// What the case's kernel calls allocate through.
+    charges: seismic::Charges,
 }
 
 impl Bound {
@@ -386,6 +388,7 @@ impl Bound {
             value_codes,
             value_coefficients,
             slab_rows: slab_rows as u32,
+            charges: seismic::Charges::tally(device),
         }
     }
 
@@ -488,7 +491,7 @@ macro_rules! prefill_args {
 
 /// The Metal device, where one is present: the Metal-only tests' device.
 fn metal_device() -> Option<Device> {
-    seismic_native_tests::every_device().into_iter().find(|device| device.backend() == BackendName::Metal)
+    seismic_native_tests::devices(&[BackendName::Metal]).into_iter().next()
 }
 
 /// Whether Vulkan's vector decode form (SIMDS, SLICES, KEYWISE) is within the
@@ -1177,7 +1180,7 @@ fn metal_direct_prefill_retains_state_at_1024_rows() {
         let mut reference_bound = Bound::new(&device, &encoded);
         let reference = bf16_values(
             &prefill_kernel(&device, geometry, &default)
-                .call(prefill_args!(reference_bound, encoded.case))
+                .call(&reference_bound.charges, prefill_args!(reference_bound, encoded.case))
                 .unwrap()
                 .value,
         );
@@ -1196,7 +1199,7 @@ fn metal_direct_prefill_retains_state_at_1024_rows() {
             ];
             let mut bound = Bound::new(&device, &encoded);
             let gated = prefill_kernel(&device, geometry, &config)
-                .call(prefill_args!(bound, encoded.case))
+                .call(&bound.charges, prefill_args!(bound, encoded.case))
                 .unwrap()
                 .value;
             let label = format!(
@@ -1351,7 +1354,7 @@ fn cuda_prefill_of_two_piece_heads_matches_host_model() {
                     None => Bound::new(&device, &encoded),
                 };
                 let gated = prefill_kernel(&device, geometry, &config)
-                    .call(prefill_args!(bound, encoded.case))
+                    .call(&bound.charges, prefill_args!(bound, encoded.case))
                     .unwrap()
                     .value;
                 check(
@@ -1412,14 +1415,14 @@ fn metal_form_agrees_with_the_default(
         let mut direct_bound = bind(&device);
         let reference = bf16_values(
             &prefill_kernel(&device, geometry, &default)
-                .call(prefill_args!(direct_bound, encoded.case))
+                .call(&direct_bound.charges, prefill_args!(direct_bound, encoded.case))
                 .unwrap()
                 .value,
         );
         for config in configs(geometry) {
             let mut bound = bind(&device);
             let gated = prefill_kernel(&device, geometry, &config)
-                .call(prefill_args!(bound, encoded.case))
+                .call(&bound.charges, prefill_args!(bound, encoded.case))
                 .unwrap()
                 .value;
             let label = format!(
@@ -1602,7 +1605,7 @@ fn metal_prefill_reads_scattered_history_tiles() {
         let run = |encoded: &Encoded, config: &[(&'static str, u64)]| {
             let mut bound = Bound::new_with_slab_rows(&device, encoded, slab_rows, false);
             let gated = prefill_kernel(&device, geometry, config)
-                .call(prefill_args!(bound, encoded.case))
+                .call(&bound.charges, prefill_args!(bound, encoded.case))
                 .unwrap()
                 .value;
             (gated, bound)
@@ -1653,7 +1656,7 @@ fn metal_prefill_reads_scattered_history_tiles() {
         bound.history_tiles = i32_tensor(&device, &[0, 1], &[]);
         let gated = unlisted(0)
             .unwrap()
-            .call(prefill_args!(bound, scattered.case))
+            .call(&bound.charges, prefill_args!(bound, scattered.case))
             .unwrap()
             .value;
         assert!(
@@ -1722,7 +1725,7 @@ fn metal_direct_prefill_resumes_across_rounds() {
                 .chain(form.iter().copied())
                 .collect::<Vec<_>>();
             let gated = prefill_kernel(&device, geometry, &config)
-                .call(prefill_args!(bound, encoded.case))
+                .call(&bound.charges, prefill_args!(bound, encoded.case))
                 .unwrap()
                 .value;
             (gated, bound)
@@ -2075,7 +2078,7 @@ fn decode_matches_portable_body_on(device: &Device, encoded: &Encoded) {
         let kernel = decode_kernel(device, GROUPED, &config);
         let mut bound = Bound::new(device, encoded);
         let gated = kernel
-            .call(args!(attention_decode_k8v4, bound, encoded.case))
+            .call(&bound.charges, args!(attention_decode_k8v4, bound, encoded.case))
             .unwrap()
             .value;
         check(
@@ -2088,15 +2091,15 @@ fn decode_matches_portable_body_on(device: &Device, encoded: &Encoded) {
     }
 }
 
-/// Every row of a verify block, at every verify width, is bit for bit the
-/// row launched alone (plain decode), under every configuration the other
-/// tests sweep, on every backend: the same row over the same affine
-/// history, its earlier block rows fresh keys in the wider launches and
-/// history rows (as the widest launch appended them) in the narrower
-/// (`verify_blocks`). So a fresh key and value are read as their encoding,
-/// the one history holds, and a row's reduction order is set by its own
-/// keys' positions alone, never by the rows sharing its launch or its tile
-/// or by how far its tile's other rows reach.
+/// Every row of a verify block, at every verify width, attends its own
+/// affine history within the host model's bound (`check`), under every
+/// configuration the other tests sweep, on every backend: the same row over
+/// the same history, its earlier block rows fresh keys in the wider
+/// launches and history rows (as the widest launch appended them) in the
+/// narrower (`verify_blocks`). So a fresh key and value are read as their
+/// encoding, and a row reads its own keys' positions whichever rows share
+/// its launch or its tile and however far its tile's other rows reach; each
+/// launch appends its rows' vectors where they belong.
 ///
 /// The histories: 8 rows (one key partition); 20 and 28 rows, whose block rows'
 /// 29 to 36 keys cross the first 32-key partition and tile; and two spans
@@ -2106,7 +2109,7 @@ fn decode_matches_portable_body_on(device: &Device, encoded: &Encoded) {
 /// 2100 rows, past every swept configuration's PARTS x SPAN keys (at most
 /// 2048), so each partition holds several chunks of a row's keys.
 #[test]
-fn decode_rows_are_the_same_at_every_verify_width() {
+fn verify_rows_attend_their_history_at_every_width() {
     // (label, history spans, store rows, rows per slab)
     let histories: [(&str, &[(i32, i32)], usize, usize); 5] = [
         ("8 history rows", &[(0, 8)], 24, 24),
@@ -2123,7 +2126,6 @@ fn decode_rows_are_the_same_at_every_verify_width() {
         ("qwen35b", QWEN35B, 121, decode_forms),
         ("sliced", SLICED, 122, decode_configs),
     ];
-    let bits = |values: &[f32]| values.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
     let mut failures = Vec::new();
     for device in seismic_native_tests::every_device() {
         for (name, geometry, seed, configs) in geometries {
@@ -2136,21 +2138,29 @@ fn decode_rows_are_the_same_at_every_verify_width() {
                     &verify_rows(spans, 0..VERIFY_ROWS),
                     seed,
                 ));
+                let expected = widest.expected();
                 for config in configs(device.backend(), geometry) {
                     let label = format!("{name} {history} {:?} {config:?}", device.backend());
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let kernel = decode_kernel(&device, geometry, &config);
-                        let run = |encoded: &Encoded| {
+                        // Each launch against the widest block's host model
+                        // (its rows `rows`), its appended vectors among the
+                        // widest block's; the planes it leaves.
+                        let run = |encoded: &Encoded, label: &str, rows: std::ops::Range<usize>| {
                             let mut bound =
                                 Bound::new_with_slab_rows(&device, encoded, slab_rows, false);
                             let gated = kernel
-                                .call(args!(attention_decode_k8v4, bound, encoded.case))
+                                .call(&bound.charges, args!(attention_decode_k8v4, bound, encoded.case))
                                 .unwrap()
                                 .value;
-                            (bf16_values(&gated), bound.planes())
+                            let block = (
+                                expected.0[rows.start * row..rows.end * row].to_vec(),
+                                expected.1.clone(),
+                            );
+                            check(label, &widest, &gated, &bound, &block);
+                            bound.planes()
                         };
-                        let (wide, planes) = run(&widest);
-                        let mut alone = vec![Vec::new(); VERIFY_ROWS];
+                        let planes = run(&widest, &format!("{label} width {VERIFY_ROWS}"), 0..VERIFY_ROWS);
                         for block in verify_blocks() {
                             let mut case = Case::new(
                                 geometry,
@@ -2170,27 +2180,7 @@ fn decode_rows_are_the_same_at_every_verify_width() {
                                 case,
                                 planes: planes.clone(),
                             };
-                            let (actual, narrow_planes) = run(&narrow);
-                            assert_eq!(actual.len(), block.len() * row);
-                            if block.len() == 1 {
-                                alone[block.start] = bits(&actual);
-                            }
-                            for (j, i) in block.clone().enumerate() {
-                                assert!(
-                                    bits(&actual[j * row..(j + 1) * row]) == alone[i],
-                                    "{label}: row {i} in rows {block:?} differs from row {i} alone"
-                                );
-                            }
-                            assert_eq!(
-                                narrow_planes, planes,
-                                "{label} rows {block:?}: history planes"
-                            );
-                        }
-                        for i in 0..VERIFY_ROWS {
-                            assert!(
-                                bits(&wide[i * row..(i + 1) * row]) == alone[i],
-                                "{label}: row {i} of the widest block differs from row {i} alone"
-                            );
+                            run(&narrow, &format!("{label} rows {block:?}"), block.clone());
                         }
                     }));
                     if outcome.is_err() {
@@ -2236,7 +2226,7 @@ fn sinks_decode_and_prefill_match_host_model() {
                 let kernel = decode_kernel_with_sinks(&device, geometry, &config, 1);
                 let mut bound = Bound::new(&device, encoded);
                 let gated = kernel
-                    .call(args!(attention_decode_k8v4, bound, encoded.case))
+                    .call(&bound.charges, args!(attention_decode_k8v4, bound, encoded.case))
                     .unwrap()
                     .value;
                 check(
@@ -2254,7 +2244,7 @@ fn sinks_decode_and_prefill_match_host_model() {
                 let kernel = prefill_kernel_with_sinks(&device, geometry, &config, 1);
                 let mut bound = Bound::new(&device, encoded);
                 let gated = kernel
-                    .call(prefill_args!(bound, encoded.case))
+                    .call(&bound.charges, prefill_args!(bound, encoded.case))
                     .unwrap()
                     .value;
                 check(
@@ -2294,7 +2284,7 @@ fn decode_reads_and_writes_across_affine_history_slabs() {
         for reused in [false, true] {
             let mut bound = Bound::new_with_slab_rows(&device, &encoded, 32, reused);
             let gated = kernel
-                .call(args!(attention_decode_k8v4, bound, encoded.case))
+                .call(&bound.charges, args!(attention_decode_k8v4, bound, encoded.case))
                 .unwrap()
                 .value;
             check(
@@ -2338,7 +2328,7 @@ fn decode_reads_spans_crossing_affine_history_slabs() {
             for reused in [false, true] {
                 let mut bound = Bound::new_with_slab_rows(&device, &encoded, 32, reused);
                 let gated = kernel
-                    .call(args!(attention_decode_k8v4, bound, encoded.case))
+                    .call(&bound.charges, args!(attention_decode_k8v4, bound, encoded.case))
                     .unwrap()
                     .value;
                 check(
@@ -2403,7 +2393,7 @@ fn scattered_selected_runs(geometry: Geometry) {
             let kernel = decode_kernel(&device, geometry, &config);
             let mut bound = Bound::new_with_slab_rows(&device, &encoded, 32, false);
             let gated = kernel
-                .call(args!(attention_decode_k8v4, bound, encoded.case))
+                .call(&bound.charges, args!(attention_decode_k8v4, bound, encoded.case))
                 .unwrap()
                 .value;
             check(
@@ -2447,7 +2437,7 @@ fn prefill_matches_portable_body_on(device: &Device, encoded: &Encoded) {
         let kernel = prefill_kernel(device, SMALL, &config);
         let mut bound = Bound::new(device, encoded);
         let gated = kernel
-            .call(prefill_args!(bound, encoded.case))
+            .call(&bound.charges, prefill_args!(bound, encoded.case))
             .unwrap()
             .value;
         check(
@@ -2493,7 +2483,7 @@ fn prefill_reads_and_writes_across_affine_history_slabs() {
         let kernel = prefill_kernel(&device, GROUPED, &config);
         let mut bound = Bound::new_with_slab_rows(&device, &encoded, 32, true);
         let gated = kernel
-            .call(prefill_args!(bound, encoded.case))
+            .call(&bound.charges, prefill_args!(bound, encoded.case))
             .unwrap()
             .value;
         check(
@@ -2528,7 +2518,7 @@ fn qwen_geometry_decode_and_prefill_match_host_model_on(device: &Device) {
             let kernel = decode_kernel(device, QWEN, &config);
             let mut bound = Bound::new(device, &encoded);
             let gated = kernel
-                .call(args!(attention_decode_k8v4, bound, encoded.case))
+                .call(&bound.charges, args!(attention_decode_k8v4, bound, encoded.case))
                 .unwrap()
                 .value;
             check(
@@ -2558,7 +2548,7 @@ fn qwen_geometry_decode_and_prefill_match_host_model_on(device: &Device) {
                 let kernel = decode_kernel(device, QWEN, config);
                 let mut bound = Bound::new(device, &encoded);
                 let gated = kernel
-                    .call(args!(attention_decode_k8v4, bound, encoded.case))
+                    .call(&bound.charges, args!(attention_decode_k8v4, bound, encoded.case))
                     .unwrap()
                     .value;
                 check(
@@ -2586,7 +2576,7 @@ fn qwen_geometry_decode_and_prefill_match_host_model_on(device: &Device) {
             let kernel = prefill_kernel(device, QWEN, &config);
             let mut bound = Bound::new(device, &encoded);
             let gated = kernel
-                .call(prefill_args!(bound, encoded.case))
+                .call(&bound.charges, prefill_args!(bound, encoded.case))
                 .unwrap()
                 .value;
             check(
@@ -2678,7 +2668,7 @@ fn wide_head_decode_and_prefill_match_host_model() {
                     )
                     .map(|kernel| {
                         kernel
-                            .call(args!(attention_decode_k8v4, bound, encoded.case))
+                            .call(&bound.charges, args!(attention_decode_k8v4, bound, encoded.case))
                             .unwrap()
                             .value
                     })
@@ -2690,7 +2680,7 @@ fn wide_head_decode_and_prefill_match_host_model() {
                     )
                     .map(|kernel| {
                         kernel
-                            .call(prefill_args!(bound, encoded.case))
+                            .call(&bound.charges, prefill_args!(bound, encoded.case))
                             .unwrap()
                             .value
                     })
@@ -2729,7 +2719,7 @@ fn large_group_decode_and_prefill_at_4k_match_host_model(geometry: Geometry) {
             let kernel = decode_kernel(&device, geometry, &config);
             let mut bound = Bound::new(&device, &encoded);
             let gated = kernel
-                .call(args!(attention_decode_k8v4, bound, encoded.case))
+                .call(&bound.charges, args!(attention_decode_k8v4, bound, encoded.case))
                 .unwrap()
                 .value;
             check(
@@ -2752,7 +2742,7 @@ fn large_group_decode_and_prefill_at_4k_match_host_model(geometry: Geometry) {
             let kernel = prefill_kernel(&device, geometry, &config);
             let mut bound = Bound::new(&device, &encoded);
             let gated = kernel
-                .call(prefill_args!(bound, encoded.case))
+                .call(&bound.charges, prefill_args!(bound, encoded.case))
                 .unwrap()
                 .value;
             check(
@@ -2803,7 +2793,7 @@ fn metal_packed_four_minicpm5_matches_host_model() {
         let kernel = decode_kernel(&device, geometry, &config);
         let mut bound = Bound::new(&device, &encoded);
         let gated = kernel
-            .call(args!(attention_decode_k8v4, bound, encoded.case))
+            .call(&bound.charges, args!(attention_decode_k8v4, bound, encoded.case))
             .unwrap()
             .value;
         check(
@@ -2850,7 +2840,7 @@ fn metal_packed_four_qwen35b_matches_host_model() {
             let kernel = decode_kernel(&device, geometry, &config);
             let mut bound = Bound::new(&device, &encoded);
             let gated = kernel
-                .call(args!(attention_decode_k8v4, bound, encoded.case))
+                .call(&bound.charges, args!(attention_decode_k8v4, bound, encoded.case))
                 .unwrap()
                 .value;
             check(
@@ -2889,7 +2879,7 @@ fn metal_qwen35b_single_row_matrix_slices_match_host_model() {
         let kernel = decode_kernel(&device, geometry, &config);
         let mut bound = Bound::new(&device, &encoded);
         let gated = kernel
-            .call(args!(attention_decode_k8v4, bound, encoded.case))
+            .call(&bound.charges, args!(attention_decode_k8v4, bound, encoded.case))
             .unwrap()
             .value;
         check(
@@ -2924,7 +2914,7 @@ fn metal_packed_four_qwen35b_long_context_matches_host_model() {
     let kernel = decode_kernel(&device, geometry, &config);
     let mut bound = Bound::new(&device, &encoded);
     let gated = kernel
-        .call(args!(attention_decode_k8v4, bound, encoded.case))
+        .call(&bound.charges, args!(attention_decode_k8v4, bound, encoded.case))
         .unwrap()
         .value;
     check(
@@ -2975,7 +2965,7 @@ fn metal_packed_four_padded_heads_match_host_model() {
             let kernel = decode_kernel(&device, geometry, &config);
             let mut bound = Bound::new(&device, &encoded);
             let gated = kernel
-                .call(args!(attention_decode_k8v4, bound, encoded.case))
+                .call(&bound.charges, args!(attention_decode_k8v4, bound, encoded.case))
                 .unwrap()
                 .value;
             check(
@@ -3050,7 +3040,7 @@ fn gemma_head_geometry_matches_synthetic_reference() {
         let kernel = decode_kernel(&device, geometry, &configuration);
         let mut bound = Bound::new(&device, &encoded);
         let output = kernel
-            .call(args!(attention_decode_k8v4, bound, encoded.case))
+            .call(&bound.charges, args!(attention_decode_k8v4, bound, encoded.case))
             .unwrap()
             .value;
         check(
@@ -3099,7 +3089,7 @@ fn gemma_g8_tuning_uses_portable_reference() {
         Ok(())
     });
     let result = attention_decode_k8v4::native_tune_with(
-        &device,
+        &bound.charges,
         attention_decode_k8v4::Elements { A: Element::bf16() },
         &specialization_on(&device, geometry, &[]),
         vec![seismic::TuningPoint {
@@ -3188,7 +3178,7 @@ fn gemma_form_decode_configurations_agree() {
             )
             .unwrap();
             let out = kernel
-                .call(args!(attention_decode_k8v4, bound, encoded.case))
+                .call(&bound.charges, args!(attention_decode_k8v4, bound, encoded.case))
                 .unwrap()
                 .value;
             let actual = bf16_values(&out);
@@ -3298,7 +3288,7 @@ fn gemma_fresh_only_with_scale(scale: f64) {
     .map(|tensor| (tensor.clone(), tensor.read_to_host().unwrap()))
     .collect::<Vec<_>>();
     let result = attention_decode_k8v4::native_tune_with(
-        &device,
+        &bound.charges,
         attention_decode_k8v4::Elements { A: Element::bf16() },
         &spec,
         vec![seismic::TuningPoint {
@@ -3352,7 +3342,7 @@ fn gemma_fresh_only_with_scale(scale: f64) {
             .unwrap();
             let actual = bf16_values(
                 &kernel
-                    .call(args!(attention_decode_k8v4, bound, encoded.case))
+                    .call(&bound.charges, args!(attention_decode_k8v4, bound, encoded.case))
                     .unwrap()
                     .value,
             );
@@ -3427,7 +3417,7 @@ fn prepared_causal_verification_matches_committed_prefix() {
             let run = |encoded: &Encoded| {
                 let mut bound = Bound::new(&device, encoded);
                 let result = kernel
-                    .call(args!(attention_decode_k8v4, bound, encoded.case))
+                    .call(&bound.charges, args!(attention_decode_k8v4, bound, encoded.case))
                     .unwrap()
                     .value;
                 bf16_values(&result)
@@ -3446,7 +3436,7 @@ fn prepared_causal_verification_matches_committed_prefix() {
             )
             .unwrap();
             append
-                .call(args!(attention_append_k8v4, prepared, batch.case))
+                .call(&prepared.charges, args!(attention_append_k8v4, prepared, batch.case))
                 .unwrap();
             let mut cached_view = Bound::new(&device, &serial);
             std::mem::swap(&mut cached_view.key_codes, &mut prepared.key_codes);
@@ -3461,7 +3451,7 @@ fn prepared_causal_verification_matches_committed_prefix() {
             );
             let normalized = bf16_values(
                 &kernel
-                    .call(args!(attention_decode_k8v4, cached_view, serial.case))
+                    .call(&cached_view.charges, args!(attention_decode_k8v4, cached_view, serial.case))
                     .unwrap()
                     .value,
             );
@@ -3508,10 +3498,10 @@ fn ordered_append_matches_fused_codec() {
             let mut fused = Bound::new(&device, &encoded);
             let mut ordered = Bound::new(&device, &encoded);
             decode
-                .call(args!(attention_decode_k8v4, fused, encoded.case))
+                .call(&fused.charges, args!(attention_decode_k8v4, fused, encoded.case))
                 .unwrap();
             append
-                .call(args!(attention_append_k8v4, ordered, encoded.case))
+                .call(&ordered.charges, args!(attention_append_k8v4, ordered, encoded.case))
                 .unwrap();
             assert_eq!(
                 ordered.planes(),
@@ -3597,7 +3587,7 @@ fn metal_gemma_fresh_scalar_preserves_bf16_values() {
         .unwrap();
         let actual = bf16_values(
             &kernel
-                .call(args!(attention_decode_k8v4, bound, encoded.case))
+                .call(&bound.charges, args!(attention_decode_k8v4, bound, encoded.case))
                 .unwrap()
                 .value,
         );
@@ -3671,7 +3661,7 @@ fn codec_group32_storage_and_single_history_value_match_independent_recipe() {
         )
         .unwrap();
         append
-            .call(args!(attention_append_k8v4, bound, encoded.case))
+            .call(&bound.charges, args!(attention_append_k8v4, bound, encoded.case))
             .unwrap();
         let actual = bound.planes();
         let (key_codes, key_coefficients) = encode(&encoded.case.key, 8);
@@ -3706,7 +3696,7 @@ fn codec_group32_storage_and_single_history_value_match_independent_recipe() {
         .unwrap();
         let attended = bf16_values(
             &kernel
-                .call(args!(attention_decode_k8v4, bound, encoded.case))
+                .call(&bound.charges, args!(attention_decode_k8v4, bound, encoded.case))
                 .unwrap()
                 .value,
         );
@@ -3833,7 +3823,7 @@ fn actual_gemma_dense_and_affine_publication_share_prepared_values() {
             )
             .unwrap();
             dense
-                .call(magnitude_kernels::attention_append_dense::Args {
+                .call(&bound.charges, magnitude_kernels::attention_append_dense::Args {
                     key: &bound.key,
                     value: &bound.value,
                     key_norm: &bound.key_norm,
@@ -3880,7 +3870,7 @@ fn actual_gemma_dense_and_affine_publication_share_prepared_values() {
             )
             .unwrap();
             affine
-                .call(args!(attention_append_k8v4, bound, encoded.case))
+                .call(&bound.charges, args!(attention_append_k8v4, bound, encoded.case))
                 .unwrap();
             let actual = bound.planes();
             let expected = Planes::encode(geometry, &dense_k, &dense_v);
@@ -4211,7 +4201,7 @@ fn actual_gemma_prepared_history_consumers_match_decoded_oracle() {
             )
             .unwrap();
             publish
-                .call(magnitude_kernels::attention_append_dense::Args {
+                .call(&inputs.charges, magnitude_kernels::attention_append_dense::Args {
                     key: &inputs.key,
                     value: &inputs.value,
                     key_norm: &inputs.key_norm,
@@ -4241,7 +4231,7 @@ fn actual_gemma_prepared_history_consumers_match_decoded_oracle() {
             )
             .unwrap();
             affine_publish
-                .call(args!(attention_append_k8v4, inputs, encoded_prep.case))
+                .call(&inputs.charges, args!(attention_append_k8v4, inputs, encoded_prep.case))
                 .unwrap();
             let published_planes = inputs.planes();
             let dk = bf16_values(&dk);
@@ -4346,7 +4336,7 @@ fn actual_gemma_prepared_history_consumers_match_decoded_oracle() {
                         &spec,
                     )
                     .unwrap()
-                    .call(prefill_args!(bound, encoded.case))
+                    .call(&bound.charges, prefill_args!(bound, encoded.case))
                     .unwrap()
                     .value
                 } else {
@@ -4356,7 +4346,7 @@ fn actual_gemma_prepared_history_consumers_match_decoded_oracle() {
                         &spec,
                     )
                     .unwrap()
-                    .call(args!(attention_decode_k8v4, bound, encoded.case))
+                    .call(&bound.charges, args!(attention_decode_k8v4, bound, encoded.case))
                     .unwrap()
                     .value
                 };
@@ -4462,7 +4452,7 @@ fn actual_gemma_sequential_publication_matches_batch() {
             let mut batch = Bound::new(&device, &encoded);
             batch.value_norm = f32_tensor(&device, &[1, w], &vec![1.0; w]);
             append
-                .call(args!(attention_append_k8v4, batch, encoded.case))
+                .call(&batch.charges, args!(attention_append_k8v4, batch, encoded.case))
                 .unwrap();
             let expected = batch.planes();
             let one = [Row {
@@ -4518,10 +4508,10 @@ fn actual_gemma_sequential_publication_matches_batch() {
                     if fused {
                         let mut args = args!(attention_decode_k8v4, sequential, one_encoded.case);
                         args.gate_function = -1;
-                        decode.call(args).unwrap();
+                        decode.call(&sequential.charges, args).unwrap();
                     } else {
                         append
-                            .call(args!(attention_append_k8v4, sequential, one_encoded.case))
+                            .call(&sequential.charges, args!(attention_append_k8v4, sequential, one_encoded.case))
                             .unwrap();
                     }
                 }
@@ -4607,7 +4597,9 @@ const LFM: Geometry = Geometry { kv: 8, g: 4, p: 32, s: 0 };
 #[test]
 #[cfg(target_arch = "x86_64")]
 fn cpu_vector_tier_matches_portable_tier() {
-    let device = seismic::Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap();
+    let Some(device) = seismic_native_tests::devices(&[BackendName::Cpu]).into_iter().next() else {
+        return;
+    };
     if !std::arch::is_x86_feature_detected!("avx2") {
         return;
     }
@@ -4618,7 +4610,7 @@ fn cpu_vector_tier_matches_portable_tier() {
         let run = |tier: u64| {
             let kernel = decode_kernel(&device, geometry, &[("cpu.tier", tier)]);
             let mut bound = Bound::new_with_slab_rows(&device, &encoded, 48, false);
-            let gated = kernel.call(args!(attention_decode_k8v4, bound, encoded.case)).unwrap().value;
+            let gated = kernel.call(&bound.charges, args!(attention_decode_k8v4, bound, encoded.case)).unwrap().value;
             gated.read_to_host().unwrap()
         };
         // Tier 0 is the detected tier; 1 names x86-64-v2.
@@ -4641,14 +4633,14 @@ fn cpu_vector_tier_matches_portable_tier() {
 #[test]
 fn cpu_decode_matches_host_model_at_every_partition_fill() {
     use seismic::device::DeviceValues;
-    let device = seismic::Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Cpu) else { return };
     let units = device.properties().value("units") as i32;
     for base in [5, 64 * units, 128 * units + 65] {
         let encoded = Encoded::new(Case::new(GROUPED, base as usize + 64, 2, &decode_rows(base), 43));
         let expected = encoded.expected();
         let kernel = decode_kernel(&device, GROUPED, &[]);
         let mut bound = Bound::new(&device, &encoded);
-        let gated = kernel.call(args!(attention_decode_k8v4, bound, encoded.case)).unwrap().value;
+        let gated = kernel.call(&bound.charges, args!(attention_decode_k8v4, bound, encoded.case)).unwrap().value;
         check(
             &format!("Cpu decode over {} history keys on {units} participants", base + 12),
             &encoded,

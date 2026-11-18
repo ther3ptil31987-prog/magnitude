@@ -240,18 +240,18 @@ fn generated_surface_is_one_dense_import_and_one_exact_repack() {
     assert!(!source.contains("NegativeExp"));
 }
 
-/// The opened device of `backend`, when this host has one.
+/// The device of `backend`, where the host has one and the runner requests
+/// it or none ([`seismic_native_tests::devices`]).
 fn device(backend: seismic::BackendName) -> Option<seismic::Device> {
-    seismic::Devices::discover(&[])
-        .ok()?
-        .open_backend(backend)
-        .ok()
+    seismic_native_tests::devices(&[backend]).into_iter().next()
 }
 
 #[cfg(target_os = "macos")]
 #[test]
 fn metal_dense_import_matches_host_for_all_nine_pairs() {
-    dense_import_matches_host_for_all_nine_pairs(&device(seismic::BackendName::Metal).unwrap());
+    if let Some(device) = device(seismic::BackendName::Metal) {
+        dense_import_matches_host_for_all_nine_pairs(&device);
+    }
 }
 
 /// A record port whose records lie in a graph's workspace (an import's
@@ -260,7 +260,10 @@ fn metal_dense_import_matches_host_for_all_nine_pairs() {
 #[cfg(target_os = "macos")]
 #[test]
 fn metal_record_ports_bind_graph_workspace_records() {
-    let device = device(seismic::BackendName::Metal).unwrap();
+    let Some(device) = device(seismic::BackendName::Metal) else {
+        return;
+    };
+    let charges = seismic::Charges::tally(&device);
     let values = [-3.25f32, -0.0, 0.125, 1.5, 19.0];
     let extents = [3, 7, values.len() as u64];
     let bytes = dense_bytes("f32", &values).repeat(21);
@@ -287,15 +290,15 @@ fn metal_record_ports_bind_graph_workspace_records() {
         .value;
     graph.store(&widened, &result_port).unwrap();
     let plan = graph.seal().unwrap();
-    let source = seismic::Tensor::from_host(&device, f32, &extents, &bytes).unwrap();
-    let result = seismic::Tensor::from_host(&device, f32, &extents, &vec![0; bytes.len()]).unwrap();
+    let source = seismic::Tensor::from_host(&charges, f32, &extents, &bytes).unwrap();
+    let result = seismic::Tensor::from_host(&charges, f32, &extents, &vec![0; bytes.len()]).unwrap();
     let mut bindings = plan.bindings();
-    bindings.set(&source_port, &source).unwrap();
-    bindings.set(&result_port, &result).unwrap();
+    bindings.set(&charges, &source_port, &source).unwrap();
+    bindings.set(&charges, &result_port, &result).unwrap();
     let (_, completion) = plan
-        .new_slot()
+        .new_slot(&charges)
         .unwrap()
-        .attach(bindings, plan.new_outputs().unwrap())
+        .attach(bindings, plan.new_outputs(&charges).unwrap())
         .unwrap()
         .submit()
         .unwrap();
@@ -305,7 +308,9 @@ fn metal_record_ports_bind_graph_workspace_records() {
 
 #[test]
 fn cpu_dense_import_matches_host_for_all_nine_pairs() {
-    dense_import_matches_host_for_all_nine_pairs(&device(seismic::BackendName::Cpu).unwrap());
+    if let Some(device) = device(seismic::BackendName::Cpu) {
+        dense_import_matches_host_for_all_nine_pairs(&device);
+    }
 }
 
 #[test]
@@ -320,8 +325,11 @@ fn cuda_dense_import_matches_host_for_all_nine_pairs() {
 fn metal_repack_matches_the_registered_conversion_for_every_format_and_layout() {
     // Metal's repack writes every storage of these layouts but CUDA's
     // `records`.
+    let Some(device) = device(seismic::BackendName::Metal) else {
+        return;
+    };
     repack_matches_the_registered_conversion(
-        &device(seismic::BackendName::Metal).unwrap(),
+        &device,
         &[
             seismic::Layout::Packet,
             seismic::Layout::Rows16,
@@ -339,8 +347,11 @@ fn metal_repack_matches_the_registered_conversion_for_every_format_and_layout() 
 #[test]
 #[ignore = "timing"]
 fn metal_repack_timing() {
+    let Some(device) = device(seismic::BackendName::Metal) else {
+        return;
+    };
     repack_timing(
-        &device(seismic::BackendName::Metal).unwrap(),
+        &device,
         &[seismic::Layout::Packet, seismic::Layout::Rows32],
     );
 }
@@ -377,11 +388,12 @@ fn cuda_repack_timing() {
 /// tensor of every GGUF source, into each of `layouts`: the best of eleven
 /// batches of 20 repacks.
 fn repack_timing(device: &seismic::Device, layouts: &[seismic::Layout]) {
+    let charges = seismic::Charges::tally(device);
     let shape = [1, 4096, 4096];
     for (source_element, operands) in conversions() {
         let length = source_element.canonical_byte_len(&shape).unwrap();
         let source =
-            seismic::Tensor::from_host(device, source_element, &shape, &source_bytes(length, 7))
+            seismic::Tensor::from_host(&charges, source_element, &shape, &source_bytes(length, 7))
                 .unwrap();
         for &layout in layouts {
             let destination = source_element.converted(layout, operands).unwrap();
@@ -394,11 +406,11 @@ fn repack_timing(device: &seismic::Device, layouts: &[seismic::Layout]) {
                 &seismic::NativeSpecialization::new(),
             )
             .unwrap();
-            let mut result = seismic::Tensor::zeros(device, destination, &shape).unwrap();
+            let mut result = seismic::Tensor::zeros(&charges, destination, &shape).unwrap();
             const CALLS: u32 = 20;
             let best = (0..12)
                 .map(|_| {
-                    let mut batch = seismic::NativeTensorBatch::new(device);
+                    let mut batch = seismic::NativeTensorBatch::new(&charges);
                     for _ in 0..CALLS {
                         batch
                             .push(
@@ -452,6 +464,7 @@ fn cuda_repack_into_mma16_matches_the_host_at_a_real_shape() {
     let Some(device) = device(seismic::BackendName::Cuda) else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     use magnitude_ggml::Encoding;
     let shape = [1, 2048, 2048];
     for encoding in [
@@ -470,7 +483,7 @@ fn cuda_repack_into_mma16_matches_the_host_at_a_real_shape() {
             .unwrap();
         let length = source_element.canonical_byte_len(&shape).unwrap();
         let bytes = source_bytes(length, 11);
-        let source = seismic::Tensor::from_host(&device, source_element, &shape, &bytes).unwrap();
+        let source = seismic::Tensor::from_host(&charges, source_element, &shape, &bytes).unwrap();
         let label = format!("{} -> {} over {shape:?}", source_element.name(), destination.name());
         let native = declared::prepared(
             &device,
@@ -481,7 +494,7 @@ fn cuda_repack_into_mma16_matches_the_host_at_a_real_shape() {
             &seismic::NativeSpecialization::new(),
         )
         .unwrap()
-        .call(repack_weight::Args { source: &source })
+        .call(&charges, repack_weight::Args { source: &source })
         .unwrap_or_else(|error| panic!("{label}: {error:?}"))
         .value;
         assert!(
@@ -502,8 +515,11 @@ fn vulkan_dense_import_matches_host_for_all_nine_pairs() {
 /// The CPU repacks into both supported row layouts.
 #[test]
 fn cpu_repack_matches_the_registered_conversion_for_every_format() {
+    let Some(device) = device(seismic::BackendName::Cpu) else {
+        return;
+    };
     repack_matches_the_registered_conversion(
-        &device(seismic::BackendName::Cpu).unwrap(),
+        &device,
         &[seismic::Layout::Rows16, seismic::Layout::Rows8],
         false,
     );
@@ -523,6 +539,7 @@ fn vulkan_repack_matches_the_registered_conversion_for_every_format() {
 /// byte: the planar windows' tile grids at a width of many windows, which the
 /// small shapes of the every-format test do not reach.
 fn planar_streamed_conversion_matches_the_host_at_real_extents(device: &seismic::Device) {
+    let charges = seismic::Charges::tally(device);
     let resident = device.backend().resident_layout();
     for (source_element, operands) in conversions().into_iter().filter(|(element, _)| element.is_planar()) {
         let destination = source_element.converted(resident, operands).unwrap();
@@ -531,7 +548,7 @@ fn planar_streamed_conversion_matches_the_host_at_real_extents(device: &seismic:
         }
         for shape in [[1, 16, 256], [1, 16, 6144], [1, 48, 6144], [2, 2048, 6144], [2, 6144, 2048]] {
             let bytes = source_bytes(source_element.canonical_byte_len(&shape).unwrap(), shape[1] as u32);
-            let source = seismic::Tensor::from_host(device, source_element, &shape, &bytes).unwrap();
+            let source = seismic::Tensor::from_host(&charges, source_element, &shape, &bytes).unwrap();
             let label = format!("{} -> {} over {shape:?}", source_element.name(), destination.name());
             let actual = streamed_conversion(device, &source, destination, &shape);
             let expected = destination.repack_host(source_element, &shape, &bytes).unwrap();
@@ -569,6 +586,7 @@ fn vulkan_planar_streamed_conversion_matches_the_host_at_real_extents() {
 
 fn dense_import_matches_host_for_all_nine_pairs(device: &seismic::Device) {
     let device = device.clone();
+    let charges = seismic::Charges::tally(&device);
     let values = [-3.25f32, -0.0, 0.125, 1.5, 19.0];
     // One row, and 21 rows of the same values over two matrices (rows of
     // several row blocks).
@@ -579,7 +597,7 @@ fn dense_import_matches_host_for_all_nine_pairs(device: &seismic::Device) {
                 let source_element = seismic::Element::named(source_name).unwrap();
                 let destination_element = seismic::Element::named(destination_name).unwrap();
                 let source = seismic::Tensor::from_host(
-                    &device,
+                    &charges,
                     source_element,
                     &[matrices as u64, rows as u64, values.len() as u64],
                     &repeated(dense_bytes(source_name, &values)),
@@ -595,7 +613,7 @@ fn dense_import_matches_host_for_all_nine_pairs(device: &seismic::Device) {
                     &seismic::NativeSpecialization::new(),
                 )
                 .unwrap()
-                .call(import_dense::Args { source: &source })
+                .call(&charges, import_dense::Args { source: &source })
                 .unwrap()
                 .value;
                 assert_eq!(
@@ -637,21 +655,22 @@ fn streamed_conversion(
     shape: &[u64; 3],
 ) -> Vec<u8> {
     const SEQUENCE: i32 = 1;
+    let charges = seismic::Charges::tally(device);
     let words = |values: &[i32]| {
         let bytes = values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
-        seismic::Tensor::from_host(device, seismic::Element::i32(), &[values.len() as u64], &bytes).unwrap()
+        seismic::Tensor::from_host(&charges, seismic::Element::i32(), &[values.len() as u64], &bytes).unwrap()
     };
     let shared = |shape: &[u64], values: &[i32]| {
-        let tensor = seismic::Tensor::shared(device, seismic::Element::i32(), shape).unwrap();
+        let tensor = seismic::Tensor::shared(&charges, seismic::Element::i32(), shape).unwrap();
         // SAFETY: no device work uses the tensor yet.
         unsafe { tensor.write_shared(0, &values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>()).unwrap() };
         tensor
     };
-    let zeros = |element: seismic::Element, shape: &[u64]| seismic::Tensor::zeros(device, element, shape).unwrap();
+    let zeros = |element: seismic::Element, shape: &[u64]| seismic::Tensor::zeros(&charges, element, shape).unwrap();
     let mut step = words(&[0, 0]);
     declared::prepared(device, &routed_step::native_entry(), &seismic::NativeSpecialization::new())
         .unwrap()
-        .call(routed_step::Args {
+        .call(&charges, routed_step::Args {
             step: &mut step,
             sequence: &words(&[SEQUENCE, 0]),
         })
@@ -690,7 +709,7 @@ fn streamed_conversion(
     )
     .unwrap();
     native
-    .call_answered(routed_round::Args {
+    .call_answered(&charges, routed_round::Args {
         step: &step,
         scratch: &mut shared(&table.extents(), &scratch),
         window: &words(&[0]),
@@ -728,6 +747,7 @@ fn repack_matches_the_registered_conversion(
     records: bool,
 ) {
     let device = device.clone();
+    let charges = seismic::Charges::tally(&device);
     let streams = routed_round::native_implementation(&device)
         .unwrap()
         .is_some();
@@ -742,7 +762,7 @@ fn repack_matches_the_registered_conversion(
             let length = source_element.canonical_byte_len(&shape).unwrap();
             let bytes = source_bytes(length, shape[1] as u32);
             let source =
-                seismic::Tensor::from_host(&device, source_element, &shape, &bytes).unwrap();
+                seismic::Tensor::from_host(&charges, source_element, &shape, &bytes).unwrap();
             let packet = source_element.converted(seismic::Layout::Packet, operands).unwrap();
             let expected_values = packet
                 .decode_host(
@@ -771,7 +791,7 @@ fn repack_matches_the_registered_conversion(
                     &seismic::NativeSpecialization::new(),
                 )
                 .unwrap()
-                .call(repack_weight::Args { source: &source })
+                .call(&charges, repack_weight::Args { source: &source })
                 .unwrap()
                 .value;
                 let actual = native.read_to_host().unwrap();
@@ -812,7 +832,7 @@ fn repack_matches_the_registered_conversion(
             }
             let shape = [whole_tiles[0], whole_tiles[1], wide];
             let bytes = source_bytes(source_element.canonical_byte_len(&shape).unwrap(), shape[1] as u32);
-            let source = seismic::Tensor::from_host(&device, source_element, &shape, &bytes).unwrap();
+            let source = seismic::Tensor::from_host(&charges, source_element, &shape, &bytes).unwrap();
             assert!(
                 streamed_conversion(&device, &source, destination, &shape)
                     == destination.repack_host(source_element, &shape, &bytes).unwrap(),

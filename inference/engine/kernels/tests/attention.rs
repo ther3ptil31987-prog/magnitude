@@ -45,6 +45,8 @@ struct Bound {
     history_key: Tensor,
     history_value: Tensor,
     slab_rows: u32,
+    /// What the case's kernel calls allocate through.
+    charges: seismic::Charges,
 }
 
 /// Slab-stored key and value history. The two tensors' slabs are allocated
@@ -123,6 +125,7 @@ impl Bound {
     /// The case's tensors with its activations and history stored in
     /// `element`.
     fn new_with_options(device: &Device, case: &Case, slab_rows: u32, reuse_middle: bool, element: Element) -> Self {
+        let charges = seismic::Charges::tally(device);
         let Geometry { kv, g, p, .. } = case.geometry;
         let (m, w) = (case.rows, case.geometry.w());
         let [
@@ -132,7 +135,7 @@ impl Bound {
         let (selected_rows, _) = no_picks(device, m, kv, w);
         let stored = |shape: &[usize], values: &[f32]| {
             let shape = shape.iter().map(|x| *x as u64).collect::<Vec<_>>();
-            Tensor::from_host(device, element, &shape, &stored_bytes(element, values)).unwrap()
+            Tensor::from_host(&charges, element, &shape, &stored_bytes(element, values)).unwrap()
         };
         let selected = stored(&[0, kv, w], &[]);
         Self {
@@ -162,6 +165,7 @@ impl Bound {
             history_key,
             history_value,
             slab_rows,
+            charges,
         }
     }
 }
@@ -500,7 +504,7 @@ fn run_decode(
     case: &Case,
 ) -> Tensor {
     kernel
-        .call(args!(attention_decode, bound, case))
+        .call(&bound.charges, args!(attention_decode, bound, case))
         .unwrap()
         .value
 }
@@ -511,7 +515,7 @@ fn run_prefill(
     case: &Case,
 ) -> Tensor {
     kernel
-        .call(args!(attention_prefill, bound, case))
+        .call(&bound.charges, args!(attention_prefill, bound, case))
         .unwrap()
         .value
 }
@@ -831,16 +835,8 @@ fn attention_reads_and_writes_after_reusing_an_interior_slab() {
 
 fn check_attention_slab_case(case: &Case, reused: bool) {
     let expected = case.expected();
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    for backend in [
-        BackendName::Cpu,
-        BackendName::Metal,
-        BackendName::Cuda,
-        BackendName::Vulkan,
-    ] {
-        let Ok(device) = catalog.open_backend(backend) else {
-            continue;
-        };
+    for device in seismic_native_tests::devices(&[BackendName::Cpu, BackendName::Metal, BackendName::Cuda, BackendName::Vulkan]) {
+        let backend = device.backend();
         // CUDA: the vector and the grouped-query matrix forms.
         let decode_specs = if backend == BackendName::Cuda {
             [(4, 0, 2, 1), (1, 1, 3, 2)]
@@ -1137,11 +1133,8 @@ fn dense_append_publishes_only_the_same_history_as_prefill() {
     ];
     let case = Case::new(SMALL, 64, 1, &rows, 97);
     let expected = case.expected();
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    for backend in [BackendName::Cpu, BackendName::Metal] {
-        let Ok(device) = catalog.open_backend(backend) else {
-            continue;
-        };
+    for device in seismic_native_tests::devices(&[BackendName::Cpu, BackendName::Metal]) {
+        let backend = device.backend();
         let specialization = if is_cpu(&device) {
             cpu_statics(SMALL)
         } else {
@@ -1155,7 +1148,7 @@ fn dense_append_publishes_only_the_same_history_as_prefill() {
         .unwrap();
         let mut appended = Bound::new_with_slab_rows(&device, &case, 32);
         append
-            .call(args!(attention_append_dense, appended, case))
+            .call(&appended.charges, args!(attention_append_dense, appended, case))
             .unwrap();
         let mut full = Bound::new_with_slab_rows(&device, &case, 32);
         let prefill = prefill_specializations_on(&device, SMALL, &[(16, 1)])
@@ -1214,7 +1207,9 @@ const LFM: Geometry = Geometry { kv: 8, g: 4, p: 32, s: 0 };
 #[test]
 #[cfg(target_arch = "x86_64")]
 fn cpu_vector_tier_matches_portable_tier() {
-    let device = seismic::Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap();
+    let Some(device) = seismic_native_tests::devices(&[BackendName::Cpu]).into_iter().next() else {
+        return;
+    };
     if !std::arch::is_x86_feature_detected!("avx2") {
         return;
     }
@@ -1248,7 +1243,7 @@ fn cpu_vector_tier_matches_portable_tier() {
 #[test]
 fn cpu_decode_matches_host_model_at_every_partition_fill() {
     use seismic::device::DeviceValues;
-    let device = seismic::Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Cpu) else { return };
     let units = device.properties().value("units") as i32;
     for base in [5, 64 * units, 128 * units + 65] {
         let case = Case::new(SMALL, base as usize + 64, 2, &decode_rows(base), 43);
@@ -1275,7 +1270,7 @@ const QWEN3_8B: Geometry = Geometry { kv: 8, g: 4, p: 64, s: 0 };
 /// match the host model.
 #[test]
 fn cpu_prefill_row_blocks_keep_result_bits() {
-    let device = seismic::Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Cpu) else { return };
     let case = Case::new(QWEN35B, 448, 2, &prefill_rows(70, 300), 61);
     let expected = case.expected();
     let mut first = None;
@@ -1295,7 +1290,7 @@ fn cpu_prefill_row_blocks_keep_result_bits() {
 /// rows share none and each walk their keys alone.
 #[test]
 fn cpu_prefill_shared_blocks_match_each_row_alone() {
-    let device = seismic::Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Cpu) else { return };
     let rows = 70;
     let case = Case::new(QWEN35B, 448, 2, &prefill_rows(rows, 300), 67);
     let kernel = prefill_kernel(&device, &cpu_statics(QWEN35B));
@@ -1303,7 +1298,7 @@ fn cpu_prefill_shared_blocks_match_each_row_alone() {
     let mut alone = Bound::new(&device, &case);
     // Sixteen words a row: 512 one-key blocks, past every row's keys.
     let every = vec![u32::MAX; rows * 16].iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
-    alone.selection = Tensor::from_host(&device, Element::u32(), &[rows as u64, 16], &every).unwrap();
+    alone.selection = Tensor::from_host(&alone.charges, Element::u32(), &[rows as u64, 16], &every).unwrap();
     let shared = run_prefill(&kernel, &mut shared, &case).read_to_host().unwrap();
     let alone = run_prefill(&kernel, &mut alone, &case).read_to_host().unwrap();
     assert!(shared == alone, "shared key blocks change the result bits");

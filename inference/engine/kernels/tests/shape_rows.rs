@@ -188,11 +188,11 @@ fn portable_shaping_matches_the_ordered_host_reference() {
 
 #[test]
 fn generated_surface_exposes_planned_and_native_preparation() {
-    let planned: fn(&seismic::Device, seismic::PreparationOptions) -> _ = shape_rows::for_device;
+    let planned: fn(&seismic::Charges, seismic::PreparationOptions) -> _ = shape_rows::for_device;
     let native: fn(&seismic::Device, &seismic::NativeSpecialization) -> _ =
         shape_rows::native_for_device;
     let _ = (planned, native);
-    let planned_sample: fn(&seismic::Device, seismic::PreparationOptions) -> _ =
+    let planned_sample: fn(&seismic::Charges, seismic::PreparationOptions) -> _ =
         sample_rows::for_device;
     let native_sample: fn(&seismic::Device, &seismic::NativeSpecialization) -> _ =
         sample_rows::native_for_device;
@@ -201,20 +201,11 @@ fn generated_surface_exposes_planned_and_native_preparation() {
 
 const PARTITIONS: [u64; 3] = [64, 32, 128];
 
-/// Every accelerator this host opens, then the CPU.
+/// Every accelerator the host has, then the CPU; a requested backend alone
+/// ([`seismic_native_tests::devices`]).
 fn devices() -> Vec<seismic::Device> {
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    [
-        seismic::BackendName::Metal,
-        seismic::BackendName::Cuda,
-        seismic::BackendName::Vulkan,
-    ]
-    .into_iter()
-    .filter_map(|backend| catalog.open_backend(backend).ok())
-    .chain(std::iter::once(
-        catalog.open_backend(seismic::BackendName::Cpu).unwrap(),
-    ))
-    .collect()
+    use seismic::BackendName::{Cpu, Cuda, Metal, Vulkan};
+    seismic_native_tests::devices(&[Metal, Cuda, Vulkan, Cpu])
 }
 
 fn is_cpu(device: &seismic::Device) -> bool {
@@ -290,6 +281,7 @@ fn native_shape_constrained(
     history: &[i32],
     parts: Option<u64>,
 ) -> Vec<f32> {
+    let charges = seismic::Charges::tally(device);
     let hn = history.len() / rows;
     let f32_bytes = |values: &[f32]| {
         values
@@ -298,14 +290,14 @@ fn native_shape_constrained(
             .collect::<Vec<_>>()
     };
     let mut logits = seismic::Tensor::from_host(
-        device,
+        &charges,
         seismic::Element::f32(),
         &[rows as u64, vocabulary as u64],
         &f32_bytes(logits),
     )
     .unwrap();
     let mask = seismic::Tensor::from_host(
-        device,
+        &charges,
         seismic::Element::u32(),
         &[rows as u64, vocabulary.div_ceil(32) as u64],
         &mask
@@ -315,7 +307,7 @@ fn native_shape_constrained(
     )
     .unwrap();
     let constrained = seismic::Tensor::from_host(
-        device,
+        &charges,
         seismic::Element::i32(),
         &[rows as u64],
         &constrained
@@ -325,14 +317,14 @@ fn native_shape_constrained(
     )
     .unwrap();
     let params = seismic::Tensor::from_host(
-        device,
+        &charges,
         seismic::Element::f32(),
         &[rows as u64, 8],
         &f32_bytes(params),
     )
     .unwrap();
     let history = seismic::Tensor::from_host(
-        device,
+        &charges,
         seismic::Element::i32(),
         &[rows as u64, hn as u64],
         &history
@@ -348,7 +340,7 @@ fn native_shape_constrained(
     );
     declared::prepared(device, &shape_rows::native_entry(), &specialization)
         .unwrap()
-        .call(shape_rows::Args {
+        .call(&charges, shape_rows::Args {
             logits: &mut logits,
             mask: &mask,
             constrained: &constrained,
@@ -375,6 +367,7 @@ fn native_sample(
     parts: Option<u64>,
 ) -> Vec<i32> {
     let words = vocabulary.div_ceil(32);
+    let charges = seismic::Charges::tally(device);
     let u32_bytes = |values: &[u32]| {
         values
             .iter()
@@ -382,7 +375,7 @@ fn native_sample(
             .collect::<Vec<_>>()
     };
     let logits = seismic::Tensor::from_host(
-        device,
+        &charges,
         seismic::Element::f32(),
         &[rows as u64, vocabulary as u64],
         &logits
@@ -392,14 +385,14 @@ fn native_sample(
     )
     .unwrap();
     let mask = seismic::Tensor::from_host(
-        device,
+        &charges,
         seismic::Element::u32(),
         &[rows as u64, words as u64],
         &u32_bytes(mask),
     )
     .unwrap();
     let constrained = seismic::Tensor::from_host(
-        device,
+        &charges,
         seismic::Element::i32(),
         &[rows as u64],
         &constrained
@@ -409,18 +402,18 @@ fn native_sample(
     )
     .unwrap();
     let draws = seismic::Tensor::from_host(
-        device,
+        &charges,
         seismic::Element::u32(),
         &[rows as u64, 6],
         &u32_bytes(draws),
     )
     .unwrap();
     let mut result =
-        seismic::Tensor::zeros(device, seismic::Element::i32(), &[rows as u64, 2]).unwrap();
+        seismic::Tensor::zeros(&charges, seismic::Element::i32(), &[rows as u64, 2]).unwrap();
     let specialization = specialization_on(device, parts, &[("V", vocabulary as u64)]);
     declared::prepared(device, &sample_rows::native_entry(), &specialization)
         .unwrap()
-        .call(sample_rows::Args {
+        .call(&charges, sample_rows::Args {
             logits: &logits,
             mask: &mask,
             constrained: &constrained,

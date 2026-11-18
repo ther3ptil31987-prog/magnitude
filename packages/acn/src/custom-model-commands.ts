@@ -17,6 +17,7 @@ import {
   LocalModelAssessmentSchema,
   DrafterCandidateSchema,
   LocalModelMutationFailed,
+  localModelIsInstalled,
   ModelRepositoryNotFound,
   ModelSourceUnavailable,
   HuggingFaceAccessRequired,
@@ -194,6 +195,16 @@ export class CustomModelCommands extends Context.Tag("CustomModelCommands")<
 >() {}
 
 
+/**
+ * Whether the inference service says trying again may succeed (a removal racing a model's load
+ * is refused for the moment), as its error body's own flag says; a server error where it says
+ * nothing.
+ */
+const remoteRetryable = (cause: GeneratedClientError<unknown> & { readonly _tag: "GeneratedClientRemoteError" }): boolean => {
+  const body = cause.body as { readonly error?: { readonly retryable?: unknown } } | undefined
+  return typeof body?.error?.retryable === "boolean" ? body.error.retryable : cause.status >= 500
+}
+
 const remoteMessage = (cause: GeneratedClientError<unknown>): string => {
   if (cause._tag === "GeneratedClientRemoteError") {
     const body = cause.body as { readonly error?: { readonly message?: unknown } } | undefined
@@ -300,7 +311,7 @@ const commandFailed = (operation: string) => (cause: GeneratedClientError<unknow
     : new LocalModelMutationFailed({
         code: `custom_model_${operation}_failed`,
         message: remoteMessage(cause),
-        retryable: cause._tag !== "GeneratedClientRemoteError" || cause.status >= 500,
+        retryable: cause._tag !== "GeneratedClientRemoteError" || remoteRetryable(cause),
       })
 
 const withoutKey = <K extends string, V>(record: Readonly<Partial<Record<K, V>>>, key: K): Partial<Record<K, V>> => {
@@ -757,6 +768,27 @@ export const CustomModelCommandsLive: Layer.Layer<
         : Effect.void,
   { discard: true })
 
+  /** Removes a model added from Hugging Face as if it had never been added: its downloads, Magnitude's copy, and its record. */
+  const removeAdded = (
+    modelId: CustomFormModelId,
+    addedId: HuggingFaceFormModelId,
+    related: readonly RelatedDownload[],
+  ) => Effect.gen(function* () {
+    yield* endDownloads(related)
+    // ICN deletes only Magnitude's copy; the same bytes elsewhere remain and the model stays as found.
+    yield* localModels_.removeFiles(modelId).pipe(
+      Effect.catchIf((error) => error._tag === "GeneratedClientRemoteError" && error.status === 404, () => Effect.void),
+      Effect.mapError(commandFailed("remove")),
+    )
+    yield* customModels.modify((current) => Effect.succeed([undefined, {
+      ...withDrafterChoice(current, modelId, { _tag: "Auto" }),
+      added: withoutKey(current.added, addedId),
+    }] as const))
+    yield* settle
+    yield* pruneDrafters
+    return {}
+  })
+
   const commands = CustomModelCommands.of({
     searchHuggingFace: ({ query, limit, cursor }) => icn.search({
       query,
@@ -993,19 +1025,7 @@ export const CustomModelCommandsLive: Layer.Layer<
         yield* settle
         return {}
       }
-      yield* endDownloads(related)
-      // ICN deletes only Magnitude's copy; the same bytes elsewhere remain and the model stays as found.
-      yield* localModels_.removeFiles(modelId).pipe(
-        Effect.catchIf((error) => error._tag === "GeneratedClientRemoteError" && error.status === 404, () => Effect.void),
-        Effect.mapError(commandFailed("remove")),
-      )
-      yield* customModels.modify((current) => Effect.succeed([undefined, {
-        ...withDrafterChoice(current, modelId, { _tag: "Auto" }),
-        added: withoutKey(current.added, added.value[0]),
-      }] as const))
-      yield* settle
-      yield* pruneDrafters
-      return {}
+      return yield* removeAdded(modelId, added.value[0], related)
     }),
 
     sync: (modelId) => Effect.gen(function* () {
@@ -1040,12 +1060,19 @@ export const CustomModelCommandsLive: Layer.Layer<
       cause as GeneratedClientError<unknown> | ModelCandidateError,
     ))),
 
-    cancelSync: (modelId) => modelAcquisition(modelId).pipe(
-      Effect.flatMap(({ related }) => Effect.forEach(related.filter(({ download }) => downloadIsActive(download)), ({ download }) =>
-        downloads.cancel(download.id), { discard: true })),
-      Effect.mapError(commandFailed("cancel")),
-      Effect.as({}),
-    ),
+    // Cancelling the download that would first bring an added model's files abandons adding it; cancelling an update
+    // or a drafter download keeps the model.
+    cancelSync: (modelId) => Effect.gen(function* () {
+      const { config, related } = yield* modelAcquisition(modelId).pipe(Effect.mapError(commandFailed("cancel")))
+      const added = addedModel(config, modelId)
+      const installed = Option.exists(yield* rowFor(modelId), localModelIsInstalled)
+      if (Option.isSome(added) && !installed && Option.exists(currentDownload(related, "Target"), downloadIsActive)) {
+        return yield* removeAdded(modelId, added.value[0], related)
+      }
+      yield* Effect.forEach(related.filter(({ download }) => downloadIsActive(download)), ({ download }) =>
+        downloads.cancel(download.id), { discard: true }).pipe(Effect.mapError(commandFailed("cancel")))
+      return {}
+    }),
 
     acknowledgeSyncFailure: (modelId) => modelAcquisition(modelId).pipe(
       Effect.flatMap(({ related }) => Effect.forEach(

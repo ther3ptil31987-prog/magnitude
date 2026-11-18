@@ -3,7 +3,7 @@
 //! device batches kept in flight up to the ring's depth.
 
 use seismic::{
-    BackendName, Devices, Element, FlightRing, NativeSpecialization, NativeTensorBatch,
+    BackendName, Element, FlightRing, NativeSpecialization, NativeTensorBatch,
     NativeTensorBatchCompletion, Tensor,
 };
 use seismic_native_tests::scale_rows;
@@ -24,16 +24,16 @@ fn bytes(values: &[f32]) -> Vec<u8> {
 /// result is the scaled values written into its entry, none overwritten
 /// while the device still read it.
 fn an_entry_is_rewritten_only_after_its_batch_completed(backend: BackendName) {
-    let devices = Devices::discover(&[]).unwrap();
-    let Ok(device) = devices.open_backend(backend) else {
+    let Some(device) = seismic_native_tests::fresh_device(backend) else {
         return;
     };
     let kernel =
         scale_rows::native_for_device(&device, &NativeSpecialization::new().with_param("ROWS", 1))
             .unwrap();
+    let charges = seismic::Charges::tally(&device);
     for depth in 1..=3 {
         let mut ring = FlightRing::<Tensor, NativeTensorBatchCompletion>::default();
-        ring.resize(depth, || Tensor::shared(&device, Element::f32(), &[ROWS, COLUMNS]))
+        ring.resize(depth, || Tensor::shared(&charges, Element::f32(), &[ROWS, COLUMNS]))
             .unwrap();
         let mut flying: VecDeque<(Tensor, Vec<f32>)> = VecDeque::new();
         let observe = |(result, expected): (Tensor, Vec<f32>)| {
@@ -52,8 +52,8 @@ fn an_entry_is_rewritten_only_after_its_batch_completed(backend: BackendName) {
             unsafe { entry.value().write_shared(0, &bytes(&values)) }.unwrap();
             // SAFETY: the entry writes every f32 result element.
             let mut result =
-                unsafe { Tensor::uninitialized(&device, Element::f32(), &[ROWS, COLUMNS]) }.unwrap();
-            let mut batch = NativeTensorBatch::new(&device);
+                unsafe { Tensor::uninitialized(&charges, Element::f32(), &[ROWS, COLUMNS]) }.unwrap();
+            let mut batch = NativeTensorBatch::new(&charges);
             batch
                 .push(
                     &kernel,

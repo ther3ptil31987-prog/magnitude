@@ -120,7 +120,7 @@ fn tensor(
         .iter()
         .map(|extent| *extent as u64)
         .collect::<Vec<_>>();
-    seismic::Tensor::from_host(device, element, &shape, &bytes).unwrap()
+    seismic::Tensor::from_host(&seismic::Charges::tally(device), element, &shape, &bytes).unwrap()
 }
 
 fn read(tensor: &seismic::Tensor, dtype: DType) -> Vec<f32> {
@@ -343,36 +343,61 @@ impl Case {
         [low, inject, inverse, partials]
     }
 
+    /// The statics of the case's entries.
+    fn statics(&self) -> [(&'static str, u64); 4] {
+        [
+            ("H", self.h as u64),
+            ("S", self.s as u64),
+            ("LR", self.r as u64),
+            ("C", self.c as u64),
+        ]
+    }
+
+    /// `stream_mix_down` on `device` at its declared defaults as `specialize`
+    /// changes them: (low, inject, inverse).
+    fn mixed(
+        &self,
+        device: &seismic::Device,
+        specialize: impl Fn(seismic::NativeSpecialization) -> seismic::NativeSpecialization,
+    ) -> [Vec<f32>; 3] {
+        let (s, h, r, rows, width) = (self.s, self.h, self.r, self.rows, self.width());
+        let charges = seismic::Charges::tally(device);
+        let statics = self.statics();
+        let entry = stream_mix_down::native_entry_with(stream_mix_down::Elements {
+            NW: seismic::Element::f32(),
+            DW: seismic::Element::bf16(),
+            IW: seismic::Element::f32(),
+            A: seismic::Element::bf16(),
+        });
+        let declared = declared::declared(device, &entry, |name| {
+            statics
+                .iter()
+                .find(|(given, _)| *given == name)
+                .unwrap_or_else(|| panic!("static {name} is given"))
+                .1
+        }, &[]).unwrap();
+        let mixed = entry
+            .prepare(device, &specialize(declared))
+            .unwrap()
+            .call(&charges, stream_mix_down::Args {
+                hidden: &tensor(device, DType::F32, &[rows, s, h], &self.hidden),
+                norm: &tensor(device, DType::F32, &[s, h], &self.norm),
+                down_weight: &tensor(device, DType::BF16, &[r, width], &self.down),
+                inject_weight: &tensor(device, DType::F32, &[self.c * s, width], &self.inject),
+                epsilon: EPSILON,
+            })
+            .unwrap();
+        [read(&mixed.r0, DType::BF16), read(&mixed.r1, DType::F32), read(&mixed.r2, DType::F32)]
+    }
+
     /// The native entries on `device`: (low, inject, inverse) of the first
     /// stage, and the second stage's partials over the expected first
     /// stage's low rows and inverses.
     fn native(&self, device: &seismic::Device, expected: &[Vec<f64>; 4]) -> [Vec<f32>; 4] {
+        let charges = seismic::Charges::tally(device);
         let (s, h, r, rows, width) = (self.s, self.h, self.r, self.rows, self.width());
-        let statics = [
-            ("H", h as u64),
-            ("S", s as u64),
-            ("LR", r as u64),
-            ("C", self.c as u64),
-        ];
-        let mixed = at_defaults(
-            device,
-            stream_mix_down::native_entry_with(stream_mix_down::Elements {
-                NW: seismic::Element::f32(),
-                DW: seismic::Element::bf16(),
-                IW: seismic::Element::f32(),
-                A: seismic::Element::bf16(),
-            }),
-            &statics,
-        )
-        .unwrap()
-        .call(stream_mix_down::Args {
-            hidden: &tensor(device, DType::F32, &[rows, s, h], &self.hidden),
-            norm: &tensor(device, DType::F32, &[s, h], &self.norm),
-            down_weight: &tensor(device, DType::BF16, &[r, width], &self.down),
-            inject_weight: &tensor(device, DType::F32, &[self.c * s, width], &self.inject),
-            epsilon: EPSILON,
-        })
-        .unwrap();
+        let statics = self.statics();
+        let [low_rows, inject, inverse_rows] = self.mixed(device, |declared| declared);
         let low = expected[0].iter().map(|v| *v as f32).collect::<Vec<_>>();
         let inverse = expected[2].iter().map(|v| *v as f32).collect::<Vec<_>>();
         let gated = at_defaults(
@@ -385,7 +410,7 @@ impl Case {
             &statics[..3],
         )
         .unwrap()
-        .call(stream_mix_up::Args {
+        .call(&charges, stream_mix_up::Args {
             low: &tensor(device, DType::BF16, &[rows, r], &low),
             up_weight: &tensor(device, DType::BF16, &[width, r], &self.up),
             hidden: &tensor(device, DType::F32, &[rows, s, h], &self.hidden),
@@ -393,12 +418,7 @@ impl Case {
             norm: &tensor(device, DType::F32, &[s, h], &self.norm),
         })
         .unwrap();
-        [
-            read(&mixed.r0, DType::BF16),
-            read(&mixed.r1, DType::F32),
-            read(&mixed.r2, DType::F32),
-            read(&gated.value, DType::F32),
-        ]
+        [low_rows, inject, inverse_rows, read(&gated.value, DType::F32)]
     }
 }
 
@@ -498,7 +518,7 @@ fn native_stream_mix_matches_portable_bodies() {
 #[test]
 fn cpu_stream_mix_row_shares_match_the_host_replica() {
     use seismic::device::DeviceValues;
-    let device = seismic::Devices::discover(&[]).unwrap().open_backend(seismic::BackendName::Cpu).unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(seismic::BackendName::Cpu) else { return };
     let units = device.properties().value("units") as usize;
     for (geometry, c) in [
         ((32, 1, 4), 1),
@@ -522,6 +542,7 @@ fn cpu_stream_mix_row_shares_match_the_host_replica() {
 fn native_repeat_rows_matches_portable_body() {
     let module = crate::common::kernels();
     for device in devices() {
+        let charges = seismic::Charges::tally(&device);
         for (h, rows, scales) in [
             (256usize, 1usize, vec![1.0f32; 4]),
             (2560, 70, vec![1.0, -0.5, 3.25, 0.0]),
@@ -543,7 +564,7 @@ fn native_repeat_rows_matches_portable_body() {
                 &[],
             )
             .unwrap()
-            .call(repeat_rows::Args {
+            .call(&charges, repeat_rows::Args {
                 rows: &tensor(&device, DType::F32, &[rows, h], &source),
                 scales: &tensor(&device, DType::F32, &[s], &scales),
             })
@@ -567,6 +588,7 @@ fn native_repeat_rows_matches_portable_body() {
 #[test]
 fn repeat_rows_publishes_every_nan_as_the_one_nan() {
     for device in devices() {
+        let charges = seismic::Charges::tally(&device);
         let h = 8usize;
         let source = [
             0x7f80_0001u32, 0xff80_0001, 0x7fc0_1234, 0xffc0_0000, 0xffff_ffff, 0x7fbf_ffff, 0x3f80_0000, 0x7f80_0000,
@@ -576,7 +598,7 @@ fn repeat_rows_publishes_every_nan_as_the_one_nan() {
         let scales = vec![1.0f32, -0.5];
         let repeated = at_defaults(&device, repeat_rows::native_entry(), &[])
             .unwrap()
-            .call(repeat_rows::Args {
+            .call(&charges, repeat_rows::Args {
                 rows: &tensor(&device, DType::F32, &[1, h], &source),
                 scales: &tensor(&device, DType::F32, &[scales.len()], &scales),
             })
@@ -722,6 +744,7 @@ impl Sinkhorn {
         rows: usize,
         (h, s, n): (usize, usize, usize),
     ) -> [Vec<f32>; 3] {
+        let charges = seismic::Charges::tally(device);
         let mixes = (2 + s) * s;
         let carried = usize::from(previous.is_some());
         let site = at_defaults(
@@ -730,7 +753,7 @@ impl Sinkhorn {
             &[("H", h as u64), ("S", s as u64), ("P", carried as u64)],
         )
         .unwrap()
-        .call(stream_mix_sinkhorn::Args {
+        .call(&charges, stream_mix_sinkhorn::Args {
             hidden: &tensor(device, DType::F32, &[rows, s, h], x),
             previous: &tensor(device, DType::F32, &[rows, carried * s], previous.unwrap_or(&[])),
             function: &tensor(device, DType::F32, &[mixes, s * h], &self.function),
@@ -815,6 +838,7 @@ impl Projection {
         h: usize,
         s: usize,
     ) -> Vec<f32> {
+        let charges = seismic::Charges::tally(device);
         let statics = [
             ("D", h as u64),
             ("SN", s as u64),
@@ -854,7 +878,7 @@ impl Projection {
             .expect("attention_output joins through the comb on this backend");
         let joined = declared::prepared(device, &attention_output::native_entry_with(elements), &specialization)
             .unwrap()
-            .call(attention_output::Args {
+            .call(&charges, attention_output::Args {
                 hidden: &tensor(device, DType::F32, &[rows, s * h], x),
                 inject: &tensor(device, DType::F32, &[rows, s + s * s], join),
                 gated: &tensor(device, DType::BF16, &[rows, self.q, self.w], &self.gated),
@@ -1112,6 +1136,7 @@ fn collapse_native(
     h: usize,
     s: usize,
 ) -> Vec<f32> {
+    let charges = seismic::Charges::tally(device);
     let previous = usize::from(pre.is_some());
     let collapsed = at_defaults(
         device,
@@ -1119,7 +1144,7 @@ fn collapse_native(
         &[("H", h as u64), ("S", s as u64), ("P", previous as u64)],
     )
     .unwrap()
-    .call(magnitude_kernels::stream_collapse::Args {
+    .call(&charges, magnitude_kernels::stream_collapse::Args {
         hidden: &tensor(device, DType::F32, &[rows, s, h], streams),
         pre: &tensor(device, DType::F32, &[rows, previous * s], pre.unwrap_or(&[])),
     })
@@ -1226,6 +1251,7 @@ fn native_stream_join_matches_its_formula_on_adversarial_values() {
             let (expected, magnitude) = join_reference(&residual, &y, &inject, (h, sn, width));
             let bound = magnitude.iter().map(|m| gamma(sn + 1) * m).collect::<Vec<_>>();
             for device in devices() {
+                let charges = seismic::Charges::tally(&device);
                 let statics = [("H", h as u64), ("SN", sn as u64), ("IN", width as u64)];
                 let joined = at_defaults(
                     &device,
@@ -1233,7 +1259,7 @@ fn native_stream_join_matches_its_formula_on_adversarial_values() {
                     &statics,
                 )
                 .unwrap()
-                .call(magnitude_kernels::stream_join::Args {
+                .call(&charges, magnitude_kernels::stream_join::Args {
                     residual: &tensor(&device, DType::F32, &[rows, sn * h], &residual),
                     y: &tensor(&device, DType::F32, &[rows, h], &y),
                     inject: &tensor(&device, DType::F32, &[rows, width], &inject),
@@ -1321,6 +1347,7 @@ fn native_sinkhorn_split_timing() {
     let Some(device) = seismic_native_tests::devices(&[Cuda, Metal]).into_iter().next() else {
         return;
     };
+    let charges = seismic::Charges::tally(&device);
     let (h, s, n) = V41;
     let mixes = (2 + s) * s;
     let functions = (0..32u32)
@@ -1345,9 +1372,9 @@ fn native_sinkhorn_split_timing() {
         (
             tensor(&device, DType::F32, &[rows, s, h], &pattern(rows * s * h, 71, 2.0)),
             tensor(&device, DType::F32, &[rows, s], &narrow(&entry_pre(rows, s))),
-            seismic::Tensor::zeros(&device, seismic::Element::f32(), &[rows as u64, h as u64]).unwrap(),
-            seismic::Tensor::zeros(&device, seismic::Element::f32(), &[rows as u64, s as u64]).unwrap(),
-            seismic::Tensor::zeros(&device, seismic::Element::f32(), &[rows as u64, (s + s * s) as u64]).unwrap(),
+            seismic::Tensor::zeros(&charges, seismic::Element::f32(), &[rows as u64, h as u64]).unwrap(),
+            seismic::Tensor::zeros(&charges, seismic::Element::f32(), &[rows as u64, s as u64]).unwrap(),
+            seismic::Tensor::zeros(&charges, seismic::Element::f32(), &[rows as u64, (s + s * s) as u64]).unwrap(),
         )
     };
     let mut tensors = cases.iter().map(|&(rows, _)| rows_of(rows)).collect::<Vec<_>>();
@@ -1357,7 +1384,7 @@ fn native_sinkhorn_split_timing() {
         for ((&(_, iterations), (hidden, previous, input, pre, join)), best) in
             cases.iter().zip(&mut tensors).zip(&mut best)
         {
-            let mut batch = seismic::NativeTensorBatch::new(&device);
+            let mut batch = seismic::NativeTensorBatch::new(&charges);
             for call in 0..CALLS as usize {
                 batch
                     .push(
@@ -1389,5 +1416,44 @@ fn native_sinkhorn_split_timing() {
             best.as_secs_f64() * 1e6,
             function_bytes / best.as_secs_f64() / 1e9
         );
+    }
+}
+
+/// `stream_mix_down`'s parted GEMV (`gemv_runtime`) stages its activations
+/// as F32 under STAGE, a plain form the `dense` projection declares at both
+/// values: at every GEMV row count of every case, low, inject and inverse
+/// are bit for bit those of STAGE 0.
+#[test]
+fn metal_stream_mix_down_stages_activations_without_changing_a_bit() {
+    let module = crate::common::kernels();
+    let id = module.entry_named("stream_mix_down").expect("`stream_mix_down` is declared");
+    let native = module
+        .native_implementation(id, seismic::BackendName::Metal)
+        .expect("`stream_mix_down` has a Metal implementation");
+    let stage = native
+        .declared_params()
+        .find(|parameter| parameter.name == "STAGE")
+        .expect("`stream_mix_down` declares STAGE");
+    assert_eq!(stage.values, vec![0, 1]);
+    let Some(device) = devices().into_iter().find(|device| device.backend() == seismic::BackendName::Metal) else {
+        return;
+    };
+    let gemv_rows = ROWS
+        .into_iter()
+        .filter(|&rows| rows as u64 <= magnitude_kernels::constants::VERIFY_ROWS);
+    for geometry in GEOMETRIES {
+        for c in [1, 0] {
+            for rows in gemv_rows.clone() {
+                let case = Case::new(geometry, c, rows);
+                let [neither, staged] =
+                    [0, 1].map(|stage| case.mixed(&device, |declared| declared.with_param("STAGE", stage)));
+                for (name, (neither, staged)) in ["low", "inject", "inverse"].into_iter().zip(neither.iter().zip(&staged)) {
+                    assert!(
+                        neither.iter().zip(staged).all(|(a, b)| a.to_bits() == b.to_bits()),
+                        "{geometry:?} C {c} M {rows}: {name} differs under STAGE 1"
+                    );
+                }
+            }
+        }
     }
 }

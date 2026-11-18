@@ -33,16 +33,18 @@ pub use super::comparison::{
 use super::plan::{self, PointShape};
 use super::sampling::{Rates, Sequence};
 use super::search::{Cost, LaunchKey, ParameterValues, SearchSettings};
+use super::survey::{SurveyIndex, SurveyRecord, SurveyedPoint, SurveyedRow, SurveyedWork, WorkOutcome};
 use super::timing::{OutputPool, PointTiming};
 use super::validation::{PreparedPoint, Validator};
 use super::{FormationClass, HeldPrograms, NativePrepared, Rendered};
 use crate::api::device::DeviceInner;
+use crate::memory::Charges;
 use crate::api::kernel::{EncodedArgs, PrepareError};
 use crate::api::{CallError, TensorError};
 use seismic_compiler::errors::ExecutionError;
 use seismic_compiler::prepared::{validate_invocation, InvocationContract};
 use seismic_lang::checked::{
-    CheckedModule, NativeDefault, NativeImplementation, NativeNatExpr, NativeSpecialization,
+    CheckedModule, NativeDefault, NativeImplementation, NativeNatExpr, NativeParameter, NativeSpecialization,
 };
 use seismic_lang::entry::{ElementBindings, LogicalEntry, ParameterKind, TensorAccess};
 use seismic_lang::expr::SymbolValue;
@@ -183,7 +185,8 @@ pub trait PointSource<'a> {
 /// measures ([`PointSource::surveyed`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SurveyProgress {
-    /// Every configuration the survey forms and measures.
+    /// Every configuration the survey forms and measures: the defaults,
+    /// and one standing for each work at a point no other runs.
     pub configurations: usize,
     /// Those whose formation ran (some may have been excluded by it).
     pub formed: usize,
@@ -299,15 +302,16 @@ impl<'a> TuningPoint<'a> {
         })
     }
 
-    /// The point with the cold copies its timed passes on `device` run.
-    fn timed(mut self, device: &DeviceInner) -> Result<Self, BuildError> {
-        if let Some(cold) = super::point::cold_bytes(device) {
+    /// The point with the cold copies its timed passes on `charges`'
+    /// device run, allocated through them.
+    fn timed(mut self, charges: &Charges) -> Result<Self, BuildError> {
+        if let Some(cold) = super::point::cold_bytes(charges.device()) {
             let workload = self
                 .workload
                 .iter()
                 .map(|index| self.rotation[*index].clone())
                 .collect::<Vec<_>>();
-            self.copies = super::point::cold_copies(&workload, cold).map_err(BuildError::of)?;
+            self.copies = super::point::cold_copies(charges, &workload, cold).map_err(BuildError::of)?;
         }
         Ok(self)
     }
@@ -545,8 +549,11 @@ pub struct DeclaredParameter {
 pub enum TuningMethod {
     /// The defaults, measured at the points discovered so far.
     Census,
-    /// Every admissible configuration, `samples` per point.
-    Survey { samples: usize },
+    /// Every work of every surveyed configuration at each point, `samples`
+    /// per point, and that record ([`SurveyRecord`]). The configurations
+    /// recorded are the defaults and the one chosen, each composed from the
+    /// work it runs at each point.
+    Survey { samples: usize, record: SurveyRecord },
     /// A search of each independent group of the planned domain
     /// ([`GroupSearch`]): the groups of launches that run together, or the
     /// one group that is a program formed whole. `candidates` are the
@@ -765,13 +772,11 @@ pub struct SearchPlan {
     pub start: Vec<ParameterValues>,
 }
 
-/// Every admissible configuration that runs work of its own at the points,
-/// measured and validated (development; [`SurveyDomain`]). What is surveyed
-/// is what the caller names: the declared domain with `domains` in place of
-/// the value lists they name. The configurations are visited in the
-/// declaration's order, a batch at a time, and never held: what a survey
-/// holds is the record it returns, one entry for each configuration it
-/// visited.
+/// The work of every admissible configuration that runs work of its own,
+/// measured and validated once at each point (development;
+/// [`SurveyDomain`], [`super::survey`]). What is surveyed is what the caller
+/// names: the declared domain with `domains` in place of the value lists
+/// they name.
 #[derive(Clone, Debug)]
 pub struct SurveyPlan {
     /// Samples per point of every configuration.
@@ -884,12 +889,13 @@ fn held_bytes(device: &DeviceInner, charged: u64, retained: u64, footprint: Opti
 /// timing: with the cold copies of its workload ([`TuningPoint::timed`]),
 /// which are part of its build.
 fn build_point<'a>(
-    device: &DeviceInner,
+    charges: &Charges,
     source: &mut dyn PointSource<'a>,
     spec: &PointSpec,
     index: usize,
     resident: &mut Observed,
 ) -> Result<Option<TuningPoint<'a>>, TuneError> {
+    let device = charges.device();
     let before = device.room(seismic_topology::Contract::DeviceOnly);
     // What the source built for a point that is not made is given up with
     // it: nothing holds the point, so nothing would give it up later.
@@ -900,7 +906,7 @@ fn build_point<'a>(
                 source.release(index);
             }
             point?
-                .timed(device)
+                .timed(charges)
                 .inspect_err(|_| source.release(index))
         }
         Err(error) => Err(error),
@@ -1111,7 +1117,8 @@ pub struct Standing {
 }
 
 pub struct TuneRequest<'r, 'a> {
-    pub device: &'r Arc<DeviceInner>,
+    /// What the tuning allocates through: its device's charges.
+    pub charges: &'r Charges,
     pub module: &'r CheckedModule,
     pub entry: EntryId,
     pub bindings: ElementBindings,
@@ -1126,7 +1133,7 @@ pub struct TuneRequest<'r, 'a> {
 
 /// Forms configurations of one entry's implementation.
 struct Formation<'s, 'm> {
-    device: &'s Arc<DeviceInner>,
+    charges: &'s Charges,
     module: &'m CheckedModule,
     entry: EntryId,
     logical: &'s Arc<LogicalEntry>,
@@ -1147,7 +1154,7 @@ struct Formation<'s, 'm> {
 macro_rules! formation {
     ($unit:expr) => {
         Formation {
-            device: &$unit.device,
+            charges: &$unit.charges,
             module: $unit.module,
             entry: $unit.entry,
             logical: &$unit.logical,
@@ -1320,7 +1327,7 @@ impl FormationPrice {
 /// search and submits nothing to the device, so it runs on any thread
 /// while the device measures other work.
 pub struct Forming<'m> {
-    device: Arc<DeviceInner>,
+    charges: Charges,
     module: &'m CheckedModule,
     entry: EntryId,
     logical: Arc<LogicalEntry>,
@@ -1358,14 +1365,14 @@ impl Forming<'_> {
                 ProcessMemory::footprint_now(),
             )
         };
-        let before = held(&self.device);
-        let products = concurrently(&self.device, &self.work, |(formable, rendered)| {
-            let class = rendered.class(&self.device);
+        let before = held(self.charges.device());
+        let products = concurrently(self.charges.device(), &self.work, |(formable, rendered)| {
+            let class = rendered.class(self.charges.device());
             let began = Instant::now();
             let product = match formable {
                 Formable::Launches(sources) => Product::Launches(
                     NativePrepared::hold_launch_variants(
-                        &self.device,
+                        self.charges.device(),
                         self.module,
                         self.entry,
                         &self.bindings,
@@ -1377,7 +1384,7 @@ impl Forming<'_> {
                 ),
                 Formable::Program(specialization) => Product::Program(
                     NativePrepared::prepare_implementation(
-                        &self.device,
+                        self.charges.device(),
                         self.module,
                         self.entry,
                         &self.logical,
@@ -1393,7 +1400,7 @@ impl Forming<'_> {
             (class, product, began.elapsed())
         });
         Formed {
-            added_bytes: held(&self.device) as f64 - before as f64,
+            added_bytes: held(self.charges.device()) as f64 - before as f64,
             calls: self
                 .work
                 .into_iter()
@@ -1464,7 +1471,7 @@ impl UnitSearch<'_, '_> {
 
 /// The compile of a unit's canonical program ([`UnitSearch::grounding`]).
 pub struct Grounding<'m> {
-    device: Arc<DeviceInner>,
+    charges: Charges,
     module: &'m CheckedModule,
     entry: EntryId,
     logical: Arc<LogicalEntry>,
@@ -1480,7 +1487,7 @@ impl Grounding<'_> {
     pub fn run(self) -> Grounded {
         let began = Instant::now();
         let kernel = NativePrepared::prepare_implementation(
-            &self.device,
+            self.charges.device(),
             self.module,
             self.entry,
             &self.logical,
@@ -1531,7 +1538,7 @@ impl<'m> Formation<'_, 'm> {
     /// What the one call forming `formable` does, read from the device's
     /// live programs and the artifact store before it starts.
     fn class(&self, formable: &Formable) -> Formative {
-        self.rendered(formable).class(self.device)
+        self.rendered(formable).class(self.charges.device())
     }
 
     /// Whether forming `formable` renders any program for a toolchain.
@@ -1548,7 +1555,7 @@ impl<'m> Formation<'_, 'm> {
             .entry(formable.clone())
             .or_insert_with(|| match formable {
                 Formable::Launches(sources) => NativePrepared::launch_variants_rendered(
-                    self.device,
+                    self.charges.device(),
                     self.module,
                     self.entry,
                     self.bindings,
@@ -1557,7 +1564,7 @@ impl<'m> Formation<'_, 'm> {
                     sources,
                 ),
                 Formable::Program(specialization) => NativePrepared::implementation_rendered(
-                    self.device,
+                    self.charges.device(),
                     self.module,
                     self.entry,
                     self.logical,
@@ -1578,7 +1585,7 @@ impl<'m> Formation<'_, 'm> {
     fn quote(&self, formables: &[Formable]) -> Quote {
         let mut quote = Quote::default();
         let threads = formation_threads(formables.len());
-        let toolchain = self.device.programs.compiled();
+        let toolchain = self.charges.device().programs.compiled();
         let formatives = formables
             .iter()
             .map(|formable| self.class(formable))
@@ -1606,7 +1613,7 @@ impl<'m> Formation<'_, 'm> {
     /// any thread; none when they are none.
     fn forming(&self, formables: Vec<Formable>) -> Option<Forming<'m>> {
         (!formables.is_empty()).then(|| Forming {
-            device: self.device.clone(),
+            charges: self.charges.clone(),
             module: self.module,
             entry: self.entry,
             logical: self.logical.clone(),
@@ -2080,11 +2087,11 @@ fn measure_matched(
         let mut candidate_slots = Vec::new();
         let admitting = Instant::now();
         for (point, workload) in points.iter().enumerate() {
-            let mut timing = match PointTiming::reusing_outputs(
+            let mut timing = match outputs.timing(
                 &formed.kernel,
+                &workload.label,
                 workload.workload_rotation(),
                 workload.copies(),
-                outputs.at(&workload.label),
             ) {
                 Ok(timing) => timing,
                 Err(error) => {
@@ -2177,11 +2184,11 @@ fn measure_matched(
             }
             continue;
         }
-        let beside = PointTiming::reusing_outputs(
+        let beside = outputs.timing(
             incumbent.kernel,
+            &workload.label,
             workload.workload_rotation(),
             workload.copies(),
-            outputs.at(&workload.label),
         )
         .map_err(|error| WorkError::Failed(measurement_failure(points, point, error)))
         .and_then(|mut timing| {
@@ -2472,6 +2479,17 @@ enum Keying {
 }
 
 impl Keying {
+    /// How a survey keys `implementation`'s points: by the launches that
+    /// work and the parameters they read, launch-scoped ones included,
+    /// every entry parameter told apart (no boundary).
+    fn of(implementation: &NativeImplementation) -> Self {
+        if implementation.launch_scoped() {
+            Self::Launches(Vec::new())
+        } else {
+            Self::Whole(Influence::of(implementation))
+        }
+    }
+
     /// The key of `specialization` at a point where the launches `working`
     /// do work.
     fn key(
@@ -2569,11 +2587,11 @@ fn place<'a>(
             .map(
                 |(index, point)| -> Result<PointTiming<'a>, WorkError<Exclusion>> {
                     deadline.check(Duration::ZERO)?;
-                    Ok(PointTiming::reusing_outputs(
+                    Ok(outputs.timing(
                         kernel,
+                        &point.label,
                         point.workload_rotation(),
                         point.copies(),
-                        outputs.at(&point.label),
                     )
                     .map_err(|error| measurement_failure(points, index, error))?)
                 },
@@ -2633,15 +2651,11 @@ struct PointSurveyor {
 }
 
 impl PointSurveyor {
-    fn new(implementation: &NativeImplementation, gated: bool) -> Self {
+    fn new(implementation: &NativeImplementation, gated: bool, charges: &Charges) -> Self {
         Self {
-            keying: if implementation.launch_scoped() {
-                Keying::Launches(Vec::new())
-            } else {
-                Keying::Whole(Influence::of(implementation))
-            },
+            keying: Keying::of(implementation),
             measured: HashMap::new(),
-            outputs: OutputPool::default(),
+            outputs: OutputPool::new(charges.clone()),
             gated,
             shuffle: Shuffle::default(),
             clock: None,
@@ -3202,13 +3216,13 @@ impl ScopeQualification<'_, '_> {
 /// Tune one unit within its budget: its canonical defaults formed, then the
 /// [`UnitSearch`]'s work started piece by piece while each piece's whole
 /// price fits what remains ([`Quote::fits`]), under the original cutoff;
-/// or a survey of every admissible configuration that runs work of its own
-/// at the points ([`SurveyDomain`]). The result is the unit's
+/// or a survey of the work of every admissible configuration that runs work
+/// of its own at the points ([`SurveyDomain`]). The result is the unit's
 /// served choice when no further piece fits.
 pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
     let began = Instant::now();
     let TuneRequest {
-        device,
+        charges,
         module,
         entry,
         bindings,
@@ -3218,6 +3232,7 @@ pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
         validation,
         strategy,
     } = request;
+    let device = charges.device();
     // The standalone consumer owns its formation's threads as a load's
     // tuner owns the load's: a device nobody lent workers gets its own for
     // this tuning, and they leave with it.
@@ -3232,7 +3247,7 @@ pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
         Staffed(device)
     });
     let request = UnitRequest {
-        device,
+        charges,
         module,
         entry,
         bindings,
@@ -3268,7 +3283,8 @@ pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
 
 /// What opening a unit's search needs.
 pub struct UnitRequest<'r, 'm> {
-    pub device: &'r Arc<DeviceInner>,
+    /// What the tuning allocates through: its device's charges.
+    pub charges: &'r Charges,
     pub module: &'m CheckedModule,
     pub entry: EntryId,
     pub bindings: ElementBindings,
@@ -3435,7 +3451,7 @@ struct Run {
 ///   whose lead is nominal, and its conversion if they resolve it.
 pub struct UnitSearch<'m, 'a> {
     expired: bool,
-    device: Arc<DeviceInner>,
+    charges: Charges,
     module: &'m CheckedModule,
     entry: EntryId,
     bindings: ElementBindings,
@@ -3517,7 +3533,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         domains: &BTreeMap<String, Vec<u64>>,
     ) -> Result<Self, TuneError> {
         let UnitRequest {
-            device,
+            charges,
             module,
             entry,
             bindings,
@@ -3525,6 +3541,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             cpu,
             validation: requirement,
         } = request;
+        let device = charges.device();
         let backend = super::backend_name(&device.kind);
         let entry_name = super::entry_name(module, entry);
         let implementation = super::offered(device, module, entry, &bindings)
@@ -3563,14 +3580,14 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                 implementation_identity,
                 parameters: entry_parameters(&implementation),
             },
-            device: device.clone(),
+            charges: charges.clone(),
             module,
             entry,
             bindings,
             statics,
             cpu,
             backend,
-            surveyor: Some(PointSurveyor::new(&implementation, true)),
+            surveyor: Some(PointSurveyor::new(&implementation, true, charges)),
             implementation: implementation.into_implementation(),
             logical,
             mutable,
@@ -3637,7 +3654,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     ) -> Result<Option<Grounding<'m>>, TuneError> {
         self.describe(source)?;
         Ok(self.ground.is_none().then(|| Grounding {
-            device: self.device.clone(),
+            charges: self.charges.clone(),
             module: self.module,
             entry: self.entry,
             logical: self.logical.clone(),
@@ -3658,6 +3675,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             &self.mutable,
             &self.unit.requirement,
             &kernel,
+            &self.charges,
         );
         kernel
             .hand_off()
@@ -3824,7 +3842,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         // A piece that follows builds the inputs again.
         self.offered.set(None);
         if let Some(surveyor) = &mut self.surveyor {
-            surveyor.outputs = OutputPool::default();
+            surveyor.outputs.release();
         }
         match &mut self.progress {
             Progress::Discovering(slots) => {
@@ -3842,7 +3860,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                         source.release(*index);
                     }
                 }
-                searching.run.outputs = OutputPool::default();
+                searching.run.outputs.release();
                 if exhausted {
                     self.programs.clear();
                 }
@@ -3945,8 +3963,8 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     /// The bytes held now ([`held_bytes`]).
     fn held(&self) -> u64 {
         held_bytes(
-            &self.device,
-            self.device.allocated(),
+            self.charges.device(),
+            self.charges.device().allocated(),
             self.ground
                 .as_ref()
                 .map_or(0, |ground| ground.validator.retained_bytes()),
@@ -3979,9 +3997,10 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             builds,
             resident_bytes,
             time,
-            device,
+            charges,
             ..
         } = self;
+        let device = charges.device();
         let Progress::Searching(searching) = progress else {
             return Ok(true);
         };
@@ -4005,7 +4024,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             let before = held();
             let building = Instant::now();
             let Some(built_point) = build_point(
-                device,
+                charges,
                 source,
                 &specs[index],
                 index,
@@ -4464,7 +4483,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         // What the piece holds is read from the ledgers' high-water marks,
         // started again here: what it took and gave back within itself is
         // seen.
-        self.device.restart_high_water();
+        self.charges.device().restart_high_water();
         if let Some(ground) = &self.ground {
             ground.validator.restart_retained_high_water();
         }
@@ -4474,7 +4493,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         // within it is over this.
         let ledgers = |unit: &Self| {
             (
-                (unit.device.allocated(), unit.device.high_water()),
+                (unit.charges.device().allocated(), unit.charges.device().high_water()),
                 unit.ground.as_ref().map_or((0, 0), |ground| {
                     (
                         ground.validator.retained_bytes(),
@@ -4563,26 +4582,26 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         let rise = high_water
             .saturating_sub(usage_began.0)
             .saturating_add(retained_most.saturating_sub(retained_began));
-        let host = footprint_peak(&self.device, host_began, host, rise);
+        let host = footprint_peak(self.charges.device(), host_began, host, rise);
         let memory = PieceMemory {
             began_bytes,
             peak_bytes: held_bytes(
-                &self.device,
-                self.device.high_water(),
+                self.charges.device(),
+                self.charges.device().high_water(),
                 self.ground
                     .as_ref()
                     .map_or(0, |ground| ground.validator.retained_high_water()),
                 host,
             ),
             ended_bytes: held_bytes(
-                &self.device,
-                self.device.allocated(),
+                self.charges.device(),
+                self.charges.device().allocated(),
                 self.ground
                     .as_ref()
                     .map_or(0, |ground| ground.validator.retained_bytes()),
                 ended,
             ),
-            ledger_peak_bytes: self.device.high_water()
+            ledger_peak_bytes: self.charges.device().high_water()
                 + self
                     .ground
                     .as_ref()
@@ -4638,11 +4657,12 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         // What the device's storage can take as the piece begins: a refusal
         // within it is priced from what the piece took of it.
         let before = self
-            .device
+            .charges
+            .device()
             .room(seismic_topology::Contract::DeviceOnly);
         let building = Instant::now();
         let Some(point) = build_point(
-            &self.device,
+            &self.charges,
             source,
             &self.specs[index],
             index,
@@ -4670,7 +4690,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         }
         let mut point = ground.validator.point(point)?;
         let shape =
-            point_shapes(&self.device, &self.logical, std::slice::from_ref(&point))?
+            point_shapes(self.charges.device(), &self.logical, std::slice::from_ref(&point))?
                 .remove(0);
         // The defaults' time here is the unit of every time the unit
         // records and the point's weight in what it optimises: the median
@@ -4850,7 +4870,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         // priced 21 s from the default's samples, ran 39 s to the cutoff
         // without completing a round (its single-participant challengers
         // sample 7 s at 512 rows) and recorded nothing.
-        if matches!(self.device.kind, crate::backends::OpenedKind::Cpu(_)) {
+        if matches!(self.charges.device().kind, crate::backends::OpenedKind::Cpu(_)) {
             if let Some(piece) = &mut searching.planned {
                 piece.keep_first();
             }
@@ -5271,42 +5291,19 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         mut canonical: Vec<PointMeasurement>,
     ) -> Result<(Run, Vec<PointMeasurement>), TuneError> {
         let implementation = &self.implementation;
-        let (partition, keying) = if implementation.launch_scoped() {
-            if !matches!(
+        if implementation.launch_scoped()
+            && !matches!(
                 self.backend,
                 seismic_lang::registry::BackendName::Metal
                     | seismic_lang::registry::BackendName::Cuda
-            ) {
-                return Err(TuneError::Declaration(format!(
-                    "launch-scoped native tuning is not yet available on `{}`",
-                    self.backend.as_str(),
-                )));
-            }
-            let partition =
-                plan::partition(implementation, &self.statics, shapes).map_err(planning)?;
-            let keying = Keying::Launches(partition.boundary.clone());
-            (partition, keying)
-        } else {
-            let (unserved, points) = unserved_parameters(implementation, &self.statics, shapes)?;
-            let parameters = implementation
-                .params
-                .iter()
-                .filter(|parameter| {
-                    !unserved.contains(&plan::ParameterAddress::Entry(parameter.name.clone()))
-                })
-                .map(|parameter| {
-                    (
-                        parameter.name.clone(),
-                        parameter.values.clone(),
-                        parameter.form,
-                    )
-                })
-                .collect::<Vec<_>>();
-            (
-                plan::whole(&parameters, implementation.launches.len(), points),
-                Keying::Whole(Influence::of(implementation)),
             )
-        };
+        {
+            return Err(TuneError::Declaration(format!(
+                "launch-scoped native tuning is not yet available on `{}`",
+                self.backend.as_str(),
+            )));
+        }
+        let (partition, keying) = search_plan(implementation, &self.statics, shapes)?;
         // The defaults' measurement, keyed as the search keys its own.
         for measured in &mut canonical {
             measured.key = keying.key(implementation, measured.key.launches.clone(), &self.default);
@@ -5332,7 +5329,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                     plan.start.clone(),
                 ),
                 keying,
-                outputs: OutputPool::default(),
+                outputs: OutputPool::new(self.charges.clone()),
                 samples,
                 shuffle: Shuffle::default(),
                 clock,
@@ -5368,9 +5365,9 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         }
     }
 
-    /// Measure and validate every admissible configuration that runs work
-    /// of its own at the points, at every point (development): the domain
-    /// the caller named ([`SurveyPlan`], [`SurveyDomain`]).
+    /// Measure and validate the work every admissible configuration that
+    /// runs work of its own runs at each point, once (development): the
+    /// domain the caller named ([`SurveyPlan`], [`SurveyDomain`]).
     pub fn survey(
         mut self,
         source: &mut dyn PointSource<'a>,
@@ -5388,7 +5385,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                 detail: error.to_string(),
             })?;
             let point = TuningPoint::new(spec, inputs)?
-                .timed(&self.device)
+                .timed(&self.charges)
                 .map_err(|error| TuneError::Inputs {
                     point: spec.label.clone(),
                     detail: error.to_string(),
@@ -5400,12 +5397,12 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             &self.implementation,
             &self.statics,
             &self.default,
-            point_shapes(&self.device, &self.logical, &points)?,
+            point_shapes(self.charges.device(), &self.logical, &points)?,
         )?;
         // The record names the domain surveyed.
         self.unit.parameters = entry_parameters(&domain.implementation);
         let formation = Formation {
-            device: &self.device,
+            charges: &self.charges,
             module: self.module,
             entry: self.entry,
             logical: &self.logical,
@@ -5421,6 +5418,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             domain: &domain,
             statics: &self.statics,
             default: &self.default,
+            requirement: &self.unit.requirement,
             ground: &ground,
         };
         let (configurations, overall, method, time) =
@@ -5771,7 +5769,7 @@ impl Programs {
             .map(|specialization| match self {
                 // Assembled from the held launch programs: nothing compiles.
                 Self::Launches(_) => NativePrepared::prepare_implementation(
-                    formation.device,
+                    formation.charges.device(),
                     formation.module,
                     formation.entry,
                     formation.logical,
@@ -7281,14 +7279,15 @@ pub fn kernel_digest(
         })?;
     // A kernel's identity names a backend, not a device: a declaration
     // whose defaults read the device has no device-free default to name.
+    // A launch's geometry may read the device; the declaration's digest
+    // names it as declared.
     let default = implementation
-        .device_independent()
+        .default_specialization_without_device(statics)
         .ok_or_else(|| {
             declaration(format!(
                 "`{entry_name}`'s defaults read the device's properties; a kernel identity names no device"
             ))
         })?
-        .default_specialization(statics)
         .map_err(|error| declaration(error.to_string()))?;
     let mut digest = Sha256::new();
     digest.update(b"kernel-identity-v1");
@@ -7499,12 +7498,18 @@ struct Tuned<'s> {
     domain: &'s SurveyDomain,
     statics: &'s NativeSpecialization,
     default: &'s NativeSpecialization,
+    requirement: &'s NumericalRequirement,
     ground: &'s Ground,
 }
 
 type Tuning = (Records, NativeSpecialization, TuningMethod, TuningTime);
 
 impl Tuned<'_> {
+    /// Measure the work of every surveyed configuration at each point
+    /// ([`super::survey`]): the defaults, then, point by point, the first
+    /// configuration running each work forecast there that no
+    /// configuration measured before runs, each formed and measured at
+    /// every point, where work measured before is not measured again.
     fn survey(
         &self,
         points: &[PreparedPoint<'_>],
@@ -7518,7 +7523,7 @@ impl Tuned<'_> {
         let mut time = TuningTime::default();
         // A survey measures and times every configuration whatever its
         // verdict, and prices nothing.
-        let mut surveyor = PointSurveyor::new(self.formation.implementation, false);
+        let mut surveyor = PointSurveyor::new(self.formation.implementation, false, self.formation.charges);
         // A survey resolves no comparison and names no error rate. Its
         // device is raised at the rate one of its samples stands for: what
         // the samples of a point can tell apart at all.
@@ -7527,145 +7532,209 @@ impl Tuned<'_> {
         };
         let mut admission = Observed::default();
         let validator = &self.ground.validator;
-        let mut records = Vec::new();
         // The unit's programs as its search forms them: launches formed
         // separately from held launch programs, or programs formed whole,
         // the canonical program's among them.
         let mut programs = Programs::of(self.formation.implementation.launch_scoped());
         programs.grounded(self.formation.implementation, self.default, &self.ground.kernel);
-        // What the walk visits, counted before anything is formed.
+        let rows = self.domain.rows(self.statics, self.default)?;
+        // The configurations measured, and at each point those that run
+        // each forecast work there. Two configurations forecast to run the
+        // same work at a point run the same work there
+        // ([`SurveyDomain::forecast`]).
+        let mut standing = Vec::new();
+        let mut covering = vec![HashMap::<LaunchKey, Vec<usize>>::new(); rows.len()];
+        let stand = |specialization: &NativeSpecialization,
+                     standing: &mut Vec<NativeSpecialization>,
+                     covering: &mut [HashMap<LaunchKey, Vec<usize>>]| {
+            for (point, covering) in covering.iter_mut().enumerate() {
+                covering
+                    .entry(self.domain.forecast(specialization, point))
+                    .or_default()
+                    .push(standing.len());
+            }
+            standing.push(specialization.clone());
+        };
+        stand(self.default, &mut standing, &mut covering);
+        for (point, surveyed) in rows.iter().enumerate() {
+            for row in &surveyed.rows {
+                if !covering[point].contains_key(&row.key) {
+                    stand(&row.configuration, &mut standing, &mut covering);
+                }
+            }
+        }
         let mut progress = SurveyProgress {
-            configurations: 0,
+            configurations: standing.len(),
             formed: 0,
             measured: 0,
         };
-        self.domain.walk(self.statics, self.default, |_| {
-            progress.configurations += 1;
-            true
-        })?;
         report(progress);
-        // One batch of the walk: its programs formed together, then each
-        // measured. A batch is as many as form at once.
-        let mut survey = |batch: Vec<NativeSpecialization>| -> Result<(), TuneError> {
+        // Each configuration's artifact and measurement at every point, or
+        // why it could not be formed or measured; a batch is as many as
+        // form at once.
+        let mut measured = Vec::with_capacity(standing.len());
+        for batch in standing.chunks(formation_threads(usize::MAX)) {
             let began = Instant::now();
-            let kernels = programs.form(self.formation, &batch, &[])?;
+            let kernels = programs.form(self.formation, batch, &[])?;
             time.forming_seconds += began.elapsed().as_secs_f64();
             progress.formed += batch.len();
             report(progress);
-            let batched = batch.len();
-            for (specialization, kernel) in batch.into_iter().zip(kernels) {
+            for (specialization, kernel) in batch.iter().zip(kernels) {
                 let began = Instant::now();
-                let launches = kernel.as_ref().map(|kernel| kernel.launch_programs()).unwrap_or_default();
-                let (artifact, outcome) = match kernel {
-                    Err(exclusion) => (None, Outcome::Excluded(exclusion)),
-                    Ok(kernel) => (
-                        Some(kernel.artifact().0.clone()),
-                        match surveyor.measure(
-                            self.formation.implementation,
-                            &kernel,
-                            points,
-                            &specialization,
-                            &options,
-                            &settings,
-                            Some(&mut admission),
-                            Deadline::default(),
-                        ) {
-                            Ok(measured) => Outcome::Measured {
-                                points: measured,
-                                confirmed: Vec::new(),
-                            },
-                            Err(WorkError::Failed(exclusion)) => Outcome::Excluded(exclusion),
-                            Err(WorkError::Expired) => unreachable!("a survey has no deadline"),
-                        },
-                    ),
-                };
+                measured.push(kernel.and_then(|kernel| {
+                    match surveyor.measure(
+                        self.formation.implementation,
+                        &kernel,
+                        points,
+                        specialization,
+                        &options,
+                        &settings,
+                        Some(&mut admission),
+                        Deadline::default(),
+                    ) {
+                        Ok(measurements) => Ok((kernel.artifact().0.clone(), measurements)),
+                        Err(WorkError::Failed(exclusion)) => Err(exclusion),
+                        Err(WorkError::Expired) => unreachable!("a survey has no deadline"),
+                    }
+                }));
                 time.measuring_seconds += began.elapsed().as_secs_f64();
-                records.push(ConfigurationRecord {
-                    formation: None,
-                    launches,
-                    configuration: Configuration::of(&specialization),
-                    observations: artifact
-                        .as_deref()
-                        .map(|artifact| validator.held(artifact))
-                        .unwrap_or_default(),
-                    artifact,
-                    outcome,
-                });
             }
-            progress.measured += batched;
+            progress.measured += batch.len();
             report(progress);
-            Ok(())
-        };
-        // The configurations that run work of their own at the points, in
-        // the declaration's order, the defaults first, a batch at a time:
-        // the walk holds one batch, and the survey the records it returns.
-        let threads = formation_threads(usize::MAX);
-        let mut batch = Vec::with_capacity(threads);
-        let mut failed = None;
-        self.domain.walk(self.statics, self.default, |specialization| {
-            batch.push(specialization.clone());
-            if batch.len() == threads {
-                if let Err(error) = survey(std::mem::take(&mut batch)) {
-                    failed = Some(error);
-                    return false;
+        }
+        // Configurations forecast to run the same work at a point were
+        // measured running the same work there.
+        for (point, covering) in covering.iter().enumerate() {
+            for (forecast, covering) in covering {
+                let mut keys = covering.iter().filter_map(|&standing| match &measured[standing] {
+                    Ok((_, measurements)) => Some(&measurements[point].key),
+                    Err(_) => None,
+                });
+                if let Some(first) = keys.next() {
+                    assert!(
+                        keys.all(|key| key == first),
+                        "configurations forecast to run {forecast:?} at `{}` ran different work there",
+                        points[point].label
+                    );
                 }
             }
-            true
-        })?;
-        if let Some(error) = failed {
-            return Err(error);
         }
-        if !batch.is_empty() {
-            survey(batch)?;
-        }
-        let measured = |record: &ConfigurationRecord| match &record.outcome {
-            Outcome::Measured { points, .. } => Some(points.clone()),
-            Outcome::Excluded(_) => None,
-        };
-        let reference = records.iter().find_map(measured).ok_or_else(|| {
-            TuneError::NoValidatedCandidate(
-                records
-                    .iter()
-                    .filter_map(|record| match &record.outcome {
-                        Outcome::Excluded(error) => Some(error.clone()),
-                        _ => None,
-                    })
-                    .collect(),
-            )
-        })?;
-        // The survey serves the fastest configuration its requirement
-        // admits; the others' measurements and times are its record.
-        let weighing = Weighing::of(points);
-        let chosen = records
+        let observations = validator.observations();
+        let observed = observations
             .iter()
             .enumerate()
-            .filter(|(_, record)| {
-                record
-                    .artifact
-                    .as_deref()
-                    .is_some_and(|artifact| validator.admits(artifact))
+            .map(|(index, observation)| ((observation.point.as_str(), &observation.key), index))
+            .collect::<HashMap<_, _>>();
+        let reference = &self.ground.kernel.artifact().0;
+        let parameters = super::survey::surveyed_parameters(&self.domain.implementation);
+        let surveyed = rows
+            .into_iter()
+            .enumerate()
+            .map(|(point, surveyed)| {
+                let label = points[point].label.as_str();
+                // Each work once: measured, by its key; excluded, by the
+                // work it was forecast to be.
+                let mut found = HashMap::<(bool, LaunchKey), usize>::new();
+                let mut work = Vec::new();
+                let rows = surveyed
+                    .rows
+                    .into_iter()
+                    .map(|row| {
+                        let covering = &covering[point][&row.key];
+                        let at = covering
+                            .iter()
+                            .copied()
+                            .find(|&standing| measured[standing].is_ok())
+                            .unwrap_or(covering[0]);
+                        let (id, outcome, artifact) = match &measured[at] {
+                            Ok((artifact, measurements)) => {
+                                let measurement = measurements[point].clone();
+                                ((true, measurement.key.clone()), WorkOutcome::Measured(measurement), Some(artifact.clone()))
+                            }
+                            Err(exclusion) => ((false, row.key.clone()), WorkOutcome::Excluded(exclusion.clone()), None),
+                        };
+                        let index = *found.entry(id).or_insert_with(|| {
+                            let observation = match (&outcome, &artifact) {
+                                (WorkOutcome::Measured(measurement), Some(artifact)) if artifact != reference => Some(
+                                    *observed
+                                        .get(&(label, &measurement.key))
+                                        .expect("a candidate is observed under its key at every point it is measured"),
+                                ),
+                                _ => None,
+                            };
+                            work.push(SurveyedWork {
+                                configuration: Configuration::of(&standing[at]),
+                                artifact,
+                                observation,
+                                outcome,
+                            });
+                            work.len() - 1
+                        });
+                        SurveyedRow { values: row.values, work: index }
+                    })
+                    .collect();
+                SurveyedPoint {
+                    leading: surveyed
+                        .leading
+                        .iter()
+                        .map(|(launch, name)| {
+                            parameters
+                                .iter()
+                                .position(|parameter| parameter.launch == *launch && parameter.name == *name)
+                                .expect("a leading parameter is surveyed")
+                        })
+                        .collect(),
+                    rows,
+                    work,
+                }
             })
-            .filter_map(|(index, record)| {
-                measured(record).map(|points| (index, weighing.cost(&points, &reference).total()))
-            })
-            .min_by(|(_, left), (_, right)| left.total_cmp(right))
-            .map(|(index, _)| records[index].configuration.specialization())
-            .ok_or_else(|| TuneError::Reference("no measured configuration is admitted".into()))?;
-        time.validating_seconds += points.iter().map(|p| p.validation_seconds()).sum::<f64>();
-        let mut served = vec![Configuration::of(self.default)];
-        if Configuration::of(&chosen) != served[0] {
-            served.push(Configuration::of(&chosen));
+            .collect();
+        let record = SurveyRecord {
+            parameters,
+            defaults: Configuration::of(self.default),
+            formed: standing.len(),
+            points: surveyed,
+            plan: self.domain.plan.clone(),
+        };
+        let index = SurveyIndex::new(&record);
+        let defaults = index
+            .composed(&record.defaults)
+            .expect("the defaults run work of their own at every point");
+        if let Outcome::Excluded(exclusion) = &defaults.outcome {
+            return Err(TuneError::NoValidatedCandidate(vec![exclusion.clone()]));
         }
+        // The survey serves the configuration of least demand-weighted time
+        // its requirement admits at every point; the rest is its record.
+        let demand = points.iter().map(|point| point.weight).collect::<Vec<_>>();
+        let chosen = index
+            .best(|point, work| match &record.points[point].work[work] {
+                SurveyedWork { outcome: WorkOutcome::Measured(measurement), observation, .. }
+                    if observation
+                        .is_none_or(|observation| admit(&observations[observation], self.requirement).is_ok()) =>
+                {
+                    Some(if demand[point] > 0. { demand[point] * measurement.median_seconds } else { 0. })
+                }
+                _ => None,
+            })
+            .ok_or_else(|| TuneError::Reference("no measured configuration is admitted".into()))?;
+        let mut records = vec![defaults];
+        let mut served = vec![record.defaults.clone()];
+        if chosen != record.defaults {
+            records.push(index.composed(&chosen).expect("the chosen configuration is of the record's domain"));
+            served.push(chosen.clone());
+        }
+        time.validating_seconds += points.iter().map(|p| p.validation_seconds()).sum::<f64>();
         Ok((
             Records {
                 points: labels(points),
                 records,
                 served,
-                observations: validator.observations(),
+                observations,
             },
-            chosen,
+            chosen.specialization(),
             TuningMethod::Survey {
                 samples: plan.samples,
+                record,
             },
             time,
         ))
@@ -7687,6 +7756,35 @@ fn point_records(points: &[PointSpec]) -> Vec<PointRecord> {
 /// A plan that failed: its declaration cannot be planned.
 fn planning(error: plan::PlanError) -> TuneError {
     TuneError::Declaration(format!("native launch plan: {error:?}"))
+}
+
+/// The plan a unit's search orders `implementation`'s domain at `shapes`
+/// by, and how it keys its points: over the groups of launches that run
+/// together where launches are formed separately, over the one group of
+/// the whole program, less its unserved parameters
+/// ([`unserved_parameters`]), where it is formed whole. A search plans by
+/// it, and a survey records it for a replay of the search.
+fn search_plan(
+    implementation: &NativeImplementation,
+    statics: &NativeSpecialization,
+    shapes: &[PointShape],
+) -> Result<(plan::TuningPartition, Keying), TuneError> {
+    if implementation.launch_scoped() {
+        let partition = plan::partition(implementation, statics, shapes).map_err(planning)?;
+        let keying = Keying::Launches(partition.boundary.clone());
+        return Ok((partition, keying));
+    }
+    let (unserved, points) = unserved_parameters(implementation, statics, shapes)?;
+    let parameters = implementation
+        .params
+        .iter()
+        .filter(|parameter| !unserved.contains(&plan::ParameterAddress::Entry(parameter.name.clone())))
+        .map(|parameter| (parameter.name.clone(), parameter.values.clone(), parameter.form))
+        .collect::<Vec<_>>();
+    Ok((
+        plan::whole(&parameters, implementation.launches.len(), points),
+        Keying::Whole(Influence::of(implementation)),
+    ))
 }
 
 /// Parameters read only by launches that no admissible configuration
@@ -7738,21 +7836,44 @@ fn unserved_parameters(
     Ok((entries.chain(launches).collect(), points))
 }
 
-/// What a survey at its points walks and records: each configuration that
-/// runs work of its own there. A configuration that moves a parameter off
-/// its default which no launch it runs at any point reads runs, at every
-/// point, the work of the configuration with that parameter at its default:
-/// same launches, same keys ([`Influence`]). The survey records that one
-/// alone, as its measurements are the same. The walk's domain holds every
-/// parameter no admissible configuration can make read at a point
-/// ([`unserved_parameters`]) at its default, so walking it takes time in
-/// the configurations that run distinct work, never in the product of the
-/// domains of launches that do not run at the points.
+/// What a survey measures at its points ([`super::survey`]): at each point,
+/// each assignment of the parameters that decide the work there (every
+/// entry parameter, and every parameter of each launch that can run there)
+/// that an admissible configuration running work of its own takes. A
+/// configuration that moves a parameter off its default which no launch it
+/// runs at any point reads runs, at every point, the work of the
+/// configuration with that parameter at its default: same launches, same
+/// keys ([`Influence`]); the survey takes no such configuration. The domain
+/// holds every parameter no admissible configuration can make read at a
+/// point ([`unserved_parameters`]) at its default.
 struct SurveyDomain {
     /// The unit's implementation with its unserved parameters fixed.
     implementation: NativeImplementation,
     influence: Influence,
+    /// How the unit's points are keyed, as its surveyor keys them.
+    keying: Keying,
     shapes: Vec<PointShape>,
+    /// The plan the unit's search orders the declared domain by
+    /// ([`search_plan`]), which the record keeps for a replay.
+    plan: plan::TuningPartition,
+}
+
+/// The assignments a survey takes at one point.
+struct SurveyedRows {
+    /// The parameters that decide the work there, in declaration order.
+    leading: Vec<(Option<usize>, String)>,
+    /// In the declaration's walk order with the leading parameters first.
+    rows: Vec<SurveyedAssignment>,
+}
+
+/// One assignment of a point's leading parameters.
+struct SurveyedAssignment {
+    values: Vec<u64>,
+    /// The first configuration of the survey that takes it.
+    configuration: NativeSpecialization,
+    /// The work it runs at the point, as forecast
+    /// ([`SurveyDomain::forecast`]).
+    key: LaunchKey,
 }
 
 impl SurveyDomain {
@@ -7763,6 +7884,7 @@ impl SurveyDomain {
         shapes: Vec<PointShape>,
     ) -> Result<Self, TuneError> {
         let (unserved, _) = unserved_parameters(implementation, statics, &shapes)?;
+        let (plan, _) = search_plan(implementation, statics, &shapes)?;
         let mut walked = implementation.clone();
         for address in &unserved {
             let parameter = match address {
@@ -7782,35 +7904,120 @@ impl SurveyDomain {
         }
         Ok(Self {
             influence: Influence::of(&walked),
+            keying: Keying::of(&walked),
             implementation: walked,
             shapes,
+            plan,
         })
     }
 
-    /// Visit, in declaration order, each admissible configuration that runs
-    /// work of its own at the points, until `visit` returns false.
-    fn walk(
+    /// Each point's assignments: for each assignment of its leading
+    /// parameters that an admissible configuration running work of its own
+    /// takes, the first such configuration. A prefix of the walk that
+    /// already does not run work of its own ([`Self::runs_its_own`]) is not
+    /// extended, nor one whose leading assignment was taken: the walk
+    /// follows the assignments, never the product of the domains of the
+    /// launches that do not decide the point's work.
+    fn rows(
         &self,
         statics: &NativeSpecialization,
         default: &NativeSpecialization,
-        mut visit: impl FnMut(&NativeSpecialization) -> bool,
-    ) -> Result<(), TuneError> {
-        self.implementation
-            .walk_admissible(statics, |specialization| {
-                !self.runs_its_own(specialization, default) || visit(specialization)
+    ) -> Result<Vec<SurveyedRows>, TuneError> {
+        (0..self.shapes.len())
+            .map(|point| {
+                let leading = self.leading(statics, point);
+                let addresses = leading
+                    .iter()
+                    .map(|(launch, name)| (*launch, name.as_str()))
+                    .collect::<Vec<_>>();
+                let mut rows = Vec::new();
+                self.implementation
+                    .walk_admitted_within(
+                        statics,
+                        &addresses,
+                        |prefix| self.runs_its_own(prefix, default),
+                        |configuration| {
+                            rows.push(SurveyedAssignment {
+                                values: addresses
+                                    .iter()
+                                    .map(|(launch, name)| {
+                                        match launch {
+                                            None => configuration.param(name),
+                                            Some(launch) => configuration.launch_param(*launch, name),
+                                        }
+                                        .expect("a walked configuration values every parameter")
+                                    })
+                                    .collect(),
+                                key: self.forecast(configuration, point),
+                                configuration: configuration.clone(),
+                            });
+                            true
+                        },
+                    )
+                    .map_err(|error| TuneError::Declaration(error.to_string()))?;
+                Ok(SurveyedRows { leading, rows })
             })
-            .map_err(|error| TuneError::Declaration(error.to_string()))
+            .collect()
+    }
+
+    /// The parameters that decide the work at `point`, in declaration
+    /// order: every entry parameter, and every parameter of each launch
+    /// whose condition the point does not refuse whatever the parameters of
+    /// more than one value.
+    fn leading(&self, statics: &NativeSpecialization, point: usize) -> Vec<(Option<usize>, String)> {
+        let implementation = &self.implementation;
+        let shape = &self.shapes[point];
+        let dimension = |name: &str| shape.dimensions.get(name).copied().or_else(|| statics.static_value(name));
+        let one = |parameter: &NativeParameter| (parameter.values.len() == 1).then(|| parameter.values[0]);
+        let entries = implementation.params.iter().map(|parameter| (None, parameter.name.clone()));
+        let launches = implementation.launches.iter().enumerate().filter(|(_, launch)| {
+            launch.when.as_ref().is_none_or(|when| {
+                let parameter = |name: &str| {
+                    launch
+                        .params
+                        .iter()
+                        .find(|parameter| parameter.name == name)
+                        .or_else(|| implementation.params.iter().find(|parameter| parameter.name == name))
+                        .and_then(one)
+                };
+                when.decided(&dimension, &parameter) != Some(false)
+            })
+        });
+        entries
+            .chain(launches.flat_map(|(ordinal, launch)| {
+                launch.params.iter().map(move |parameter| (Some(ordinal), parameter.name.clone()))
+            }))
+            .collect()
+    }
+
+    /// The work `specialization` runs at `point` as the declaration
+    /// forecasts it: keyed as the surveyor keys a measurement, over the
+    /// launches whose condition there does not refuse it. A launch runs only
+    /// where its condition holds, and what else decides whether it does
+    /// (its groups, the host's words) reads only what the key holds, so two
+    /// configurations forecast to run the same work there run the same
+    /// work, whichever the launches that do run.
+    fn forecast(&self, specialization: &NativeSpecialization, point: usize) -> LaunchKey {
+        let working = (0..self.implementation.launches.len())
+            .filter(|&launch| self.runs_at(specialization, launch, &self.shapes[point]))
+            .collect();
+        self.keying.key(&self.implementation, working, specialization)
     }
 
     /// Whether every parameter `specialization` moves off `default` is read
-    /// by a launch it runs at one of the points.
+    /// by a launch it may run at one of the points. Of a prefix of a
+    /// configuration (some parameters unassigned) it is false only when it
+    /// is false of every configuration extending it: a moved parameter stays
+    /// moved, and a launch whose condition reads an unassigned parameter may
+    /// run ([`Self::runs_at`]), while one the prefix shows does not run at
+    /// any point runs at none whatever the rest.
     fn runs_its_own(
         &self,
         specialization: &NativeSpecialization,
         default: &NativeSpecialization,
     ) -> bool {
         let running = (0..self.implementation.launches.len())
-            .filter(|&launch| self.runs(specialization, launch))
+            .filter(|&launch| self.shapes.iter().any(|shape| self.runs_at(specialization, launch, shape)))
             .collect::<Vec<_>>();
         let entries = specialization
             .params()
@@ -7832,9 +8039,10 @@ impl SurveyDomain {
                 .all(|((launch, _), _)| running.contains(launch))
     }
 
-    /// Whether `specialization` runs launch `launch` at one of the points.
-    /// A condition the point cannot decide is taken to hold.
-    fn runs(&self, specialization: &NativeSpecialization, launch: usize) -> bool {
+    /// Whether `specialization` may run launch `launch` at `shape`: unless
+    /// its condition is false there. A condition the point cannot decide is
+    /// taken to hold.
+    fn runs_at(&self, specialization: &NativeSpecialization, launch: usize, shape: &PointShape) -> bool {
         let Some(when) = &self.implementation.launches[launch].when else {
             return true;
         };
@@ -7843,16 +8051,14 @@ impl SurveyDomain {
                 .launch_param(launch, name)
                 .or_else(|| specialization.param(name))
         };
-        self.shapes.iter().any(|shape| {
-            let dimension = |name: &str| {
-                shape
-                    .dimensions
-                    .get(name)
-                    .copied()
-                    .or_else(|| specialization.static_value(name))
-            };
-            when.holds(&dimension, &parameter).unwrap_or(true)
-        })
+        let dimension = |name: &str| {
+            shape
+                .dimensions
+                .get(name)
+                .copied()
+                .or_else(|| specialization.static_value(name))
+        };
+        when.holds(&dimension, &parameter).unwrap_or(true)
     }
 }
 
@@ -8283,7 +8489,7 @@ mod tests {
             .collect::<String>();
         let implementation = declared(&bands);
         let statics = NativeSpecialization::new();
-        let default = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
+        let default = implementation.default_specialization_without_device(&statics).unwrap().unwrap();
         let partition = plan::partition(&implementation, &statics, &shapes(&[1, 2, 3])).unwrap();
         let keying = launches(&partition);
         let domain = Declared {
@@ -8362,7 +8568,7 @@ mod tests {
         );
         assert!(!implementation.launch_scoped());
         let statics = NativeSpecialization::new();
-        let default = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
+        let default = implementation.default_specialization_without_device(&statics).unwrap().unwrap();
         let shapes = shapes(&[4, 16]);
         let (unserved, points) = unserved_parameters(&implementation, &statics, &shapes).unwrap();
         assert!(unserved.is_empty());
@@ -8431,7 +8637,7 @@ mod tests {
             "    params (LEFT in [2, 1, 4] default 2, RIGHT in [2, 1, 4] default 2)\n    where LEFT == RIGHT\n    launch gemv:\n        threadgroups (ceil_div(N, LEFT * RIGHT), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
         );
         let statics = NativeSpecialization::new();
-        let default = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
+        let default = implementation.default_specialization_without_device(&statics).unwrap().unwrap();
         let partition = plan::partition(&implementation, &statics, &shapes(&[4])).unwrap();
         let keying = launches(&partition);
         let domain = Declared {
@@ -8457,7 +8663,7 @@ mod tests {
     fn rest_of(body: &str, batch: usize) -> (Vec<Vec<u64>>, Vec<Vec<u64>>) {
         let implementation = declared(body);
         let statics = NativeSpecialization::new();
-        let seed = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
+        let seed = implementation.default_specialization_without_device(&statics).unwrap().unwrap();
         let partition = plan::partition(&implementation, &statics, &shapes(&[1])).unwrap();
         assert_eq!(partition.groups.len(), 1);
         let group = &partition.groups[0];
@@ -8580,7 +8786,7 @@ mod tests {
     fn a_search_over_v41_attention_decode_places_what_its_declaration_admits() {
         let implementation = declared(V41_ATTENTION_DECODE);
         let statics = NativeSpecialization::new();
-        let seed = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
+        let seed = implementation.default_specialization_without_device(&statics).unwrap().unwrap();
         let partition = plan::partition(&implementation, &statics, &shapes(&[1])).unwrap();
         let parameters = partition
             .groups
@@ -8670,7 +8876,7 @@ mod tests {
             "    launch gemv:\n        params (A in [1, 2, 3] default 1, B in [1, 2, 3] default 1)\n        threadgroups (ceil_div(N, A * B), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
         );
         let statics = NativeSpecialization::new();
-        let seed = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
+        let seed = implementation.default_specialization_without_device(&statics).unwrap().unwrap();
         let partition = plan::partition(&implementation, &statics, &shapes(&[4])).unwrap();
         let keying = launches(&partition);
         let group = partition.groups[0].clone();
@@ -8735,7 +8941,7 @@ mod tests {
             "    params (FROM in [3, 2, 5] default 3)\n    launch small when N < FROM:\n        params (A in [1, 2, 3] default 1, T in [0, 1, 2] default 0)\n        threadgroups (ceil_div(N, A + T), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch large when N >= FROM:\n        params (B in [1, 2, 3] default 1)\n        threadgroups (ceil_div(N, B), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
         );
         let statics = NativeSpecialization::new();
-        let seed = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
+        let seed = implementation.default_specialization_without_device(&statics).unwrap().unwrap();
         let rows = [1u64, 2, 4];
         let partition = plan::partition(&implementation, &statics, &shapes(&rows)).unwrap();
         assert_eq!(
@@ -8896,7 +9102,7 @@ mod tests {
         });
         assert_eq!(implementation.launch_scoped(), whole.is_none());
         let statics = NativeSpecialization::new();
-        let seed = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
+        let seed = implementation.default_specialization_without_device(&statics).unwrap().unwrap();
         let (partition, keying) = match whole {
             Some(_) => {
                 let (unserved, points) =
@@ -9025,7 +9231,7 @@ mod tests {
             .with_static("F", 4096)
             .with_static("DS", 0)
             .with_static("DB", 0);
-        let seed = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
+        let seed = implementation.default_specialization_without_device(&statics).unwrap().unwrap();
         let rows = [1u64, 8, 128];
         let shapes = rows
             .iter()
@@ -9097,10 +9303,10 @@ mod tests {
             panic!("the first piece is whole configurations");
         };
         assert!(run.structural, "the first piece is the other forms'");
-        // Forms: TALL, INT8, PACK, RESIDUE, MATRIX, SMALL, and TILED (two
-        // non-default values), each at its other values that the
-        // declaration's restrictions admit.
-        assert!(first.len() <= 7, "{}", first.len());
+        // Forms: TALL, INT8, PACK, RESIDUE, MATRIX, SMALL, STAGE, and TILED
+        // and PACKED_ROWS (two non-default values each), each at its other
+        // values that the declaration's restrictions admit.
+        assert!(first.len() <= 11, "{}", first.len());
         let packing = first
             .iter()
             .find(|form| form.param("PACK") == Some(1))
@@ -9108,7 +9314,7 @@ mod tests {
         // Each differs from the defaults in its form, and in what that
         // form's restrictions couple to it alone.
         assert!(first.iter().all(|form| {
-            ["TALL", "INT8", "PACK", "RESIDUE", "MATRIX", "SMALL", "TILED"]
+            ["TALL", "INT8", "PACK", "RESIDUE", "MATRIX", "SMALL", "STAGE", "TILED", "PACKED_ROWS"]
                 .iter()
                 .filter(|name| form.param(name) != seed.param(name))
                 .count()
@@ -9384,7 +9590,7 @@ mod tests {
     fn recorded(points: usize) -> Recorded {
         let (logical, default, kernel) = project_kernel();
         let requirement = NumericalRequirement::BitExact;
-        let validator = Validator::new(&logical, &[], &requirement, &kernel);
+        let validator = Validator::new(&logical, &[], &requirement, &kernel, &crate::memory::Charges::tally(&kernel.public_device));
         let canonical = timed(points, |_| 0, |_| 1.);
         let cost = Weighing {
             weights: vec![1.; points],
@@ -9603,7 +9809,7 @@ mod tests {
             }
         };
         let statics = NativeSpecialization::new();
-        let seed = implementation.device_independent().unwrap().default_specialization(&statics).unwrap();
+        let seed = implementation.default_specialization_without_device(&statics).unwrap().unwrap();
         let partition = plan::partition(&implementation, &statics, &shapes(&[4])).unwrap();
         let reference = vec![measurement(&implementation, &seed)];
         let run = GroupSearch::new(partition, seed, reference, vec![1.], Vec::new());
@@ -9882,7 +10088,7 @@ mod tests {
             .native_implementation(module.entry_named("scale").unwrap(), BackendName::Metal)
             .unwrap();
         let default = implementation
-            .device_independent().unwrap().default_specialization(&NativeSpecialization::new())
+            .default_specialization_without_device(&NativeSpecialization::new()).unwrap()
             .unwrap();
         let split = default.clone().with_param("SPLIT", 2);
         assert_eq!(
@@ -9914,9 +10120,10 @@ mod tests {
             "    launch gemv when N < 16:\n        params (ROWS in [1, 2] default 1)\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch gemm when N >= 16:\n        params (TILE in [4, 8] default 4)\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
         );
         let default = implementation
-            .device_independent().unwrap().default_specialization(&NativeSpecialization::new())
+            .default_specialization_without_device(&NativeSpecialization::new()).unwrap()
             .unwrap();
-        let surveyor = PointSurveyor::new(&implementation, false);
+        let device = crate::devices::Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap();
+        let surveyor = PointSurveyor::new(&implementation, false, &crate::memory::Charges::tally(&device));
         let key = |working: Vec<usize>, specialization: &NativeSpecialization| {
             surveyor.keying.key(&implementation, working, specialization)
         };
@@ -9928,6 +10135,52 @@ mod tests {
         assert_ne!(key(vec![1], &default), key(vec![1], &tile));
     }
 
+    /// A survey takes every value of an entry parameter declared before
+    /// launches whose own parameters multiply, as dense_output's `PACK`
+    /// before its launches' choices: each point's rows are the assignments
+    /// of the parameters that decide its work, so the launches that run
+    /// elsewhere never multiply them. A walk of whole configurations varies
+    /// the first-declared parameter slowest and, over four launches of 512
+    /// choices each, never moved it off its default.
+    #[test]
+    fn a_survey_takes_every_value_of_an_entry_parameter_declared_before_the_launches() {
+        let values = "[1, 2, 3, 4, 5, 6, 7, 8] default 1";
+        let launch = |name: &str, when: &str| {
+            format!(
+                "    launch {name} when {when}:\n        params (A in {values}, B in {values}, C in {values})\n        \
+                 threadgroups (N, A, B * (PACK + 1))\n        threads_per_threadgroup (C, 1, 1)\n"
+            )
+        };
+        let body = format!(
+            "    params (PACK in [0, 1] default 0)\n{}{}{}{}",
+            launch("first", "N < 4"),
+            launch("second", "N >= 4 and N < 8"),
+            launch("third", "N >= 8 and N < 16"),
+            launch("fourth", "N >= 16"),
+        );
+        let implementation = declared(&body);
+        let statics = NativeSpecialization::new();
+        let default = implementation
+            .device_independent()
+            .unwrap()
+            .default_specialization(&statics)
+            .unwrap();
+        let domain = SurveyDomain::of(&implementation, &statics, &default, shapes(&[1, 4, 8, 16])).unwrap();
+        let rows = domain.rows(&statics, &default).unwrap();
+        for point in &rows {
+            let pack = point
+                .leading
+                .iter()
+                .position(|(launch, name)| launch.is_none() && name == "PACK")
+                .expect("an entry parameter decides every point's work");
+            let taken = point.rows.iter().map(|row| row.values[pack]).collect::<BTreeSet<_>>();
+            assert_eq!(taken, BTreeSet::from([0, 1]));
+            // Each value of `PACK` with each of the one working launch's
+            // choices: the point's own assignments, not the product.
+            assert_eq!(point.rows.len(), 2 * 8 * 8 * 8);
+        }
+    }
+
     /// What a search formed stays held whatever was formed after it: a
     /// variant is asked of the toolchain once, a later compile call asks
     /// only for what no held program has, and the programs leave only when
@@ -9936,7 +10189,7 @@ mod tests {
     fn a_formed_variant_is_held_until_given_up_and_never_asked_for_twice() {
         let implementation = declared(ROWS_BY_LAUNCH);
         let default = implementation
-            .device_independent().unwrap().default_specialization(&NativeSpecialization::new())
+            .default_specialization_without_device(&NativeSpecialization::new()).unwrap()
             .unwrap();
         let rows = |rows| default.clone().with_param("ROWS", rows);
         let mut programs = Programs::Launches(LaunchPrograms::default());
@@ -9984,7 +10237,7 @@ mod tests {
     fn the_canonical_programs_are_counted_once_and_never_formed_again() {
         let implementation = declared(ROWS_BY_LAUNCH);
         let default = implementation
-            .device_independent().unwrap().default_specialization(&NativeSpecialization::new())
+            .default_specialization_without_device(&NativeSpecialization::new()).unwrap()
             .unwrap();
         let rows = |rows| default.clone().with_param("ROWS", rows);
         let (_, _, kernel) = project_kernel();
@@ -10103,7 +10356,7 @@ mod tests {
             .native_implementation(module.entry_named("scale").unwrap(), BackendName::Metal)
             .unwrap();
         let default = implementation
-            .device_independent().unwrap().default_specialization(&NativeSpecialization::new())
+            .default_specialization_without_device(&NativeSpecialization::new()).unwrap()
             .unwrap();
         let changed = default.clone().with_param("BATCH_FROM", 9);
         let boundary = [plan::ParameterAddress::Entry("BATCH_FROM".into())];
@@ -10162,8 +10415,9 @@ mod tests {
         observed.observe((FormationClass::Compiled, 1), Duration::from_secs(5));
         observed.observe((FormationClass::Kept, 0), Duration::from_millis(1));
         let price = Mutex::new(observed);
+        let charges = Charges::tally(&device);
         let formation = Formation {
-            device: &device,
+            charges: &charges,
             module: &module,
             entry,
             logical: &logical,

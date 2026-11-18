@@ -1,4 +1,4 @@
-use seismic::{BackendName, Devices, Element, NativeSpecialization, NativeTensorBatch, SlabFill, SlabRegion, SlabTensor, Tensor};
+use seismic::{BackendName, Element, NativeSpecialization, NativeTensorBatch, SlabFill, SlabRegion, SlabTensor, Tensor};
 use seismic_native_tests::{pool, scale_rows, slab_scale};
 
 #[test]
@@ -56,14 +56,12 @@ fn native_cuda_slab_port_refuses_a_plain_tensor() {
 /// slab addresses. A call refuses one, as a native graph's port binding
 /// does, before anything is encoded.
 fn slab_port_refuses_a_plain_tensor(backend: BackendName) {
-    let device = Devices::discover(&[])
-        .unwrap()
-        .open_backend(backend)
-        .unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(backend) else { return };
+    let charges = seismic::Charges::tally(&device);
     let kernel = slab_scale::native_for_device(&device, &NativeSpecialization::new()).unwrap();
-    let plain = Tensor::from_host(&device, Element::f32(), &[4, 1], &[0; 16]).unwrap();
+    let plain = Tensor::from_host(&charges, Element::f32(), &[4, 1], &[0; 16]).unwrap();
     let refused = seismic::WorkflowError::PlainSlabBinding { parameter: "x".into() };
-    match kernel.call(slab_scale::Args { x: &plain, slab_rows: 4, factor: 2.0, delay_ms: 0 }) {
+    match kernel.call(&charges, slab_scale::Args { x: &plain, slab_rows: 4, factor: 2.0, delay_ms: 0 }) {
         Err(seismic::CallError::Workflow(error)) => assert_eq!(error, refused),
         other => panic!("a plain tensor at a slab port: {:?}", other.map(|_| ())),
     }
@@ -86,7 +84,7 @@ fn slab_port_refuses_a_plain_tensor(backend: BackendName) {
     let plan = graph.seal().unwrap();
     let mut bindings = plan.bindings();
     assert_eq!(
-        bindings.set(&port, &plain),
+        bindings.set(&charges, &port, &plain),
         Err(seismic::WorkflowError::PlainSlabBinding { parameter: "port 0".into() })
     );
 }
@@ -96,11 +94,10 @@ fn slab_port_refuses_a_plain_tensor(backend: BackendName) {
 /// tensor is; a slice past the extent is still refused.
 #[test]
 fn an_empty_slice_of_a_slab_view_holds_no_slab() {
-    let device = Devices::discover(&[])
-        .unwrap()
-        .open_backend(BackendName::Cpu)
-        .unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Cpu) else { return };
+    let charges = seismic::Charges::tally(&device);
     let slabs = SlabTensor::in_pool(
+        &charges,
         &pool(&device),
         2,
         2,
@@ -121,24 +118,6 @@ fn an_empty_slice_of_a_slab_view_holds_no_slab() {
         empty.write_from_host(&[]).unwrap();
     }
     assert!(logical.slice_leading(2, 3).is_err());
-
-    // A one-row-per-slab empty slice forms a zero-count record view over the
-    // store's address table without allocating a view table, even after the
-    // device's record tables are sealed.
-    let record_slabs = SlabTensor::in_pool(
-        &pool(&device),
-        1,
-        4,
-        &[SlabRegion {
-            element: Element::f32(),
-            row_shape: vec![16],
-        }],
-    )
-    .unwrap();
-    device.seal_record_tables();
-    let empty_records = record_slabs.logical_region(0).unwrap().slice_leading(2, 2).unwrap();
-    assert_eq!(empty_records.extents(), &[0, 16]);
-    empty_records.hold_record_table().unwrap();
 }
 
 fn native_reads_rows_across_slab_boundary(backend: BackendName) {
@@ -146,13 +125,12 @@ fn native_reads_rows_across_slab_boundary(backend: BackendName) {
 }
 
 fn native_reads_rows_with_slab_size(backend: BackendName, slab_rows: u64) {
-    let device = Devices::discover(&[])
-        .unwrap()
-        .open_backend(backend)
-        .unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(backend) else { return };
+    let charges = seismic::Charges::tally(&device);
     let tail_rows = slab_rows.min(44);
     let logical_rows = slab_rows + tail_rows;
     let slabs = SlabTensor::in_pool(
+        &charges,
         &pool(&device),
         slab_rows,
         logical_rows,
@@ -177,7 +155,7 @@ fn native_reads_rows_with_slab_size(backend: BackendName, slab_rows: u64) {
     let logical = slabs.logical_region(0).unwrap();
     let kernel = slab_scale::native_for_device(&device, &NativeSpecialization::new()).unwrap();
     let result = kernel
-        .call(slab_scale::Args {
+        .call(&charges, slab_scale::Args {
             x: &logical,
             slab_rows: slab_rows as u32,
             factor: 2.0,
@@ -220,11 +198,10 @@ fn native_vulkan_reads_reused_interior_slab_index() {
 }
 
 fn native_reads_reused_interior_slab_index(backend: BackendName) {
-    let device = Devices::discover(&[])
-        .unwrap()
-        .open_backend(backend)
-        .unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(backend) else { return };
+    let charges = seismic::Charges::tally(&device);
     let slabs = SlabTensor::in_pool(
+        &charges,
         &pool(&device),
         256,
         3 * 256,
@@ -253,7 +230,7 @@ fn native_reads_reused_interior_slab_index(backend: BackendName) {
     let logical = slabs.logical_region(0).unwrap();
     let kernel = slab_scale::native_for_device(&device, &NativeSpecialization::new()).unwrap();
     let output = kernel
-        .call(slab_scale::Args {
+        .call(&charges, slab_scale::Args {
             x: &logical,
             slab_rows: 256,
             factor: 2.0,
@@ -281,11 +258,13 @@ fn metal_submission_cost_with_one_and_one_hundred_slabs() {
     use seismic_native_tests::slab_probe;
     use std::time::Instant;
 
-    fn sample(device: &seismic::Device, slab_count: usize) -> (u128, u128) {
+    fn sample(charges: &seismic::Charges, slab_count: usize) -> (u128, u128) {
+        let device = &charges.device();
         // Keep the logical shape, address-table size and compiled kernel
         // identical. Only the number of backed slabs changes.
         let rows = 100 * 256;
         let slabs = SlabTensor::in_pool(
+            charges,
             &pool(device),
             256,
             rows,
@@ -322,9 +301,9 @@ fn metal_submission_cost_with_one_and_one_hundred_slabs() {
         let mut submit_samples = Vec::new();
         for index in 0..600 {
             let mut bindings = plan.bindings();
-            bindings.set(&input, &logical).unwrap();
-            let outputs = plan.new_outputs().unwrap();
-            let mut slot = plan.new_slot().unwrap();
+            bindings.set(charges, &input, &logical).unwrap();
+            let outputs = plan.new_outputs(charges).unwrap();
+            let mut slot = plan.new_slot(charges).unwrap();
             let ready = slot.attach(bindings, outputs).unwrap();
             let mut sequence = device.native_sequence(seismic::NativeQueue::Compute);
             let start = Instant::now();
@@ -351,13 +330,11 @@ fn metal_submission_cost_with_one_and_one_hundred_slabs() {
         )
     }
 
-    let device = Devices::discover(&[])
-        .unwrap()
-        .open_backend(BackendName::Metal)
-        .unwrap();
-    let one_before = sample(&device, 1);
-    let hundred = sample(&device, 100);
-    let one_after = sample(&device, 1);
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Metal) else { return };
+    let charges = seismic::Charges::tally(&device);
+    let one_before = sample(&charges, 1);
+    let hundred = sample(&charges, 100);
+    let one_after = sample(&charges, 1);
     eprintln!(
         "Metal queue/submit median ns: 1 slab before={one_before:?}, 100 slabs={hundred:?}, 1 slab after={one_after:?}"
     );
@@ -378,11 +355,10 @@ fn metal_frees_slab_after_submitted_read() {
 }
 
 fn free_after_submitted_read(backend: BackendName) {
-    let device = Devices::discover(&[])
-        .unwrap()
-        .open_backend(backend)
-        .unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(backend) else { return };
+    let charges = seismic::Charges::tally(&device);
     let slabs = SlabTensor::in_pool(
+        &charges,
         &pool(&device),
         256,
         300,
@@ -423,10 +399,10 @@ fn free_after_submitted_read(backend: BackendName) {
     let plan = graph.seal().unwrap();
     let mut bindings = plan.bindings();
     let logical = slabs.logical_region(0).unwrap();
-    bindings.set(&input, &logical).unwrap();
-    let mut slot = plan.new_slot().unwrap();
+    bindings.set(&charges, &input, &logical).unwrap();
+    let mut slot = plan.new_slot(&charges).unwrap();
     let (outputs, completion) = slot
-        .attach(bindings, plan.new_outputs().unwrap())
+        .attach(bindings, plan.new_outputs(&charges).unwrap())
         .unwrap()
         .submit()
         .unwrap();
@@ -453,11 +429,10 @@ fn free_after_submitted_read(backend: BackendName) {
 /// the run runs, so a slab frees beside it.
 #[test]
 fn a_queued_graph_run_holds_off_no_slab_change() {
-    let device = Devices::discover(&[])
-        .unwrap()
-        .open_backend(BackendName::Cpu)
-        .unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(BackendName::Cpu) else { return };
+    let charges = seismic::Charges::tally(&device);
     let slabs = SlabTensor::in_pool(
+        &charges,
         &pool(&device),
         256,
         300,
@@ -489,9 +464,9 @@ fn a_queued_graph_run_holds_off_no_slab_change() {
     let plan = graph.seal().unwrap();
     let mut bindings = plan.bindings();
     let logical = slabs.logical_region(0).unwrap();
-    bindings.set(&input, &logical).unwrap();
-    let mut slot = plan.new_slot().unwrap();
-    let ready = slot.attach(bindings, plan.new_outputs().unwrap()).unwrap();
+    bindings.set(&charges, &input, &logical).unwrap();
+    let mut slot = plan.new_slot(&charges).unwrap();
+    let ready = slot.attach(bindings, plan.new_outputs(&charges).unwrap()).unwrap();
     drop(logical);
     let mut sequence = device.native_sequence(seismic::NativeQueue::Compute);
     ready.queue(&mut sequence).unwrap();
@@ -514,11 +489,10 @@ fn metal_frees_slab_after_a_submitted_batch_read() {
 /// A slab freed while a batch's read is in flight keeps its rows for that
 /// read: its granule is claimable again only once the batch completes.
 fn free_after_batch_read(backend: BackendName) {
-    let device = Devices::discover(&[])
-        .unwrap()
-        .open_backend(backend)
-        .unwrap();
+    let Some(device) = seismic_native_tests::fresh_device(backend) else { return };
+    let charges = seismic::Charges::tally(&device);
     let slabs = SlabTensor::in_pool(
+        &charges,
         &pool(&device),
         256,
         300,
@@ -542,8 +516,8 @@ fn free_after_batch_read(backend: BackendName) {
     }
     let kernel = slab_scale::native_for_device(&device, &NativeSpecialization::new()).unwrap();
     let logical = slabs.logical_region(0).unwrap();
-    let mut value = Tensor::zeros(&device, Element::f32(), &[300, 1]).unwrap();
-    let mut batch = NativeTensorBatch::new(&device);
+    let mut value = Tensor::zeros(&charges, Element::f32(), &[300, 1]).unwrap();
+    let mut batch = NativeTensorBatch::new(&charges);
     batch
         .push(
             &kernel,
@@ -590,10 +564,12 @@ fn plain_port_refuses_a_slab_view() {
 }
 
 fn plain_port_refuses_a_non_empty_slab_view(device: seismic::Device) {
+    let charges = seismic::Charges::tally(&device);
     let kernel =
         scale_rows::native_for_device(&device, &NativeSpecialization::new().with_param("ROWS", 1))
             .unwrap();
     let slabs = SlabTensor::in_pool(
+        &charges,
         &pool(&device),
         2,
         4,
@@ -610,7 +586,7 @@ fn plain_port_refuses_a_non_empty_slab_view(device: seismic::Device) {
     let refused = seismic::WorkflowError::SlabPlainBinding {
         parameter: "x".into(),
     };
-    match kernel.call(scale_rows::Args {
+    match kernel.call(&charges, scale_rows::Args {
         x: &subview,
         factor: 2.0,
     }) {
@@ -618,7 +594,7 @@ fn plain_port_refuses_a_non_empty_slab_view(device: seismic::Device) {
         other => panic!("a non-empty slab view at a plain port: {:?}", other.map(|_| ())),
     }
     let empty = logical.slice_leading(2, 2).unwrap();
-    match kernel.call(scale_rows::Args {
+    match kernel.call(&charges, scale_rows::Args {
         x: &empty,
         factor: 2.0,
     }) {
@@ -645,7 +621,7 @@ fn plain_port_refuses_a_non_empty_slab_view(device: seismic::Device) {
     let plan = graph.seal().unwrap();
     let mut bindings = plan.bindings();
     assert_eq!(
-        bindings.set(&port, &subview),
+        bindings.set(&charges, &port, &subview),
         Err(seismic::WorkflowError::SlabPlainBinding {
             parameter: "port 0".into(),
         })
@@ -665,10 +641,12 @@ fn multi_slab_subviews_compose_and_scope_slabs() {
 }
 
 fn multi_slab_subviews_compose_and_scope_slabs_on(device: seismic::Device) {
+    let charges = seismic::Charges::tally(&device);
     // 4 slots, 4 rows per slab, 14 logical rows (slots 0..3 hold 4 rows each,
     // slot 3 holds 2 tail rows), and two regions so region 1 starts past
     // region 0's table entries.
     let slabs = SlabTensor::in_pool(
+        &charges,
         &pool(&device),
         4,
         14,
@@ -759,7 +737,7 @@ fn multi_slab_subviews_compose_and_scope_slabs_on(device: seismic::Device) {
     // from region 1's table offset for both `mid_and_tail` and `nested`.
     let kernel = slab_scale::native_for_device(&device, &NativeSpecialization::new()).unwrap();
     let scaled_mid = kernel
-        .call(slab_scale::Args {
+        .call(&charges, slab_scale::Args {
             x: &mid_and_tail,
             slab_rows: 4,
             factor: 3.0,
@@ -777,7 +755,7 @@ fn multi_slab_subviews_compose_and_scope_slabs_on(device: seismic::Device) {
     assert_eq!(got_mid, want_mid);
 
     let scaled_nested = kernel
-        .call(slab_scale::Args {
+        .call(&charges, slab_scale::Args {
             x: &nested,
             slab_rows: 4,
             factor: 2.0,

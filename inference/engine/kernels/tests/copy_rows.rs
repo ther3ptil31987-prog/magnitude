@@ -84,7 +84,7 @@ fn generated_surface_exposes_native_and_planned_dense_plane_bindings() {
         elements: copy_rows::Elements,
     ) -> Result<seismic::Kernel<copy_rows::Entry>, seismic::LoadError> {
         copy_rows::for_device_with(
-            device,
+            &seismic::Charges::tally(device),
             seismic::PreparationOptions::analytical(seismic::PrecisionPolicy::Exact),
             elements,
         )
@@ -100,21 +100,13 @@ fn generated_surface_exposes_native_and_planned_dense_plane_bindings() {
 
 #[test]
 fn native_copies_indexed_word_plane_rows_bit_exactly_on_every_device() {
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    for backend in [
-        seismic::BackendName::Metal,
-        seismic::BackendName::Cuda,
-        seismic::BackendName::Vulkan,
-        seismic::BackendName::Cpu,
-    ] {
-        let Ok(device) = catalog.open_backend(backend) else {
-            continue;
-        };
+    for device in seismic_native_tests::devices(&[seismic::BackendName::Metal, seismic::BackendName::Cuda, seismic::BackendName::Vulkan, seismic::BackendName::Cpu]) {
         copy_word_plane_rows(&device);
     }
 }
 
 fn copy_word_plane_rows(device: &seismic::Device) {
+    let charges = seismic::Charges::tally(device);
     let element = seismic::Element::u32();
     let source = (0_u32..24).collect::<Vec<_>>();
     let source_bytes = source
@@ -130,9 +122,9 @@ fn copy_word_plane_rows(device: &seismic::Device) {
     let rows = slabbed_rows(device, element, 4, &[2, 3], &source_bytes, 2);
     let mut rows_region = rows.logical_region(0).unwrap();
     let from =
-        seismic::Tensor::from_host(&device, seismic::Element::i32(), &[2], &indices(&[3, 1]))
+        seismic::Tensor::from_host(&charges, seismic::Element::i32(), &[2], &indices(&[3, 1]))
             .unwrap();
-    let to = seismic::Tensor::from_host(&device, seismic::Element::i32(), &[2], &indices(&[0, 2]))
+    let to = seismic::Tensor::from_host(&charges, seismic::Element::i32(), &[2], &indices(&[0, 2]))
         .unwrap();
     declared::prepared(
         &device,
@@ -140,7 +132,7 @@ fn copy_word_plane_rows(device: &seismic::Device) {
         &seismic::NativeSpecialization::new(),
     )
     .unwrap()
-    .call(copy_rows::Args {
+    .call(&charges, copy_rows::Args {
         rows: &mut rows_region,
         from: &from,
         to: &to,
@@ -159,19 +151,13 @@ fn copy_word_plane_rows(device: &seismic::Device) {
     assert_eq!(&actual[18..24], &source[18..24], "{:?}", device.backend());
 }
 
-/// The host's GPU (Metal on macOS, else Vulkan when present), then the CPU.
+/// The host's GPU (Metal on macOS, else Vulkan when present), then the CPU;
+/// a requested backend among them alone
+/// ([`seismic_native_tests::first_and_cpu`]).
 fn devices() -> Vec<seismic::Device> {
-    let catalog = seismic::Devices::discover(&[]).unwrap();
-    let gpu = if cfg!(target_os = "macos") {
-        Some(catalog.open_backend(seismic::BackendName::Metal).unwrap())
-    } else {
-        catalog.open_backend(seismic::BackendName::Vulkan).ok()
-    };
-    gpu.into_iter()
-        .chain(std::iter::once(
-            catalog.open_backend(seismic::BackendName::Cpu).unwrap(),
-        ))
-        .collect()
+    use seismic::BackendName::{Cpu, Metal, Vulkan};
+    let gpu = if cfg!(target_os = "macos") { Metal } else { Vulkan };
+    seismic_native_tests::first_and_cpu(&[gpu], &[gpu, Cpu])
 }
 
 fn assert_native_two_byte_plane_copy(
@@ -179,6 +165,7 @@ fn assert_native_two_byte_plane_copy(
     element: seismic::Element,
     source: &[u16],
 ) {
+    let charges = seismic::Charges::tally(device);
     let source_bytes = source
         .iter()
         .flat_map(|value| value.to_le_bytes())
@@ -192,9 +179,9 @@ fn assert_native_two_byte_plane_copy(
     let rows = slabbed_rows(device, element, 4, &[2, 3], &source_bytes, 2);
     let mut rows_region = rows.logical_region(0).unwrap();
     let from =
-        seismic::Tensor::from_host(&device, seismic::Element::i32(), &[2], &indices(&[3, 1]))
+        seismic::Tensor::from_host(&charges, seismic::Element::i32(), &[2], &indices(&[3, 1]))
             .unwrap();
-    let to = seismic::Tensor::from_host(&device, seismic::Element::i32(), &[2], &indices(&[0, 2]))
+    let to = seismic::Tensor::from_host(&charges, seismic::Element::i32(), &[2], &indices(&[0, 2]))
         .unwrap();
 
     declared::prepared(
@@ -203,7 +190,7 @@ fn assert_native_two_byte_plane_copy(
         &seismic::NativeSpecialization::new(),
     )
     .unwrap()
-    .call(copy_rows::Args {
+    .call(&charges, copy_rows::Args {
         rows: &mut rows_region,
         from: &from,
         to: &to,
@@ -271,6 +258,7 @@ fn native_copy_across_slab_boundary() {
 }
 
 fn native_copy_across_slab_boundary_on(device: &seismic::Device) {
+    let charges = seismic::Charges::tally(device);
     let element = seismic::Element::u32();
     let words = |values: &[u32]| {
         values
@@ -288,10 +276,10 @@ fn native_copy_across_slab_boundary_on(device: &seismic::Device) {
     );
     let mut rows_region = rows.logical_region(0).unwrap();
     let from =
-        seismic::Tensor::from_host(&device, seismic::Element::i32(), &[1], &0_i32.to_le_bytes())
+        seismic::Tensor::from_host(&charges, seismic::Element::i32(), &[1], &0_i32.to_le_bytes())
             .unwrap();
     let to =
-        seismic::Tensor::from_host(&device, seismic::Element::i32(), &[1], &2_i32.to_le_bytes())
+        seismic::Tensor::from_host(&charges, seismic::Element::i32(), &[1], &2_i32.to_le_bytes())
             .unwrap();
     declared::prepared(
         &device,
@@ -300,6 +288,7 @@ fn native_copy_across_slab_boundary_on(device: &seismic::Device) {
     )
     .unwrap()
     .call_into(
+        &charges,
         copy_rows::Args {
             rows: &mut rows_region,
             from: &from,
